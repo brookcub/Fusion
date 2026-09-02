@@ -4150,6 +4150,37 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
     }
   });
 
+  /*
+  FNXC:TaskActivityLogApi 2026-09-02-14:37:
+  `POST /tasks/:id/log` appends task activity notes through TaskStore.logEntry. Keep it singular so it cannot be confused with the existing plural `/logs` agent-log reader.
+  */
+  router.post("/tasks/:id/log", async (req, res) => {
+    try {
+      const { store: scopedStore } = await getProjectContext(req);
+      const { message, level } = req.body ?? {};
+      if (typeof message !== "string") {
+        throw badRequest("message is required and must be a string");
+      }
+      if (message.length === 0 || message.length > 2000) {
+        throw badRequest("message must be between 1 and 2000 characters");
+      }
+      if (level !== undefined && typeof level !== "string") {
+        throw badRequest("level must be a string");
+      }
+      const normalizedLevel = level?.trim() || undefined;
+      const task = await scopedStore.logEntry(req.params.id, message, normalizedLevel);
+      res.json(task);
+    } catch (err: unknown) {
+      if (err instanceof ApiError) {
+        throw err;
+      }
+      if (isTaskLookupMiss(err)) {
+        throw notFound(`Task ${req.params.id} not found`);
+      }
+      rethrowAsApiError(err);
+    }
+  });
+
   // Get historical agent logs for a task.
   // Tool-oriented detail payloads may be clipped server-side to keep the
   // dashboard responsive when agents emit very large command results.
