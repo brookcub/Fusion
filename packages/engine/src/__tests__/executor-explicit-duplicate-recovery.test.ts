@@ -72,4 +72,56 @@ describe("executor explicit duplicate redirect parse recovery", () => {
       await rm(tasksDir, { recursive: true, force: true });
     }
   });
+
+  it("rebounds missing implementation steps to replan instead of parking failed", async () => {
+    resetExecutorMocks();
+    const tasksDir = await mkdtemp(join(tmpdir(), "fusion-missing-steps-"));
+    const store = createMockStore();
+    const liveTask = task({
+      id: "KB-125",
+      title: "Implement feature",
+      description: "Missing steps",
+      error: "parse error",
+    });
+    await mkdir(join(tasksDir, liveTask.id), { recursive: true });
+    await writeFile(join(tasksDir, liveTask.id, "PROMPT.md"), "# Real spec\n\n## Mission\nShip the change.\n", "utf-8");
+    store.getTasksDir = vi.fn(() => tasksDir);
+    store.getTask.mockResolvedValue(liveTask);
+    const executor = new TaskExecutor(store, "/tmp/test");
+
+    try {
+      await (executor as any).handleGraphFailure(liveTask, {
+        disposition: "failed",
+        outcome: "failure",
+        reason: "missing-implementation-steps",
+        visitedNodeIds: ["parse"],
+        context: { "node:parse:value": "missing-implementation-steps" },
+      });
+
+      expect(store.moveTask).toHaveBeenCalledWith(liveTask.id, "todo", { preserveWorktree: true });
+      expect(store.updateTask).toHaveBeenCalledWith(liveTask.id, {
+        status: "needs-replan",
+        error: null,
+      }, undefined);
+      expect(store.logEntry).toHaveBeenCalledWith(
+        liveTask.id,
+        "AI spec revision requested",
+        expect.stringContaining("no executable Step headings"),
+        undefined,
+      );
+      expect(store.logEntry).toHaveBeenCalledWith(
+        liveTask.id,
+        "Parse node failed with missing implementation steps — rebounded to todo for re-specification",
+        "missing-implementation-steps",
+        undefined,
+      );
+      expect(store.updateTask).not.toHaveBeenCalledWith(
+        liveTask.id,
+        expect.objectContaining({ status: "failed" }),
+        undefined,
+      );
+    } finally {
+      await rm(tasksDir, { recursive: true, force: true });
+    }
+  });
 });

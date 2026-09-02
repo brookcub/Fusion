@@ -2362,8 +2362,8 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   async startStep( id: string, stepIndex: number, options?: { source?: "graph" }, ): Promise<import("./task-store/merge-queue-ops.js").StepStartResult> {
     return startStepImpl(this, id, stepIndex, options);
   }
-  async checkAndRecordUnplannedExecutionBlock(id: string, episode: string): Promise<boolean> {
-    return checkAndRecordUnplannedExecutionBlockImpl(this, id, episode);
+  async checkAndRecordUnplannedExecutionBlock(id: string, episode: string, reason?: import("./types.js").TaskReleaseGateVerdict["reason"]): Promise<boolean> {
+    return checkAndRecordUnplannedExecutionBlockImpl(this, id, episode, reason);
   }
   async transitionQueuedEpisode(id: string, transition: QueuedEpisodeTransition): Promise<import("./task-store/audit-ops.js").QueuedEpisodeTransitionResult> {
     return transitionQueuedEpisodeImpl(this, id, transition);

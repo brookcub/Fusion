@@ -716,6 +716,12 @@ export async function handleGraphFailure(
       re-ran forever on Retry. Rebound to needs-replan with feedback instead of
       terminal failed so triage rewrites a real plan. Primary gate is scheduler
       filesystem validation; this recovers cards already past admission.
+
+      FNXC:ExecutionPlanning 2026-09-02-16:09:
+      `missing-implementation-steps` is the same planning defect one lane later: the workflow
+      reached parse without executable Step headings. Rebound it to the workflow-aware replan
+      column with revision feedback instead of terminalizing in WIP, but keep duplicate-only
+      prompts on their existing duplicate-specific message path.
       */
       if (
         !live.paused
@@ -730,10 +736,10 @@ export async function handleGraphFailure(
             : join(deps.rootDir, ".fusion", "tasks");
           const promptContent = await readFile(getPromptPath(tasksDir, live.id), "utf-8").catch(() => "");
           const redirectReason = nonExecutableDuplicateRedirectReason(promptContent, live.title);
+          const replanColumn = await resolveReplanTargetColumn(deps.store, live.id);
           if (redirectReason) {
             const duplicateResolution = resolveExplicitDuplicateMarker(promptContent, live.title);
             const marker = duplicateResolution.marker;
-            const replanColumn = await resolveReplanTargetColumn(deps.store, live.id);
             await moveTaskToReplanColumn(deps.store, { id: live.id, column: live.column }, replanColumn);
             await deps.store.updateTask(live.id, {
               status: "needs-replan",
@@ -755,6 +761,29 @@ export async function handleGraphFailure(
               deps.getRunContextFor(live.id),
             );
             executorLog.warn(`${live.id}: ${redirectReason} — replan instead of failed park`);
+            deps.activeWorktrees.delete(live.id);
+            await deps.persistTokenUsage(live.id);
+            return;
+          }
+          if (failureValue === "missing-implementation-steps") {
+            await moveTaskToReplanColumn(deps.store, { id: live.id, column: live.column }, replanColumn);
+            await deps.store.updateTask(live.id, {
+              status: "needs-replan",
+              error: null,
+            }, deps.getRunContextFor(live.id));
+            await deps.store.logEntry(
+              live.id,
+              "AI spec revision requested",
+              "Execution parse rejected the current PROMPT.md because it has no executable Step headings. Add at least one implementation step or declare **No commits expected:** true.",
+              deps.getRunContextFor(live.id),
+            );
+            await deps.store.logEntry(
+              live.id,
+              `Parse node failed with missing implementation steps — rebounded to ${replanColumn} for re-specification`,
+              "missing-implementation-steps",
+              deps.getRunContextFor(live.id),
+            );
+            executorLog.warn(`${live.id}: missing implementation steps — replan instead of failed park`);
             deps.activeWorktrees.delete(live.id);
             await deps.persistTokenUsage(live.id);
             return;

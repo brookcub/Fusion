@@ -49,6 +49,7 @@ import {
   resolveWorkflowIrForTask,
   isUnplannedSeedPrompt,
   isDuplicateRedirectOnlyPrompt,
+  getStepParser,
   isWorkflowOptionalGroupEnabled,
   resolveEffectiveAutoMerge,
   isTaskBlockedOnApproval,
@@ -189,6 +190,7 @@ export async function checkAndRecordUnplannedExecutionBlock(
 ): Promise<void> {
   const recorder = (store as Partial<Pick<TaskStore, "checkAndRecordUnplannedExecutionBlock">>).checkAndRecordUnplannedExecutionBlock;
   if (!recorder) return;
+  const evaluation = await evaluateUnplannedForExecution(store, task, ir);
   const planReviewNode = resolvePreReleasePlanReviewNode(ir)?.id ?? "none";
   let promptContent = typeof task.prompt === "string" ? task.prompt : "";
   const tasksDir = typeof store.getTasksDir === "function" ? store.getTasksDir() : undefined;
@@ -207,11 +209,12 @@ export async function checkAndRecordUnplannedExecutionBlock(
     planReviewNode,
     promptMarker,
     dependencies,
+    reason: evaluation.reason ?? null,
     status: task.status ?? null,
     handoffFingerprint: task.approvedPlanFingerprint ?? null,
   })).digest("hex");
   try {
-    await recorder.call(store, task.id, episode);
+    await recorder.call(store, task.id, episode, evaluation.reason ?? undefined);
   } catch (error) {
     // The gate is safety-critical; its diagnostic must not turn an otherwise-safe refusal into a dispatch failure.
     schedulerLog.warn(`Could not persist unplanned dispatch refusal for ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
@@ -220,9 +223,22 @@ export async function checkAndRecordUnplannedExecutionBlock(
 
 export interface UnplannedForExecutionEvaluation {
   unplanned: boolean;
-  reason: "plan-review-pending" | "planning-status" | "needs-replan" | "duplicate-prompt" | "seed-prompt" | null;
+  reason: "plan-review-pending" | "planning-status" | "needs-replan" | "duplicate-prompt" | "seed-prompt" | "no-parsed-plan" | "no-executable-steps" | null;
   readyAtCapacityBoundary: boolean;
   planReview?: NonNullable<TaskReleaseGateVerdict["planReview"]>;
+}
+
+function workflowRequiresPromptImplementationSteps(ir: WorkflowIr): boolean {
+  return ir.nodes.some((node) =>
+    node.kind === "parse-steps"
+    && (node.config?.artifact === undefined || node.config.artifact === "PROMPT.md")
+    && node.config?.parser === "step-headings"
+    && node.config?.requireStepsUnlessNoCommits === true
+  );
+}
+
+function promptDeclaresNoCommitsExpected(text: string): boolean {
+  return /^\*\*No commits expected:\*\*\s*(true|yes)\b/im.test(text);
 }
 
 /*
@@ -246,7 +262,8 @@ export async function evaluateUnplannedForExecution(store: TaskStore, task: Task
   }
   if (task.status === "planning") return { unplanned: true, reason: "planning-status", readyAtCapacityBoundary, planReview };
   if (task.status === "needs-replan") return { unplanned: true, reason: "needs-replan", readyAtCapacityBoundary, planReview };
-  const flags = findColumn(ir, task.column) ? resolveColumnFlags(findColumn(ir, task.column)!) : {};
+  const currentColumn = findColumn(ir, task.column);
+  const flags = currentColumn ? resolveColumnFlags(currentColumn) : {};
   if (flags.intake !== true && flags.hold !== true) return { unplanned: false, reason: null, readyAtCapacityBoundary, planReview };
   /*
   FNXC:DuplicateIntake 2026-08-11-20:53:
@@ -255,15 +272,34 @@ export async function evaluateUnplannedForExecution(store: TaskStore, task: Task
   the duplicate redirect refusal rather than accidentally releasing the card.
   */
   if (isDuplicateRedirectOnlyPrompt(undefined, task.title)) return { unplanned: true, reason: "duplicate-prompt", readyAtCapacityBoundary, planReview };
-  if (typeof store.getTasksDir !== "function") return { unplanned: false, reason: null, readyAtCapacityBoundary, planReview };
-  try {
-    const prompt = await readFile(getPromptPath(store.getTasksDir(), task.id), "utf-8");
-    if (isDuplicateRedirectOnlyPrompt(prompt, task.title)) return { unplanned: true, reason: "duplicate-prompt", readyAtCapacityBoundary, planReview };
-    const unplanned = isUnplannedSeedPrompt(prompt, task.id, task.title, task.description);
-    return { unplanned, reason: unplanned ? "seed-prompt" : null, readyAtCapacityBoundary, planReview };
-  } catch {
-    return { unplanned: false, reason: null, readyAtCapacityBoundary, planReview };
+  const promptPath = typeof store.getTasksDir === "function" ? getPromptPath(store.getTasksDir(), task.id) : undefined;
+  const prompt = typeof task.prompt === "string"
+    ? task.prompt
+    : promptPath
+      ? await readFile(promptPath, "utf-8").catch(() => undefined)
+      : undefined;
+  if (typeof prompt !== "string") {
+    return workflowRequiresPromptImplementationSteps(ir)
+      ? { unplanned: true, reason: "no-parsed-plan", readyAtCapacityBoundary, planReview }
+      : { unplanned: false, reason: null, readyAtCapacityBoundary, planReview };
   }
+  if (isDuplicateRedirectOnlyPrompt(prompt, task.title)) return { unplanned: true, reason: "duplicate-prompt", readyAtCapacityBoundary, planReview };
+  const unplanned = isUnplannedSeedPrompt(prompt, task.id, task.title, task.description);
+  if (unplanned) return { unplanned: true, reason: "seed-prompt", readyAtCapacityBoundary, planReview };
+  /*
+  FNXC:ExecutionPlanning 2026-09-02-16:09:
+  A spec-shaped PROMPT.md without parseable Step headings is not executable handoff evidence for
+  workflows that explicitly require `step-headings` plus `requireStepsUnlessNoCommits`. The same
+  PROMPT.md predicate must gate hold-release admission and triage recovery so step-less specs
+  rebound for revision instead of entering parse loops in WIP.
+  */
+  if (workflowRequiresPromptImplementationSteps(ir) && !promptDeclaresNoCommitsExpected(prompt)) {
+    const parsedSteps = getStepParser("step-headings")?.parse(prompt).steps ?? [];
+    if (parsedSteps.length === 0) {
+      return { unplanned: true, reason: "no-executable-steps", readyAtCapacityBoundary, planReview };
+    }
+  }
+  return { unplanned: false, reason: null, readyAtCapacityBoundary, planReview };
 }
 
 /** Compatibility wrapper retained for scheduler and release callers. */
