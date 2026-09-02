@@ -29,6 +29,7 @@ const TOOL_RESULT_DETAIL_LIMIT = 4_096;
 const TOOL_RESULT_DETAIL_TRUNCATION_NOTICE = "\n\n[tool output truncated to keep dashboard log views responsive]";
 const TOOL_RESULT_MAX_ARRAY_ITEMS = 25;
 const TOOL_RESULT_MAX_OBJECT_KEYS = 50;
+const TASK_LOG_WARNING_DETAIL_LIMIT = 500;
 
 function truncateToolResultDetail(value: string): string {
   if (value.length <= TOOL_RESULT_DETAIL_LIMIT) return value;
@@ -282,6 +283,7 @@ export class AgentLogger {
    * Tool completion rows need non-sensitive processing duration for Bash and every other tool. Store only start timestamps in FIFO order per tool name so overlapping same-name calls do not leak arguments/results or collapse into one duration.
    */
   private readonly toolStartedAt = new Map<string, number[]>();
+  private readonly pendingTaskLogWarningWrites = new Set<Promise<void>>();
 
   constructor(options: AgentLoggerOptions) {
     this.store = options.store;
@@ -442,6 +444,9 @@ export class AgentLogger {
     const startedAt = this.shiftToolStart(name);
     const durationMs = startedAt !== undefined ? Math.max(0, Date.now() - startedAt) : undefined;
     this.writeEntry(name, type, detail, `Failed to log tool end "${name}" (${type}) for ${this.taskId}`, false, durationMs !== undefined ? { durationMs } : undefined);
+    if (isError) {
+      this.recordTaskLogToolFailure(name, detail);
+    }
     // Record completion as tool_result/tool_error with a duration descriptor.
     // meta NEVER includes the tool result payload — only non-sensitive metrics.
     const meta: Record<string, unknown> = {};
@@ -465,6 +470,9 @@ export class AgentLogger {
     await this.flushTextBuffer();
     await this.flushThinkingBuffer();
     await this.flushPendingEntries();
+    if (this.pendingTaskLogWarningWrites.size > 0) {
+      await Promise.all([...this.pendingTaskLogWarningWrites]);
+    }
   }
 
   // ── Internal helpers ───────────────────────────────────────────────
@@ -478,6 +486,35 @@ export class AgentLogger {
   private markFirstVisibleOutput(): number {
     this.firstVisibleOutputRecorded = true;
     return Math.max(0, Date.now() - this.requestStartedAtMs);
+  }
+
+  private recordTaskLogToolFailure(toolName: string, detail: string | undefined): void {
+    if (!this.store || !this.taskId || typeof this.store.logEntry !== "function") {
+      return;
+    }
+    const outcome = this.buildTaskLogToolFailurePreview(detail);
+    const write = this.store
+      .logEntry(this.taskId, `Tool call failed: ${toolName}`, outcome, undefined, { level: "warning" })
+      .then(() => undefined)
+      .catch((err) => {
+        this.log.warn(`Failed to append task-log warning for tool failure "${toolName}" on ${this.taskId}: ${err instanceof Error ? err.message : String(err)}`);
+      })
+      .finally(() => {
+        this.pendingTaskLogWarningWrites.delete(write);
+      });
+    this.pendingTaskLogWarningWrites.add(write);
+  }
+
+  private buildTaskLogToolFailurePreview(detail: string | undefined): string {
+    /*
+    FNXC:TaskActivityFeed 2026-09-02-14:28:
+    Session-local tool validation failures need a durable operator breadcrumb, but task activity should store only a short redacted preview rather than the full agent-log payload. Reuse the existing tool-result summarizer/redaction seam, then cap more aggressively for the feed.
+    */
+    const redacted = redactSecrets(detail ?? "Tool returned an error result with no detail.");
+    if (redacted.length <= TASK_LOG_WARNING_DETAIL_LIMIT) {
+      return redacted;
+    }
+    return `${redacted.slice(0, TASK_LOG_WARNING_DETAIL_LIMIT)}…`;
   }
 
   private shiftToolStart(name: string): number | undefined {

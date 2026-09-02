@@ -8,7 +8,7 @@
  */
 import { and, eq, isNull } from "drizzle-orm";
 import {TaskStore} from "../store.js";
-import type { Task, TaskDetail, TaskLogEntry, RunMutationContext } from "../types.js";
+import type { Task, TaskDetail, TaskLogEntry, TaskLogEntryWriteOptions, RunMutationContext } from "../types.js";
 import {findWorkflowColumn} from "../plugins/plugin-gate-verdict.js";
 import {getTraitRegistry} from "../workflows/trait-registry.js";
 import {makeTransitionPending} from "../tasks/transition-types.js";
@@ -248,12 +248,13 @@ export async function checkAndRecordUnplannedExecutionBlockImpl(
   return recorded;
 }
 
-export async function logEntryImpl(store: TaskStore, id: string, action: string, outcome?: string, runContext?: RunMutationContext): Promise<Task> {
+export async function logEntryImpl(store: TaskStore, id: string, action: string, outcome?: string, runContext?: RunMutationContext, options?: TaskLogEntryWriteOptions): Promise<Task> {
     return store.withTaskLock(id, async () => {
       const entry: TaskLogEntry = {
         timestamp: new Date().toISOString(),
         action,
         outcome: truncateTaskLogOutcome(outcome),
+        ...(options?.level !== undefined ? { level: options.level } : {}),
       };
       if (runContext) {
         {

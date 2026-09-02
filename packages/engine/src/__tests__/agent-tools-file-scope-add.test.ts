@@ -77,6 +77,7 @@ describe("fn_task_file_scope_add", () => {
     const result = await runTool(tool, { files: ["../secrets.txt", "/etc/passwd"] });
 
     expect(updateTask).not.toHaveBeenCalled();
+    expect(result.isError).toBe(true);
     expect(getText(result)).toMatch(/Rejected/);
   });
 
@@ -87,6 +88,7 @@ describe("fn_task_file_scope_add", () => {
     const result = await runTool(tool, { files: ["packages/engine/src/foo.ts", "../bad"] });
 
     expect(updateTask).toHaveBeenCalledTimes(1);
+    expect(result.isError).not.toBe(true);
     const text = getText(result);
     expect(text).toMatch(/Added to File Scope: packages\/engine\/src\/foo\.ts/);
     expect(text).toMatch(/Rejected.*\.\.\/bad/);
@@ -99,6 +101,7 @@ describe("fn_task_file_scope_add", () => {
     const result = await runTool(tool, { files: ["packages/engine/src/foo.ts"] });
 
     expect(updateTask).not.toHaveBeenCalled();
+    expect(result.isError).toBe(true);
     expect(getText(result)).toMatch(/no "## File Scope" section/);
   });
 });

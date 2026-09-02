@@ -2153,6 +2153,7 @@ export function createTaskPromptWriteTool(store: TaskStore, taskId: string, runC
             text: `ERROR: Failed to update PROMPT.md for ${taskId}: ${err.message}`,
           }],
           details: {},
+          isError: true,
         };
       }
     },
@@ -2174,7 +2175,11 @@ export function createTaskFileScopeAddTool(store: TaskStore, taskId: string, run
       "Paths are repo-relative (no leading slash, no `..`).",
     parameters: taskFileScopeAddParams,
     execute: async (_id: string, params: Static<typeof taskFileScopeAddParams>) => {
-      const errorContent = (text: string) => ({ content: [{ type: "text" as const, text }], details: {} });
+      /*
+      FNXC:TaskActivityFeed 2026-09-02-14:28:
+      Full File Scope rejections must classify as tool failures so the shared tool-end logger can mirror them into the durable task activity feed instead of leaving operators with a stalled card and only session-local validation output.
+      */
+      const errorContent = (text: string) => ({ content: [{ type: "text" as const, text }], details: {}, isError: true as const });
       try {
         const requested = params.files.map((f) => f.trim()).filter((f) => f.length > 0);
         const rejected = requested.filter((f) => !fusionCore.isValidFileScopeEntry(f));

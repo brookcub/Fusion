@@ -207,6 +207,7 @@ describe("task_prompt_write tool", () => {
       content: "# Plan that must persist",
     });
 
+    expect(result.isError).toBe(true);
     expect(getText(result)).toContain("ERROR:");
     expect(getText(result)).toContain("could not be verified");
   });

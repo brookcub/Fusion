@@ -32,10 +32,21 @@ export interface RunMutationContext {
   source?: string;
 }
 
+/*
+FNXC:TaskActivityFeed 2026-09-02-14:28:
+Operator-facing task activity needs a lightweight severity hint so failed tool-call breadcrumbs can surface as warnings without changing the JSONB-backed log shape or forcing every legacy caller to populate a level.
+*/
+export type TaskLogLevel = "info" | "warning" | "error";
+
+export interface TaskLogEntryWriteOptions {
+  level?: TaskLogLevel;
+}
+
 export interface TaskLogEntry {
   timestamp: string;
   action: string;
   outcome?: string;
+  level?: TaskLogLevel;
   /** Correlation metadata linking this entry to the agent run that produced it. */
   runContext?: RunMutationContext;
 }
