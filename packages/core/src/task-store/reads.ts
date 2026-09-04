@@ -333,7 +333,11 @@ export async function listTasksImpl(store: TaskStore, options?: { limit?: number
     const startupMemoEnabled = options?.startupMemo ?? (!store.isWatching && slim);
 
     if (startupMemoEnabled && slim && options?.limit === undefined && options?.offset === undefined) {
-      const memoKey = `${includeArchived ? "all" : "active"}:${columnFilter ?? "*"}`;
+      /* FNXC:TaskListVisibility 2026-09-04-07:39:
+       * Startup readers and forensic readers must never share a cached deleted-row
+       * policy. Tuple encoding also keeps an absent column distinct from its text.
+       */
+      const memoKey = JSON.stringify([includeArchived, options?.includeDeleted === true, columnFilter ?? null]);
       const now = Date.now();
       const cached = store.startupSlimListMemo.get(memoKey);
       if (cached && cached.expiresAt > now) {
