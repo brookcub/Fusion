@@ -1,33 +1,32 @@
 import { spawn } from "node:child_process";
 import { dirname, resolve } from "node:path";
-import { existsSync } from "node:fs";
 import { cp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 export const packageRoot = resolve(__dirname, "..");
 export const workspaceRoot = resolve(packageRoot, "..", "..");
 
-function resolveBin(command: string, cwd: string): string {
-  const suffix = process.platform === "win32" ? ".cmd" : "";
-  const localBin = resolve(cwd, "node_modules", ".bin", `${command}${suffix}`);
-  if (existsSync(localBin)) {
-    return localBin;
-  }
-
-  return resolve(workspaceRoot, "node_modules", ".bin", `${command}${suffix}`);
-}
-
 export function runWorkspaceBin(command: string, args: string[], cwd: string): Promise<void> {
+  /* FNXC:WindowsPackaging 2026-09-04-07:39:
+   * Workspace paths may contain spaces. Invoke known JS tools through Node,
+   * not an unquoted absolute .cmd shim interpreted by a second shell.
+   */
+  const entrypoints: Record<string, [string, string]> = {
+    tsc: ["typescript", "bin/tsc"], vite: ["vite", "bin/vite.js"], vitest: ["vitest", "vitest.mjs"],
+  };
+  const entry = entrypoints[command];
+  if (!entry) return Promise.reject(new Error(`Unsupported workspace tool: ${command}`));
+  const require = createRequire(resolve(cwd, "package.json"));
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(resolveBin(command, cwd), args, {
+    const tool = resolve(dirname(require.resolve(`${entry[0]}/package.json`)), entry[1]);
+    const child = spawn(process.execPath, [tool, ...args], {
       cwd,
       stdio: "inherit",
       env: process.env,
-      // On Windows the resolved bin is a .cmd shim; Node refuses to spawn
-      // .cmd/.bat without a shell (EINVAL) since CVE-2024-27980. resolveBin
-      // produces an absolute, space-free path, so shell quoting is safe here.
-      shell: process.platform === "win32",
+      shell: false,
+      windowsHide: true,
     });
 
     child.on("error", rejectPromise);
