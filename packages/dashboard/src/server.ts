@@ -70,6 +70,7 @@ import { CliChatSessionRunner } from "./cli-chat.js";
 import { stopAllDevServers } from "./dev-server-routes.js";
 import type { SkillsAdapter } from "./skills-adapter.js";
 import { createAuthMiddleware, authenticateUpgradeRequest, getDaemonToken } from "./auth-middleware.js";
+import { deploymentMaintenance } from "./deployment-maintenance.js";
 import { setupCliSessionWebSocket } from "./cli-session-ws.js";
 import { createCliSessionsRouter } from "./routes/cli-sessions.js";
 import { getProjectIdFromRequest, resolveStoreForProjectId } from "./routes/context.js";
@@ -975,6 +976,7 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   });
 
   const app = express();
+  app.use(deploymentMaintenance);
   app.locals.hybridExecutor = options?.hybridExecutor;
   const runtimeLogger = options?.runtimeLogger ?? createRuntimeLogger("server");
   const mutationRateLimit = rateLimit(RATE_LIMITS.mutation);

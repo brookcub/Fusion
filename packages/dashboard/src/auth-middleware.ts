@@ -8,6 +8,7 @@
 import { timingSafeEqual } from "node:crypto";
 import type { Request, Response, NextFunction } from "express";
 import type { IncomingMessage } from "node:http";
+import { deploymentMaintenanceActive } from "./deployment-maintenance.js";
 
 /**
  * Query-string fallback used when the client can't set an Authorization
@@ -138,6 +139,7 @@ function extractTokenFromRequest(req: { headers: { authorization?: string }; url
  * Uses constant-time comparison to resist timing attacks.
  */
 export function authenticateUpgradeRequest(token: string, req: IncomingMessage): boolean {
+  if (deploymentMaintenanceActive()) return false;
   const expectedBuffer = Buffer.from(token, "utf8");
   const provided = extractTokenFromRequest(req as { headers: { authorization?: string }; url?: string });
   if (!provided) return false;
