@@ -70,14 +70,14 @@ import type { AgentPromptsConfig, ArchiveAgentLogMode, TaskTokenBudget } from ".
 export type SettingsScope = "global" | "project";
 
 /**
- * Settings for daemon mode authentication token and server configuration.
+ * Settings for daemon/dashboard authentication token and server configuration.
  * Stored in global settings alongside user preferences.
  */
 export interface DaemonTokenSettings {
   /** The daemon authentication token (format: fn_<32 hex chars>).
    *  Used for authenticating CLI clients to the daemon server. */
   daemonToken?: string;
-  /** Port for daemon mode server binding. Default: 4040. */
+  /** Port for daemon and dashboard mode server binding. Dashboard `--port`/`-p` overrides this setting for one launch. Default: 4040. */
   daemonPort?: number;
   /** Host for daemon mode server binding. Default: "127.0.0.1" (localhost only).
    *  Set to "0.0.0.0" explicitly to expose the API on all interfaces — only do
@@ -765,7 +765,7 @@ export interface GlobalSettings {
   /** The daemon authentication token (format: fn_<32 hex chars>).
    *  Used for authenticating CLI clients to the daemon server. */
   daemonToken?: string;
-  /** Port for daemon mode server binding. Default: 4040. */
+  /** Port for daemon and dashboard mode server binding. Dashboard `--port`/`-p` overrides this setting for one launch. Default: 4040. */
   daemonPort?: number;
   /** Host for daemon mode server binding. Default: "127.0.0.1" (localhost only).
    *  Set to "0.0.0.0" explicitly to expose the API on all interfaces — only do

@@ -292,8 +292,12 @@ export const DEFAULT_GLOBAL_SETTINGS = {
   validatorGlobalThinkingLevel: undefined,
   titleSummarizerGlobalThinkingLevel: undefined,
   mergerGlobalThinkingLevel: undefined,
-  // Daemon mode settings
+  // Daemon/dashboard listen settings
   daemonToken: undefined,
+  /*
+  FNXC:DashboardPortSettings 2026-09-05-05:37:
+  `daemonPort` is the backward-compatible listen-port setting for daemon and dashboard mode. Dashboard CLI flags (`--port`/`-p`) override it for one launch, but absent flags should fall back here before the 4040 default.
+  */
   daemonPort: 4040,
   daemonHost: "127.0.0.1",
   // Node settings sync

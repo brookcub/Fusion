@@ -154,7 +154,7 @@ Fusion automatically falls back to ntfy's JSON publish format when a notificatio
 | `importTranslateGlobalModelId` | `string` | `undefined` | Global baseline model ID for import auto-translation. |
 | `importTranslateGlobalThinkingLevel` | `ThinkingLevel` | `undefined` | Optional global import-translate-lane thinking override. Inherits `defaultThinkingLevel` when unset. |
 | `daemonToken` | `string` | `undefined` | Daemon authentication token (`fn_<32 hex chars>`) used by CLI clients. |
-| `daemonPort` | `number` | `4040` | Port for daemon/serve mode binding. |
+| `daemonPort` | `number` | `4040` | Port for daemon/serve binding and the dashboard fallback listen port. `fn dashboard` and bare `fn` use this when no `--port`/`-p` flag is provided; the CLI flag wins for that launch. |
 | `daemonHost` | `string` | `"127.0.0.1"` | Host for daemon/serve mode binding. Defaults to localhost only; pass `"0.0.0.0"` to expose on all interfaces. |
 | `settingsSyncEnabled` | `boolean` | `false` | Enable automatic settings synchronization between nodes. |
 | `settingsSyncAuth` | `boolean` | `false` | Include auth-material snapshots (`sharedState.authMaterial` and auth sync endpoints) when settings sync is enabled. Ignored when `settingsSyncEnabled` is `false`. |
