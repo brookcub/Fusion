@@ -1053,13 +1053,14 @@ export class ProjectEngine {
    * Race a merge body with abort, while tracking the underlying body so the next
    * generation cannot start until the orphan work settles.
    */
-  private runAbortableMergeBody<T>(bodyFactory: () => Promise<T>, signal: AbortSignal, taskId: string): Promise<T> {
+  private runAbortableMergeBody<T>(bodyFactory: () => Promise<T>, signal: AbortSignal, taskId: string, onBody?: (body: Promise<T>) => void): Promise<T> {
     // FNXC:MergeQueue 2026-08-09-23:45: Pump-side stamp reconciliation awaits store I/O after
     // claiming the generation. If cancellation arrives in that window, do not instantiate a body:
     // `raceMergeWithAbort` checks too late (after bodyFactory), and an aborted runAiMerge can still
     // reach unrelated finalization paths before its later cooperative abort check.
     if (signal.aborted) return Promise.reject(this.createMergeAbortedError(taskId));
     const body = this.trackMergeBody(bodyFactory());
+    onBody?.(body);
     return this.raceMergeWithAbort(body, signal, taskId);
   }
 
@@ -4422,7 +4423,25 @@ export class ProjectEngine {
           maxConcurrent` check), so dropping the argument keeps per-project
           admission and oldest-first fairness exactly as they were.
           */
+          let admittedMergeBody: Promise<unknown> | undefined;
+          const trackAdmittedBody = (body: Promise<unknown>) => { admittedMergeBody = body; };
           const runWithMergeAdmission = async <T>(start: () => Promise<T>): Promise<T | undefined> => {
+            // FNXC:ContinuationMergeHandoff 2026-09-05-13:26: A resumed graph
+            // awaits this merge while owning a slot. A second admission deadlocks
+            // at cap=1. Borrow its exact project/task slot, retaining outer ownership.
+            const releaseBorrow = projectAdmissionCoordinator.borrowContinuationMerge(cwd, taskId);
+            if (releaseBorrow) {
+              this.capacityDeferredMergeReasons.delete(taskId);
+              try {
+                return await start();
+              } finally {
+                // The abort race may finish before an uncooperative raw body.
+                // Bind capacity to this exact body's settlement, not the mutable
+                // engine-wide latch (which can expire or belong to a later run).
+                if (admittedMergeBody) void admittedMergeBody.then(releaseBorrow, releaseBorrow);
+                else releaseBorrow();
+              }
+            }
             if (coordinatorReservedMerge) {
               try {
                 return await start();
@@ -4559,6 +4578,7 @@ export class ProjectEngine {
                   ),
                 abortSignal,
                 taskId,
+                trackAdmittedBody,
               );
             });
             if (result === undefined) {
@@ -4757,7 +4777,7 @@ export class ProjectEngine {
                 allowDirtyLocalCheckoutSync: settings.merger?.allowDirtyLocalCheckoutSync === true,
               };
               return runAiMerge(store, cwd, taskId, mergeOptionsWithSettings);
-              }, abortSignal, taskId);
+              }, abortSignal, taskId, trackAdmittedBody);
             };
 
             const result = await runWithMergeAdmission(rawMerge);

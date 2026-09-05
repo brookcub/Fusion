@@ -59,6 +59,8 @@ export interface AdmissionCandidate {
   lane: AdmissionLane;
   /** Starting this candidate will occupy a new execution-worktree slot. */
   consumesWorktree: boolean;
+  /** A resumed graph owns this slot through its nested merge and final node. */
+  continuationOwner?: boolean;
   createdAt?: string;
   /** Records ownership of the host reservation before the lane starts. */
   reserve?: () => void;
@@ -108,6 +110,13 @@ independent triage/execute/merge polls or semaphore lane priority. Lanes refresh
 candidates then hand their starts here; nested runNested helpers are deliberately
 not candidates because they remain parent-internal soft breaches.
 */
+interface AdmissionReservation {
+  consumesWorktree: boolean;
+  continuationOwner: boolean;
+  ownerReleased: boolean;
+  mergeBorrowed: boolean;
+}
+
 export class ProjectAdmissionCoordinator {
   private draining = new Map<string, Promise<void>>();
   private providers = new Map<string, Map<string, AdmissionProvider>>();
@@ -116,17 +125,43 @@ export class ProjectAdmissionCoordinator {
    * are deliberately project-scoped, so a prompt handoff cannot let a second
    * same-project admission observe stale persisted rows and exceed maxConcurrent.
    */
-  private reservations = new Map<string, Map<string, { consumesWorktree: boolean }>>();
+  private reservations = new Map<string, Map<string, AdmissionReservation>>();
 
-  private reserve(projectId: string, taskId: string, consumesWorktree: boolean): void {
-    const tasks = this.reservations.get(projectId) ?? new Map<string, { consumesWorktree: boolean }>();
-    tasks.set(taskId, { consumesWorktree });
+  private reserve(projectId: string, taskId: string, consumesWorktree: boolean, continuationOwner = false): void {
+    const tasks = this.reservations.get(projectId) ?? new Map<string, AdmissionReservation>();
+    // FNXC:ContinuationMergeHandoff 2026-09-05-13:26: Duplicate handoffs must
+    // not replace the identity/borrow of an already-owned reservation.
+    if (!tasks.has(taskId)) tasks.set(taskId, { consumesWorktree, continuationOwner, ownerReleased: false, mergeBorrowed: false });
     this.reservations.set(projectId, tasks);
+  }
+
+  /** Borrow only this project's still-owned continuation slot; never a fresh admission. */
+  borrowContinuationMerge(projectId: string, taskId: string): (() => void) | undefined {
+    const tasks = this.reservations.get(projectId);
+    const reservation = tasks?.get(taskId);
+    if (!reservation?.continuationOwner || reservation.ownerReleased || reservation.mergeBorrowed) return undefined;
+    reservation.mergeBorrowed = true;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      reservation.mergeBorrowed = false;
+      if (reservation.ownerReleased && tasks?.get(taskId) === reservation) {
+        tasks.delete(taskId);
+        if (tasks.size === 0 && this.reservations.get(projectId) === tasks) this.reservations.delete(projectId);
+      }
+    };
   }
 
   releaseReservation(taskId: string): void {
     for (const [projectId, tasks] of this.reservations) {
-      if (!tasks.delete(taskId)) continue;
+      const reservation = tasks.get(taskId);
+      if (!reservation) continue;
+      reservation.ownerReleased = true;
+      // Cancellation may settle the graph before its merger finishes. Keep the
+      // single slot accounted for until that borrower also relinquishes it.
+      if (reservation.mergeBorrowed) return;
+      tasks.delete(taskId);
       if (tasks.size === 0) this.reservations.delete(projectId);
       return;
     }
@@ -307,6 +342,10 @@ export class ProjectAdmissionCoordinator {
       this function exists to prevent.
       */
       for (const winner of candidates) {
+        // FNXC:ContinuationMergeHandoff 2026-09-05-13:35: Fresh admission cannot
+        // impersonate an existing owner (including its decline/throw cleanup).
+        // The continuation-to-merge path uses the explicit borrow above instead.
+        if (this.reservations.get(params.projectId)?.has(winner.taskId)) continue;
         /*
         FNXC:CapacityModel 2026-09-01-14:49:
         A worktree-blocked execute candidate must not starve checkout-free planning candidates ordered
@@ -334,7 +373,7 @@ export class ProjectAdmissionCoordinator {
         // The project reservation is independent of the optional host semaphore.
         // It bridges every lane's dispatch-to-persist gap, including runtimes
         // where the cross-project semaphore is intentionally absent.
-        this.reserve(params.projectId, winner.taskId, winner.consumesWorktree);
+        this.reserve(params.projectId, winner.taskId, winner.consumesWorktree, winner.continuationOwner);
         /*
         FNXC:ConcurrencyAdmission 2026-07-26-10:35:
         Unwind EXACTLY what this attempt took. Two ways a naive `semaphore.release()` corrupts
