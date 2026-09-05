@@ -70,6 +70,7 @@ describe("summarizeToolArgs", () => {
 function createMockStore(withBatch = false) {
   return {
     appendAgentLog: vi.fn().mockResolvedValue(undefined),
+    logEntry: vi.fn().mockResolvedValue(undefined),
     ...(withBatch ? { appendAgentLogBatch: vi.fn().mockResolvedValue(undefined) } : {}),
   } as unknown as TaskStore;
 }
@@ -661,7 +662,7 @@ describe("AgentLogger", () => {
   });
 
   it("logs tool_error on failed tool end", async () => {
-    const store = createMockStore();
+    const store = createMockStore() as TaskStore & { logEntry: ReturnType<typeof vi.fn> };
     const logger = new AgentLogger({
       store,
       taskId: "FN-016",
@@ -672,10 +673,11 @@ describe("AgentLogger", () => {
     logger.onToolEnd("Read", true, "file not found");
     await vi.advanceTimersByTimeAsync(0);
     expect(store.appendAgentLog).toHaveBeenCalledWith("FN-016", "Read", "tool_error", "file not found", "executor");
+    expect(store.logEntry).toHaveBeenCalledWith("FN-016", "Tool call failed: Read", "file not found", undefined, { level: "warning" });
   });
 
   it("preserves long tool errors without truncation", async () => {
-    const store = createMockStore();
+    const store = createMockStore() as TaskStore & { logEntry: ReturnType<typeof vi.fn> };
     const logger = new AgentLogger({
       store,
       taskId: "FN-016B",
@@ -683,12 +685,16 @@ describe("AgentLogger", () => {
       persistAgentToolOutput: true,
     });
 
-    const longError = "error:" + "y-".repeat(600);
+    const longError = `error:${"safe-long-preview-".repeat(60)}`;
     logger.onToolEnd("Read", true, longError);
-    await vi.advanceTimersByTimeAsync(0);
+    await logger.flush();
 
-    const call = (store.appendAgentLog as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(call[3]).toBe(longError);
+    const agentLogCall = (store.appendAgentLog as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(agentLogCall[3]).toContain("safe-long-preview-");
+    const taskLogCall = store.logEntry.mock.calls[0];
+    expect(taskLogCall[2]).toHaveLength(501);
+    expect(taskLogCall[2]).toContain("error:");
+    expect(taskLogCall[2].endsWith("…")).toBe(true);
   });
 
   it("preserves long tool results without truncation", async () => {
@@ -734,7 +740,7 @@ describe("AgentLogger", () => {
   });
 
   it("handles undefined result in onToolEnd", async () => {
-    const store = createMockStore();
+    const store = createMockStore() as TaskStore & { logEntry: ReturnType<typeof vi.fn> };
     const logger = new AgentLogger({
       store,
       taskId: "FN-018",
@@ -744,6 +750,43 @@ describe("AgentLogger", () => {
     logger.onToolEnd("Bash", false);
     await vi.advanceTimersByTimeAsync(0);
     expect(store.appendAgentLog).toHaveBeenCalledWith("FN-018", "Bash", "tool_result", undefined, "merger");
+    expect(store.logEntry).not.toHaveBeenCalled();
+  });
+
+  it("redacts secrets before mirroring tool failures into the task log", async () => {
+    const store = createMockStore() as TaskStore & { logEntry: ReturnType<typeof vi.fn> };
+    const logger = new AgentLogger({ store, taskId: "FN-018B", persistAgentToolOutput: true });
+
+    logger.onToolEnd("fn_task_prompt_write", true, "ERROR: token sk-ant-secret-value leaked");
+    await logger.flush();
+
+    const taskLogCall = store.logEntry.mock.calls[0];
+    expect(taskLogCall[2]).not.toContain("sk-ant-secret-value");
+    expect(taskLogCall[2]).toContain("[REDACTED]");
+  });
+
+  it("skips task-log warnings when the logger has no task id", async () => {
+    const store = createMockStore() as TaskStore & { logEntry: ReturnType<typeof vi.fn> };
+    const logger = new AgentLogger({ store, persistAgentToolOutput: true });
+
+    logger.onToolEnd("fn_task_prompt_write", true, "ERROR: Invalid File Scope");
+    await logger.flush();
+
+    expect(store.logEntry).not.toHaveBeenCalled();
+  });
+
+  it("swallows task-log warning write failures while preserving the agent tool_error", async () => {
+    const store = {
+      appendAgentLog: vi.fn().mockResolvedValue(undefined),
+      logEntry: vi.fn().mockRejectedValue(new Error("task missing")),
+    } as unknown as TaskStore & { appendAgentLog: ReturnType<typeof vi.fn>; logEntry: ReturnType<typeof vi.fn> };
+    const logger = new AgentLogger({ store, taskId: "FN-018C", agent: "executor", persistAgentToolOutput: true });
+
+    expect(() => logger.onToolEnd("fn_task_prompt_write", true, "ERROR: Invalid File Scope")).not.toThrow();
+    await logger.flush();
+
+    expect(store.appendAgentLog).toHaveBeenCalledWith("FN-018C", "fn_task_prompt_write", "tool_error", "ERROR: Invalid File Scope", "executor");
+    expect(loggerWarnSpy).toHaveBeenCalledWith(expect.stringContaining("Failed to append task-log warning for tool failure \"fn_task_prompt_write\" on FN-018C"));
   });
 
   describe("persistence failure observability", () => {
@@ -764,6 +807,7 @@ describe("AgentLogger", () => {
     it("onToolEnd warns on persistence failure", async () => {
       const store = {
         appendAgentLog: vi.fn().mockRejectedValue(new Error("EPERM: operation not permitted")),
+        logEntry: vi.fn().mockResolvedValue(undefined),
       } as unknown as TaskStore;
       const logger = new AgentLogger({ store, taskId: "FN-2090-TOOL-END" });
 

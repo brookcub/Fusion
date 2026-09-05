@@ -49,6 +49,19 @@ pgTest("TaskStore RunMutationContext (PostgreSQL)", () => {
     expect(lastEntry.outcome).toBe("Test outcome");
   });
 
+  it("logEntry() preserves optional warning level metadata", async () => {
+    const store = h.store();
+    const task = await store.createTask({ description: "Test task" });
+    const runContext = { runId: "run-level", agentId: "agent-level" };
+
+    await store.logEntry(task.id, "Tool call failed: fn_task_prompt_write", "ERROR: Invalid File Scope", runContext, { level: "warning" });
+
+    const updatedTask = await store.getTask(task.id);
+    const lastEntry = updatedTask.log[updatedTask.log.length - 1];
+    expect(lastEntry.level).toBe("warning");
+    expect(lastEntry.runContext).toEqual(runContext);
+  });
+
   it("logEntry() without runContext has no runContext field (backward compat)", async () => {
     const store = h.store();
     const task = await store.createTask({ description: "Test task" });

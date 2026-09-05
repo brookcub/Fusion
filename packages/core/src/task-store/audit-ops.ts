@@ -10,7 +10,7 @@ import { emitBoundedRunAudit } from "../run-audit/emit-bounded-run-audit.js";
  */
 import { and, eq, isNull } from "drizzle-orm";
 import {TaskStore} from "../store.js";
-import type { Task, TaskDetail, TaskLogEntry, RunMutationContext } from "../types.js";
+import type { Task, TaskDetail, TaskLogEntry, TaskLogEntryWriteOptions, RunMutationContext, TaskReleaseGateVerdict } from "../types.js";
 import {findWorkflowColumn} from "../plugins/plugin-gate-verdict.js";
 import {getTraitRegistry} from "../workflows/trait-registry.js";
 import {makeTransitionPending} from "../tasks/transition-types.js";
@@ -242,17 +242,62 @@ export async function transitionQueuedEpisodeImpl(
   return { appended: result.appended, task };
 }
 
+function describeUnplannedExecutionReason(reason?: TaskReleaseGateVerdict["reason"]): { action: string; outcome?: string } {
+  switch (reason) {
+    case "no-executable-steps":
+      return {
+        action: "Execution dispatch refused — no-executable-steps",
+        outcome: "PROMPT.md has no parseable implementation steps and does not declare no commits expected",
+      };
+    case "no-parsed-plan":
+      return {
+        action: "Execution dispatch refused — no-parsed-plan",
+        outcome: "Workflow requires PROMPT.md step headings before execution, but no prompt plan could be read",
+      };
+    case "duplicate-prompt":
+      return {
+        action: "Execution dispatch refused — duplicate-prompt",
+        outcome: "Waiting for duplicate redirect replan instead of execution",
+      };
+    case "seed-prompt":
+      return {
+        action: "Execution dispatch refused — seed-prompt",
+        outcome: "Waiting for planning lifecycle handoff or Plan Review continuation",
+      };
+    case "needs-replan":
+      return {
+        action: "Execution dispatch refused — needs-replan",
+        outcome: "Waiting for planning lifecycle handoff or Plan Review continuation",
+      };
+    case "planning-status":
+      return {
+        action: "Execution dispatch refused — planning-status",
+        outcome: "Waiting for planning lifecycle handoff or Plan Review continuation",
+      };
+    case "plan-review-pending":
+      return {
+        action: "Execution dispatch refused — plan-review-pending",
+        outcome: "Waiting for planning lifecycle handoff or Plan Review continuation",
+      };
+    default:
+      return {
+        action: "Execution dispatch refused — task is still unplanned",
+        outcome: "Waiting for planning lifecycle handoff or Plan Review continuation",
+      };
+  }
+}
+
 export async function checkAndRecordUnplannedExecutionBlockImpl(
   store: TaskStore,
   id: string,
   episode: string,
+  reason?: TaskReleaseGateVerdict["reason"],
 ): Promise<boolean> {
   const layer = store.asyncLayer!;
   const projectId = layer.projectId ?? "__legacy_unscoped__";
   const entry: TaskLogEntry = {
     timestamp: new Date().toISOString(),
-    action: "Execution dispatch refused — task is still unplanned",
-    outcome: "Waiting for planning lifecycle handoff or Plan Review continuation",
+    ...describeUnplannedExecutionReason(reason),
   };
   const recorded = await layer.transactionImmediate(async (tx) => {
     const claimed = await tx
@@ -288,12 +333,13 @@ export async function checkAndRecordUnplannedExecutionBlockImpl(
   return recorded;
 }
 
-export async function logEntryImpl(store: TaskStore, id: string, action: string, outcome?: string, runContext?: RunMutationContext): Promise<Task> {
+export async function logEntryImpl(store: TaskStore, id: string, action: string, outcome?: string, runContext?: RunMutationContext, options?: TaskLogEntryWriteOptions): Promise<Task> {
     return store.withTaskLock(id, async () => {
       const entry: TaskLogEntry = {
         timestamp: new Date().toISOString(),
         action,
         outcome: truncateTaskLogOutcome(outcome),
+        ...(options?.level !== undefined ? { level: options.level } : {}),
       };
       if (runContext) {
         {

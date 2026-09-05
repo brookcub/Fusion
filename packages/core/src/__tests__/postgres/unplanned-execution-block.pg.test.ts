@@ -52,6 +52,18 @@ pgDescribe("unplanned execution refusal dedupe", () => {
     expect(updated.log?.filter((entry) => entry.action.includes("Execution dispatch refused"))).toHaveLength(2);
   });
 
+  it("names the refusal reason in the durable task log entry", async () => {
+    const task = await h.store().createTask({ description: "stepless task" });
+
+    await expect(h.store().checkAndRecordUnplannedExecutionBlock(task.id, "episode-steps", "no-executable-steps")).resolves.toBe(true);
+
+    const updated = await h.store().getTask(task.id);
+    expect(updated.log?.at(-1)).toMatchObject({
+      action: "Execution dispatch refused — no-executable-steps",
+      outcome: "PROMPT.md has no parseable implementation steps and does not declare no commits expected",
+    });
+  });
+
   it("keeps the same task id and episode independent across projects", async () => {
     const backend: ResolvedBackend = {
       mode: "external",

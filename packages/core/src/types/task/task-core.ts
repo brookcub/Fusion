@@ -692,7 +692,7 @@ export interface TaskReleaseGateVerdict {
   promoteBlocked: boolean;
   unplannedForExecution: boolean;
   blockedOnApproval: boolean;
-  reason: "plan-review-pending" | "planning-status" | "needs-replan" | "duplicate-prompt" | "seed-prompt" | "awaiting-approval" | null;
+  reason: "plan-review-pending" | "planning-status" | "needs-replan" | "duplicate-prompt" | "seed-prompt" | "no-parsed-plan" | "no-executable-steps" | "awaiting-approval" | null;
   readyAtCapacityBoundary: boolean;
   planReview?: { nodeId: string; column: string; defaultOn: boolean; enabled: boolean; appliesToColumn: boolean; satisfied: boolean };
   releaseTargetColumn?: string;

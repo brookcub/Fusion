@@ -32,7 +32,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildBootstrapPrompt } from "@fusion/core";
 
-import { runHoldReleaseSweep, resetHoldReleaseInstrumentation, isUnplannedForExecution } from "../execution/hold-release.js";
+import { runHoldReleaseSweep, resetHoldReleaseInstrumentation, isUnplannedForExecution, evaluateTaskReleaseGate } from "../execution/hold-release.js";
 import { schedulerLog } from "../logger.js";
 
 const WF = "custom:wf";
@@ -64,7 +64,7 @@ function task(over: Partial<Task> = {}): Task {
 const SPLIT = { intake: "triage", hold: "todo", wip: "in-progress", complete: "done" };
 const MERGED = { intake: "planning", hold: "planning", wip: "in-progress", complete: "done" };
 
-function ir(names: { intake: string; hold: string; wip: string; complete: string }): WorkflowIr {
+function ir(names: { intake: string; hold: string; wip: string; complete: string }, opts: { requirePromptSteps?: boolean } = {}): WorkflowIr {
   const preImplementation = names.intake === names.hold
     ? [{
         id: names.hold,
@@ -90,12 +90,16 @@ function ir(names: { intake: string; hold: string; wip: string; complete: string
     nodes: [
       { id: "start", kind: "start", column: names.intake },
       { id: "planning", kind: "prompt", column: names.hold },
+      ...(opts.requirePromptSteps
+        ? [{ id: "parse", kind: "parse-steps" as const, column: names.hold, config: { parser: "step-headings", requireStepsUnlessNoCommits: true } }]
+        : []),
       { id: "execute", kind: "prompt", column: names.wip },
       { id: "end", kind: "end", column: names.complete },
     ],
     edges: [
       { from: "start", to: "planning", condition: "success" },
-      { from: "planning", to: "execute", condition: "success" },
+      { from: "planning", to: opts.requirePromptSteps ? "parse" : "execute", condition: "success" },
+      ...(opts.requirePromptSteps ? [{ from: "parse", to: "execute", condition: "success" }] : []),
       { from: "execute", to: "end", condition: "success" },
     ],
     columns: [
@@ -267,13 +271,19 @@ describe("a column carrying BOTH intake and hold (U11's merged Planning column)"
 
     function seedPlannedPrompt(taskId: string) {
       mkdirSync(join(tasksDir, taskId), { recursive: true });
-      writeFileSync(join(tasksDir, taskId, "PROMPT.md"), "# Real spec\n\nActual planned work.\n", "utf-8");
+      writeFileSync(join(tasksDir, taskId, "PROMPT.md"), "# Real spec\n\n## Steps\n### Step 1: Implement\n- [ ] ship the change\n", "utf-8");
     }
 
-    function gateStore(): TaskStore {
+    function seedSteplessPrompt(taskId: string, extra = "") {
+      mkdirSync(join(tasksDir, taskId), { recursive: true });
+      writeFileSync(join(tasksDir, taskId, "PROMPT.md"), `# Real spec\n\n## Mission\nShip the change.\n${extra}`, "utf-8");
+    }
+
+    function gateStore(overrides: Partial<TaskStore> = {}): TaskStore {
       return {
         getTasksDir: () => tasksDir,
         getSettings: vi.fn(async () => ({})),
+        ...overrides,
       } as unknown as TaskStore;
     }
 
@@ -330,6 +340,59 @@ describe("a column carrying BOTH intake and hold (U11's merged Planning column)"
       seedUnplannedPrompt("W1", "Working", "d");
 
       await expect(isUnplannedForExecution(gateStore(), card, ir(MERGED))).resolves.toBe(false);
+    });
+
+    it("holds a step-gated spec with no executable steps and logs the refusal reason", async () => {
+      const card = task({ id: "S1", title: "Spec only", description: "d", column: MERGED.hold });
+      seedSteplessPrompt("S1");
+      const workflowIr = ir(MERGED, { requirePromptSteps: true });
+      const store = gateStore({
+        listTasks: vi.fn(async () => [card]),
+        getTask: vi.fn(async () => card),
+        moveTaskIf: vi.fn(async () => ({ task: card, moved: false })),
+        logEntry: vi.fn(async () => card),
+        checkAndRecordUnplannedExecutionBlock: vi.fn(async (_id: string, _episode: string, reason?: string | null) => {
+          await (store as unknown as { logEntry: (id: string, action: string, outcome?: string, runContext?: unknown) => Promise<unknown> }).logEntry(
+            card.id,
+            `Execution dispatch refused — ${reason ?? "task is still unplanned"}`,
+            reason === "no-executable-steps"
+              ? "PROMPT.md has no parseable implementation steps and does not declare no commits expected"
+              : "Waiting for planning lifecycle handoff or Plan Review continuation",
+            undefined,
+          );
+          return true;
+        }),
+        recordRunAuditEvent: vi.fn(async () => undefined),
+        getCompletionHandoffAcceptedMarker: vi.fn(async () => null),
+        getTaskWorkflowSelection: vi.fn(() => ({ workflowId: WF, stepIds: [] })),
+        getTaskWorkflowSelectionAsync: vi.fn(async () => ({ workflowId: WF, stepIds: [] })),
+        getWorkflowDefinition: vi.fn(async () => ({ ir: workflowIr })),
+      });
+
+      const verdict = await evaluateTaskReleaseGate(store, card, { ir: workflowIr });
+      const result = await runHoldReleaseSweep(store, { now: () => 1_000_000 });
+
+      expect(verdict).toMatchObject({
+        promoteBlocked: true,
+        unplannedForExecution: true,
+        reason: "no-executable-steps",
+      });
+      expect(result.released).toEqual([]);
+      expect(result.held.some((entry) => entry.taskId === "S1")).toBe(true);
+      expect(store.moveTaskIf).not.toHaveBeenCalled();
+      expect(store.logEntry).toHaveBeenCalledWith(
+        "S1",
+        expect.stringContaining("Execution dispatch refused"),
+        expect.stringContaining("no parseable implementation steps"),
+        undefined,
+      );
+    });
+
+    it("allows an explicit no-commits stepless prompt for step-gated workflows", async () => {
+      const card = task({ id: "NC1", title: "No commits", description: "d", column: MERGED.hold });
+      seedSteplessPrompt("NC1", "\n**No commits expected:** true\n");
+
+      await expect(isUnplannedForExecution(gateStore(), card, ir(MERGED, { requirePromptSteps: true }))).resolves.toBe(false);
     });
   });
 });

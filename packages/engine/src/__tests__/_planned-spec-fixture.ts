@@ -57,7 +57,7 @@ export function seedPlannedSpec(
   */
   const content = opts.content
     ?? (`# ${taskId}\n\n## Context\nA planned spec, so the release sweep does not classify this card `
-      + `as an unplanned seed.\n\n## Steps\n### Step 1\n- [ ] do the planned work\n`);
+      + `as an unplanned seed.\n\n## Steps\n### Step 1: Do the planned work\n- [ ] do the planned work\n`);
 
   mkdirSync(dirname(promptPath), { recursive: true });
   writeFileSync(promptPath, content, "utf-8");
