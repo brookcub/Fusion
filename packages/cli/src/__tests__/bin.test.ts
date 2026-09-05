@@ -151,19 +151,65 @@ const dashboardCliState = vi.hoisted(() => ({
   resolveDashboardPort: vi.fn(async () => dashboardCliState.resolvedPort),
 }));
 
-vi.mock("@fusion/core", async () => {
-  const actual = await vi.importActual<typeof import("@fusion/core")>("@fusion/core");
-  return {
-    ...actual,
-    getDefaultCentralDbPath: vi.fn(() => onboardEnv.centralDbPath),
-  };
-});
+/*
+ * FNXC:CliRoutingFixture 2026-09-05-10:55:
+ * Routing exercises the real dispatcher and onboarding decision, not database
+ * initialization or every command's transitive engine graph. Keep settings in
+ * memory and fail on unexpected command dispatch rather than loading user state.
+ */
+const unexpectedHandler = vi.hoisted(() => (name: string) => vi.fn(() => {
+  throw new Error(`Unexpected command boundary in routing fixture: ${name}`);
+}));
+vi.mock("@fusion/core", () => ({
+  getDefaultCentralDbPath: vi.fn(() => onboardEnv.centralDbPath),
+  GlobalSettingsStore: class {
+    async init() {}
+    async getSettings() { return {}; }
+  },
+  isPostgresUniqueError: vi.fn(() => false),
+  ProjectPartitionRekeyError: class extends Error {},
+  FUSION_NON_RETRYABLE_EXIT_CODE: 87,
+  isLocale: unexpectedHandler("locale validation"),
+  SUPPORTED_LOCALES: [],
+}));
+vi.mock("../commands/mcp.js", () => ({
+  runMcpList: unexpectedHandler("mcp list"), runMcpAdd: unexpectedHandler("mcp add"),
+  runMcpEdit: unexpectedHandler("mcp edit"), runMcpRemove: unexpectedHandler("mcp remove"),
+  runMcpEnable: unexpectedHandler("mcp enable"), runMcpDisable: unexpectedHandler("mcp disable"),
+  runMcpImport: unexpectedHandler("mcp import"), runMcpExport: unexpectedHandler("mcp export"),
+  runMcpValidate: unexpectedHandler("mcp validate"),
+}));
+vi.mock("../commands/mcp-memory-server.js", () => ({ runMcpMemoryServer: unexpectedHandler("memory server") }));
+vi.mock("../commands/workflow.js", () => ({ runWorkflowValidate: unexpectedHandler("workflow validate") }));
+vi.mock("../commands/branch-group.js", () => ({
+  runBranchGroupList: unexpectedHandler("branch group list"), runBranchGroupShow: unexpectedHandler("branch group show"),
+  runBranchGroupPromote: unexpectedHandler("branch group promote"), runBranchGroupAbandon: unexpectedHandler("branch group abandon"),
+}));
+vi.mock("../commands/db.js", () => ({ runDbVacuum: unexpectedHandler("db vacuum"), runDbMigrate: unexpectedHandler("db migrate") }));
+vi.mock("../commands/memory-backup.js", () => ({
+  runMemoryBackupCreate: unexpectedHandler("memory backup create"), runMemoryBackupList: unexpectedHandler("memory backup list"),
+  runMemoryBackupRestore: unexpectedHandler("memory backup restore"),
+}));
+vi.mock("../commands/knowledge-graph.js", () => ({ runKnowledgeGraphBuild: unexpectedHandler("knowledge graph") }));
+vi.mock("../commands/agent-export.js", () => ({ runAgentExport: unexpectedHandler("agent export") }));
+vi.mock("../commands/chat.js", () => ({ runChatInteractive: unexpectedHandler("chat"), parseChatCliArgs: unexpectedHandler("chat args") }));
+vi.mock("../commands/plugin-publish.js", () => ({ runPluginPublish: unexpectedHandler("plugin publish") }));
+vi.mock("../commands/skills.js", () => ({
+  runSkillsSearch: unexpectedHandler("skills search"), runSkillsInstall: unexpectedHandler("skills install"), runSkillsGet: unexpectedHandler("skills get"),
+}));
+vi.mock("../commands/computer.js", () => ({ runComputer: unexpectedHandler("computer") }));
+vi.mock("../commands/experiment-finalize.js", () => ({ runExperimentFinalize: unexpectedHandler("experiment finalize") }));
+vi.mock("../commands/update.js", () => ({ dispatchUpdateCliArgs: unexpectedHandler("update") }));
 
 vi.mock("../commands/dashboard-tui/index.js", () => ({
   isTTYAvailable: vi.fn(() => ttyState.isTTYAvailable),
 }));
 
-vi.mock("../commands/onboard.js", () => ({ runOnboard: commandMocks.runOnboard }));
+vi.mock("../commands/onboard.js", () => ({
+  runOnboard: commandMocks.runOnboard,
+  isCliOnboardingComplete: (settings: { cliOnboardingCompletedAt?: unknown }) =>
+    typeof settings.cliOnboardingCompletedAt === "string" && settings.cliOnboardingCompletedAt.trim().length > 0,
+}));
 
 vi.mock("../commands/dashboard.js", () => ({
   runDashboard: commandMocks.runDashboard,
