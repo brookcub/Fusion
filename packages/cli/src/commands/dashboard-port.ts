@@ -10,7 +10,7 @@ export interface ResolveDashboardPortOptions {
 }
 
 function isUsableDashboardPort(port: unknown): port is number {
-  return Number.isInteger(port) && port > 0;
+  return typeof port === "number" && Number.isInteger(port) && port > 0;
 }
 
 async function readGlobalDashboardPortSettings(): Promise<{ daemonPort?: unknown }> {
