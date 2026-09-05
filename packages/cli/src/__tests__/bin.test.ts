@@ -140,6 +140,12 @@ const ttyState = vi.hoisted(() => ({
   isTTYAvailable: true,
 }));
 
+const dashboardCliState = vi.hoisted(() => ({
+  shouldSupervise: false,
+  resolvedPort: 4040,
+  resolveDashboardPort: vi.fn(async () => dashboardCliState.resolvedPort),
+}));
+
 vi.mock("@fusion/core", async () => {
   const actual = await vi.importActual<typeof import("@fusion/core")>("@fusion/core");
   return {
@@ -157,8 +163,11 @@ vi.mock("../commands/onboard.js", () => ({ runOnboard: commandMocks.runOnboard }
 vi.mock("../commands/dashboard.js", () => ({
   runDashboard: commandMocks.runDashboard,
   // FNXC:CliTests 2026-07-13-08:20: bin.ts now imports shouldSuperviseDashboard (supervision is the default) and runDashboardSupervised from dashboard.js; mock must surface both so the no-args dashboard launch test reaches runDashboard instead of failing on an undefined import.
-  shouldSuperviseDashboard: vi.fn(() => false),
+  shouldSuperviseDashboard: vi.fn(() => dashboardCliState.shouldSupervise),
   runDashboardSupervised: commandMocks.runDashboardSupervised,
+}));
+vi.mock("../commands/dashboard-port.js", () => ({
+  resolveDashboardPort: dashboardCliState.resolveDashboardPort,
 }));
 vi.mock("../commands/serve.js", () => ({ runServe: commandMocks.runServe }));
 vi.mock("../commands/daemon.js", () => ({ runDaemon: commandMocks.runDaemon }));
@@ -357,6 +366,9 @@ describe("bin command routing and fallbacks", () => {
     delete process.env.PI_PACKAGE_DIR;
     delete process.env.FUSION_SKIP_ONBOARDING;
     ttyState.isTTYAvailable = true;
+    dashboardCliState.shouldSupervise = false;
+    dashboardCliState.resolvedPort = 4040;
+    dashboardCliState.resolveDashboardPort.mockImplementation(async () => dashboardCliState.resolvedPort);
     onboardEnv.centralDbPath = join(mkdtempSync(join(tmpdir(), "fn-bin-onboard-")), "fusion-central.db");
     process.exit = vi.fn(((code?: number) => {
       throw new Error(`process.exit:${code ?? 0}`);
@@ -409,6 +421,93 @@ describe("bin command routing and fallbacks", () => {
       commandMocks.runDashboard.mockResolvedValue({ dispose: vi.fn() });
       await runBin([]);
       expect(commandMocks.runDashboard).toHaveBeenCalled();
+    },
+    30000,
+  );
+
+  it(
+    "routes bare fn dashboard mode through the resolved settings port",
+    async () => {
+      dashboardCliState.resolvedPort = 5678;
+
+      await runBin([]);
+
+      expect(dashboardCliState.resolveDashboardPort).toHaveBeenCalledWith({ explicitPort: undefined });
+      expect(commandMocks.runDashboard).toHaveBeenCalledWith(5678, {
+        paused: false,
+        dev: false,
+        noEngine: false,
+        interactive: false,
+        host: undefined,
+        noAuth: false,
+        token: undefined,
+        lang: undefined,
+      });
+    },
+    15000,
+  );
+
+  it(
+    "routes explicit dashboard mode through the resolved settings port",
+    async () => {
+      dashboardCliState.resolvedPort = 5678;
+
+      await runBin(["dashboard"]);
+
+      expect(dashboardCliState.resolveDashboardPort).toHaveBeenCalledWith({ explicitPort: undefined });
+      expect(commandMocks.runDashboard).toHaveBeenCalledWith(5678, expect.objectContaining({ interactive: false }));
+    },
+    15000,
+  );
+
+  it(
+    "passes the long dashboard port flag as an explicit resolver input",
+    async () => {
+      dashboardCliState.resolvedPort = 6789;
+
+      await runBin(["dashboard", "--port", "6789"]);
+
+      expect(dashboardCliState.resolveDashboardPort).toHaveBeenLastCalledWith({ explicitPort: 6789 });
+      expect(commandMocks.runDashboard).toHaveBeenLastCalledWith(6789, expect.any(Object));
+    },
+    15000,
+  );
+
+  it(
+    "passes the short dashboard port flag as an explicit resolver input",
+    async () => {
+      dashboardCliState.resolvedPort = 6790;
+
+      await runBin(["dashboard", "-p", "6790"]);
+
+      expect(dashboardCliState.resolveDashboardPort).toHaveBeenLastCalledWith({ explicitPort: 6790 });
+      expect(commandMocks.runDashboard).toHaveBeenLastCalledWith(6790, expect.any(Object));
+    },
+    15000,
+  );
+
+  it(
+    "passes the resolved dashboard port to the supervised parent without rewriting child args",
+    async () => {
+      dashboardCliState.shouldSupervise = true;
+      dashboardCliState.resolvedPort = 7777;
+
+      await runBin(["dashboard"]);
+
+      expect(commandMocks.runDashboardSupervised).toHaveBeenCalledWith(7777);
+      expect(commandMocks.runDashboard).not.toHaveBeenCalled();
+    },
+    15000,
+  );
+
+  it(
+    "seeds interactive dashboard startup with the resolved settings port",
+    async () => {
+      dashboardCliState.resolvedPort = 5656;
+
+      await runBin(["dashboard", "--interactive"]);
+
+      expect(commandMocks.runDashboard).toHaveBeenCalledWith(5656, expect.objectContaining({ interactive: true }));
     },
     15000,
   );

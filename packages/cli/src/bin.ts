@@ -860,7 +860,9 @@ async function main() {
         const portIdx = args.indexOf("--port");
         const portIdxShort = args.indexOf("-p");
         const pi = portIdx !== -1 ? portIdx : portIdxShort;
-        const port = pi !== -1 ? parseInt(args[pi + 1], 10) : 4040;
+        const explicitPort = pi !== -1 ? parseInt(args[pi + 1], 10) : undefined;
+        const { resolveDashboardPort } = await import("./commands/dashboard-port.js");
+        const port = await resolveDashboardPort({ explicitPort });
         const paused = args.includes("--paused");
         const dev = args.includes("--dev");
         const noEngine = args.includes("--no-engine");
