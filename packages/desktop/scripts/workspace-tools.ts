@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { dirname, resolve } from "node:path";
+import { dirname, resolve, basename, isAbsolute } from "node:path";
+import { existsSync } from "node:fs";
 import { cp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
@@ -127,14 +128,29 @@ export async function buildDashboard(): Promise<void> {
   await cp(resolve(dashboardRoot, "src", "registry-manifest.json"), resolve(dashboardRoot, "dist", "registry-manifest.json"));
 }
 
-function runPnpm(args: string[], cwd: string): Promise<void> {
+export function runPnpm(args: string[], cwd: string, pnpmCliOverride?: string): Promise<void> {
+  // FNXC:WindowsPackaging 2026-09-05-10:40: shell:true loses argument boundaries
+  // for the absolute deploy directory. Run the package manager's JS entrypoint.
+  let executable = "pnpm";
+  let argv = args;
+  if (process.platform === "win32" || pnpmCliOverride) {
+    const cli = pnpmCliOverride ?? process.env.npm_execpath;
+    const corepack = resolve(dirname(process.execPath), "node_modules/corepack/dist/corepack.js");
+    if (cli && isAbsolute(cli) && /^pnpm\.(c?js)$/.test(basename(cli)) && existsSync(cli)) {
+      executable = process.execPath; argv = [cli, ...args];
+    } else if (!pnpmCliOverride && existsSync(corepack)) {
+      executable = process.execPath; argv = [corepack, "pnpm", ...args];
+    } else {
+      return Promise.reject(new Error("A canonical pnpm or Corepack JS entrypoint is required on Windows"));
+    }
+  }
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn("pnpm", args, {
+    const child = spawn(executable, argv, {
       cwd,
       stdio: "inherit",
       env: process.env,
-      // pnpm resolves to a .cmd shim on Windows; Node refuses to spawn it without a shell.
-      shell: process.platform === "win32",
+      shell: false,
+      windowsHide: true,
     });
     child.on("error", rejectPromise);
     child.on("exit", (code) =>
