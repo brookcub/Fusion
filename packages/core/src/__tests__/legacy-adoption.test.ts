@@ -40,7 +40,9 @@ function listSourceFiles(root: string): string[] {
   for (const entry of readdirSync(root, { withFileTypes: true, recursive: true })) {
     if (!entry.isFile()) continue;
     const parent = entry.parentPath ?? root;
-    if (/(^|\/)(__tests__|dist|node_modules)(\/|$)/.test(parent)) continue;
+    // FNXC:WindowsMergeGate 2026-09-05-08:35: native Windows paths must exclude
+    // test helpers too; their step.status fixtures are not production task writes.
+    if (/(^|[\\/])(__tests__|dist|node_modules)([\\/]|$)/.test(parent)) continue;
     if (!entry.name.endsWith(".ts") || entry.name.endsWith(".d.ts") || /\.test\.ts$/.test(entry.name)) continue;
     out.push(join(parent, entry.name));
   }
