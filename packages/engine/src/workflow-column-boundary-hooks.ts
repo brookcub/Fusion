@@ -62,13 +62,25 @@ export function createExecutorColumnBoundaryHooks(
     // KTD-3 drift-park loop fix (PR #2342): detectDrift clears the stale pin
     // row fields so an ordinary requeue re-resolves the CURRENT IR fresh.
     clearPin: pinPersistence.clearPin,
-    /* FNXC:EnginePause 2026-08-01-00:20: settings re-read per node entry — event-independent. */
+    /*
+    FNXC:EnginePause 2026-09-05-06:55:
+    Re-read project and task pause authorities at every node entry. Continuation drains can bypass
+    scheduler dispatch, and enginePaused previously blocked timer ticks only, so a live graph could
+    start new nodes while the board advertised paused. An unavailable authority is not evidence of
+    permission to execute; fail closed until the next bounded continuation attempt.
+    */
     isPaused: async () => {
       try {
-        const settings = await store.getSettings();
-        return settings.globalPause === true;
+        const [settings, liveTask] = await Promise.all([
+          store.getSettings(),
+          store.getTask(task.id),
+        ]);
+        return settings.globalPause === true
+          || settings.enginePaused === true
+          || liveTask.paused === true
+          || liveTask.userPaused === true;
       } catch {
-        return false;
+        return true;
       }
     },
     onSuspend: async (suspension) => {

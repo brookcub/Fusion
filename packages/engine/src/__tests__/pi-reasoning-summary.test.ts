@@ -120,7 +120,7 @@ describe("createFnAgent reasoning-summary payload hook", () => {
     expect(await session.agent.onPayload?.(
       { reasoning: { effort: "medium", summary: "auto" } },
       { api: "openai-responses" },
-    )).toBeUndefined();
+    )).toEqual({ reasoning: { effort: "medium" } });
   });
 
   it("retries once on the same session after an unsupported-summary rejection", async () => {
@@ -135,7 +135,7 @@ describe("createFnAgent reasoning-summary payload hook", () => {
         { api: "openai-responses" },
       ));
       attempts += 1;
-      if (attempts === 1) throw new Error("Unsupported reasoning summary: detailed");
+      if (attempts === 1) throw new Error("Unsupported parameter: 'reasoning.summary' is not supported with this model.");
     });
 
     const { result } = await createSession(session);
@@ -144,7 +144,7 @@ describe("createFnAgent reasoning-summary payload hook", () => {
     expect(prompt).toHaveBeenCalledTimes(2);
     expect(requests).toEqual([
       { reasoning: { effort: "medium", summary: "detailed" } },
-      undefined,
+      { reasoning: { effort: "medium" } },
     ]);
   });
 });

@@ -99,6 +99,53 @@ afterEach(() => {
 });
 
 describe("executor outer dispatch dependency gate", () => {
+  it.each([
+    ["task pause", { paused: true }],
+    ["operator pause", { userPaused: true }],
+  ])("refuses direct execution when the live row has a %s", async (_label, livePatch) => {
+    resetExecutorMocks();
+    const staleDispatch = task({ dependencies: [] });
+    const liveTask = task({ dependencies: [], ...livePatch });
+    const store = prepareStore(liveTask, []);
+    const semaphore = new AgentSemaphore(1);
+    expect(semaphore.tryAcquire()).toBe(true);
+    registerPreHeldExecutorSlot(staleDispatch.id);
+    const executor = new TaskExecutor(store, "/tmp/test", { semaphore } as any);
+    const { graph } = spyOuterDispatch(executor);
+
+    await executor.execute(staleDispatch);
+
+    expect(graph).not.toHaveBeenCalled();
+    expect(hasPreHeldExecutorSlot(staleDispatch.id)).toBe(false);
+    expect(semaphore.activeCount).toBe(0);
+  });
+
+  it.each(["globalPause", "enginePaused"])("refuses direct execution while %s is active", async (pauseKey) => {
+    resetExecutorMocks();
+    const child = task({ dependencies: [] });
+    const store = prepareStore(child, []);
+    store.getSettings.mockResolvedValue(settings({ [pauseKey]: true }));
+    const executor = new TaskExecutor(store, "/tmp/test");
+    const { graph } = spyOuterDispatch(executor);
+
+    await executor.execute(child);
+
+    expect(graph).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when authoritative pause state cannot be read", async () => {
+    resetExecutorMocks();
+    const child = task({ dependencies: [] });
+    const store = prepareStore(child, []);
+    store.getTask.mockRejectedValue(new Error("store unavailable"));
+    const executor = new TaskExecutor(store, "/tmp/test");
+    const { graph } = spyOuterDispatch(executor);
+
+    await executor.execute(child);
+
+    expect(graph).not.toHaveBeenCalled();
+  });
+
   it("holds a live dependency in place before any execution surface can run", async () => {
     resetExecutorMocks();
     const child = task();

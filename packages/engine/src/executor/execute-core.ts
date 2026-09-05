@@ -26,12 +26,13 @@
  * FNXC:WorkflowExecution 2026-07-19-10:40 / 17:45 (U10/U10b):
  * Authoritative driver and bare runImplementation fallback deleted; graph is sole orchestrator.
  */
-import type { Task } from "@fusion/core";
+import type { Settings, Task, TaskStore } from "@fusion/core";
 import { executorLog } from "../logger.js";
 import { dropPreHeldExecutorSlot } from "../concurrency/concurrency.js";
 import { getActivePrincipalHoldCooldown } from "./execute-workflow-graph.js";
 
 export type ExecuteCoreDeps = {
+  store: Pick<TaskStore, "getTask" | "getSettings">;
   completionFinalizedTaskIds: Set<string>;
   graphRouting: Set<string>;
   releaseSemaphore: () => void;
@@ -93,6 +94,41 @@ export async function executeCore(deps: ExecuteCoreDeps, task: Task): Promise<vo
   deps.graphRouting.add(task.id);
   let graphRunnerOwnsClaim = false;
   try {
+    /*
+    FNXC:EnginePause 2026-09-05-06:55:
+    The scheduler is not the executor's only caller. Durable workflow continuations, restart
+    recovery, and direct dispatch all enter executeCore independently, so scheduler-only pause
+    checks allowed a paused task to start a fresh review node. Re-read both authorities after
+    claiming graphRouting and fail closed on an unavailable read. This keeps the existing
+    pre-await duplicate exclusion while making every outer execution entry pause-safe.
+    */
+    let liveTask: Task;
+    let liveSettings: Settings;
+    try {
+      [liveTask, liveSettings] = await Promise.all([
+        deps.store.getTask(task.id),
+        deps.store.getSettings(),
+      ]);
+      if (!liveTask || !liveSettings) throw new Error("Pause authority missing");
+    } catch (error) {
+      executorLog.warn(
+        `${task.id}: refusing execute — authoritative pause state unavailable: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      if (dropPreHeldExecutorSlot(task.id)) deps.releaseSemaphore();
+      return;
+    }
+    const pauseReason = liveTask.paused === true || liveTask.userPaused === true
+      ? "task is paused"
+      : liveSettings.globalPause === true
+        ? "global pause is active"
+        : liveSettings.enginePaused === true
+          ? "engine pause is active"
+          : undefined;
+    if (pauseReason) {
+      executorLog.debug(`${task.id}: refusing execute — ${pauseReason}`);
+      if (dropPreHeldExecutorSlot(task.id)) deps.releaseSemaphore();
+      return;
+    }
     await deps.clearStalePauseAbortBeforeDispatch(task);
     if (await deps.blockOuterDispatchWhenDependenciesUnmet(task)) {
       // FNXC:GlobalConcurrencyControls 2026-07-14-18:30: release any scheduler pre-held slot when outer dispatch aborts before agent work starts.

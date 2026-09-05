@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import type {
   TaskStore,
   Task,
+  Settings,
   CentralCore,
   AgentStore,
   HeartbeatInvocationSource,
@@ -2784,12 +2785,13 @@ export class InProcessRuntime
     boundary probe: the pause must bind even if `settings:updated` never reaches this instance.
     */
     try {
-      const settings = await this.taskStore.getSettings();
+      // FNXC:EnginePause 2026-09-05-08:40: pause used to return before this
+      // finally, leaving the drain owned for the watchdog's full five minutes.
+      // Unreadable pause authority is also a refusal, never permission to run.
+      let settings: Settings;
+      try { settings = await this.taskStore.getSettings(); }
+      catch { return; }
       if (settings.globalPause === true || settings.enginePaused === true) return;
-    } catch {
-      /* unreadable settings: proceed as before rather than wedging the pump */
-    }
-    try {
       await drainDuePlanningContinuations({
         listDue: () => this.taskStore.listDueWorkflowWorkItems({
           kinds: ["task"],

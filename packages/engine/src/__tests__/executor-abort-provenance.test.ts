@@ -189,6 +189,28 @@ describe("pause-abort provenance truthfulness (KB-PROV)", () => {
       expect((executor as any).userCanceledTaskIds.has(task.id)).toBe(false);
     });
 
+    it("does not lend an in-flight graph move's ownership to an operator move", async () => {
+      const { store, task, executor } = makeExecutor();
+      withActiveSession(executor, task.id);
+      (executor as any).workflowLifecycleMovesInFlight.add(task.id);
+      (executor as any).graphRouting.add(task.id);
+      await store._triggerAsync("task:moved", { task, from: "in-progress", to: "todo", source: "user" });
+      await (executor as any).pendingTaskDisposals.get(task.id);
+      expect(provenanceOf(executor, task.id)).toBe("hard-cancel");
+      expect((executor as any).userCanceledTaskIds.has(task.id)).toBe(true);
+    });
+
+    it("keeps an engine-owned graph review transition alive", async () => {
+      const { store, task, executor } = makeExecutor();
+      withActiveSession(executor, task.id);
+      (executor as any).workflowLifecycleMovesInFlight.add(task.id);
+      (executor as any).graphRouting.add(task.id);
+      await store._triggerAsync("task:moved", { task, from: "in-progress", to: "in-review", source: "engine" });
+      expect((executor as any).pendingTaskDisposals.has(task.id)).toBe(false);
+      expect(provenanceOf(executor, task.id)).toBeUndefined();
+      expect((executor as any).activeSessions.has(task.id)).toBe(true);
+    });
+
     it("a USER-sourced in-progress -> todo move still labels the abort `hard-cancel`", async () => {
       const { store, task, executor } = makeExecutor();
 

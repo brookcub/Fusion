@@ -572,6 +572,7 @@ export function buildCreateAuthoritativeWorkflowPrimitivesFromExecutorDeps(host:
     ...facadeFields(host, [
       "store", "rootDir", "graphSeamGoverningNodeId",
       "graphStepActiveContext", "pausedAborted", "mergeRequester",
+      "workflowLifecycleMovesInFlight",
     ]),
     ...facadeMethods(host, [
       "getRunContextFor",
@@ -809,6 +810,7 @@ export function buildHandleStaleInReviewPlanPauseAbortReplayDeps(host: any): any
 
 export function buildExecuteCoreDeps(host: any): any {
   return {
+    store: host.store,
     completionFinalizedTaskIds: host.completionFinalizedTaskIds,
     graphRouting: host.graphRouting,
     releaseSemaphore: () => { host.options.semaphore?.release(); },

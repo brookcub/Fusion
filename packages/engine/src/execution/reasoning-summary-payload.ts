@@ -36,13 +36,20 @@ export function applyReasoningSummaryToPayload(
   model: PayloadModel,
   detail: ReasoningSummaryDetail,
 ): ProviderPayload | undefined {
-  if (detail === "off" || detail === "auto" || !isResponsesFamilyApi(model.api) || !isRecord(payload)) {
+  if (detail === "auto" || !isResponsesFamilyApi(model.api) || !isRecord(payload)) {
     return undefined;
   }
 
   const reasoning = payload.reasoning;
   if (!isRecord(reasoning)) {
     return undefined;
+  }
+  // FNXC:ThinkingTrace 2026-09-05-08:30: off must remove the SDK's default
+  // summary too. Returning undefined preserves it and repeats the same 400.
+  if (detail === "off") {
+    if (!("summary" in reasoning)) return undefined;
+    const { summary: _summary, ...withoutSummary } = reasoning;
+    return { ...payload, reasoning: withoutSummary };
   }
 
   const effort = reasoning.effort;
@@ -66,7 +73,7 @@ export function applyReasoningSummaryToPayload(
 
 /** Match only explicit provider rejections of the optional summary request. */
 export function isReasoningSummaryUnsupportedError(message: string): boolean {
-  const mentionsReasoningSummary = /\breasoning[\s_-]*summary\b|\bsummary\b[\s\S]{0,80}\breasoning\b/i.test(message);
+  const mentionsReasoningSummary = /\breasoning[.\s_-]*summary\b|\bsummary\b[\s\S]{0,80}\breasoning\b/i.test(message);
   const rejectsFeature = /\b(?:unsupported|not supported|unknown|unrecognized|invalid|not allowed|not available)\b/i.test(message);
   return mentionsReasoningSummary && rejectsFeature;
 }

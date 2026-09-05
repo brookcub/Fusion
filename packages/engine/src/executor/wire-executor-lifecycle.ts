@@ -404,7 +404,9 @@ export function wireExecutorLifecycle(deps: WireExecutorLifecycleDeps): WireExec
         }),
       );
     } else if (from === wipLane) {
-      if (deps.workflowLifecycleMovesInFlight.has(task.id) && deps.graphRouting.has(task.id)) {
+      // FNXC:EnginePause 2026-09-05-10:10: concurrent operator moves never inherit
+      // ownership from a graph transition that is still awaiting persistence.
+      if (source === "engine" && deps.workflowLifecycleMovesInFlight.has(task.id) && deps.graphRouting.has(task.id)) {
         executorLog.debug(
           `[event:task:moved] Preserving graph run for ${task.id} across its own ${from} → ${to} boundary`,
         );

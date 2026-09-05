@@ -63,11 +63,11 @@ describe("applyReasoningSummaryToPayload", () => {
     expect(result?.reasoning).not.toBe(reasoning);
   });
 
-  it("treats auto and off detail as no-op requests", () => {
+  it("preserves auto but removes the SDK summary when explicitly off", () => {
     const payload = { reasoning: { effort: "medium", summary: "auto" } };
 
     expect(applyReasoningSummaryToPayload(payload, { api: "openai-responses" }, "auto")).toBeUndefined();
-    expect(applyReasoningSummaryToPayload(payload, { api: "openai-responses" }, "off")).toBeUndefined();
+    expect(applyReasoningSummaryToPayload(payload, { api: "openai-responses" }, "off")).toEqual({ reasoning: { effort: "medium" } });
   });
 
   it("can deliberately request concise without overriding an explicit choice", () => {
@@ -82,6 +82,7 @@ describe("applyReasoningSummaryToPayload", () => {
 describe("isReasoningSummaryUnsupportedError", () => {
   it.each([
     "Unsupported reasoning summary: detailed",
+    "Codex error: Unsupported parameter: 'reasoning.summary' is not supported with the 'gpt-5.3-codex-spark' model.",
     "reasoning_summary is invalid for this model",
     "Unknown reasoning summary option",
     "Summary reasoning is not supported by this endpoint",

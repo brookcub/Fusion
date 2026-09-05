@@ -43,6 +43,7 @@ export type CreateAuthoritativeWorkflowPrimitivesDeps = {
   graphSeamGoverningNodeId: Map<string, string>;
   graphStepActiveContext: Map<string, unknown>;
   pausedAborted: Set<string>;
+  workflowLifecycleMovesInFlight: Set<string>;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- merge requester accepts optional signal bag
   mergeRequester?: ((taskId: string, opts?: any) => Promise<any>) | null;
   getRunContextFor: (taskId: string) => EngineRunContext | undefined;
@@ -306,6 +307,37 @@ export function createAuthoritativeWorkflowPrimitivesFromExecutor(
         const taskStore = deps.store;
         const patch: Partial<TaskDetail> = {};
         /*
+        FNXC:EnginePause 2026-09-05-06:55:
+        Node-entry pause checks are necessary but not sufficient: pause may arrive after entry and
+        before this lifecycle side effect. Re-read immediately at the mutation boundary and return
+        the graph's typed abort result. Fail closed when the authority cannot be read.
+        */
+        const pauseRefusesMutation = async (): Promise<boolean> => {
+          let liveTask: TaskDetail;
+          let liveSettings: Settings;
+          try {
+            [liveTask, liveSettings] = await Promise.all([
+              taskStore.getTask(task.id),
+              taskStore.getSettings(),
+            ]);
+            if (!liveTask || !liveSettings) throw new Error("Pause authority missing");
+          } catch {
+            deps.markPausedAborted(task.id, "engine-abort", "workflow-transition:pause-state-unavailable");
+            return true;
+          }
+          if (
+            _ctx.signal?.aborted
+            || liveTask.paused === true
+            || liveTask.userPaused === true
+            || liveSettings.globalPause === true
+            || liveSettings.enginePaused === true
+          ) {
+            deps.markPausedAborted(task.id, "engine-abort", "workflow-transition:pause-gate");
+            return true;
+          }
+          return false;
+        };
+        /*
         FNXC:WorkflowLifecycleColumns 2026-07-30-21:40:
         Resolve a requested ROLE to this task's own column, because the seam that asks cannot.
 
@@ -329,6 +361,9 @@ export function createAuthoritativeWorkflowPrimitivesFromExecutor(
         Workflow graph lifecycle transitions must use TaskStore move semantics, not raw `updateTask({ column })`, because ntfy/webhook notification delivery is subscribed to `task:moved`. Direct column writes make graph-owned tasks invisible to in-review/done lifecycle notifications and bypass column hooks.
         */
         if (targetColumn !== undefined) {
+          // FNXC:EnginePause 2026-09-05-10:05: role resolution is asynchronous.
+          // Read pause authority after it, immediately before each mutation.
+          if (await pauseRefusesMutation()) return { outcome: "failure", value: "aborted" };
           const moveOptions = {
             preserveProgress: input.preserveProgress,
             moveSource: "engine" as const,
@@ -344,13 +379,20 @@ export function createAuthoritativeWorkflowPrimitivesFromExecutor(
             moveTask?: typeof taskStore.moveTask;
           };
           if (typeof storeWithMove.moveTask === "function") {
-            await storeWithMove.moveTask(task.id, targetColumn, moveOptions);
+            const alreadyOwned = deps.workflowLifecycleMovesInFlight.has(task.id);
+            deps.workflowLifecycleMovesInFlight.add(task.id);
+            try {
+              await storeWithMove.moveTask(task.id, targetColumn, moveOptions);
+            } finally {
+              if (!alreadyOwned) deps.workflowLifecycleMovesInFlight.delete(task.id);
+            }
           } else {
             patch.column = targetColumn;
           }
         }
         if (input.status !== undefined && input.status !== null) patch.status = input.status;
         if (Object.keys(patch).length > 0) {
+          if (await pauseRefusesMutation()) return { outcome: "failure", value: "aborted" };
           await taskStore.updateTask(task.id, patch);
         }
         return { outcome: "success", value: input.reason };

@@ -790,6 +790,89 @@ describe("CE workflow-step executor integration", () => {
       expect(store.updateTask).not.toHaveBeenCalledWith("FN-CE-1", expect.objectContaining({ column: "in-progress" }));
     });
 
+    it("refuses a pause arriving during asynchronous lifecycle-role resolution", async () => {
+      const store = createMockStore();
+      store.getTask.mockResolvedValue(baseStepTask({ column: "in-progress" }) as any);
+      store.getTaskWorkflowSelectionAsync.mockImplementation(async () => {
+        store.getTask.mockResolvedValue(baseStepTask({ column: "in-progress", paused: true }) as any);
+        return { workflowId: "builtin:coding", stepIds: [] };
+      });
+      const { executor } = makeExecutor(store);
+      const primitives = (executor as any).createAuthoritativeWorkflowPrimitives(await store.getSettings());
+      const result = await primitives.transitionTask(
+        { run: { runId: "late-pause", workflowId: "builtin:coding" }, node: { node: { id: "handoff" } } },
+        baseStepTask({ column: "in-progress" }), { columnRole: "review", reason: "review" });
+      expect(store.getTaskWorkflowSelectionAsync).toHaveBeenCalled();
+      expect(result).toMatchObject({ outcome: "failure", value: "aborted" });
+      expect(store.moveTask).not.toHaveBeenCalled();
+      expect(store.updateTask).not.toHaveBeenCalled();
+    });
+
+    it("refuses a separate status write when pause arrives during the column move", async () => {
+      const store = createMockStore();
+      store.getTask.mockResolvedValue(baseStepTask({ column: "in-progress" }) as any);
+      store.moveTask.mockImplementation(async () => {
+        store.getTask.mockResolvedValue(baseStepTask({ column: "in-review", paused: true }) as any);
+        return baseStepTask({ column: "in-review" }) as any;
+      });
+      const { executor } = makeExecutor(store);
+      const primitives = (executor as any).createAuthoritativeWorkflowPrimitives(await store.getSettings());
+      const result = await primitives.transitionTask(
+        { run: { runId: "move-pause", workflowId: "builtin:coding" }, node: { node: { id: "handoff" } } },
+        baseStepTask({ column: "in-progress" }), { column: "in-review", status: "queued", reason: "review" });
+      expect(store.moveTask).toHaveBeenCalledOnce();
+      expect(result).toMatchObject({ outcome: "failure", value: "aborted" });
+      expect(store.updateTask).not.toHaveBeenCalled();
+    });
+
+    it("marks primitive workflow lifecycle moves as graph-owned for the complete store mutation", async () => {
+      const store = createMockStore();
+      store.getTask.mockResolvedValue(baseStepTask({ column: "todo" }) as any);
+      const { executor } = makeExecutor(store);
+      const moves = (executor as any).workflowLifecycleMovesInFlight as Set<string>;
+      store.moveTask.mockImplementation(async () => {
+        expect(moves.has("FN-CE-1")).toBe(true);
+        return baseStepTask({ column: "in-progress" }) as any;
+      });
+      const settings = await store.getSettings();
+      const primitives = (executor as any).createAuthoritativeWorkflowPrimitives(settings);
+
+      await primitives.transitionTask(
+        {
+          run: { runId: "run-owned", taskId: "FN-CE-1", workflowId: "builtin:coding" },
+          node: { node: { id: "handoff", kind: "prompt", column: "todo", config: {} }, context: {} },
+        },
+        baseStepTask({ column: "todo" }),
+        { column: "in-review", reason: "workflow-review-handoff", preserveProgress: true },
+      );
+
+      expect(moves.has("FN-CE-1")).toBe(false);
+    });
+
+    it.each([
+      ["task pause", { paused: true }],
+      ["operator pause", { userPaused: true }],
+    ])("refuses a primitive lifecycle transition after a live %s", async (_label, livePatch) => {
+      const store = createMockStore();
+      store.getTask.mockResolvedValue(baseStepTask({ column: "todo", ...livePatch }) as any);
+      const { executor } = makeExecutor(store);
+      const settings = await store.getSettings();
+      const primitives = (executor as any).createAuthoritativeWorkflowPrimitives(settings);
+
+      const result = await primitives.transitionTask(
+        {
+          run: { runId: "run-paused", taskId: "FN-CE-1", workflowId: "builtin:coding" },
+          node: { node: { id: "handoff", kind: "prompt", column: "todo", config: {} }, context: {} },
+        },
+        baseStepTask({ column: "todo" }),
+        { column: "in-review", reason: "workflow-review-handoff", preserveProgress: true },
+      );
+
+      expect(result).toEqual(expect.objectContaining({ outcome: "failure", value: "aborted" }));
+      expect(store.moveTask).not.toHaveBeenCalled();
+      expect(store.updateTask).not.toHaveBeenCalled();
+    });
+
     it("moves direct-to-merge workflow tasks into in-review before requesting merge", async () => {
       const store = createMockStore();
       let live = baseStepTask({

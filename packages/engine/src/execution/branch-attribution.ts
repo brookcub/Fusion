@@ -1,7 +1,8 @@
-import { exec } from "node:child_process";
+import { exec, execFile } from "node:child_process";
 import { promisify } from "node:util";
 
-const execAsync = promisify(exec);
+const _execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 const GIT_TIMEOUT_MS = 30_000;
 const GIT_MAX_BUFFER = 10 * 1024 * 1024;
 
@@ -74,14 +75,14 @@ export interface BranchAttributionOptions {
   baseRef: string;
   taskId: string;
   requireTrailer?: boolean;
-  execAsyncImpl?: typeof execAsync;
+  execAsyncImpl?: typeof _execAsync;
 }
 
 export interface BranchRangeAttributionOptions {
   worktreePath: string;
   rangeRef: string;
   taskId: string;
-  execAsyncImpl?: typeof execAsync;
+  execAsyncImpl?: typeof _execAsync;
 }
 
 function quoteShellArg(value: string): string {
@@ -141,18 +142,17 @@ function taskIdsMatch(a: string | null, b: string): boolean {
 }
 
 export async function collectOwnTaskCommitsForRange(opts: BranchRangeAttributionOptions): Promise<{ ownCommitCount: number; ownCommitShas: string[] }> {
-  const execImpl = opts.execAsyncImpl ?? execAsync;
   let logOutput: string;
   try {
-    const result = await execImpl(
-      `git log --format=%H%x00%s%x00%B%x1e ${quoteShellArg(opts.rangeRef)}`,
-      {
+    const command = `git log --format=%H%x00%s%x00%B%x1e ${quoteShellArg(opts.rangeRef)}`;
+    const options = {
         cwd: opts.worktreePath,
-        encoding: "utf-8",
+        encoding: "utf-8" as const,
         timeout: GIT_TIMEOUT_MS,
         maxBuffer: GIT_MAX_BUFFER,
-      },
-    );
+      };
+    const result = opts.execAsyncImpl ? await opts.execAsyncImpl(command, options)
+      : await execFileAsync("git", ["log", "--format=%H%x00%s%x00%B%x1e", opts.rangeRef, "--"], options);
     logOutput = result.stdout;
   } catch (error) {
     const stderr =
@@ -191,15 +191,18 @@ export async function collectOwnTaskCommitsForRange(opts: BranchRangeAttribution
 }
 
 export async function filterFilesToOwnTaskCommits(opts: BranchAttributionOptions): Promise<AttributionResult> {
-  const execImpl = opts.execAsyncImpl ?? execAsync;
-  const runGit = async (command: string): Promise<string> => {
+  const runGit = async (command: string, args: string[]): Promise<string> => {
     try {
-      const { stdout } = await execImpl(command, {
+      const options = {
         cwd: opts.worktreePath,
-        encoding: "utf-8",
+        encoding: "utf-8" as const,
         timeout: GIT_TIMEOUT_MS,
         maxBuffer: GIT_MAX_BUFFER,
-      });
+      };
+      // FNXC:WindowsGit 2026-09-05-08:42: POSIX quotes became literal ref bytes
+      // under cmd.exe. Production uses argv; retain explicit injected test adapters.
+      const { stdout } = opts.execAsyncImpl ? await opts.execAsyncImpl(command, options)
+        : await execFileAsync("git", args, options);
       return stdout;
     } catch (error) {
       const stderr =
@@ -210,7 +213,7 @@ export async function filterFilesToOwnTaskCommits(opts: BranchAttributionOptions
     }
   };
 
-  const rawDiffOutput = await runGit(`git diff --name-only ${quoteShellArg(opts.baseRef)}..HEAD`);
+  const rawDiffOutput = await runGit(`git diff --name-only ${quoteShellArg(opts.baseRef)}..HEAD`, ["diff", "--name-only", `${opts.baseRef}..HEAD`, "--"]);
   const rawDiffFileCount = rawDiffOutput
     .split("\n")
     .map((line) => line.trim())
@@ -218,6 +221,7 @@ export async function filterFilesToOwnTaskCommits(opts: BranchAttributionOptions
 
   const logOutput = await runGit(
     `git log --format=%H%x00%s%x00%B%x1e ${quoteShellArg(`${opts.baseRef}..HEAD`)}`,
+    ["log", "--format=%H%x00%s%x00%B%x1e", `${opts.baseRef}..HEAD`, "--"],
   );
 
   if (!logOutput.trim()) {
@@ -262,7 +266,7 @@ export async function filterFilesToOwnTaskCommits(opts: BranchAttributionOptions
   }
 
   for (const sha of ownCommitShas) {
-    const diffTreeOutput = await runGit(`git diff-tree --no-commit-id --name-only -r ${quoteShellArg(sha)}`);
+    const diffTreeOutput = await runGit(`git diff-tree --no-commit-id --name-only -r ${quoteShellArg(sha)}`, ["diff-tree", "--no-commit-id", "--name-only", "-r", sha, "--"]);
     for (const file of diffTreeOutput
       .split("\n")
       .map((line) => line.trim())
