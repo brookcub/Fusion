@@ -24,6 +24,45 @@ export const generalSearchEntries: SettingsSearchEntry[] = [
     keywords: ["bug", "feedback", "idea", "help", "support"],
   },
   {
+    /*
+    FNXC:SettingsSearch 2026-08-16-05:07:
+    FN-8829 (d450dbe971) added the recommendations cap descriptor row without an
+    index entry; the search-index drift guard caught the gap. Labels/help mirror
+    the section's t() copy verbatim.
+    */
+    sectionId: "general",
+    key: "maxRecommendationsPerTask",
+    labelKey: "settings.general.maxRecommendationsPerTask",
+    labelFallback: "Maximum recommendations per task",
+    helpKey: "settings.general.maxRecommendationsPerTaskHelp",
+    helpFallback: "Default: 3. Set 0 to disable recommendations; choose a whole number from 1 to 20 to cap each completed task.",
+    keywords: ["suggestions", "follow-up", "cap", "limit"],
+  },
+  {
+    /* FNXC:TaskRecommendations 2026-08-19-13:05: Keep the required completion toggle searchable through the same descriptor index as its shared GeneralSection row. */
+    sectionId: "general",
+    key: "requireTaskRecommendations",
+    labelKey: "settings.general.requireTaskRecommendations",
+    labelFallback: "Require automatic task recommendations",
+    helpKey: "settings.general.requireTaskRecommendationsHelp",
+    helpFallback: "Default: disabled. When enabled, successful completion must explicitly evaluate grounded follow-ups. The executor aims toward the configured maximum, but fewer or [] are correct when relevance does not support more; cap 0 disables capture regardless of this setting.",
+    keywords: ["recommendations", "automatic", "completion", "required", "quality"],
+  },
+  {
+    /*
+    FNXC:SettingsSearch 2026-08-16-05:07:
+    FN-9021 (ea53cbd4ff) added the mailbox-notice toggle without an index entry;
+    same drift-guard gap as above.
+    */
+    sectionId: "general",
+    key: "recommendationMailboxNoticeEnabled",
+    labelKey: "settings.general.recommendationMailboxNoticeEnabled",
+    labelFallback: "Recommendation mailbox notices",
+    helpKey: "settings.general.recommendationMailboxNoticeEnabledHelp",
+    helpFallback: "Default: enabled. When a completed task captures recommendations, send a summary to your mailbox. Turning this off does not change whether recommendations are captured.",
+    keywords: ["notifications", "mail", "inbox", "suggestions"],
+  },
+  {
     sectionId: "general",
     key: "taskPrefix",
     labelKey: "settings.general.taskPrefix",

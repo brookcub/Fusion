@@ -24,7 +24,8 @@ export function initRepoWithCommit(repoDir: string, defaultBranch = "main"): voi
   git(repoDir, 'git config user.name "Test"');
   writeFileSync(path.join(repoDir, "README.md"), `# ${path.basename(repoDir)}\n`, "utf-8");
   git(repoDir, "git add README.md");
-  git(repoDir, "git commit -m 'init'");
+  // FNXC:Workspace 2026-08-15-07:05: Fixture initialization predates task anchors, so completion guards can distinguish operator baseline commits from task-era bypass commits.
+  git(repoDir, "GIT_AUTHOR_DATE='2000-01-01T00:00:00Z' GIT_COMMITTER_DATE='2000-01-01T00:00:00Z' git commit -m 'init'");
 }
 
 export interface WorkspaceFixture {
@@ -36,6 +37,8 @@ export interface WorkspaceFixture {
   repoPath(rel: string): string;
   /** Run a git command inside a sub-repo. */
   git(rel: string, command: string): string;
+  /** Create a live linked task worktree and capture its immutable acquisition baseline. */
+  createLinkedTaskWorktree(rel: string, branch: string): { worktreePath: string; baseCommitSha: string };
   /** Remove all on-disk fixture state. */
   cleanup(): void;
 }
@@ -61,6 +64,19 @@ export async function createWorkspaceFixture(
     repos,
     repoPath: (rel: string) => path.join(rootDir, rel),
     git: (rel: string, command: string) => git(path.join(rootDir, rel), command),
+    /*
+    FNXC:WorkspaceMergeEvidence 2026-08-21-17:33:
+    FN-112 needs real-Git coverage where the persisted path is the live task worktree and HEAD
+    equals its task branch. Main-checkout stand-ins hid the invalid self-comparison that erased
+    merge evidence, so this fixture captures the acquisition baseline before the task commit.
+    */
+    createLinkedTaskWorktree: (rel: string, branch: string) => {
+      const repoDir = path.join(rootDir, rel);
+      const worktreePath = path.join(rootDir, `.task-worktree-${rel.replace(/[^a-z0-9]+/gi, "-")}`);
+      const baseCommitSha = git(repoDir, "git rev-parse HEAD");
+      git(repoDir, `git worktree add -b ${branch} ${worktreePath} HEAD`);
+      return { worktreePath, baseCommitSha };
+    },
     cleanup: () => rmSync(rootDir, { recursive: true, force: true }),
   };
 }

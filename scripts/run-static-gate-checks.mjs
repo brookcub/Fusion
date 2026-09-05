@@ -12,7 +12,7 @@ no cancellation because validators do not mutate shared state.
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 export const repoRoot = resolve(scriptDir, "..");
@@ -101,6 +101,8 @@ export async function runStaticGateChecks(checkScripts, options = {}) {
   return results;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// FNXC:WindowsMergeGate 2026-09-05-07:34: Paths are not URLs. Compare encoded
+// file URLs so Windows separators and spaced checkouts cannot skip the gate.
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   await runStaticGateChecks(readStaticGateChecks());
 }

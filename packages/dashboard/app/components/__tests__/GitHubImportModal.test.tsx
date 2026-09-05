@@ -121,19 +121,21 @@ describe("GitHubImportModal", () => {
   const onImport = vi.fn();
 
   /*
-  FNXC:GitHubImport 2026-08-02-02:47:
-  This stylesheet guard complements the emitted-CSS Chromium geometry regression: only the
-  standalone importer clears the shared gutter under FloatingWindow's canonical sheet predicate.
+  FNXC:GitHubImport 2026-08-17-23:47:
+  FN-8722 gave the standalone importer sheet a local `margin-inline-end: 0` to undo the shared
+  FloatingWindow body gutter that otherwise shifted every shell region left. That shared gutter is
+  deleted outright, so the override is gone with it and this guard inverts: the importer must NOT
+  carry any body-gutter rule of its own, and the detail panel now owns a symmetric inset directly
+  instead of borrowing the gutter for its right side (it previously set `padding-inline-end: 0`).
   */
-  it("clears the standalone sheet gutter without changing embedded or detail presentations", () => {
-    const sheetStart = floatingWindowCss.indexOf("@media (max-width: 767.98px), (max-height: 480px)");
-    const sheetEnd = floatingWindowCss.indexOf("@media (max-width: 767.98px) {", sheetStart + 1);
-    const sheetStyles = floatingWindowCss.slice(sheetStart, sheetEnd);
+  it("carries no body gutter override and owns a symmetric detail-panel inset", () => {
+    expect(floatingWindowCss).not.toContain(".floating-window--github-import .floating-window__body");
 
-    expect(sheetStyles).toContain(".floating-window--github-import .floating-window__body {");
-    expect(sheetStyles).toContain("margin-inline-end: 0;");
-    expect(sheetStyles).not.toContain(".floating-window--github-import-detail .floating-window__body");
-    expect(sheetStyles).not.toContain(".github-import-embedded");
+    const importCss = readFileSync(resolve(__dirname, "../GitHubImportModal.css"), "utf8");
+    const detailPanel = importCss.match(/\.github-import-detail-panel\s*\{[^}]*\}/)?.[0] ?? "";
+    expect(detailPanel).toContain("padding: var(--space-lg);");
+    expect(detailPanel).not.toMatch(/padding-inline-end\s*:/);
+    expect(importCss).not.toContain(".floating-window--tablet-viewport .github-import-detail-panel");
   });
 
   it("uses color-mix tokens for focus and selection surfaces", () => {
@@ -141,7 +143,6 @@ describe("GitHubImportModal", () => {
     expect(source).not.toContain("rgba(var(--color-primary-rgb)");
     expect(source).not.toContain("rgba(var(--in-progress-rgb)");
     expect(source).toContain("color-mix(in srgb, var(--in-progress) 12%, transparent)");
-    expect(source).toContain("Some hardcoded colors below");
   });
 
 
@@ -2701,6 +2702,38 @@ describe("GitHubImportModal", () => {
 
 
 
+    it.each(["modal", "embedded"] as const)("retains long pull rows, imported state, and the detail sheet in the %s presentation", async (presentation) => {
+      const longBranch = "branch-".repeat(24);
+      const longPull = {
+        number: 31,
+        title: "A deliberately long pull-request title that remains available to the mobile list row",
+        body: "PR body",
+        html_url: "https://github.com/owner/repo/pull/31",
+        headBranch: longBranch,
+        baseBranch: longBranch,
+      };
+      const importedTask: Task = {
+        ...mockPRTask,
+        description: "Review and address any issues in this pull request.\n\nPR: https://github.com/owner/repo/pull/31",
+      };
+      vi.mocked(fetchGitRemotes).mockResolvedValueOnce(singleRemote);
+      vi.mocked(apiFetchGitHubPulls).mockResolvedValueOnce([longPull, mockPulls[0]]);
+
+      render(<GitHubImportModal isOpen onClose={onClose} onImport={onImport} tasks={[importedTask]} presentation={presentation} />);
+      fireEvent.click(screen.getByRole("tab", { name: /Pull Requests/i }));
+
+      const longRow = await screen.findByRole("button", { name: /Select pull request #31/i });
+      expect(longRow).toHaveTextContent(longPull.title);
+      expect(longRow).toHaveTextContent(`${longBranch} → ${longBranch}`);
+      expect(longRow).toBeDisabled();
+      expect(within(longRow).getByText("Imported")).toBeTruthy();
+
+      fireEvent.click(screen.getByRole("button", { name: /Select pull request #1/i }));
+      const detail = await screen.findByTestId("floating-window-github-import-detail");
+      expect(detail.querySelector(".github-import-detail-panel")).toBeTruthy();
+      expect(within(detail).getByTestId("github-import-detail-actions")).toBeTruthy();
+    });
+
     it("calls apiImportGitHubPull when Import is clicked on PRs tab", async () => {
       vi.mocked(fetchGitRemotes).mockResolvedValueOnce(singleRemote);
       vi.mocked(apiFetchGitHubPulls).mockResolvedValueOnce(mockPulls);
@@ -3136,7 +3169,15 @@ describe("GitHubImportModal", () => {
   */
   it("scopes the import detail FloatingWindow as the shared mobile full-screen sheet", () => {
     const source = readFileSync(resolve(__dirname, "../FloatingWindow.css"), "utf8");
-    const phoneSheetMedia = source.match(/@media \(max-width: 767\.98px\), \(max-height: 480px\) \{([\s\S]*?)\n\}\n\n@media/)?.[1];
+    /*
+     * FNXC:GitHubImport 2026-08-17-23:47:
+     * Terminate on the media block's OWN closing brace (a `}` at column 0 — every rule inside is
+     * indented) rather than on a following `@media`. The old pattern assumed another at-rule came
+     * next, so deleting the phone-only block that followed it (it held nothing but a
+     * `margin-inline-end: 0` undo of the retired shared gutter) made this match fail and the whole
+     * sheet-geometry contract silently unverifiable.
+     */
+    const phoneSheetMedia = source.match(/@media \(max-width: 767\.98px\), \(max-height: 480px\) \{([\s\S]*?)\n\}\n/)?.[1];
     expect(phoneSheetMedia, "phone-sheet media query must exist").toBeTruthy();
     const declarationList = (ruleBody: string) => ruleBody.split(";").map((declaration) => declaration.trim()).filter(Boolean);
     const ruleDeclarations = (css: string, selector: RegExp, name: string) => {
@@ -3175,12 +3216,19 @@ describe("GitHubImportModal", () => {
     expect(baseDeclarations, "base FloatingWindow must provide inherited sheet clipping").toContain("overflow: hidden");
     expect(taskSheetDeclarations, "Task Detail must override its desktop visible-overflow rule on phones").toContain("overflow: hidden !important");
 
-    const desktopTaskDetailDeclarations = ruleDeclarations(
+    /*
+     * FNXC:FloatingWindow 2026-08-18-00:26:
+     * The visible-overflow host that phone sheets must re-clip is now the SHARED desktop rule, not
+     * a task-detail-scoped one: FN-8766's outboard east targets were promoted to every window when
+     * FN-8015's body gutter was deleted. Chat and GitHub Import still must not carry an override of
+     * their own (asserted below) — they inherit the shared desktop rule and the phone reassertion.
+     */
+    const desktopVisibleOverflowHost = ruleDeclarations(
       source,
-      /\.floating-window--task-detail:not\(\.floating-window--tablet-viewport\)\s*\{([^}]*)\}/,
-      "desktop Task Detail",
+      /\n\.floating-window:not\(\.floating-window--tablet-viewport\)\s*\{([^}]*)\}/,
+      "shared desktop window",
     );
-    expect(desktopTaskDetailDeclarations, "Task Detail's phone clipping reassertion needs the desktop override").toContain("overflow: visible");
+    expect(desktopVisibleOverflowHost, "the phone clipping reassertion needs a desktop visible-overflow host").toContain("overflow: visible");
 
     const visibleOverflowSheetHosts = [...source.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
       .filter(([, selector, body]) => /overflow\s*:\s*visible(?:\s*!important)?\s*(?:;|$)/.test(body))

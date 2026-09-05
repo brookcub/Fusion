@@ -22,7 +22,7 @@ import type {
   Settings,
   TaskStore,
 } from "@fusion/core";
-import { resolveExecutorFallbackModel, resolveProjectColumnsForRoles } from "@fusion/core";
+import { resolveEffectiveConcurrency, resolveExecutorFallbackModel, resolveProjectColumnsForRoles } from "@fusion/core";
 import type { ToolDefinition, AgentSession } from "@earendil-works/pi-coding-agent";
 import {
   createResolvedAgentSession,
@@ -33,7 +33,6 @@ import {
 import { buildSessionSkillContext } from "../cli-runtime/session-skill-context.js";
 import { computeTopLevelConcurrencyClaimedFromStore } from "../concurrency/concurrency.js";
 import { buildSystemPromptWithInstructions } from "../agents/agent-instructions.js";
-import { generateWorktreeName } from "../worktree/worktree-names.js";
 import { resolveTaskWorktreePath } from "../worktree/worktree-paths.js";
 import { createRunAuditor, type EngineRunContext } from "../util/run-audit.js";
 import { executorLog } from "../logger.js";
@@ -141,7 +140,7 @@ export function createSpawnAgentTool(
           store: deps.store,
           tasks: await deps.store.listTasks({ slim: true, includeArchived: false }),
         });
-        const spawnCap = settings.maxConcurrent ?? 2;
+        const spawnCap = resolveEffectiveConcurrency(settings).maxConcurrent;
         const liveChildren = deps.getTotalSpawnedCount();
         if (spawnClaimed + liveChildren >= spawnCap) {
           return {
@@ -187,8 +186,8 @@ export function createSpawnAgentTool(
         to the agent gate alone, matching every other lane.
         */
         {
-          const spawnMaxWorktrees = (settings as { maxWorktrees?: number | null }).maxWorktrees ?? 4;
-          if (typeof spawnMaxWorktrees === "number" && Number.isFinite(spawnMaxWorktrees)) {
+          const spawnMaxWorktrees = resolveEffectiveConcurrency(settings).worktreeLimit;
+          if (spawnMaxWorktrees !== null) {
             const spawnTasks = await deps.store.listTasks({ slim: true, includeArchived: false });
             /*
             FNXC:WorkflowResolvedColumns 2026-08-01-03:05:
@@ -230,8 +229,10 @@ export function createSpawnAgentTool(
           });
 
           // Create git worktree for child (branched from parent's worktree)
-          const childWorktreeName = generateWorktreeName(deps.rootDir, settings);
-          const childWorktreePath = resolveTaskWorktreePath(deps.rootDir, settings, childWorktreeName);
+          // FNXC:TaskWorktreeNames 2026-08-29-08:51: spawned agents use their
+          // durable agent ID rather than a random directory name, so retries do
+          // not allocate untraceable worktree paths.
+          const childWorktreePath = resolveTaskWorktreePath(deps.rootDir, settings, agent.id.toLowerCase());
           const childBranch = `fusion/spawn-${agent.id}`;
           await deps.createWorktree(childBranch, childWorktreePath, taskId, worktreePath);
 
@@ -308,6 +309,7 @@ export function createSpawnAgentTool(
           // Create child agent session
           const { session: childSession } = await createResolvedAgentSession({
             sessionPurpose: "executor",
+            taskExecutionSession: true,
             runtimeHint: childRuntimeHint,
             pluginRunner: deps.pluginRunner,
             cwd: childWorktreePath,

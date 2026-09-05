@@ -1,9 +1,13 @@
-import type { Task } from "@fusion/core";
+import { isWorkspaceTask, type Task } from "@fusion/core";
 import { getPathBasename } from "./pathDisplay";
 import { isArchivedColumnRole, isCompleteColumnRole, isHoldColumnRole, isReviewColumnRole } from "./columnRoles";
 
 export interface WorktreeGroupData {
+  /** Stable identity; display labels collide for separate worktree paths. */
+  id: string;
+  kind: "worktree" | "workspace" | "unassigned" | "up-next";
   label: string;
+  repoCount?: number;
   activeTasks: Task[];
   queuedTasks: Task[];
 }
@@ -53,12 +57,12 @@ function resolveDependencyOrder(tasks: Task[]): string[] {
  * Queued tasks (eligible "todo" tasks whose dependencies are all satisfied)
  * are always placed in the "Up Next" group — they are never distributed
  * to worktree-specific groups since they have no worktree assignment yet.
- * The number of queued tasks shown is capped at `maxConcurrent`.
+ * The number of queued tasks shown is capped at the execution-worktree ceiling.
  */
 export function groupByWorktree(
   inProgressTasks: Task[],
   allTasks: Task[],
-  maxConcurrent: number,
+  worktreeLimit: number,
   /*
   FNXC:WorkflowResolvedColumns 2026-07-29-00:00 (U12 — R8 drift conversion):
   The ids of TASKS whose own column is a hold lane in their own workflow, when the caller
@@ -85,9 +89,16 @@ export function groupByWorktree(
   */
   dependencyColumnFlags?: ReadonlyMap<string, Parameters<typeof isCompleteColumnRole>[0]>,
 ): WorktreeGroupData[] {
-  // Separate assigned vs unassigned in-progress tasks
-  const assigned = inProgressTasks.filter((t) => t.worktree);
-  const unassigned = inProgressTasks.filter((t) => !t.worktree);
+  /*
+  FNXC:Workspace 2026-08-20-20:05:
+  A populated workspaceWorktrees map is authoritative over a stale singular worktree delivered
+  before asynchronous store normalization. Classify it as workspace first so a one-repository
+  workspace cannot be hidden under an unrelated singular group; stable ids still prevent
+  basename collisions between acquired repository paths.
+  */
+  const workspaceTasks = inProgressTasks.filter(isWorkspaceTask);
+  const assigned = inProgressTasks.filter((task) => !isWorkspaceTask(task) && Boolean(task.worktree));
+  const unassigned = inProgressTasks.filter((task) => !isWorkspaceTask(task) && !task.worktree);
 
   // Group assigned tasks by worktree
   const worktreeMap = new Map<string, Task[]>();
@@ -143,8 +154,23 @@ export function groupByWorktree(
 
   for (const key of worktreeKeys) {
     groups.push({
+      id: key,
+      kind: "worktree",
       label: getWorktreeLabel(key),
       activeTasks: worktreeMap.get(key)!,
+      queuedTasks: [],
+    });
+  }
+
+  for (const task of workspaceTasks) {
+    const entries = task.workspaceWorktrees!;
+    const firstRepo = Object.keys(entries).sort()[0]!;
+    groups.push({
+      id: `workspace:${task.id}`,
+      kind: "workspace",
+      label: getWorktreeLabel(entries[firstRepo]!.worktreePath),
+      repoCount: Object.keys(entries).length,
+      activeTasks: [task],
       queuedTasks: [],
     });
   }
@@ -152,16 +178,20 @@ export function groupByWorktree(
   // Add unassigned group if needed
   if (unassigned.length > 0) {
     groups.push({
+      id: "unassigned",
+      kind: "unassigned",
       label: "Unassigned",
       activeTasks: unassigned,
       queuedTasks: [],
     });
   }
 
-  // All eligible queued tasks go into the "Up Next" group (capped at maxConcurrent)
-  const queued = orderedEligible.slice(0, maxConcurrent);
+  // All eligible queued tasks go into the "Up Next" group (capped at worktree capacity).
+  const queued = orderedEligible.slice(0, worktreeLimit);
   if (queued.length > 0) {
     groups.push({
+      id: "up-next",
+      kind: "up-next",
       label: "Up Next",
       activeTasks: [],
       queuedTasks: queued,

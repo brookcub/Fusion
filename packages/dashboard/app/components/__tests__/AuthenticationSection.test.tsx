@@ -3,6 +3,7 @@ import { fireEvent, render, screen, within } from "@testing-library/react";
 import { useState } from "react";
 import { AuthenticationSection, type AuthenticationSectionData } from "../settings/sections/AuthenticationSection";
 import type { AuthProvider } from "../../api";
+import { loadComponentCss } from "../../test/cssFixture";
 
 vi.mock("../ProviderIcon", () => ({
   ProviderIcon: ({ provider }: { provider: string }) => <span data-testid={`mock-icon-${provider}`}>{provider}</span>,
@@ -99,6 +100,18 @@ function renderAuthSection(providers: AuthProvider[], overrides: Partial<Authent
 }
 
 describe("AuthenticationSection", () => {
+  it("renders a provider-agnostic device-code panel without a manual-code shell", () => {
+    renderAuthSection(
+      [{ id: "openai-codex", name: "OpenAI Codex", authenticated: false, type: "oauth", loginInProgress: true }],
+      {
+        deviceCodes: { "openai-codex": { userCode: "ABCD-1234", verificationUri: "https://auth.openai.com/codex/device" } },
+      },
+    );
+
+    expect(screen.getByTestId("auth-device-code-openai-codex")).toHaveTextContent("Enter this code to continue");
+    expect(screen.getByText("ABCD-1234")).toBeInTheDocument();
+    expect(screen.queryByTestId("auth-manual-code-openai-codex")).not.toBeInTheDocument();
+  });
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -209,8 +222,53 @@ describe("AuthenticationSection", () => {
     ]);
 
     const subscriptionCard = screen.getByTestId("auth-provider-icon-anthropic-subscription").closest(".auth-provider-card") as HTMLElement;
-    expect(within(subscriptionCard).getByRole("alert")).toHaveTextContent("expired and could not be refreshed");
+    const alert = within(subscriptionCard).getByRole("alert");
+    const header = subscriptionCard.querySelector(".auth-provider-header");
+    expect(alert).toHaveTextContent("expired and could not be refreshed");
+    expect(alert).toHaveClass("auth-provider-login-error");
+    expect(alert.tagName).toBe("P");
+    expect(header).not.toContainElement(alert);
+    expect(header?.nextElementSibling).toBe(alert);
     expect(screen.getAllByRole("alert")).toHaveLength(1);
+  });
+
+  it("keeps a connected OAuth loginError as a wrapping card banner under the header", () => {
+    renderAuthSection([
+      {
+        id: "anthropic-subscription",
+        name: "Anthropic Subscription",
+        authenticated: true,
+        type: "oauth",
+        expired: true,
+        loginError: "This OAuth session expired and could not be refreshed. Re-login to restore model access.",
+      },
+    ]);
+
+    const subscriptionCard = screen.getByTestId("auth-provider-icon-anthropic-subscription").closest(".auth-provider-card") as HTMLElement;
+    const alert = within(subscriptionCard).getByRole("alert");
+    const header = subscriptionCard.querySelector(".auth-provider-header");
+    expect(alert).toHaveClass("auth-provider-login-error");
+    expect(header).not.toContainElement(alert);
+    expect(header?.nextElementSibling).toBe(alert);
+  });
+
+  it("renders the built-in catalog action without removing the custom provider section", () => {
+    renderAuthSection([{ id: "openai", name: "OpenAI", authenticated: false, type: "api_key" }]);
+
+    expect(screen.getByRole("button", { name: "Refresh Models" })).toBeInTheDocument();
+    expect(screen.getByTestId("custom-providers-section")).toBeInTheDocument();
+  });
+
+  it("wraps the provider loginError banner inside the card on a narrow Settings width", () => {
+    const css = loadComponentCss("settings/sections/AuthenticationSection.css");
+    expect(css).toMatch(/\.auth-provider-login-error\s*\{[^}]*display:\s*block/);
+    expect(css).toMatch(/\.auth-provider-login-error\s*\{[^}]*max-width:\s*100%/);
+    expect(css).toMatch(/\.auth-provider-login-error\s*\{[^}]*overflow-wrap:\s*anywhere/);
+    expect(css).toMatch(/\.auth-provider-login-error\s*\{[^}]*word-break:\s*break-word/);
+    expect(css).toMatch(/@media[^{]*\(max-width:\s*768px\)[^{]*\{[\s\S]*\.auth-provider-login-error\s*\{[\s\S]*margin-inline:\s*var\(--space-sm\)/);
+    expect(css).toMatch(/\.auth-model-refresh\s*\{[\s\S]*display:\s*flex/);
+    expect(css).toMatch(/\.auth-model-refresh-feedback--error\s*\{[^}]*color:\s*var\(--color-error\)/);
+    expect(css).toMatch(/@media[^{]*\(max-width:\s*768px\)[^{]*\{[\s\S]*\.auth-model-refresh\s*>\s*\.btn\s*\{[\s\S]*flex:\s*1 1 100%/);
   });
 
   it("keeps Anthropic OAuth logout separate from a stored API key clear action", () => {
@@ -251,5 +309,54 @@ describe("AuthenticationSection", () => {
     fireEvent.click(within(subscriptionCard).getByRole("button", { name: "Login" }));
     expect(handleLogin).toHaveBeenCalledWith("anthropic-subscription");
     expect(handleSaveApiKey).not.toHaveBeenCalled();
+  });
+
+  /*
+  FNXC:ProviderAuth 2026-08-18-06:10:
+  Settings shares onboarding's persistent login dialog. While that dialog owns a flow, the provider
+  row must NOT also render the instructions and paste field — two inputs for the same code, one of
+  them behind the dialog. Suppression is keyed by `stateKey` (provider + credential instance), so a
+  second named account for the same provider keeps its own inline field while the first is in the
+  dialog; that is the case a bare provider-id check would break.
+  */
+  describe("persistent login dialog handoff", () => {
+    const dialogFlowOverrides = {
+      loginInstructions: { "anthropic-subscription": "Complete login in your browser." },
+      manualCodeConfigs: { "anthropic-subscription": { prompt: "Paste the final redirect URL" } },
+      authActionInProgress: { "anthropic-subscription": true },
+    } as unknown as Partial<AuthenticationSectionData>;
+
+    const subscriptionProvider = [{
+      id: "anthropic-subscription",
+      name: "Anthropic Subscription",
+      authenticated: false,
+      type: "oauth",
+    } as AuthProvider];
+
+    it("renders its own paste field when no dialog owns the flow", () => {
+      renderAuthSection(subscriptionProvider, { ...dialogFlowOverrides, activeLoginDialogKey: null });
+
+      expect(screen.getByText("Paste the final redirect URL")).toBeInTheDocument();
+      expect(screen.getByText("Complete login in your browser.")).toBeInTheDocument();
+    });
+
+    it("yields both to the dialog that owns the flow", () => {
+      renderAuthSection(subscriptionProvider, {
+        ...dialogFlowOverrides,
+        activeLoginDialogKey: "anthropic-subscription",
+      });
+
+      expect(screen.queryByText("Paste the final redirect URL")).not.toBeInTheDocument();
+      expect(screen.queryByText("Complete login in your browser.")).not.toBeInTheDocument();
+    });
+
+    it("keeps a sibling account's inline field when another instance is in the dialog", () => {
+      renderAuthSection(subscriptionProvider, {
+        ...dialogFlowOverrides,
+        activeLoginDialogKey: "anthropic-subscription[work]",
+      });
+
+      expect(screen.getByText("Paste the final redirect URL")).toBeInTheDocument();
+    });
   });
 });

@@ -10,6 +10,7 @@ import {
   isRecoverableMissingWorktreeReviewFailureNoProgress,
   isRecoverableMissingWorktreeReviewFailureWithProgress,
 } from "../healing/restart-recovery-coordinator.js";
+import { NO_PROGRESS_REQUEUE_BUDGET_EXHAUSTED_PREFIX } from "../healing/no-progress-requeue-budget.js";
 
 function createTask(overrides: Partial<Task>): Task {
   return {
@@ -180,8 +181,24 @@ describe("RestartRecoveryCoordinator", () => {
     await coordinator.recoverInterruptedRuns();
 
     expect(store.updateTask).toHaveBeenCalledWith("FN-1", expect.objectContaining({ status: "stuck-killed" }));
-    expect(store.moveTask).toHaveBeenCalledWith("FN-1", "todo");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-1", "todo", expect.objectContaining({
+      moveSource: "engine",
+      lifecycleReason: "self-healing-session-recovery",
+    }));
     expect(executor.resumeOrphaned).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not reopen an exhausted no-progress park", async () => {
+    const store = {
+      listTasks: vi.fn().mockResolvedValue([
+        createTask({ id: "FN-parked", status: "failed", error: `${NO_PROGRESS_REQUEUE_BUDGET_EXHAUSTED_PREFIX} 3/3 attempts spent. Agent finished without calling fn_task_done`, steps: [] }),
+      ]),
+      updateTask: vi.fn(), logEntry: vi.fn(), moveTask: vi.fn(),
+    } as unknown as TaskStore;
+    const executor = { resumeOrphaned: vi.fn().mockResolvedValue(undefined) } as any;
+    await new RestartRecoveryCoordinator(store, executor).recoverInterruptedRuns();
+    expect(store.updateTask).not.toHaveBeenCalled();
+    expect(store.moveTask).not.toHaveBeenCalled();
   });
 
   it("does not requeue when step progress exists", async () => {
@@ -227,8 +244,8 @@ hid a second one behind the first:
      before the read;
   2. the redundant `.filter` — DELETED rather than converted; re-asserting the column the query just
      selected on adds nothing, and a second copy of a rule is how a read and its filter drift;
-  3. the move DESTINATION — already resolved via `resolveReboundTargetForTask`; only its comment was
-     stale, still describing the pre-fix state, and is corrected in place.
+  3. the move DESTINATION — FN-207 now derives it from the live source through the contained-
+     backward helper, so WIP returns to hold and review can never jump to Planning.
 
 REVERT PROOF, measured: restore `listTasks({ column: "in-progress" })` and the renamed case requeues
 nothing.

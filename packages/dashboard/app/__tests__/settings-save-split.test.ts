@@ -34,6 +34,10 @@ describe("scope anchors", () => {
     expect(isProjectSettingsKey("gitlabAuthToken")).toBe(true);
     expect(isGlobalSettingsKey("gitlabAuthTokenType")).toBe(true);
     expect(isProjectSettingsKey("gitlabAuthTokenType")).toBe(true);
+    expect(isGlobalSettingsKey("jiraEnabled")).toBe(true);
+    expect(isProjectSettingsKey("jiraEnabled")).toBe(true);
+    expect(isProjectSettingsKey("requireTaskRecommendations")).toBe(true);
+    expect(isGlobalSettingsKey("requireTaskRecommendations")).toBe(false);
   });
 
   it("every MODEL_LANE_KEYS entry is a project settings key", () => {
@@ -77,6 +81,20 @@ describe("resolveScopedMcpSettings", () => {
   });
 });
 
+describe("required recommendation policy ownership", () => {
+  it("routes the changed toggle to the project patch only", () => {
+    const result = splitSettingsSave({
+      payload: { requireTaskRecommendations: true },
+      initialValues: { requireTaskRecommendations: false } as never,
+      initialScopedValues: { global: {}, project: { requireTaskRecommendations: false } } as never,
+      activeSection: "general",
+    });
+
+    expect(result.projectPatch).toEqual({ requireTaskRecommendations: true });
+    expect(result.globalPatch).toEqual({});
+  });
+});
+
 describe("agent clarification notification ownership", () => {
   it("persists the Notifications setting through the section save split", () => {
     const result = splitSettingsSave({
@@ -112,6 +130,76 @@ describe("splitSettingsSave", () => {
 
     expect(globalPatch).toEqual({ language: "fr" });
     expect(projectPatch).toEqual({ maxConcurrent: 5 });
+  });
+
+  it("keeps Fast & Cheap model and credential selections in the global Models save", () => {
+    const result = splitSettingsSave({
+      payload: {
+        fastCheapGlobalProvider: "openai",
+        fastCheapGlobalModelId: "gpt-fast",
+        fastCheapGlobalCredentialInstanceId: "team-fast",
+      },
+      initialValues: {} as never,
+      initialScopedValues: { global: {}, project: {} } as never,
+      activeSection: "global-models",
+    });
+
+    expect(result.globalPatch).toEqual({
+      fastCheapGlobalProvider: "openai",
+      fastCheapGlobalModelId: "gpt-fast",
+      fastCheapGlobalCredentialInstanceId: "team-fast",
+    });
+    expect(result.projectPatch).toEqual({});
+  });
+
+  it("routes Fast & Cheap project edits and explicit clears through the project patch", () => {
+    const initialScopedValues = {
+      global: {},
+      project: {
+        fastCheapProvider: "anthropic",
+        fastCheapModelId: "claude-haiku",
+        fastCheapCredentialInstanceId: "fast-credential",
+        fastCheapThinkingLevel: "low",
+      },
+    } as never;
+
+    const updated = splitSettingsSave({
+      payload: {
+        fastCheapProvider: "openai",
+        fastCheapModelId: "gpt-fast",
+        fastCheapCredentialInstanceId: "team-fast",
+        fastCheapThinkingLevel: "medium",
+      },
+      initialValues: {} as never,
+      initialScopedValues,
+      activeSection: "project-models",
+    });
+    expect(updated.globalPatch).toEqual({});
+    expect(updated.projectPatch).toEqual({
+      fastCheapProvider: "openai",
+      fastCheapModelId: "gpt-fast",
+      fastCheapCredentialInstanceId: "team-fast",
+      fastCheapThinkingLevel: "medium",
+    });
+
+    const cleared = splitSettingsSave({
+      payload: {
+        fastCheapProvider: undefined,
+        fastCheapModelId: undefined,
+        fastCheapCredentialInstanceId: undefined,
+        fastCheapThinkingLevel: undefined,
+      },
+      initialValues: {} as never,
+      initialScopedValues,
+      activeSection: "project-models",
+    });
+    expect(cleared.globalPatch).toEqual({});
+    expect(cleared.projectPatch).toEqual({
+      fastCheapProvider: null,
+      fastCheapModelId: null,
+      fastCheapCredentialInstanceId: null,
+      fastCheapThinkingLevel: null,
+    });
   });
 
   it("does not write global values that match the initial global-scoped value", () => {
@@ -524,6 +612,10 @@ describe("splitSettingsSave", () => {
     });
 
     expect(projectPatch).toEqual({});
+    expect(globalPatch.remoteAccess?.tokenStrategy).toEqual({
+      shortLived: expect.any(Object),
+    });
+    expect(JSON.stringify(globalPatch.remoteAccess)).not.toContain("persistent");
     expect(globalPatch).toEqual({
       remoteAccess: expect.objectContaining({
         activeProvider: "tailscale",
@@ -791,5 +883,46 @@ describe("splitSettingsSave", () => {
     // ...and is instead routed to the project patch on the project-scoped
     // "source-control" section, rather than being dropped or erroring.
     expect(onProject.projectPatch).toMatchObject({ githubTrackingDefaultRepo: "org/repo" });
+  });
+
+  it("does not pin untouched inherited JIRA settings into a project override", () => {
+    const result = splitSettingsSave({
+      payload: {
+        jiraEnabled: true,
+        jiraBaseUrl: "https://acme.atlassian.net",
+        jiraAuthTokenSecretScope: "global",
+      },
+      initialValues: {
+        jiraEnabled: true,
+        jiraBaseUrl: "https://acme.atlassian.net",
+        jiraAuthTokenSecretScope: "global",
+      } as never,
+      initialScopedValues: {
+        global: {
+          jiraEnabled: true,
+          jiraBaseUrl: "https://acme.atlassian.net",
+          jiraAuthTokenSecretScope: "global",
+        },
+        project: {},
+      } as never,
+      activeSection: "source-control",
+    });
+
+    expect(result.globalPatch).toEqual({});
+    expect(result.projectPatch).toEqual({});
+  });
+
+  it("clears a project JIRA override with null-as-delete", () => {
+    const { projectPatch } = splitSettingsSave({
+      payload: { jiraBaseUrl: undefined },
+      initialValues: { jiraBaseUrl: "https://project.atlassian.net" } as never,
+      initialScopedValues: {
+        global: { jiraBaseUrl: "https://global.atlassian.net" },
+        project: { jiraBaseUrl: "https://project.atlassian.net" },
+      } as never,
+      activeSection: "source-control",
+    });
+
+    expect(projectPatch).toEqual({ jiraBaseUrl: null });
   });
 });

@@ -16,6 +16,7 @@ import type {
   DriftReport,
   SpecLock,
   TaskRecommendationListItem,
+  TaskColumnSortMode,
 } from "@fusion/core";
 import { withTokenHeader } from "../../auth";
 import { api, ApiRequestError, buildApiUrl, proxyApi } from "../client/client.js";
@@ -61,10 +62,12 @@ export function fetchArchivedTasks(
   projectId?: string,
   limit?: number,
   offset?: number,
+  sortMode: TaskColumnSortMode = "completion-date-desc",
 ): Promise<{ tasks: Task[]; total: number; hasMore: boolean }> {
   const search = new URLSearchParams();
   if (limit !== undefined) search.set("limit", String(limit));
   if (offset !== undefined) search.set("offset", String(offset));
+  search.set("sort", sortMode);
   const suffix = search.size > 0 ? `?${search.toString()}` : "";
   return api<{ tasks: Task[]; total: number; hasMore: boolean }>(withProjectId(`/tasks/archived${suffix}`, projectId));
 }
@@ -117,8 +120,7 @@ export function fetchSpecLock(id: string, projectId?: string): Promise<SpecLockR
 
 /*
 FNXC:TaskDetailPlan 2026-08-05-04:05:
-Definition polling reads only PROMPT.md. It must not request a TaskDetail because board/SSE/mutation
-snapshots exclusively own lifecycle, workflow, and action state while a detail host is mounted.
+Definition polling reads only PROMPT.md so it cannot roll lifecycle or workflow state backward. Its response is degradable evidence: the mounted detail may adopt usable plan text, while absent or blank text retains the loaded plan until a separate authoritative detail read confirms whether PROMPT.md is genuinely gone.
 */
 export function fetchTaskPrompt(id: string, projectId?: string): Promise<TaskPromptResponse> {
   return api<TaskPromptResponse>(withProjectId(`/tasks/${id}/prompt`, projectId));
@@ -277,12 +279,15 @@ export async function createTask(
   projectId?: string,
   options?: CreateTaskRequestOptions,
 ): Promise<Task> {
+  /*
+  FNXC:PlanApproval 2026-08-28-11:29:
+  The dashboard create API is an explicit whitelist shared by Quick Entry and New Task. Forward the per-task approval override here so an opted-in task reaches planning with its human-review hold intact.
+  */
   const {
     title,
     description,
     column,
     dependencies,
-    breakIntoSubtasks,
     enabledWorkflowSteps,
     workflowId,
     assignedAgentId,
@@ -326,8 +331,7 @@ export async function createTask(
       description,
       column,
       dependencies,
-      breakIntoSubtasks,
-      enabledWorkflowSteps,
+        enabledWorkflowSteps,
       workflowId,
       assignedAgentId,
       modelPresetId,
@@ -369,6 +373,20 @@ export async function createTask(
     }
     throw error;
   }
+}
+
+export interface TaskOverlapBlockerReport {
+  taskId: string;
+  blockerId: string | null;
+  blockerColumn: string | null;
+  reason: "ok" | "no-overlap-blocker" | "blocker-not-found" | "no-overlap";
+  taskScopeCount: number;
+  blockerScopeCount: number;
+  overlaps: Array<{ path: string; blockerPath: string }>;
+}
+
+export function fetchOverlapBlockerReport(id: string, projectId?: string): Promise<TaskOverlapBlockerReport> {
+  return api<TaskOverlapBlockerReport>(withProjectId(`/tasks/${encodeURIComponent(id)}/overlap-blocker`, projectId));
 }
 
 export interface RepairOverlapBlockerResult {
@@ -494,7 +512,7 @@ export function moveTask(
   id: string,
   column: ColumnId,
   projectId?: string,
-  optionsOrPosition?: { preserveProgress?: boolean } | number,
+  optionsOrPosition?: { preserveProgress?: boolean; expectedColumn?: string } | number,
 ): Promise<Task> {
   return api<Task>(withProjectId(`/tasks/${id}/move`, projectId), {
     method: "POST",
@@ -503,6 +521,11 @@ export function moveTask(
       ...(
         typeof optionsOrPosition === "object" && optionsOrPosition?.preserveProgress
           ? { preserveProgress: true }
+          : {}
+      ),
+      ...(
+        typeof optionsOrPosition === "object" && optionsOrPosition?.expectedColumn !== undefined
+          ? { expectedColumn: optionsOrPosition.expectedColumn }
           : {}
       ),
     }),

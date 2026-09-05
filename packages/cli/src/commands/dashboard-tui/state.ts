@@ -18,6 +18,14 @@ export interface SystemInfo {
   authEnabled: boolean;
   authToken?: string;
   tokenizedUrl?: string;
+  /*
+  FNXC:DevTunnel 2026-08-19-04:30:
+  Public URL of whatever tunnel is exposing this dashboard — `pnpm dev --tunnel` (forwarded over the
+  dev IPC channel) or the operator's own remote tunnel (from the engine's tunnel manager). Either
+  way it belongs on screen: the dev wrapper prints a banner that a TTY run's TUI paints straight
+  over, and the remote tunnel never printed its URL anywhere the terminal could show it at all.
+  */
+  tunnelUrl?: string;
   engineMode: "no-engine" | "active" | "paused";
   fileWatcher: boolean;
   startTimeMs: number;
@@ -355,6 +363,8 @@ export interface DashboardState {
   logsSeverityFilter: "all" | LogEntry["level"];
   logsWrapEnabled: boolean;
   logsExpandedMode: boolean;
+  /* FNXC:TuiRawLogs 2026-08-26-14:10: chrome-free, mouse-released logs view for native text selection. */
+  logsRawMode: boolean;
   selectedLogIndex: number;
   logsViewportStart: number;
   // When the narrow single-pane main view is split horizontally to show a
@@ -404,6 +414,7 @@ export function createInitialState(): DashboardState {
     logsSeverityFilter: "all",
     logsWrapEnabled: false,
     logsExpandedMode: false,
+    logsRawMode: false,
     selectedLogIndex: 0,
     logsViewportStart: 0,
     narrowLogSplitFocused: false,

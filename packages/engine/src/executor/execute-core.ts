@@ -26,16 +26,19 @@
  * FNXC:WorkflowExecution 2026-07-19-10:40 / 17:45 (U10/U10b):
  * Authoritative driver and bare runImplementation fallback deleted; graph is sole orchestrator.
  */
-import type { Task } from "@fusion/core";
+import type { Settings, Task, TaskStore } from "@fusion/core";
 import { executorLog } from "../logger.js";
 import { dropPreHeldExecutorSlot } from "../concurrency/concurrency.js";
+import { getActivePrincipalHoldCooldown } from "./execute-workflow-graph.js";
 
 export type ExecuteCoreDeps = {
+  store: Pick<TaskStore, "getTask" | "getSettings">;
   completionFinalizedTaskIds: Set<string>;
   graphRouting: Set<string>;
   releaseSemaphore: () => void;
   clearStalePauseAbortBeforeDispatch: (task: Task) => Promise<void>;
   blockOuterDispatchWhenDependenciesUnmet: (task: Task) => Promise<boolean>;
+  blockOuterDispatchWhenFileScopeLeaseHeld: (task: Task) => Promise<boolean>;
   executeWorkflowGraph: (task: Task, options: { alreadyClaimed: true }) => Promise<void>;
 };
 
@@ -56,6 +59,26 @@ export async function executeCore(deps: ExecuteCoreDeps, task: Task): Promise<vo
     return;
   }
   /*
+  FNXC:WorkflowAgentRouting 2026-08-23-22:22:
+  Honor an active principal-hold cooldown BEFORE the graphRouting claim. Re-entering the graph only to re-fence
+  and re-park IS the hot loop: one graph run, two work-item writes, and two audit rows per pass for a condition
+  that cannot change without operator action (enabling or adding an agent). Skipping here is what makes the hold
+  a real wait rather than a label.
+
+  Restored after the U4 executor peel (#3317) rewrote executor.ts from a pre-change base, dropped
+  `isPrincipalHoldCoolingDown` outright, and re-inlined the read inside executeWorkflowGraph behind
+  `!opts?.alreadyClaimed` — which this, the only caller, always sets. The ladder kept recording and clearing
+  correctly, so it read as working while never once deferring a dispatch.
+
+  This must stay AHEAD of the claim: returning after `graphRouting.add` would leave the claim owned by nobody.
+  The `execute()` wrapper owns the pre-held slot release for every exit path, so no slot bookkeeping belongs here.
+  */
+  const principalHoldCooldown = getActivePrincipalHoldCooldown(task.id);
+  if (principalHoldCooldown) {
+    executorLog.debug(`execute() called for ${task.id} while a workflow-principal hold is cooling down (${principalHoldCooldown.reason}) — deferring`);
+    return;
+  }
+  /*
   FNXC:WorkflowExecution 2026-07-21-22:56:
   Claim graphRouting BEFORE any await. The previous check-then-await-then-claim
   window let concurrent execute() calls (task:moved + unpause resume after plan-review)
@@ -71,9 +94,49 @@ export async function executeCore(deps: ExecuteCoreDeps, task: Task): Promise<vo
   deps.graphRouting.add(task.id);
   let graphRunnerOwnsClaim = false;
   try {
+    /*
+    FNXC:EnginePause 2026-09-05-06:55:
+    The scheduler is not the executor's only caller. Durable workflow continuations, restart
+    recovery, and direct dispatch all enter executeCore independently, so scheduler-only pause
+    checks allowed a paused task to start a fresh review node. Re-read both authorities after
+    claiming graphRouting and fail closed on an unavailable read. This keeps the existing
+    pre-await duplicate exclusion while making every outer execution entry pause-safe.
+    */
+    let liveTask: Task;
+    let liveSettings: Settings;
+    try {
+      [liveTask, liveSettings] = await Promise.all([
+        deps.store.getTask(task.id),
+        deps.store.getSettings(),
+      ]);
+      if (!liveTask || !liveSettings) throw new Error("Pause authority missing");
+    } catch (error) {
+      executorLog.warn(
+        `${task.id}: refusing execute — authoritative pause state unavailable: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      if (dropPreHeldExecutorSlot(task.id)) deps.releaseSemaphore();
+      return;
+    }
+    const pauseReason = liveTask.paused === true || liveTask.userPaused === true
+      ? "task is paused"
+      : liveSettings.globalPause === true
+        ? "global pause is active"
+        : liveSettings.enginePaused === true
+          ? "engine pause is active"
+          : undefined;
+    if (pauseReason) {
+      executorLog.debug(`${task.id}: refusing execute — ${pauseReason}`);
+      if (dropPreHeldExecutorSlot(task.id)) deps.releaseSemaphore();
+      return;
+    }
     await deps.clearStalePauseAbortBeforeDispatch(task);
     if (await deps.blockOuterDispatchWhenDependenciesUnmet(task)) {
       // FNXC:GlobalConcurrencyControls 2026-07-14-18:30: release any scheduler pre-held slot when outer dispatch aborts before agent work starts.
+      if (dropPreHeldExecutorSlot(task.id)) deps.releaseSemaphore();
+      return;
+    }
+    if (await deps.blockOuterDispatchWhenFileScopeLeaseHeld(task)) {
+      // The overlap hold is in-place, so the scheduler reservation has no downstream owner either.
       if (dropPreHeldExecutorSlot(task.id)) deps.releaseSemaphore();
       return;
     }

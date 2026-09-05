@@ -11,8 +11,10 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { isFullScreenSheetViewport, isShortViewport, isTabletTouchViewport, useViewportMode } from "../hooks/useViewportMode";
 import { currentFloatingZ, currentTaskDetailFloatingZ, nextFloatingZ, nextTaskDetailFloatingZ } from "./floatingWindowStack";
+import { isInsidePortalSafeSurface } from "../utils/portalSurfaces";
 import "./FloatingWindow.css";
 
 /*
@@ -50,6 +52,13 @@ export interface FloatingWindowProps {
   className?: string;
   /** Optional localStorage key used to restore the last clamped position and size. */
   persistGeometryKey?: string;
+  /*
+  FNXC:FloatingWindow 2026-08-23-04:29:
+  Stacked callers can request a presentation-only cascade without changing the shared canonical
+  geometry. The persisted base remains un-cascaded, so reopening a window never walks it across
+  the viewport.
+  */
+  cascadeOffsetIndex?: number;
   /** Skip desktop geometry restoration/writes while this caller renders as a full-screen mobile sheet. */
   suspendGeometryPersistenceOnMobile?: boolean;
   /** Include the CSS short-viewport sheet breakpoint when suspending geometry persistence. */
@@ -81,6 +90,8 @@ export interface FloatingWindowProps {
    * interaction; unrelated utilities use the global floating stack.
    */
   layer?: "utility" | "task-detail";
+  /** Optional monotonic signal for owners that refresh a mounted window in place. */
+  raiseToFrontSignal?: number;
   // FNXC:FloatingWindow 2026-07-11-11:30: accessible name for the dialog overlay so headerless windows (e.g. artifact viewers with their own header chrome) stay queryable/announcable by label.
   ariaLabel?: string;
   /*
@@ -105,19 +116,7 @@ Z-index now comes from the SHARED `floatingWindowStack` module (`nextFloatingZ`/
 type ResizeDirection = "n" | "s" | "e" | "w" | "ne" | "nw" | "se" | "sw";
 const RESIZE_DIRECTIONS: ResizeDirection[] = ["n", "s", "e", "w", "ne", "nw", "se", "sw"];
 export const FLOATING_WINDOW_GEOMETRY_CHANGE_EVENT = "fusion:floating-window-geometry-change";
-
-const FLOATING_WINDOW_OUTSIDE_POINTER_SAFE_SURFACE_SELECTOR = [
-  ".floating-window",
-  ".modal-overlay",
-  "[role=\"dialog\"]",
-  ".model-combobox-dropdown--portal",
-  ".model-nested-menu--portal",
-  ".dep-dropdown--portal",
-  ".node-picker-dropdown--portal",
-  ".agent-picker-dropdown--portal",
-  ".priority-picker-dropdown--portal",
-  ".activity-view-menu",
-].join(", ");
+export const FLOATING_WINDOW_CASCADE_STEP_PX = 28;
 
 /*
 FNXC:ModalTouchGeometry 2026-07-27-12:00:
@@ -153,13 +152,86 @@ function clampPosition(position: FloatingWindowPosition, size: FloatingWindowSiz
   };
 }
 
+export interface FloatingWindowCascade {
+  offset: FloatingWindowPosition;
+  size: FloatingWindowSize;
+}
+
+interface FloatingWindowCascadeAxis {
+  offset: number;
+  size: number;
+}
+
+function resolveFloatingWindowCascadeAxis(
+  base: number,
+  size: number,
+  minSize: number,
+  viewportSize: number,
+  distance: number,
+): FloatingWindowCascadeAxis {
+  const maximumPosition = Math.max(VIEWPORT_PADDING, viewportSize - size - VIEWPORT_PADDING);
+  const forwardTravel = Math.max(0, Math.min(base + distance, maximumPosition) - base);
+  const backwardTravel = Math.max(0, base - Math.max(base - distance, VIEWPORT_PADDING));
+  const availableReduction = Math.max(0, size - minSize);
+
+  if (forwardTravel > 0) {
+    const reduction = Math.min(distance - forwardTravel, availableReduction);
+    return { offset: forwardTravel + reduction, size: size - reduction };
+  }
+
+  if (backwardTravel >= distance) {
+    return { offset: -distance, size };
+  }
+
+  const reduction = Math.min(distance, availableReduction);
+  if (reduction > 0) {
+    return { offset: reduction, size: size - reduction };
+  }
+
+  return { offset: -backwardTravel, size };
+}
+
+/*
+FNXC:FloatingWindow 2026-08-27-09:18:
+FN-193 requires stacked chat windows to remain visibly separated even when their shared base nearly fills the viewport. Preserve the existing forward-first and far-edge backward behavior, but shrink only the presented dimension when its requested forward travel is clamped; persistence restores the un-cascaded, un-shrunk base.
+*/
+export function resolveFloatingWindowCascade(
+  base: FloatingWindowPosition,
+  size: FloatingWindowSize,
+  minSize: FloatingWindowSize,
+  cascadeIndex: number,
+): FloatingWindowCascade {
+  const unchanged = (): FloatingWindowCascade => ({ offset: { x: 0, y: 0 }, size });
+  if (
+    !Number.isFinite(cascadeIndex)
+    || cascadeIndex <= 0
+    || !Number.isFinite(base.x)
+    || !Number.isFinite(base.y)
+    || !Number.isFinite(size.width)
+    || !Number.isFinite(size.height)
+    || !Number.isFinite(minSize.width)
+    || !Number.isFinite(minSize.height)
+    || typeof window === "undefined"
+    || !Number.isFinite(window.innerWidth)
+    || !Number.isFinite(window.innerHeight)
+  ) return unchanged();
+
+  const distance = cascadeIndex * FLOATING_WINDOW_CASCADE_STEP_PX;
+  const horizontal = resolveFloatingWindowCascadeAxis(base.x, size.width, minSize.width, window.innerWidth, distance);
+  const vertical = resolveFloatingWindowCascadeAxis(base.y, size.height, minSize.height, window.innerHeight, distance);
+  return {
+    offset: { x: horizontal.offset, y: vertical.offset },
+    size: { width: horizontal.size, height: vertical.size },
+  };
+}
+
 /*
 FNXC:FloatingWindow 2026-06-22-20:45:
 Default position cascades by windowKey so opening several windows in a row visibly offsets each one from a roughly-centered origin instead of stacking them pixel-perfect on top of one another.
 */
 function defaultPositionFor(windowKey: string, size: FloatingWindowSize): FloatingWindowPosition {
   if (typeof window === "undefined") return { x: VIEWPORT_PADDING, y: VIEWPORT_PADDING };
-  const cascade = cascadeIndexFor(windowKey) * 28;
+  const cascade = cascadeIndexFor(windowKey) * FLOATING_WINDOW_CASCADE_STEP_PX;
   return clampPosition(
     { x: (window.innerWidth - size.width) / 2 + cascade, y: (window.innerHeight - size.height) / 2 + cascade },
     size
@@ -212,6 +284,7 @@ export function FloatingWindow({
   dragHandleSelector,
   className,
   persistGeometryKey,
+  cascadeOffsetIndex = 0,
   suspendGeometryPersistenceOnMobile = false,
   suspendGeometryPersistenceOnShortViewport = false,
   closeOnOutsidePointerDown = false,
@@ -220,9 +293,11 @@ export function FloatingWindow({
   testId,
   hidden = false,
   layer = "utility",
+  raiseToFrontSignal,
   ariaLabel,
   ariaLabelledBy,
 }: FloatingWindowProps) {
+  const { t } = useTranslation("app");
   const resolvedMinSize: FloatingWindowSize = minSize ?? { width: DEFAULT_MIN_WIDTH, height: DEFAULT_MIN_HEIGHT };
   const viewportMode = useViewportMode();
   /*
@@ -236,17 +311,20 @@ export function FloatingWindow({
   FNXC:ModalTouchGeometry 2026-08-01-04:23:
   NAMING CONTRACT — FloatingWindow has two distinct tablet markers; do not conflate them:
   - `floating-window--tablet-viewport`: the viewport MODE classifies as tablet (769-1024px
-    width OR a known 768px touch tablet), touch or not. Pure styling surface — currently the
-    FN-8015 gutter zeroing lives here.
+    width OR a known 768px touch tablet), touch or not. Pure styling surface.
   - `floating-window--touch-geometry`: tablet AND touch-capable (`isTabletTouchViewport`) —
     enlarged 44px drag/resize targets only.
-  A 900px non-touch window is `--tablet-viewport` but NOT `--touch-geometry`, and operators
-  still see the FN-8015 scrollbar gutter as an uneven right inset there (third recurrence of
-  the Task Detail right-padding bug — FN-8630/FN-8634 fixed only the `.modal-overlay` shells,
-  while every tablet task popup and floating terminal renders through THIS host).
+  A 900px non-touch window is `--tablet-viewport` but NOT `--touch-geometry`; the marker exists so
+  such a window still gets tablet STYLING. It used to carry FN-8015's gutter zeroing, because that
+  shared gutter read as an uneven right inset on tablet (third recurrence of the Task Detail
+  right-padding bug — FN-8630/FN-8634 fixed only the `.modal-overlay` shells, while every tablet
+  task popup and floating terminal renders through THIS host). The gutter is deleted outright as of
+  2026-08-17, so no gutter zeroing hangs off this class any more.
   */
   const isTabletViewportMode = viewportMode === "tablet";
   const initialGeometry = useRef<{ size: FloatingWindowSize; position: FloatingWindowPosition } | null>(null);
+  const cascadeOffsetRef = useRef<FloatingWindowPosition>({ x: 0, y: 0 });
+  const cascadeSizeReductionRef = useRef<FloatingWindowSize>({ width: 0, height: 0 });
   /*
   FNXC:ModalGeometryPersistence 2026-07-16-00:40:
   Opt-in sheet callers leave desktop geometry untouched at `max-width: 768px`. Most wide, short
@@ -257,19 +335,35 @@ export function FloatingWindow({
     isFullScreenSheetViewport() || (suspendGeometryPersistenceOnShortViewport && isShortViewport())
   );
 
+  const applyCascadeOffset = (geometry: { size: FloatingWindowSize; position: FloatingWindowPosition }) => {
+    const cascade = geometryPersistenceSuspended
+      ? { offset: { x: 0, y: 0 }, size: geometry.size }
+      : resolveFloatingWindowCascade(geometry.position, geometry.size, resolvedMinSize, cascadeOffsetIndex);
+    cascadeOffsetRef.current = cascade.offset;
+    cascadeSizeReductionRef.current = {
+      width: geometry.size.width - cascade.size.width,
+      height: geometry.size.height - cascade.size.height,
+    };
+    return {
+      size: cascade.size,
+      position: { x: geometry.position.x + cascade.offset.x, y: geometry.position.y + cascade.offset.y },
+    };
+  };
+
   if (!initialGeometry.current) {
     const fallbackSize = clampSize(defaultSize ?? { width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT }, resolvedMinSize);
     const fallbackPosition = defaultPosition ? clampPosition(defaultPosition, fallbackSize) : defaultPositionFor(windowKey, fallbackSize);
-    initialGeometry.current = geometryPersistenceSuspended
+    const baseGeometry = geometryPersistenceSuspended
       ? { size: fallbackSize, position: fallbackPosition }
       : readPersistedGeometry(persistGeometryKey, fallbackSize, fallbackPosition, resolvedMinSize);
+    initialGeometry.current = applyCascadeOffset(baseGeometry);
   }
 
   const [size, setSize] = useState<FloatingWindowSize>(() =>
     initialGeometry.current!.size
   );
   const [position, setPosition] = useState<FloatingWindowPosition>(() => initialGeometry.current!.position);
-  const geometryIdentityRef = useRef({ windowKey, persistGeometryKey });
+  const geometryIdentityRef = useRef({ windowKey, persistGeometryKey, cascadeOffsetIndex });
 
   /*
   FNXC:ModalTouchGeometry 2026-07-27-20:00:
@@ -279,18 +373,23 @@ export function FloatingWindow({
   */
   useLayoutEffect(() => {
     const previousIdentity = geometryIdentityRef.current;
-    if (previousIdentity.windowKey === windowKey && previousIdentity.persistGeometryKey === persistGeometryKey) return;
+    if (
+      previousIdentity.windowKey === windowKey
+      && previousIdentity.persistGeometryKey === persistGeometryKey
+      && previousIdentity.cascadeOffsetIndex === cascadeOffsetIndex
+    ) return;
 
     const fallbackSize = clampSize(defaultSize ?? { width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT }, resolvedMinSize);
     const fallbackPosition = defaultPosition ? clampPosition(defaultPosition, fallbackSize) : defaultPositionFor(windowKey, fallbackSize);
-    const nextGeometry = geometryPersistenceSuspended
+    const baseGeometry = geometryPersistenceSuspended
       ? { size: fallbackSize, position: fallbackPosition }
       : readPersistedGeometry(persistGeometryKey, fallbackSize, fallbackPosition, resolvedMinSize);
-    geometryIdentityRef.current = { windowKey, persistGeometryKey };
+    const nextGeometry = applyCascadeOffset(baseGeometry);
+    geometryIdentityRef.current = { windowKey, persistGeometryKey, cascadeOffsetIndex };
     initialGeometry.current = nextGeometry;
     setSize(nextGeometry.size);
     setPosition(nextGeometry.position);
-  }, [defaultPosition, defaultSize, geometryPersistenceSuspended, persistGeometryKey, resolvedMinSize, windowKey]);
+  }, [cascadeOffsetIndex, defaultPosition, defaultSize, geometryPersistenceSuspended, persistGeometryKey, resolvedMinSize, windowKey]);
 
   const claimFrontZ = useCallback(() => (layer === "task-detail" ? nextTaskDetailFloatingZ() : nextFloatingZ()), [layer]);
   const readCurrentZ = useCallback(() => (layer === "task-detail" ? currentTaskDetailFloatingZ() : currentFloatingZ()), [layer]);
@@ -317,6 +416,19 @@ export function FloatingWindow({
       return claimFrontZ();
     });
   }, [claimFrontZ, readCurrentZ]);
+
+  /*
+  FNXC:FloatingWindow 2026-08-23-03:33:
+  FN-169 needs a third re-raise path for owners that refresh a mounted entry in place: such a
+  window neither remounts nor transitions from hidden to visible. An omitted signal preserves
+  every existing caller's stack behavior.
+  */
+  const previousRaiseToFrontSignalRef = useRef(raiseToFrontSignal);
+  useEffect(() => {
+    if (raiseToFrontSignal === previousRaiseToFrontSignalRef.current) return;
+    previousRaiseToFrontSignalRef.current = raiseToFrontSignal;
+    bringToFront();
+  }, [bringToFront, raiseToFrontSignal]);
 
   /*
   FNXC:FloatingWindow 2026-07-18-00:00:
@@ -562,8 +674,7 @@ export function FloatingWindow({
         return;
       }
 
-      const targetElement = target instanceof Element ? target : target.parentNode instanceof Element ? target.parentNode : null;
-      if (targetElement?.closest(FLOATING_WINDOW_OUTSIDE_POINTER_SAFE_SURFACE_SELECTOR)) return;
+      if (isInsidePortalSafeSurface(target)) return;
 
       onClose();
     };
@@ -580,17 +691,32 @@ export function FloatingWindow({
   }, [closeOnOutsidePointerDown, hidden, onClose]);
 
   /*
+  FNXC:FloatingWindow 2026-08-23-04:29:
+  Persist the un-cascaded base rather than a stacked presentation position. Shared chat windows can
+  then retain one stable geometry while each visible panel applies its own offset.
+
+  FNXC:FloatingWindow 2026-08-27-09:18:
+  FN-193 also re-expands a cascade-shrunk presentation size before saving. The shared desktop base must never progressively shrink just because several chat windows opened near a viewport edge.
+
   FNXC:ChatModal 2026-06-22-14:57:
   Quick Chat reopens should restore the last desktop floating-window size and position while still clamping onto the current viewport. Keep persistence generic and opt-in with persistGeometryKey so each caller controls whether geometry is shared or isolated.
   */
   useEffect(() => {
     if (hidden || !persistGeometryKey || typeof window === "undefined" || geometryPersistenceSuspended) return;
     try {
-      localStorage.setItem(persistGeometryKey, JSON.stringify({ size, position }));
+      const canonicalSize = clampSize({
+        width: size.width + cascadeSizeReductionRef.current.width,
+        height: size.height + cascadeSizeReductionRef.current.height,
+      }, resolvedMinSize);
+      const canonicalPosition = clampPosition({
+        x: position.x - cascadeOffsetRef.current.x,
+        y: position.y - cascadeOffsetRef.current.y,
+      }, canonicalSize);
+      localStorage.setItem(persistGeometryKey, JSON.stringify({ size: canonicalSize, position: canonicalPosition }));
     } catch {
       // Ignore storage failures; geometry persistence is a convenience only.
     }
-  }, [geometryPersistenceSuspended, hidden, persistGeometryKey, position, size]);
+  }, [geometryPersistenceSuspended, hidden, persistGeometryKey, position, resolvedMinSize, size]);
 
   /*
   FNXC:ModalTouchGeometry 2026-07-26-18:42:
@@ -673,7 +799,7 @@ export function FloatingWindow({
             data-testid={`floating-window-resize-${direction}`}
             {...(hasTabletTouchGeometry ? { "data-resize-hit-target": "true" } : {})}
             role="separator"
-            aria-label="Resize floating window"
+            aria-label={t("floatingWindow.resize", "Resize floating window")}
             onPointerDown={(event) => handleResizePointerDown(event, direction)}
           />
         ))}
@@ -689,7 +815,7 @@ export function FloatingWindow({
               type="button"
               className="floating-window__close"
               onClick={onClose}
-              aria-label="Close floating window"
+              aria-label={t("floatingWindow.close", "Close floating window")}
               data-testid={`floating-window-close-${windowKey}`}
             >
               <X size={18} />

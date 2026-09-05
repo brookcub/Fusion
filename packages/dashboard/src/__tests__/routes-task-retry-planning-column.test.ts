@@ -95,20 +95,41 @@ function mkTask(overrides: Partial<Task> = {}): Task {
 }
 
 function buildApp(input: { task: Task; workflowId?: string; definition?: unknown }) {
-  const updateTask = vi.fn(async () => input.task);
+  const updateTask = vi.fn(async (_taskId: string, patch: Partial<Task>) => Object.assign(input.task, patch));
   const moveTask = vi.fn(async () => input.task);
+  const workflowItems: Array<Record<string, unknown>> = [];
   const store = {
     getTask: async () => input.task,
     getTaskDetail: async () => input.task,
     updateTask,
     moveTask,
     logEntry: vi.fn(async () => {}),
+    withPlanningLifecycleLock: async (_taskId: string, work: () => Promise<unknown>) => work(),
+    updateTaskAtomic: async (_taskId: string, updater: (current: Task) => Partial<Task> | null | undefined | Promise<Partial<Task> | null | undefined>) => {
+      const patch = await updater(structuredClone(input.task));
+      if (patch) Object.assign(input.task, patch);
+      return input.task;
+    },
+    pauseTask: async (_taskId: string, paused: boolean, _context?: unknown, options?: { pausedReason?: string }) => {
+      input.task.paused = paused || undefined;
+      input.task.pausedReason = paused ? options?.pausedReason : undefined;
+      return input.task;
+    },
+    cancelActiveWorkflowWorkItemsForTask: async () => {},
+    replaceActiveTaskWorkflowContinuation: async (item: Record<string, unknown>) => {
+      workflowItems.push(item);
+      return item;
+    },
+    listWorkflowWorkItemsForTask: async () => workflowItems,
+    clearWorkflowRunStepInstancesAsync: async () => {},
     getSettings: async () => ({}),
     getSettingsFast: async () => ({}),
     // A path that cannot exist, so the specification branch's PROMPT.md unlink is a
     // no-op (`force: true`) rather than touching any real tree.
     getRootDir: () => "/tmp/fusion-retry-planning-column-does-not-exist",
     listTasks: async () => [input.task],
+    // FNXC:TaskWedgeNotifications 2026-08-15-05:10: dashboard Retry now clears the spent generic-terminal auto-recovery budget before mutating task state; the fixture must expose the seam or every retry 500s.
+    resetTerminalFailureAutoRecoveryBudget: async () => {},
     getTaskWorkflowSelectionAsync: async () => (input.workflowId ? { workflowId: input.workflowId } : null),
     getWorkflowDefinition: async () => input.definition,
     getWorkflowSettingsProjectId: () => undefined,

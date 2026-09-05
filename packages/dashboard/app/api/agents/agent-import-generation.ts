@@ -3,7 +3,7 @@
  * Agent import catalog and generation client API peeled from legacy.ts.
  */
 
-import type { GlobalSettings, ProjectSettings } from "@fusion/core";
+import type { GlobalSettings, ProjectSettings, ThinkingLevel } from "@fusion/core";
 import { api } from "../client/client.js";
 import { withProjectId } from "../client/health.js";
 
@@ -89,7 +89,7 @@ export interface AgentGenerationSpec {
   /** Detailed system prompt in markdown */
   systemPrompt: string;
   /** Suggested thinking level */
-  thinkingLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  thinkingLevel: ThinkingLevel;
   /** Suggested max turns (1-500) */
   maxTurns: number;
 }
@@ -141,11 +141,25 @@ export interface BackupInfo {
   path: string;
 }
 
+/** Schedule evidence returned alongside the database backup inventory. */
+export interface BackupScheduleStatus {
+  enabled: boolean;
+  cronExpression: string;
+  routineRegistered: boolean;
+  nextRunAt?: string;
+  lastRunAt?: string;
+  lastRunSucceeded?: boolean;
+  lastRunOutput?: string;
+  runCount?: number;
+}
+
 /** Result of listing backups */
 export interface BackupListResponse {
   backups: BackupInfo[];
   count: number;
   totalSize: number;
+  schedule: BackupScheduleStatus;
+  listError?: string;
 }
 
 /** Result of creating a backup */

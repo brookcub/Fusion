@@ -1,3 +1,5 @@
+import { emitBoundedRunAudit } from "../run-audit/emit-bounded-run-audit.js";
+/* FNXC:RunAudit 2026-08-20-05:49: FN-9177 bounds optional audit telemetry so a hostile sink cannot alter this lifecycle path. */
 /**
  * FNXC:CodeOrganization 2026-07-20-14:00:
  * Domain rename from remaining-ops-7: merge-queue peeks, archive/done transitions,
@@ -10,6 +12,8 @@
  */
 
 import { TaskStore } from "../store.js";
+import { buildPatchnodeEntryInput } from "../board/patchnode.js";
+import { appendPatchnodeEntryInTransaction } from "./async/async-patchnode.js";
 import { resolveProjectColumnsForRoles } from "../project-lane-vocabulary.js";
 import {declaresAnyLifecycleTrait, resolveReviewColumns, resolveTaskLifecycleColumns} from "../workflows/workflow-lifecycle-traits.js";
 import {resolveWorkflowIrForTask} from "../workflows/workflow-ir-resolver.js";
@@ -22,6 +26,7 @@ import * as schema from "../postgres/schema/index.js";
 import { runCommandAsync } from "../process/run-command.js";
 import { getStepParser } from "../tasks/step-parsers.js";
 import { getTaskMergeBlocker } from "../merge/task-merge.js";
+import { resolveRequiredPreMergeStepIds } from "../merge/required-pre-merge-steps.js";
 import { deleteTaskDocument as deleteTaskDocumentAsync, getArtifact as getArtifactAsync, getArtifacts as getArtifactsAsync, getLiveTaskColumn, getTaskDocument as getTaskDocumentAsync, getTaskDocumentRevisions as getTaskDocumentRevisionsAsync, listTaskDocuments as listTaskDocumentsAsync, updateArtifactRow as updateArtifactRowAsync } from "./async/async-comments-attachments.js";
 import { emitUsageEvent as emitUsageEventAsync, recordPluginActivation as recordPluginActivationAsync } from "./async/async-events.js";
 import { enqueueMergeQueue as enqueueMergeQueueAsync, peekMergeQueue as peekMergeQueueAsync, peekMergeQueueHead as peekMergeQueueHeadAsync } from "./async/async-merge-coordination.js";
@@ -62,7 +67,7 @@ export async function clearCompletionHandoffAcceptedMarkerImpl(store: TaskStore,
     const existing = await getCompletionHandoffMarkerAsync(layer.db, taskId);
     if (!existing) return;
     await clearCompletionHandoffMarkerAsync(layer.db, taskId);
-    void store.recordRunAuditEvent({
+    void emitBoundedRunAudit(store, {
       taskId,
       agentId: "system",
       runId: `completion-handoff-clear:${taskId}:${Date.now()}`,
@@ -554,12 +559,16 @@ export async function moveToDoneImpl(store: TaskStore, task: Task, dir: string):
     "unscoped legacy acceptance" the glasses plugin's own review caught, and I reintroduced it here.
     */
     let reviewColumns: ReadonlySet<string> = new Set<string>(["in-review"]);
+    let mergeIr: Awaited<ReturnType<typeof resolveWorkflowIrForTask>> | undefined;
     try {
-      const ir = await resolveWorkflowIrForTask(store, task.id);
-      const resolved = ir ? resolveReviewColumns(ir) : [];
+      mergeIr = await resolveWorkflowIrForTask(store, task.id);
+      const resolved = mergeIr ? resolveReviewColumns(mergeIr) : [];
       if (resolved.length > 0) reviewColumns = new Set(resolved);
     } catch { /* degraded: the board told us nothing, so the legacy id stands */ }
-    const mergeBlocker = getTaskMergeBlocker(task, { reviewColumns });
+    const mergeBlocker = getTaskMergeBlocker(task, {
+      reviewColumns,
+      requiredPreMergeStepIds: mergeIr ? resolveRequiredPreMergeStepIds(mergeIr, task.enabledWorkflowSteps, task) : undefined,
+    });
     if (mergeBlocker) {
       throw new Error(`Cannot move ${task.id} to done: ${mergeBlocker}`);
     }
@@ -572,7 +581,22 @@ export async function moveToDoneImpl(store: TaskStore, task: Task, dir: string):
       task.executionCompletedAt = task.columnMovedAt;
     }
 
-    await store.atomicWriteTaskJson(dir, task);
+    /*
+    FNXC:PatchnodeLedger 2026-08-28-12:16:
+    Each completion is keyed by this move's columnMovedAt and snapshots its current title and summary. The next move overwrites that occurrence evidence, so this insert belongs inside the task-row transaction and intentionally fails the move if it cannot commit; the already-complete return above prevents duplicate delivery writes.
+
+    FNXC:PatchnodeLedger 2026-08-28-13:35:
+    Completion capture requires the store's real project partition. An unbound writer must fail this transaction instead of manufacturing a legacy project id whose entry the project-scoped feed can never read.
+    */
+    await store.atomicWriteTaskJson(dir, task, {
+      withinTransaction: async (tx) => {
+        await appendPatchnodeEntryInTransaction(
+          tx,
+          store.asyncLayer!.projectId ?? "",
+          buildPatchnodeEntryInput(task, "completed", task.columnMovedAt!),
+        );
+      },
+    });
 
     // Update cache if watcher is active
     if (store.isWatching) store.taskCache.set(task.id, { ...task });
@@ -588,7 +612,8 @@ export async function moveToDoneImpl(store: TaskStore, task: Task, dir: string):
     lane-less left that leak reachable through this path even after the listener itself was fixed.
     */
     const movedLanes = toTaskMoveLanes(await resolveWorkflowIrForTask(store, task.id).catch(() => undefined));
-    store.laneCache.set(task.id, movedLanes);
+    /* FNXC:WorkflowEvents 2026-08-22-00:13: an unresolved payload is unknown; retain a warm real cache answer until its TTL expires. */
+      if (movedLanes) store.laneCache.set(task.id, movedLanes);
     store.emit("task:moved", { task, from: fromColumn, to: completeColumn as Column, source: "engine", lanes: movedLanes });
 }
 
@@ -599,6 +624,8 @@ export function clearDoneTransientFieldsImpl(store: TaskStore, task: Task): bool
       || task.blockedBy !== undefined
       || task.overlapBlockedBy !== undefined
       || task.recoveryRetryCount !== undefined
+      || task.sessionContentionHoldCount !== undefined
+      || task.sessionContentionWaitReason !== undefined
       || task.nextRecoveryAt !== undefined
       || task.paused !== undefined
       || task.userPaused !== undefined
@@ -611,6 +638,8 @@ export function clearDoneTransientFieldsImpl(store: TaskStore, task: Task): bool
     task.blockedBy = undefined;
     task.overlapBlockedBy = undefined;
     task.recoveryRetryCount = undefined;
+    task.sessionContentionHoldCount = 0;
+    task.sessionContentionWaitReason = undefined;
     task.nextRecoveryAt = undefined;
     task.paused = undefined;
     task.userPaused = undefined;

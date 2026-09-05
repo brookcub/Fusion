@@ -15,6 +15,7 @@ import type {
   GithubIssueAction,
   MergeResult,
   Task,
+  TaskColumnSortMode,
   TaskCreateInput,
   TaskDetail,
   ThemeMode,
@@ -48,12 +49,14 @@ import type { ChatReportHandoff } from "../chatReportHandoff";
 import { SettingsView } from "../SettingsModal";
 import { AgentsView } from "../AgentsView";
 import { ChatView } from "../ChatView";
+import type { ChatSessionInfo } from "../../hooks/useChat";
 import { CommandCenter } from "../command-center/CommandCenter";
 import { DevServerView } from "../DevServerView";
 import { DocumentsView } from "../DocumentsView";
 import { EvalsView } from "../EvalsView";
 import { GitHubImportModal } from "../GitHubImportModal";
 import { GoalsView } from "../GoalsView";
+import { PatchnodeView } from "../PatchnodeView";
 import { InsightsView } from "../InsightsView";
 import { MemoryView } from "../MemoryView";
 import { PullRequestView } from "../PullRequestView";
@@ -133,11 +136,22 @@ export interface MainContentProps {
   mergeStrategy: string;
   planAutoApproveEnabled: boolean;
   settingsLoaded: boolean;
+  openTasksInRightSidebar: boolean;
   openMobileTasksInPopup: boolean;
+  taskPopupsBoardListOnly: boolean;
+  showCostBadgeOnCards: boolean;
   taskDetailChatFirst: boolean;
+  chatMessageLayout: "bubbles" | "full-width";
+  setOpenTasksInRightSidebarImmediate: (enabled: boolean) => void;
+  setOpenMobileTasksInPopupImmediate: (enabled: boolean) => void;
+  setTaskPopupsBoardListOnlyImmediate: (enabled: boolean) => void;
+  setShowCostBadgeOnCardsImmediate: (enabled: boolean) => void;
+  setTaskDetailChatFirstImmediate: (enabled: boolean) => void;
+  setChatMessageLayoutImmediate: (layout: "bubbles" | "full-width") => void;
   skillsEnabled: boolean;
   experimentalFeatures: Record<string, boolean>;
   setQuickChatOpen: Dispatch<SetStateAction<boolean>>;
+  onOpenSessionInNewWindow?: (session: ChatSessionInfo) => void;
   /** Optional so existing MainContent callers preserve their unseeded Chat behavior. */
   chatComposerPrefill?: { text: string; nonce: number } | null;
   mailComposerPrefill?: (ChatReportHandoff & { nonce: number }) | null;
@@ -179,20 +193,20 @@ export interface MainContentProps {
   mainPanelDetailTask: Task | TaskDetail | null;
   filteredBoardTasks: Task[];
   maxConcurrent: number;
+  /** Execution-worktree ceiling used by the board's Up Next worktree preview. */
+  maxWorktrees: number;
   showWorktreeGrouping: boolean;
   moveTask: (
     id: string,
     column: ColumnId,
-    optionsOrPosition?: { preserveProgress?: boolean } | number,
+    optionsOrPosition?: { preserveProgress?: boolean; expectedColumn?: string } | number,
   ) => Promise<Task>;
   pauseTask: (id: string) => Promise<Task>;
   openBoardTaskDetail: (task: Task | TaskDetail, initialTab?: DetailTaskTab) => void;
   openTaskDetailInMainPanel: (task: Task | TaskDetail, initialTab?: DetailTaskTab) => void;
   openGroupModalWithNav: (groupId: string) => void;
   handleBoardQuickCreate: (input: TaskCreateInput) => Promise<Task>;
-  openNewTaskWithNav: () => void;
-  subtaskBreakdownEnabled: boolean;
-  openSubtaskBreakdownWithNav: (description: string, workflowId?: string | null) => void;
+  openNewTaskWithNav: (workflowId?: string | null) => void;
   toggleAutoMerge: () => Promise<void>;
   togglePlanAutoApprove: () => Promise<void>;
   globalPaused: boolean;
@@ -222,6 +236,10 @@ export interface MainContentProps {
   loadArchivedTasks: () => Promise<void>;
   /** FNXC:ArchivePagination 2026-07-08-00:00: FN-7659 — fetch the next 100-item page of archived tasks (newest-first). */
   loadMoreArchivedTasks: () => Promise<void>;
+  /** Board action callback that commits Archive order only after its first replacement page succeeds. */
+  changeArchivedSortMode: (mode: TaskColumnSortMode) => Promise<void>;
+  /** Committed server-backed Archive order. */
+  archivedSortMode: TaskColumnSortMode;
   /** Whether another page of archived tasks is available beyond what is currently loaded. */
   archivedHasMore: boolean;
   /** True while a "Show more" archived page fetch is in flight. */
@@ -233,7 +251,7 @@ export interface MainContentProps {
   handleOpenDetailWithTab: (task: Task | TaskDetail, initialTab: "changes" | "retries" | "workflow") => void;
   handleToggleFavorite: (provider: string) => Promise<void>;
   handleToggleModelFavorite: (modelId: string) => Promise<void>;
-  taskStuckTimeoutMs: number | undefined;
+  // FNXC:StuckTagRemoval 2026-08-17-22:30: stuck-task tagging removed from the dashboard; taskStuckTimeoutMs is engine-side only now.
   staleHighFanoutBlockerAgeThresholdMs: number;
   lastFetchTimeMs: number | undefined;
   openCreateWorkflowWithNav: () => void;
@@ -243,8 +261,8 @@ export interface MainContentProps {
   closeTaskDetailMainPanel: () => void;
   setMainPanelDetailTask: Dispatch<SetStateAction<Task | TaskDetail | null>>;
   mergeTask: (id: string) => Promise<MergeResult>;
-  resetTask: (id: string) => Promise<Task>;
-  duplicateTask: (id: string) => Promise<Task>;
+  resetTask: (id: string, options?: { description?: string }) => Promise<Task>;
+  duplicateTask: (id: string, options?: { workflowId?: string }) => Promise<Task>;
   unpauseTask: (id: string) => Promise<Task>;
   capacityRiskBannerEnabled: boolean;
   capacityRiskDismissed: boolean;
@@ -258,6 +276,7 @@ export interface MainContentProps {
   DocumentsView: LazyExoticComponent<typeof DocumentsView>;
   EvalsView: LazyExoticComponent<typeof EvalsView>;
   GoalsView: LazyExoticComponent<typeof GoalsView>;
+  PatchnodeView: LazyExoticComponent<typeof PatchnodeView>;
   InsightsView: LazyExoticComponent<typeof InsightsView>;
   MemoryView: LazyExoticComponent<typeof MemoryView>;
   PullRequestView: LazyExoticComponent<typeof PullRequestView>;

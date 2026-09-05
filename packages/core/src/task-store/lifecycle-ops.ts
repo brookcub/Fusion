@@ -1,3 +1,5 @@
+import { emitBoundedRunAudit } from "../run-audit/emit-bounded-run-audit.js";
+/* FNXC:RunAudit 2026-08-20-05:49: FN-9177 bounds optional audit telemetry so a hostile sink cannot alter this lifecycle path. */
 /**
  * lifecycle-ops operations.
  *
@@ -36,6 +38,7 @@ import {resolveWorkflowIrForTask} from "../workflows/workflow-ir-resolver.js";
 import {recordRunAuditEventWithinTransaction} from "../postgres/data-layer.js";
 import * as schema from "../postgres/schema/index.js";
 import {diffSettingsForActivity, formatSettingsActivity} from "./settings-activity.js";
+import {LIFECYCLE_ROLE_RANK} from "../workflows/workflow-lifecycle-direction.js";
 
 export async function initImpl(store: TaskStore): Promise<void> {
     store.closing = false;
@@ -72,6 +75,18 @@ export async function initImpl(store: TaskStore): Promise<void> {
     async store API (listTasks/updateTask), so it is PG-safe.
     */
     await adoptLegacyTaskRowsOnOpen(store);
+    /*
+    FNXC:PatchnodeLedger 2026-08-28-12:16:
+    Store-open reconciliation is a warn-degraded backlog convenience, not the live durability guarantee. Init runs once per process; completion writers capture in their own transactions, while the TTL-rearmed read path revisits surviving legacy evidence.
+    */
+    try {
+      await store.reconcilePatchnodeLedger({ force: true });
+    } catch (error) {
+      storeLog.warn("Patchnode reconciliation failed during backend init", {
+        phase: "init:patchnode-reconcile",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
     // Lifecycle listeners are backend-agnostic: recordActivity() routes their
     // best-effort writes through the injected PostgreSQL data layer.
     store.setupActivityLogListeners();
@@ -229,6 +244,7 @@ export async function adoptLegacyTaskRowsOnOpen(store: TaskStore): Promise<numbe
         const plan = planLegacyAdoption(
           {
             status: task.status,
+            column: task.column,
             reviewLevel: task.reviewLevel,
             enabledWorkflowSteps: task.enabledWorkflowSteps,
             legacyAdoptedAt: task.legacyAdoptedAt,
@@ -291,13 +307,29 @@ export function setupActivityLogListenersImpl(store: TaskStore): void {
     // Task moved
     store.on("task:moved", (data) => {
       if (data.from === data.to) return;
+      const roles = Object.keys(LIFECYCLE_ROLE_RANK) as Array<keyof typeof LIFECYCLE_ROLE_RANK>;
+      const fromRole = roles.find((role) => data.lanes?.[role] === data.from);
+      const toRole = roles.find((role) => data.lanes?.[role] === data.to);
+      const direction = !fromRole || !toRole
+        ? "unclassified"
+        : LIFECYCLE_ROLE_RANK[toRole] > LIFECYCLE_ROLE_RANK[fromRole]
+          ? "forward"
+          : LIFECYCLE_ROLE_RANK[toRole] < LIFECYCLE_ROLE_RANK[fromRole]
+            ? "backward"
+            : "lateral";
       store.recordActivityFromListener(
         {
           type: "task:moved",
           taskId: data.task.id,
           taskTitle: data.task.title,
-          details: `Task ${data.task.id} moved: ${data.from} → ${data.to}`,
-          metadata: { from: data.from, to: data.to },
+          details: `Task ${data.task.id} moved: ${data.from} → ${data.to} (${direction})`,
+          metadata: {
+            from: data.from,
+            to: data.to,
+            direction,
+            source: data.source,
+            ...(data.lifecycleReason ? { lifecycleReason: data.lifecycleReason } : {}),
+          },
         },
         "task:moved",
       );
@@ -318,9 +350,14 @@ export function setupActivityLogListenersImpl(store: TaskStore): void {
       );
     });
 
-    // Task updated (check for failures)
-    store.on("task:updated", (task) => {
-      if (task.status === "failed") {
+    /*
+    FNXC:ActivityLogFailureDedup 2026-08-19-19:33:
+    A failed-state bookkeeping update is not a new durable failure episode. Only the serialized
+    non-failed → failed transition from updateTask may append task:failed activity, so listeners
+    cannot turn subsequent task mutations into an unbounded project.activity_log write path.
+    */
+    store.on("task:updated", (task, meta) => {
+      if (meta?.failedTransition) {
         store.recordActivityFromListener(
           {
             type: "task:failed",
@@ -992,7 +1029,7 @@ export async function recoverStaleTransitionPendingImpl(store: TaskStore): Promi
           // best-effort; a later sweep retries.
         }
 
-        void store.recordRunAuditEvent({
+        void emitBoundedRunAudit(store, {
           taskId: id,
           agentId: "system",
           runId: `transition-pending-recovery-${id}-${Date.now()}`,

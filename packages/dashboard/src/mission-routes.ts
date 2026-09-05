@@ -161,6 +161,19 @@ function validateOptionalWorkflowId(workflowId: unknown): string | null | undefi
 }
 
 /*
+FNXC:MissionWorkflows 2026-08-15-05:10:
+Structural match on core's TaskIntakeOwnerResolutionError (the class is not exported from
+@fusion/core's index). `workflow-unresolvable` means the client named a workflow whose
+definition does not exist — a 4xx concern for the triage routes; every other reason stays a
+genuine server-side failure.
+*/
+function isUnresolvableWorkflowIntakeError(err: unknown): boolean {
+  return err instanceof Error
+    && (err as { code?: unknown }).code === "task-intake-owner-resolution"
+    && (err as { reason?: unknown }).reason === "workflow-unresolvable";
+}
+
+/*
 FNXC:MissionAssertions 2026-08-01-19:44:
 The assertion guard landed on 2026-04-11 for two-segment IDs, but MissionStore.generateId added its idSequence segment on 2026-05-04. Keep this validator aligned with every dash-separated alphanumeric segment emitted by MissionStore while preserving legacy assertion rows.
 */
@@ -3003,7 +3016,22 @@ export function createMissionRouter(
         throw badRequest("Feature is not linked to a task");
       }
 
-      const feature = await missionStore.unlinkFeatureFromTask(featureId);
+      let feature;
+      try {
+        feature = await missionStore.unlinkFeatureFromTask(featureId);
+      } catch (error) {
+        /*
+        FNXC:MissionFeatureUnlinkRoute 2026-08-19-21:24 (RUFU-134 / PR #3491 CodeRabbit):
+        The pre-check above handles the normal case; the store still throws its not-linked
+        error if a concurrent unlink wins between the check and the write. That is a
+        client-visible precondition (4xx), not a server fault — an uncaught generic Error
+        would surface as a 500 via catchHandler.
+        */
+        if (error instanceof Error && /is not linked to any task/.test(error.message)) {
+          throw badRequest(error.message);
+        }
+        throw error;
+      }
       res.json(feature);
     })
   );
@@ -3055,6 +3083,18 @@ export function createMissionRouter(
         if (errMsg.includes("TaskStore")) {
           throw new ApiError(503, "TaskStore not available for triage operations");
         }
+        /*
+        FNXC:MissionWorkflows 2026-08-15-05:10:
+        Core's intake-ownership boundary (FNXC:IntakeOwnership 2026-08-09) now rejects a
+        client-named missing workflow with the typed TaskIntakeOwnerResolutionError
+        (code "task-intake-owner-resolution", reason "workflow-unresolvable") instead of a
+        "Workflow ... not found" message, so the message-pattern mapping below stopped firing
+        and an unknown workflowId leaked as a 500. Map the typed rejection back to 404: it is
+        client input, not a server fault, and no feature/task link is created.
+        */
+        if (isUnresolvableWorkflowIntakeError(err)) {
+          throw notFound("Workflow not found for triage");
+        }
         if (/workflow/i.test(errMsg) && /not found/i.test(errMsg)) {
           throw notFound(errMsg);
         }
@@ -3099,6 +3139,10 @@ export function createMissionRouter(
         const errMsg = err instanceof Error ? err.message : String(err);
         if (errMsg.includes("TaskStore")) {
           throw new ApiError(503, "TaskStore not available for triage operations");
+        }
+        // FNXC:MissionWorkflows 2026-08-15-05:10: see the single-feature triage handler above — the typed intake-ownership rejection replaced the "Workflow ... not found" message for a missing client-named workflow.
+        if (isUnresolvableWorkflowIntakeError(err)) {
+          throw notFound("Workflow not found for triage");
         }
         if (/workflow/i.test(errMsg) && /not found/i.test(errMsg)) {
           throw notFound(errMsg);

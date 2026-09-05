@@ -6,6 +6,13 @@ Task create/link success lines use `result()` so they survive quiet mode.
 Capture that seam for assertions that previously spied console.log.
 */
 const resultSpy = vi.hoisted(() => vi.fn());
+const requiredTaskStoreCapabilities = vi.hoisted(() => () => ({
+  getSettings: vi.fn().mockResolvedValue({}),
+  getGlobalSettingsStore: vi.fn().mockReturnValue({
+    getSettings: vi.fn().mockResolvedValue({}),
+  }),
+  resetTerminalFailureAutoRecoveryBudget: vi.fn().mockResolvedValue(undefined),
+}));
 vi.mock("../../output.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../output.js")>();
   return {
@@ -67,7 +74,13 @@ vi.mock("@fusion/core", async (importActual) => {
   const taskStoreMockImplementation = TaskStoreMock.mockImplementation.bind(TaskStoreMock);
   TaskStoreMock.mockImplementation = ((impl: (...args: any[]) => unknown) =>
     taskStoreMockImplementation(function (this: unknown, ...args: any[]) {
-      return impl(...args);
+      const instance = impl(...args);
+      if (typeof instance === "object" && instance !== null) {
+        for (const [name, capability] of Object.entries(requiredTaskStoreCapabilities())) {
+          if (!(name in instance)) Object.assign(instance, { [name]: capability });
+        }
+      }
+      return instance;
     })) as typeof TaskStoreMock.mockImplementation;
 
   const CentralCoreMock = vi.fn(function () {});
@@ -117,6 +130,9 @@ vi.mock("@fusion/engine", () => ({
   aiMergeTask: vi.fn(),
   runAiMerge: vi.fn(),
   landWorkspaceTask: vi.fn(),
+  withWorkspaceMergeDispatchLease: vi.fn(async (_store: unknown, _taskId: string, body: (handle?: unknown) => unknown) => body(undefined)),
+  clearOwnedMergeStamp: vi.fn().mockResolvedValue(false),
+  reconcileUnownedStaleMergeStamp: vi.fn().mockResolvedValue(false),
   // FNXC:CliTests 2026-07-12-07:10: task.ts imports isInReviewMissingWorktreeSessionStartFailure from @fusion/engine (FN-7798 in-review stale worktree guard); the hand-written engine mock must surface it.
   isInReviewMissingWorktreeSessionStartFailure: vi.fn(() => false),
 }));
@@ -184,9 +200,25 @@ vi.mock("@fusion/core/gh-cli", () => ({
 }));
 
 // Mock project-context
-vi.mock("../../project-context.js", () => ({
+vi.mock("../../project-context.js", () => {
+  const resolveProjectMock = vi.fn();
+  const withRequiredStoreCapabilities = (context: any) => {
+    for (const [name, capability] of Object.entries(requiredTaskStoreCapabilities())) {
+      if (!(name in context.store)) Object.assign(context.store, { [name]: capability });
+    }
+    return context;
+  };
+  const mockResolvedValue = resolveProjectMock.mockResolvedValue.bind(resolveProjectMock);
+  const mockResolvedValueOnce = resolveProjectMock.mockResolvedValueOnce.bind(resolveProjectMock);
+  resolveProjectMock.mockResolvedValue = ((context: any) =>
+    mockResolvedValue(withRequiredStoreCapabilities(context))) as typeof resolveProjectMock.mockResolvedValue;
+  resolveProjectMock.mockResolvedValueOnce = ((context: any) =>
+    mockResolvedValueOnce(withRequiredStoreCapabilities(context))) as typeof resolveProjectMock.mockResolvedValueOnce;
+  resolveProjectMock.mockRejectedValue(new Error("No project context"));
+
+  return {
   resolveProjectPathOnly: vi.fn(async () => process.cwd()),
-  resolveProject: vi.fn().mockRejectedValue(new Error("No project context")),
+  resolveProject: resolveProjectMock,
   getStore: vi.fn().mockResolvedValue({}),
   getDefaultProject: vi.fn().mockResolvedValue(undefined),
   setDefaultProject: vi.fn().mockResolvedValue(undefined),
@@ -222,10 +254,11 @@ vi.mock("../../project-context.js", () => ({
     isRegistered: false,
     store,
   })),
-}));
+  };
+});
 
 import { createInterface } from "node:readline/promises";
-import { TaskStore, CentralCore, extractIntentSignature, findNearDuplicates, runDeterministicDuplicateGuard, reconcileDeterministicDuplicate } from "@fusion/core";
+import { TaskStore, CentralCore, extractIntentSignature, findNearDuplicates, MAX_TASK_MESSAGE_LENGTH, runDeterministicDuplicateGuard, reconcileDeterministicDuplicate, TaskIsLiveError } from "@fusion/core";
 import { watchFile, unwatchFile, statSync, existsSync, readFileSync } from "node:fs";
 import { exec } from "node:child_process";
 import { runTaskShow, runTaskCreate, runTaskList, runTaskDuplicate, runTaskRefine, runTaskDelete, runTaskRetry, runTaskLogs, runTaskComment, runTaskComments, runTaskPrCreate, runTaskPlan, runTaskMove, runTaskAttach, runTaskPause, runTaskUnpause, runTaskArchive, runTaskUnarchive, runTaskSteer, runTaskSetNode, runTaskClearNode, runTaskImportFromGitHub, runTaskImportGitHubInteractive, runTaskUpdate, runTaskLog, runTaskMerge, type LogsOptions } from "../task.js";
@@ -238,7 +271,7 @@ import {
 import { GitHubClient, generatePrMetadata, isGitHubIssueAlreadyImported } from "@fusion/dashboard";
 import { createSession, submitResponse } from "@fusion/dashboard/planning";
 import { resolveProject, createLocalStore } from "../../project-context.js";
-import { aiMergeTask, runAiMerge, landWorkspaceTask } from "@fusion/engine";
+import { aiMergeTask, runAiMerge, landWorkspaceTask, reconcileUnownedStaleMergeStamp, clearOwnedMergeStamp } from "@fusion/engine";
 
 const mockedExec = vi.mocked(exec);
 
@@ -538,11 +571,11 @@ vi.mock("node:fs/promises", () => ({
 }));
 
 /*
-FNXC:OriginWorkflowSelection 2026-07-26-19:40:
-Every partial TaskStore mock below stubs `resolveOriginWorkflowOverrideId`: `runTaskCreate`
-consults it to honor the project `taskCreateWorkflowId` setting, and these mocks are structural
-partials, so a missing method is a TypeError rather than a fallback. `undefined` is the
-unconfigured answer — CLI create then takes its unchanged project-default path.
+FNXC:OriginWorkflowSelection 2026-08-15-01:12:
+Every partial TaskStore mock below stubs `resolveOriginWorkflowOverrideId`; the central constructor and project-context wrappers also preserve the global-settings and retry-budget capabilities now required by CLI creation and manual retry. `undefined` keeps the unchanged project-default workflow path.
+
+FNXC:CliTests 2026-08-15-01:12:
+CLI create fixture assertions must include `{ invokeTaskCreatedHook: false }`; the command synchronously owns post-create tracking work and suppresses the deferred store hook to avoid duplicate or lost issue creation.
 */
 describe("project-aware task command behavior", () => {
   afterEach(() => {
@@ -649,7 +682,7 @@ describe("project-aware task command behavior", () => {
       description: "test task",
       dependencies: undefined,
       source: { sourceType: "cli", sourceMetadata: { contentFingerprint: "fp-1" } },
-    });
+    }, { invokeTaskCreatedHook: false });
     expect(logSpy.mock.calls.some((call) => String(call[0]).includes("Project: demo-project"))).toBe(true);
 
     logSpy.mockRestore();
@@ -671,7 +704,10 @@ describe("project-aware task command behavior", () => {
     await runTaskCreate("default task");
 
     expect(resolveProject).toHaveBeenCalledWith(undefined);
-    expect(mockCreateTask).toHaveBeenCalledWith({ description: "default task", dependencies: undefined, source: { sourceType: "cli", sourceMetadata: undefined } });
+    expect(mockCreateTask).toHaveBeenCalledWith(
+      { description: "default task", dependencies: undefined, source: { sourceType: "cli", sourceMetadata: undefined } },
+      { invokeTaskCreatedHook: false },
+    );
   });
 
   it("runTaskCreate without project flag falls back to TaskStore(process.cwd()) when resolution fails", async () => {
@@ -687,6 +723,7 @@ describe("project-aware task command behavior", () => {
     );
 
     vi.mocked(createLocalStore).mockResolvedValueOnce({
+      ...requiredTaskStoreCapabilities(),
       init,
       resolveOriginWorkflowOverrideId: vi.fn().mockResolvedValue(undefined), createTask: mockCreateTask,
       addAttachment: vi.fn(),
@@ -698,7 +735,10 @@ describe("project-aware task command behavior", () => {
 
     expect(resolveProject).toHaveBeenCalledWith(undefined);
     expect(createLocalStore).toHaveBeenCalledWith("/current/project");
-    expect(mockCreateTask).toHaveBeenCalledWith({ description: "local task", dependencies: undefined, source: { sourceType: "cli", sourceMetadata: { contentFingerprint: "fp-local" } } });
+    expect(mockCreateTask).toHaveBeenCalledWith(
+      { description: "local task", dependencies: undefined, source: { sourceType: "cli", sourceMetadata: { contentFingerprint: "fp-local" } } },
+      { invokeTaskCreatedHook: false },
+    );
     cwdSpy.mockRestore();
   });
 
@@ -829,13 +869,16 @@ describe("project-aware task command behavior", () => {
 
     await runTaskCreate("Investigate /pr/options /pr/preflight flow");
 
-    expect(mockCreateTask).toHaveBeenCalledWith(expect.objectContaining({
-      source: expect.objectContaining({
-        sourceMetadata: expect.objectContaining({
-          intentSignature: expect.objectContaining({ routePaths: ["/pr/options", "/pr/preflight"] }),
+    expect(mockCreateTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: expect.objectContaining({
+          sourceMetadata: expect.objectContaining({
+            intentSignature: expect.objectContaining({ routePaths: ["/pr/options", "/pr/preflight"] }),
+          }),
         }),
       }),
-    }));
+      { invokeTaskCreatedHook: false },
+    );
     expect(close).toHaveBeenCalled();
 
     Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: originalInTTY });
@@ -914,14 +957,17 @@ describe("project-aware task command behavior", () => {
     expect(runDeterministicDuplicateGuard).toHaveBeenCalledWith(expect.anything(), { description: "same task" }, expect.objectContaining({ bypass: true }));
     expect(findNearDuplicates).not.toHaveBeenCalled();
     expect(extractIntentSignature).toHaveBeenCalledWith({ description: "same task" });
-    expect(mockCreateTask).toHaveBeenCalledWith(expect.objectContaining({
-      source: expect.objectContaining({
-        sourceMetadata: expect.objectContaining({
-          contentFingerprint: "fp-no-dedup",
-          intentSignature: expect.objectContaining({ routePaths: ["/pr/options", "/pr/preflight"] }),
+    expect(mockCreateTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: expect.objectContaining({
+          sourceMetadata: expect.objectContaining({
+            contentFingerprint: "fp-no-dedup",
+            intentSignature: expect.objectContaining({ routePaths: ["/pr/options", "/pr/preflight"] }),
+          }),
         }),
       }),
-    }));
+      { invokeTaskCreatedHook: false },
+    );
   });
 
   it("runTaskCreate fails open when listTasks throws during near-duplicate checking", async () => {
@@ -1282,8 +1328,70 @@ describe("project-aware task command behavior", () => {
     await runTaskArchive("FN-123", "demo-project");
     await runTaskUnarchive("FN-123", "demo-project");
 
-    expect(archiveTask).toHaveBeenCalledWith("FN-123");
+    expect(archiveTask).toHaveBeenCalledWith("FN-123", {liveExecutionGuard: "refuse"});
     expect(unarchiveTask).toHaveBeenCalledWith("FN-123");
+  });
+
+  it("refuses a live archive before calling the store and exits non-zero", async () => {
+    const getTask = vi.fn().mockResolvedValue(makeTask({ id: "FN-123", column: "in-progress" }));
+    const archiveTask = vi.fn();
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit:${code}`);
+    }) as (code?: number) => never);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true,
+      store: { getTask, archiveTask } as unknown as TaskStore,
+    });
+
+    try {
+      await expect(runTaskArchive("FN-123", "demo-project")).rejects.toThrow("process.exit:1");
+      expect(archiveTask).not.toHaveBeenCalled();
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Refusing to archive live task FN-123"));
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("--force"));
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    } finally {
+      errorSpy.mockRestore();
+      exitSpy.mockRestore();
+    }
+  });
+
+  it("allows the human --force archive escape hatch for a live task", async () => {
+    const getTask = vi.fn().mockResolvedValue(makeTask({ id: "FN-123", column: "in-progress" }));
+    const archiveTask = vi.fn().mockResolvedValue(makeTask({ id: "FN-123", column: "archived" }));
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true,
+      store: { getTask, archiveTask } as unknown as TaskStore,
+    });
+
+    await runTaskArchive("FN-123", "demo-project", { force: true });
+
+    expect(archiveTask).toHaveBeenCalledWith("FN-123", { liveExecutionGuard: "off" });
+  });
+
+  it("formats a raced transactional live refusal without a raw error", async () => {
+    const getTask = vi.fn().mockResolvedValue(makeTask({ id: "FN-123", column: "todo" }));
+    const archiveTask = vi.fn().mockRejectedValue(new TaskIsLiveError("FN-123", ["wip-lane"]));
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit:${code}`);
+    }) as (code?: number) => never);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true,
+      store: { getTask, archiveTask } as unknown as TaskStore,
+    });
+
+    try {
+      await expect(runTaskArchive("FN-123", "demo-project")).rejects.toThrow("process.exit:1");
+      expect(archiveTask).toHaveBeenCalledWith("FN-123", { liveExecutionGuard: "refuse" });
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Refusing to archive live task FN-123"));
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("--force"));
+      expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining("Task FN-123 is live"));
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    } finally {
+      errorSpy.mockRestore();
+      exitSpy.mockRestore();
+    }
   });
 
   it("runTaskRetry uses resolved project store", async () => {
@@ -1394,20 +1502,231 @@ describe("project-aware task command behavior", () => {
     expect(logEntry).toHaveBeenCalled();
     // FNXC:GrokCliRouting 2026-07-15-10:17: bare `fn task merge` has no ProjectEngine and does not invent a PluginRunner.
     expect(runAiMerge).toHaveBeenCalledWith(
-      resolvedStore,
+      expect.any(Object),
       "/test",
       "FN-123",
       expect.objectContaining({
         onAgentText: expect.any(Function),
+        signal: expect.any(AbortSignal),
       }),
     );
     const mergeOpts = vi.mocked(runAiMerge).mock.calls.at(-1)?.[3] as { pluginRunner?: unknown } | undefined;
     expect(mergeOpts?.pluginRunner).toBeUndefined();
     expect(landWorkspaceTask).not.toHaveBeenCalled();
     expect(aiMergeTask).not.toHaveBeenCalled();
+    expect(reconcileUnownedStaleMergeStamp).toHaveBeenCalledWith(resolvedStore, "FN-123");
+    expect(process.listenerCount("SIGINT")).toBe(0);
+    expect(process.listenerCount("SIGTERM")).toBe(0);
+    expect(process.listenerCount("SIGHUP")).toBe(0);
     expect(exitSpy).not.toHaveBeenCalled();
     expect(duplicateTask).toHaveBeenCalledWith("FN-123");
     expect(refineTask).toHaveBeenCalledWith("FN-123", "more tests");
+  });
+
+  it.each([
+    ["SIGINT", 130],
+    ["SIGTERM", 143],
+    ["SIGHUP", 129],
+  ] as const)("%s aborts the body, clears its owned stamp, and keeps the signal exit", async (signal, exitCode) => {
+    const task = makeTask({ id: `FN-${signal}`, column: "in-review", status: "merging" });
+    const getTask = vi.fn().mockImplementation(async () => task);
+    const updateTask = vi.fn().mockImplementation(async (_id: string, patch: { status?: string | null }) => {
+      if (patch.status !== undefined) task.status = patch.status;
+    });
+    const close = vi.fn().mockResolvedValue(undefined);
+    const resolvedStore = { getTask, updateTask, close } as unknown as TaskStore;
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true, store: resolvedStore,
+    });
+    // Model the helper's independently tested authorization-B mutation so this door test
+    // proves the command wires its abort, cleanup, close, and exit paths together.
+    vi.mocked(clearOwnedMergeStamp).mockImplementation(async () => {
+      task.status = null;
+      return true;
+    });
+    let bodySignal: AbortSignal | undefined;
+    vi.mocked(runAiMerge).mockImplementation((async (_store, _path, taskId, options) => {
+      // A completed local transient write is the authorization-B proof required before cleanup.
+      await _store.updateTask(taskId, { status: "merging" });
+      return await new Promise((_resolve, reject) => {
+        bodySignal = options.signal;
+        options.signal?.addEventListener("abort", () => reject(new Error("merge aborted")), { once: true });
+      });
+    }) as never);
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+
+    const pending = runTaskMerge(task.id, "demo-project");
+    await vi.waitFor(() => expect(process.listenerCount(signal)).toBeGreaterThan(0));
+    process.emit(signal, signal);
+    // A terminal close arriving after Ctrl-C (or vice versa) must share the same cleanup.
+    process.emit("SIGHUP", "SIGHUP");
+    await pending;
+
+    expect(bodySignal?.aborted).toBe(true);
+    expect(task.status).toBeNull();
+    expect(clearOwnedMergeStamp).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalled();
+    expect(exitSpy).toHaveBeenCalledWith(exitCode);
+    expect(process.listenerCount(signal)).toBe(0);
+    exitSpy.mockRestore();
+  });
+
+  it("does not clear a stamp it never wrote when a merge body rejects before claiming", async () => {
+    const task = makeTask({ id: "FN-MERGE-ERROR", column: "in-review", status: "merging" });
+    const getTask = vi.fn().mockImplementation(async () => task);
+    const close = vi.fn().mockResolvedValue(undefined);
+    const resolvedStore = { getTask, close } as unknown as TaskStore;
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true, store: resolvedStore,
+    });
+    vi.mocked(runAiMerge).mockRejectedValue(new Error("merge failed"));
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((((code?: number) => {
+      throw new Error(`process.exit:${code}`);
+    }) as unknown) as (code?: string | number | null | undefined) => never);
+
+    await expect(runTaskMerge(task.id, "demo-project")).rejects.toThrow("process.exit:1");
+
+    expect(task.status).toBe("merging");
+    expect(clearOwnedMergeStamp).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalled();
+    exitSpy.mockRestore();
+  });
+
+  it("waits for the owned clear before signal exit", async () => {
+    const task = makeTask({ id: "FN-CLEAR-ORDER", column: "in-review", status: "merging" });
+    const getTask = vi.fn().mockResolvedValue(task);
+    const updateTask = vi.fn().mockResolvedValue(undefined);
+    const close = vi.fn().mockResolvedValue(undefined);
+    const resolvedStore = { getTask, updateTask, close } as unknown as TaskStore;
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true, store: resolvedStore,
+    });
+    vi.mocked(reconcileUnownedStaleMergeStamp).mockResolvedValue(false);
+    let resolveClear!: () => void;
+    vi.mocked(clearOwnedMergeStamp).mockImplementation(() => new Promise<boolean>((resolve) => {
+      resolveClear = () => resolve(true);
+    }));
+    vi.mocked(runAiMerge).mockImplementation((async (candidateStore, _path, taskId, options) => {
+      await candidateStore.updateTask(taskId, { status: "merging" });
+      return await new Promise((_resolve, reject) => {
+        options.signal?.addEventListener("abort", () => reject(new Error("merge aborted")), { once: true });
+      });
+    }) as never);
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+
+    const pending = runTaskMerge(task.id, "demo-project");
+    await vi.waitFor(() => expect(process.listenerCount("SIGINT")).toBeGreaterThan(0));
+    process.emit("SIGINT", "SIGINT");
+    await vi.waitFor(() => expect(clearOwnedMergeStamp).toHaveBeenCalledOnce());
+    expect(exitSpy).not.toHaveBeenCalled();
+    resolveClear();
+    await pending;
+
+    expect(exitSpy).toHaveBeenCalledWith(130);
+    exitSpy.mockRestore();
+  });
+
+  it.each([
+    ["clears aged residue", "merging", 6 * 60_000, true],
+    ["preserves fresh residue", "merging", 60_000, false],
+    ["does nothing for a clean row", null, 0, false],
+  ])("%s through the manual-door pre-claim reconcile", async (_label, status, ageMs, shouldClear) => {
+    const task = makeTask({
+      id: `FN-PRECLAIM-${String(status ?? "clean")}`,
+      column: "in-review",
+      status,
+      updatedAt: new Date(Date.now() - ageMs).toISOString(),
+    });
+    const getTask = vi.fn().mockResolvedValue(task);
+    const resolvedStore = { getTask } as unknown as TaskStore;
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true, store: resolvedStore,
+    });
+    vi.mocked(reconcileUnownedStaleMergeStamp).mockImplementation(async (candidateStore) => {
+      expect(candidateStore).toBe(resolvedStore);
+      if (shouldClear) task.status = null;
+      return shouldClear;
+    });
+    vi.mocked(runAiMerge).mockResolvedValue({
+      merged: true, task, branch: "fusion/preclaim", worktreeRemoved: true, branchDeleted: true,
+    } as never);
+
+    await runTaskMerge(task.id, "demo-project");
+
+    expect(reconcileUnownedStaleMergeStamp).toHaveBeenCalledWith(resolvedStore, task.id);
+    expect(task.status).toBe(shouldClear ? null : status);
+    vi.mocked(reconcileUnownedStaleMergeStamp).mockResolvedValue(false);
+  });
+
+  it("does not clear a pre-existing stamp when interrupted before the body claims it", async () => {
+    const task = makeTask({ id: "FN-NO-LOCAL-CLAIM", column: "in-review", status: "merging" });
+    const getTask = vi.fn().mockResolvedValue(task);
+    const close = vi.fn().mockResolvedValue(undefined);
+    const resolvedStore = { getTask, close } as unknown as TaskStore;
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test", projectPath: "/test", projectName: "demo-project", isRegistered: true, store: resolvedStore,
+    });
+    vi.mocked(reconcileUnownedStaleMergeStamp).mockResolvedValue(false);
+    vi.mocked(runAiMerge).mockImplementation(((_store, _path, _id, options) => new Promise((_resolve, reject) => {
+      options.signal?.addEventListener("abort", () => reject(new Error("merge aborted before claim")), { once: true });
+    })) as never);
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+
+    const pending = runTaskMerge(task.id, "demo-project");
+    await vi.waitFor(() => expect(process.listenerCount("SIGINT")).toBeGreaterThan(0));
+    process.emit("SIGINT", "SIGINT");
+    await pending;
+
+    expect(clearOwnedMergeStamp).not.toHaveBeenCalled();
+    expect(task.status).toBe("merging");
+    expect(close).toHaveBeenCalledOnce();
+    expect(exitSpy).toHaveBeenCalledWith(130);
+    exitSpy.mockRestore();
+  });
+
+  it("exits non-zero when a workspace finalize is blocked after all repos landed", async () => {
+    const getTask = vi.fn().mockResolvedValue(makeTask({
+      id: "FN-WS-BLOCKED",
+      column: "in-review",
+      workspaceWorktrees: { "repo-a": { worktreePath: "/tmp/a", branch: "fusion/fn-ws-blocked" } },
+    }));
+    const resolvedStore = { getTask } as unknown as TaskStore;
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test",
+      projectPath: "/test",
+      projectName: "demo-project",
+      isRegistered: true,
+      store: resolvedStore,
+    });
+    vi.mocked(reconcileUnownedStaleMergeStamp).mockResolvedValue(false);
+    vi.mocked(landWorkspaceTask).mockResolvedValue({
+      allLanded: true,
+      finalized: false,
+      finalizeBlockedReason: "operator review required",
+      repos: [{ repo: "repo-a", status: "empty", integrationBranch: "main" }],
+    } as never);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((((code?: number) => {
+      throw new Error(`process.exit:${code}`);
+    }) as unknown) as (code?: string | number | null | undefined) => never);
+
+    let output = "";
+    try {
+      await expect(runTaskMerge("FN-WS-BLOCKED", "demo-project")).rejects.toThrow("process.exit:1");
+      output = logSpy.mock.calls.flat().join(" ");
+    } finally {
+      exitSpy.mockRestore();
+      logSpy.mockRestore();
+    }
+
+    expect(output).toContain("Merge blocked — operator review required");
+    expect(output).not.toContain("task finalized to done");
+    expect(landWorkspaceTask).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.any(Object),
+      "/test",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
   });
 
   it("routes GitHub import commands through the resolved project store", async () => {
@@ -1629,8 +1948,8 @@ describe("runTaskCreate with --depends", () => {
     expect(mockCreateTask).toHaveBeenCalledWith({
       description: "test task",
       dependencies: ["FN-124"],
-      source: { sourceType: "cli" },
-    });
+      source: { sourceType: "cli", sourceMetadata: undefined },
+    }, { invokeTaskCreatedHook: false });
   });
 
   it("passes multiple dependencies correctly", async () => {
@@ -1639,8 +1958,8 @@ describe("runTaskCreate with --depends", () => {
     expect(mockCreateTask).toHaveBeenCalledWith({
       description: "test task",
       dependencies: ["FN-124", "FN-100"],
-      source: { sourceType: "cli" },
-    });
+      source: { sourceType: "cli", sourceMetadata: undefined },
+    }, { invokeTaskCreatedHook: false });
 
     const depsLine = logSpy.mock.calls.find(
       (call) => typeof call[0] === "string" && call[0].includes("Dependencies:"),
@@ -1656,8 +1975,8 @@ describe("runTaskCreate with --depends", () => {
     expect(mockCreateTask).toHaveBeenCalledWith({
       description: "test task",
       dependencies: undefined,
-      source: { sourceType: "cli" },
-    });
+      source: { sourceType: "cli", sourceMetadata: undefined },
+    }, { invokeTaskCreatedHook: false });
   });
 });
 
@@ -2363,7 +2682,7 @@ describe("runTaskRefine", () => {
     mockRefineTask = vi.fn().mockResolvedValue({
       id: "FN-002",
       description: "Refinement of FN-001",
-      column: "triage",
+      column: "todo",
       dependencies: ["FN-001"],
       steps: [],
       currentStep: 0,
@@ -2398,6 +2717,13 @@ describe("runTaskRefine", () => {
     expect(successLine).toBeDefined();
     expect(successLine![0]).toContain("FN-002");
     expect(successLine![0]).toContain("FN-001");
+
+    const columnLine = logSpy.mock.calls.find(
+      (call) => typeof call[0] === "string" && call[0].includes("Column:"),
+    );
+    expect(columnLine).toBeDefined();
+    expect(columnLine![0]).toContain("Column: todo");
+    expect(columnLine![0]).not.toContain("triage");
 
     // Check that dependency is printed
     const depLine = logSpy.mock.calls.find(
@@ -2440,24 +2766,26 @@ describe("runTaskRefine", () => {
     exitSpy.mockRestore();
   });
 
-  it("exits when feedback exceeds 2000 characters", async () => {
+  it("exits when feedback exceeds the shared task-message limit", async () => {
     const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {}) as (code?: number) => never);
 
-    await runTaskRefine("FN-001", "A".repeat(2001));
+    await runTaskRefine("FN-001", "A".repeat(MAX_TASK_MESSAGE_LENGTH + 1));
 
-    expect(errorSpy).toHaveBeenCalledWith("Feedback must be 2000 characters or less");
+    expect(errorSpy).toHaveBeenCalledWith(`Feedback must be ${MAX_TASK_MESSAGE_LENGTH} characters or less`);
     expect(exitSpy).toHaveBeenCalledWith(1);
 
     exitSpy.mockRestore();
   });
 
-  it("allows feedback at exactly 2000 characters", async () => {
-    const longFeedback = "A".repeat(2000);
+  it("allows feedback above the former limit and at the shared boundary", async () => {
+    const overFormerLimit = "A".repeat(2001);
+    const atSharedLimit = "B".repeat(MAX_TASK_MESSAGE_LENGTH);
 
-    await runTaskRefine("FN-001", longFeedback);
+    await runTaskRefine("FN-001", overFormerLimit);
+    await runTaskRefine("FN-001", atSharedLimit);
 
-    expect(mockRefineTask).toHaveBeenCalledOnce();
-    expect(mockRefineTask).toHaveBeenCalledWith("FN-001", longFeedback);
+    expect(mockRefineTask).toHaveBeenNthCalledWith(1, "FN-001", overFormerLimit);
+    expect(mockRefineTask).toHaveBeenNthCalledWith(2, "FN-001", atSharedLimit);
   });
 
   it("throws when task not in done or in-review", async () => {
@@ -2660,6 +2988,21 @@ describe("runTaskComment", () => {
     expect(logSpy).toHaveBeenCalledWith("  ✓ Comment added to FN-001");
   });
 
+  it("forwards comments above the former limit without truncation", async () => {
+    const longComment = "A".repeat(5_000);
+    const addTaskComment = vi.fn().mockResolvedValue(makeTask({
+      comments: [{ id: "c1", text: longComment, author: "alice", createdAt: new Date().toISOString() }],
+    }));
+    (TaskStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      init: vi.fn(),
+      addTaskComment,
+    }));
+
+    await runTaskComment("FN-001", longComment, "alice");
+
+    expect(addTaskComment).toHaveBeenCalledWith("FN-001", longComment, "alice");
+  });
+
   it("lists task comments", async () => {
     (TaskStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
       init: vi.fn(),
@@ -2724,9 +3067,11 @@ describe("runTaskRetry", () => {
       error: null,
       worktree: null,
       branch: null,
+      branchWriteOrigin: "engine",
       baseBranch: null,
       baseCommitSha: null,
       nextRecoveryAt: null,
+      sessionContentionWaitReason: null,
       /*
       FNXC:CliTests 2026-07-17-10:57:
       The exact manual retry reset contract now clears bulk-completion refusal
@@ -2741,6 +3086,7 @@ describe("runTaskRetry", () => {
       planReviewReplanCount: 0,
       stuckKillCount: 0,
       recoveryRetryCount: 0,
+      sessionContentionHoldCount: 0,
       taskDoneRetryCount: 0,
       worktreeSessionRetryCount: 0,
       workflowStepRetries: 0,
@@ -2750,6 +3096,9 @@ describe("runTaskRetry", () => {
       branchConflictRecoveryCount: 0,
       reviewerContextRetryCount: 0,
       reviewerFallbackRetryCount: 0,
+      // FNXC:TaskRetry 2026-08-23-15:59: FN-149 added review-convergence stage/escalation counters to MANUAL_RETRY_RESET_FIELDS; manual retry must zero them with the other recovery budgets.
+      reviewConvergenceStage: 0,
+      reviewConvergenceEscalationCount: 0,
       completionHandoffLimboRecoveryCount: 0,
       // FNXC:TaskRetry 2026-07-13-08:15: executeRequeueLoopCount added to TaskResetField set; retry must zero it alongside other recovery counters.
       executeRequeueLoopCount: 0,
@@ -2813,9 +3162,11 @@ describe("runTaskRetry", () => {
       error: null,
       worktree: null,
       branch: null,
+      branchWriteOrigin: "engine",
       baseBranch: null,
       baseCommitSha: null,
       nextRecoveryAt: null,
+      sessionContentionWaitReason: null,
       /*
       FNXC:CliTests 2026-07-17-10:57:
       The exact manual retry reset contract now clears bulk-completion refusal
@@ -2830,6 +3181,7 @@ describe("runTaskRetry", () => {
       planReviewReplanCount: 0,
       stuckKillCount: 0,
       recoveryRetryCount: 0,
+      sessionContentionHoldCount: 0,
       taskDoneRetryCount: 0,
       worktreeSessionRetryCount: 0,
       workflowStepRetries: 0,
@@ -2839,6 +3191,9 @@ describe("runTaskRetry", () => {
       branchConflictRecoveryCount: 0,
       reviewerContextRetryCount: 0,
       reviewerFallbackRetryCount: 0,
+      // FNXC:TaskRetry 2026-08-23-15:59: FN-149 added review-convergence stage/escalation counters to MANUAL_RETRY_RESET_FIELDS; manual retry must zero them with the other recovery budgets.
+      reviewConvergenceStage: 0,
+      reviewConvergenceEscalationCount: 0,
       completionHandoffLimboRecoveryCount: 0,
       // FNXC:TaskRetry 2026-07-13-08:15: executeRequeueLoopCount added to TaskResetField set; retry must zero it alongside other recovery counters.
       executeRequeueLoopCount: 0,
@@ -3071,6 +3426,55 @@ describe("runTaskLogs", () => {
     expect(calls[4]).toContain("[ERROR]");
   });
 
+  it("renders multiline tool arguments as one indented terminal block", async () => {
+    mockGetTask.mockResolvedValueOnce(makeTask({ id: "FN-001" }));
+    mockGetAgentLogs.mockResolvedValueOnce([
+      makeAgentLogEntry({
+        type: "tool",
+        text: "fn_run_verification",
+        detail: "command=pnpm lint\nallowFullSuite=false",
+      }),
+    ]);
+
+    await runTaskLogs("FN-001");
+
+    expect(logSpy).toHaveBeenCalledTimes(1);
+    const formatted = logSpy.mock.calls[0]?.[0] as string;
+    expect(formatted).toContain("[TOOL] fn_run_verification");
+    expect(formatted).toContain("\n\x1b[2m\x1b[90m    command=pnpm lint\n    allowFullSuite=false");
+  });
+
+  it("renders multiline results and errors as indented blocks while retaining the red error header", async () => {
+    mockGetTask.mockResolvedValueOnce(makeTask({ id: "FN-001" }));
+    mockGetAgentLogs.mockResolvedValueOnce([
+      makeAgentLogEntry({ type: "tool_result", text: "bash", detail: "stdout line one\nstdout line two" }),
+      makeAgentLogEntry({ type: "tool_error", text: "bash", detail: "stderr line one\nstderr line two" }),
+    ]);
+
+    await runTaskLogs("FN-001");
+
+    const [result, error] = logSpy.mock.calls.map((call) => call[0] as string);
+    expect(result).toContain("[RESULT] bash\n\x1b[2m\x1b[90m    stdout line one");
+    expect(error).toMatch(/^\x1b\[31m.*\[ERROR] bash/);
+    expect(error).toContain("\n\x1b[2m\x1b[90m    stderr line one");
+  });
+
+  it("keeps short single-line tool detail inline and omits an empty detail block", async () => {
+    mockGetTask.mockResolvedValueOnce(makeTask({ id: "FN-001" }));
+    mockGetAgentLogs.mockResolvedValueOnce([
+      makeAgentLogEntry({ type: "tool", text: "read", detail: "path/to/file.ts" }),
+      makeAgentLogEntry({ type: "tool_result", text: "read" }),
+    ]);
+
+    await runTaskLogs("FN-001");
+
+    const [tool, result] = logSpy.mock.calls.map((call) => call[0] as string);
+    expect(tool).toContain("[TOOL] read (path/to/file.ts)");
+    expect(tool).not.toContain("\n");
+    expect(result).toContain("[RESULT] read");
+    expect(result).not.toContain("\n");
+  });
+
   it("displays agent role when present", async () => {
     mockGetTask.mockResolvedValueOnce(makeTask({ id: "FN-001" }));
     mockGetAgentLogs.mockResolvedValueOnce([
@@ -3253,6 +3657,31 @@ describe("runTaskLogs", () => {
     expect(newEntry).toBeDefined();
 
     // Clean up
+    sigintHandlers.forEach((handler) => handler());
+  });
+
+  it("formats multiline tool detail from follow-mode JSONL through the shared formatter", async () => {
+    mockGetTask.mockResolvedValueOnce(makeTask({ id: "FN-001" }));
+    mockGetAgentLogs.mockResolvedValueOnce([]);
+    mockStatSync.mockReturnValue({ size: 0 });
+
+    runTaskLogs("FN-001", { follow: true });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const watchCallback = mockWatchFile.mock.calls[0]?.[2] as () => void;
+    mockStatSync.mockReturnValueOnce({ size: 200 });
+    mockReadFileSync.mockReturnValueOnce(`${JSON.stringify(makeAgentLogEntry({
+      type: "tool_result",
+      text: "fn_run_verification",
+      detail: "result line one\nresult line two",
+    }))}\n`);
+    watchCallback();
+
+    const followed = logSpy.mock.calls.find(
+      (call) => typeof call[0] === "string" && call[0].includes("[RESULT] fn_run_verification"),
+    )?.[0] as string | undefined;
+    expect(followed).toContain("\n\x1b[2m\x1b[90m    result line one");
+
     sigintHandlers.forEach((handler) => handler());
   });
 

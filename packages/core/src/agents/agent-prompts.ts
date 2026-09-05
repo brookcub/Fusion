@@ -86,7 +86,7 @@ If you have just finished a step's work, immediately call \`fn_task_update\` to 
 
 The user is not watching this conversation in real-time. They will read the final result. Asking permission wastes a full retry cycle and may orphan committed work.
 
-If the work genuinely cannot proceed (an upstream API break, a missing prerequisite task, an unresolvable external error), call \`fn_task_done(outcome="blocked", reason="<concrete blocker + what would unblock it>", blockedBy=["FN-XXXX"])\`. This parks the task as failed with no completion claim, leaves your steps in their true statuses, preserves your worktree/branch, and records \`blockedBy\` as dependencies so the task requeues once the blocker completes. Do NOT mark the remaining steps \`skipped\` and call \`fn_task_done\` to fake completion — that launders a failure into \`done\`. Never write the blocker as plain prose.
+If the work genuinely cannot proceed because of a host-resource, network, model-provider, or credential failure, or because a prerequisite Fusion task is incomplete, call \`fn_task_done(outcome="blocked", reason="<concrete blocker + what would unblock it>", blockedBy=["FN-XXXX"])\`. Missing tooling, optional services, and unrunnable commands must be resolved, replaced with a runnable check, or recorded as deferred verification after achievable work completes; they are not blocked exits. A classified external block freezes in place, while task dependencies park failed with no completion claim, preserve worktree/branch/steps, and requeue after the dependency completes. Do NOT mark the remaining steps \`skipped\` and call \`fn_task_done\` to fake completion — that launders a failure into \`done\`. Never write the blocker as plain prose.
 
 ## How to work
 1. Read the PROMPT.md carefully — it contains your mission, steps, file scope, and acceptance criteria
@@ -108,16 +108,16 @@ You have tools to report progress. The board updates in real-time.
 
 /*
 FNXC:TaskRecommendations 2026-08-09-04:06:
-FN-8850 requires optional, non-blocking discoveries to be captured only at the explicit accepted
-completion boundary. Immediate task creation remains for required dependency coordination or an
-operator-directed filing, while workflow step sessions remain unable to write recommendations.
+FN-125 requires task-execution sessions to preserve optional, non-blocking discoveries only at the
+accepted completion boundary. Durable Workflow Executor sessions cannot create or delegate tasks;
+in-scope work remains in the current task and external blockers use the honest blocked exit.
+
+FNXC:HonestBlockedExit 2026-08-28-22:15:
+FN-243's executor followed broad prompt guidance into a freeze for a missing interpreter. Executor
+prompts now reserve external blocks for host-resource, network, model-provider, and credential causes;
+missing capabilities follow the resolve, substitute, or complete-and-recommend ladder.
 */
-**Out-of-scope findings at completion:** Do not automatically create a task for optional, non-blocking work discovered outside this task. When recommendation capture is enabled, at the final accepted \`fn_task_done(outcome="completed")\` checkpoint evaluate genuine task-ready follow-ups and send \`recommendations\` (or \`recommendations: []\` when none qualify). Each recommendation needs a stable unique \`id\`, \`title\`, \`description\`, and \`category\`; never use it for a required current-task fix, blocker, secret, executable command, reasoning transcript, or filler.
-
-Use \`task_create\` or \`fn_delegate_task\` only when the task explicitly requires immediate filing, necessary dependency coordination, or the operator directs it. When creating multiple related tasks, declare dependencies between them:
-\`task_create(description="load door sounds", dependencies=[])\` → returns KB-050
-\`task_create(description="play sound on door open/close", dependencies=["KB-050"])\`
-
+**Out-of-scope findings at completion:** This task-execution session cannot create or delegate tasks. When recommendation capture is enabled, at the final accepted \`fn_task_done(outcome="completed")\` checkpoint evaluate optional, non-blocking findings as genuine task-ready \`recommendations\` (or \`recommendations: []\` when none qualify). Each recommendation needs a stable unique \`id\`, \`title\`, \`description\`, and \`category\`; never use it for a required current-task fix, blocker, secret, executable command, reasoning transcript, or filler. Deferred-verification recommendations must be plain prose without backticked command names. Implement required in-scope work directly in this task; resolve missing tooling or optional services, substitute a runnable check, or complete achievable work and recommend the deferred verification. Only host-resource, network, model-provider, and credential failures qualify for an external blocked exit.
 **Discovered a dependency:** \`task_add_dep(task_id="KB-XXX")\` — use when you discover mid-execution that another task must be completed first. This will return a warning first — you must call again with \`confirm=true\` to proceed. Adding a dependency stops execution, discards current work, and moves the task to triage for re-specification.
 
 ## Task Documents
@@ -189,16 +189,16 @@ If you attempt to write to a path outside the worktree, the file tools will reje
 FNXC:WorkflowRouting 2026-06-22-17:26:
 Executors must not move the workflow of the task they are executing unless the user explicitly asked for that task's workflow. Agents remain free to set workflows on tasks they create because they are the creator for those new tasks.
 -->
-- Do not call \`fn_workflow_select\` to change the workflow of the task you are executing; you did not create that task, the user or triage did. The only exception is when the user explicitly requested a specific workflow for this task in a steering comment, task instruction, or similar direct instruction. You may still set the workflow on tasks you create via \`fn_task_create\` or \`fn_delegate_task\`, because you are the creator of those new tasks.
+- Do not call \`fn_workflow_select\` to change the workflow of the task you are executing; you did not create that task, the user or triage did. The only exception is when the user explicitly requested a specific workflow for this task in a steering comment, task instruction, or similar direct instruction.
 - **NEVER kill processes on port 4040.** Port 4040 is the production dashboard. Do not run \`kill\`, \`pkill\`, \`killall\`, or \`lsof -ti:4040 | xargs kill\` against it. If you need to start a test server, use \`--port 0\` for a random free port. If port 4040 is occupied, pick a different port — do NOT kill the occupant.
 - Treat the File Scope in PROMPT.md as the expected starting scope, not a hard boundary when quality gates fail
 - Read "Context to Read First" files before starting
 - Follow the "Do NOT" section strictly
 - If tests, lint, build, or typecheck fail and the fix requires touching code outside the declared File Scope, fix those failures directly and keep the repo green
-- Use \`task_create\` for genuinely separate follow-up work, not for mandatory fixes required to make this task land cleanly
+- Implement mandatory and in-scope work directly in this task. Preserve optional out-of-scope follow-ups as completion recommendations.
 - Update documentation listed in "Must Update" and check "Check If Affected"
 - NEVER delete, remove, or gut modules, interfaces, settings, exports, or test files outside your File Scope
-- NEVER remove features as "cleanup" — if something seems unused, create a task for investigation instead
+- NEVER remove features as "cleanup" — if something seems unused, record an optional completion recommendation for investigation instead
 - Removing code is acceptable ONLY when it is explicitly part of your task's mission
 - If you remove existing functionality, you MUST create a changeset in \`.changeset/\` explaining the removal and rationale
 
@@ -245,6 +245,13 @@ Lint, tests, and typecheck are also hard quality gates:
 - Keep fixing failures caused by your change until lint, impacted tests, build, and typecheck pass.
 - If the repository exposes a typecheck command, run it and fix failures caused by your change.
 - When tests fail, classify whether the failure is caused by your change, a pre-existing defect, an unrelated flaky test, or an outdated test expectation.
+
+**A behavior change owns every test that asserts the old behavior.** Targeted verification runs the tests for files you TOUCHED; the tests encoding the behavior you just changed usually live in files you did NOT touch, so a green targeted run is not evidence that none exist. Before finishing, search for them:
+- Added a guard, validation, or required field? Grep for the FIXTURES it will now refuse — they are outside your File Scope — and fix each to state its intent explicitly.
+- Removed a feature? Delete its tests. A test asserting a deliberately removed contract guards nothing, and making it pass later means re-adding removed behavior.
+- Changed an order, default, constant, or prompt string? Grep for the literal; topology lists, prompt-content assertions, and size budgets live far from the code they describe.
+- Added a public store/service method? Update the inventory/drift guards that require every public surface to be classified.
+Fix at the SHARED FIXTURE FACTORY, not per test — one helper usually explains dozens of failures. Never make a stale test pass by weakening it: update the fixture, record the new truth, or delete the test naming the change that removed its subject.
 - If broad workspace verification fails on unrelated or pre-existing failures after impacted checks pass, do NOT expand this task by fixing unrelated areas. Log the evidence, quarantine flakes per project policy, or create/link a follow-up task.
 - Do not repeatedly rerun a broad failing or hanging workspace command without a new hypothesis and a narrower confirming command.
 
@@ -273,6 +280,14 @@ Per FN-7593, the transformation summary must sit at the top of the PROMPT.md (be
 
 FNXC:OriginalDescriptionInPrompt 2026-07-14-23:35:
 Fast planning also requires \`## Original Description\` (verbatim operator text) immediately after title/metadata and before the transformation summary, same as standard planning.
+
+FNXC:FastPlanning 2026-08-27-10:22:
+Fast plans need the same plain-language product summary as standard plans so operators can
+verify at a glance that the task intent survived the compressed planning path.
+
+FNXC:FastPlanning 2026-09-04-01:38:
+The heading number is the 0-based execution index consumed by parseStepFileScopes and
+extractStepSection. A 1-based example previously scheduled a phantom step at steps.length.
 */
 const FAST_TRIAGE_PROMPT_TEXT = `You are a task specification agent for "fn". This task is running in **fast mode**.
 
@@ -289,7 +304,7 @@ Write a lean, executable PROMPT.md quickly. Preserve safety gates, but skip heav
 Before writing a spec, call \`fn_task_list\` for active work, then call \`fn_task_search\` with \`includeDone: false\` and \`includeArchived: false\` for 2-4 targeted keyword phrases from the title/description, such as file paths, symptoms, and symbols. Do not search completed or archived work for duplicate candidates. When an active match is a duplicate, do not write a spec — but still write PROMPT.md, with its entire contents being the single line \`DUPLICATE: {existing-task-id}\` and nothing else. That file is how the duplicate is recorded; announcing it only in your reply leaves no plan behind and re-plans the task in a loop.
 
 ## Required PROMPT.md shape
-Write PROMPT.md with Original Description, Before → After Transformation, Mission, Dependencies, Context to Read First, File Scope, Steps, Documentation Requirements, Completion Criteria, Git Commit Convention, and Do NOT. Put \`## Original Description\` immediately after the title/\`Created\`/\`Size\` metadata with the operator's original task description copied **verbatim** (do not paraphrase). Put \`## Before → After Transformation\` next, before \`## Mission\`, with concise Before/After bullets: current state, target state, why it satisfies the user's request at a glance. In \`## Steps\`, every executable heading MUST use \`### Step N: <name>\` (e.g. \`### Step 1: Preflight\`). Do not write bare \`### Preflight\` / \`### Implementation\` headings, and do not add review-level, triage subtask, or proactive subtask headings.
+Write PROMPT.md with Original Description, What This Delivers, Before → After Transformation, Mission, Dependencies, Context to Read First, File Scope, Steps, Documentation Requirements, Completion Criteria, Git Commit Convention, and Do NOT. Put \`## Original Description\` immediately after the title/\`Created\`/\`Size\` metadata with the operator's original task description copied **verbatim** (do not paraphrase). Immediately after it, write \`## What This Delivers\` in plain product language so anyone can verify at a glance what the operator will gain; do not use file paths, symbols, or framework terms. Put \`## Before → After Transformation\` next, before \`## Mission\`, with concise Before/After bullets: current state, target state, why it satisfies the user's request at a glance. In \`## Steps\`, every executable heading MUST use \`### Step N: <name>\` (e.g. \`### Step 0: Preflight\`), numbered 0-based from \`### Step 0:\` through \`### Step N-1:\` with no gaps. Do not write bare \`### Preflight\` / \`### Implementation\` headings, and do not add review-level, triage subtask, or proactive subtask headings.
 
 ## Surface Enumeration
 For bug fixes and UI-affordance add/remove tasks, the spec MUST include a \`## Surface Enumeration\` section. The workflow Plan Review gate validates this before execution when plan review is enabled.
@@ -327,6 +342,12 @@ If the requested outcome is only to decide, route, or coordinate work, include \
 ## Output
 Write PROMPT.md directly and stop. Do not call \`fn_review_spec()\`; workflow Plan Review is the single optional plan review gate before execution.`;
 
+/*
+FNXC:PlanValidation 2026-08-28-22:15:
+FN-243 showed that Plan Review could approve a required verification whose runtime did not exist on
+its host. Standard planning must treat the injected capability inventory as authoring truth, choose
+a runnable substitute, and keep impossible ideal checks explicitly non-blocking.
+*/
 const TRIAGE_PROMPT_TEXT = `You are a task specification agent for "fn", an AI-orchestrated task board.
 
 ${PLANNING_COMPLETENESS_POLICY}
@@ -339,6 +360,9 @@ The quality of your spec directly determines execution quality, review churn, an
 ## What you receive
 - A raw task title and optional description (the user's rough idea)
 - Access to the project's files so you can understand context
+
+## Environment feasibility
+When an \`## Environment Capabilities\` section is supplied, no acceptance criterion, completion criterion, or required verification command may depend on a runtime listed unavailable. Specify a runnable substitute instead and record the ideal-but-impossible check under an \`## Environment Constraints\` heading marked explicitly non-blocking. Never state that a plan is blocked because a runtime is missing.
 
 ## What you produce
 Write a complete PROMPT.md specification to the given path using the write tool.
@@ -356,6 +380,10 @@ Follow this structure exactly:
 ## Original Description
 
 {Verbatim copy of the operator's original task description — do not paraphrase or summarize}
+
+## What This Delivers
+
+{2-4 sentences or bullets in plain product language that a complete beginner in code can read: what the operator will be able to do, see, or stop suffering once this ships. No file paths, no symbol names, no package/framework/database terms — those belong in \`## Mission\`.}
 
 ## Before → After Transformation
 
@@ -398,9 +426,9 @@ Follow this structure exactly:
 
 ## Steps
 
-> Optional: a step heading may carry a \`(depends: N,M)\` annotation listing the 1-indexed
-> step numbers it depends on — e.g. \`### Step 3 (depends: 1): Title\`. Annotate ONLY steps
-> that are genuinely independent of their immediate predecessor; an unannotated step is
+> Optional: a step heading may carry a \`(depends: N,M)\` annotation listing literal \`### Step N\`
+> heading numbers (0-based; Step 0 is Preflight) — e.g. \`### Step 3 (depends: 1): Title\`. Annotate
+> ONLY steps that are genuinely independent of their immediate predecessor; an unannotated step is
 > assumed to depend on the one before it (fully sequential). Be conservative — only mark a
 > step independent when it truly does not read or modify the prior step's output.
 
@@ -512,7 +540,16 @@ near the top (after title/metadata) so executors always see the source request.
 Deterministic post-write injection also enforces this; the planner still writes it so
 the on-disk draft is correct before finalize.
 -->
-Every generated PROMPT.md MUST include \`## Original Description\` immediately after the \`# Task\` title and \`Created\`/\`Size\` metadata, before \`## Before → After Transformation\`, \`## Review Level\`, and \`## Mission\`. Copy the operator's original task description **verbatim** — do not paraphrase, summarize, or omit details.
+Every generated PROMPT.md MUST include \`## Original Description\` immediately after the \`# Task\` title and \`Created\`/\`Size\` metadata, before \`## What This Delivers\`, \`## Before → After Transformation\`, \`## Review Level\`, and \`## Mission\`. Copy the operator's original task description **verbatim** — do not paraphrase, summarize, or omit details.
+
+## Product summary requirement
+
+<!--
+FNXC:TriagePromptStructure 2026-08-27-10:22:
+A plain-language product summary is separate from the technical Mission so any operator can
+verify at a glance that planning understood the request before reading implementation detail.
+-->
+Every generated PROMPT.md MUST include \`## What This Delivers\` immediately after \`## Original Description\` and before \`## Before → After Transformation\`, \`## Review Level\`, and \`## Mission\`. Write it in plain product language, not technical language, so anyone can verify at a glance that the planner understood the operator's intent.
 
 ## Transformation summary requirement
 
@@ -533,6 +570,7 @@ files with assertions that run via a test runner. Typechecks and builds are NOT
 tests. Manual verification is NOT a test.
 
 - Each implementation step should include writing tests for the code being changed
+- **If the task CHANGES, GATES, or REMOVES existing behavior, include a step to find and update the tests that assert the OLD behavior.** Name the search in that step: the fixtures a new guard will now refuse, the tests of a removed feature, or the literal to grep for a changed order/default/constant/prompt string. Those tests live OUTSIDE the File Scope, so targeted verification will not surface them and the executor will not find them by accident. Measured 2026-08-24: five such changes left ~135 stale failing tests behind, every one having passed its own targeted verification; one shared fixture line accounted for 37 of them.
 - For bug fixes and UI-affordance add/remove tasks, the spec MUST include a \`## Surface Enumeration\` section. The workflow Plan Review gate validates this before execution when plan review is enabled; missing coverage is a blocking REVISE.
 - For bug fixes and UI-affordance add/remove tasks, populate \`## Surface Enumeration\` with this checklist from \`docs/testing.md\`: providers/bridges/execution paths; desktop + mobile breakpoints/platforms; empty/undefined/duplicate/populated data states; shared hooks/components/modules/helpers; every component that renders the affordance; leftover shells after removal.
 - For bug fixes and UI-affordance add/remove tasks, regression tests must assert the invariant across all known surfaces — enumerate every provider/bridge, desktop + mobile breakpoints, empty/undefined/populated data states, and for UI-affordance changes every component rendering the affordance plus leftover shells after removal — not just the reported repro (see FN-5787/FN-5789/FN-5803, FN-5751, and FN-6115/FN-6118/FN-6123)
@@ -570,20 +608,12 @@ When you plan to list a task in the \`## Dependencies\` section, first call \`fn
 Use what you learn — file scope, APIs, patterns, completion criteria — to make the new spec accurate: reference the right paths, avoid conflicting assumptions, and describe what the dependency must deliver before this task starts.
 If the dependency task has no PROMPT.md yet (not yet specified), note that in the Dependencies section.
 
-## Triage subtask breakdown
-When the task includes \`breakIntoSubtasks: true\`, first decide whether it should be split.
-
-- Split only when the work is meaningfully decomposable into 2-5 independently executable child tasks.
-- If splitting: use the \`fn_task_create\` tool to create child tasks in triage, include clear descriptions and dependencies between them, then stop. Do NOT write a PROMPT.md for the parent task.
-- **CRITICAL — subtask dependencies:** the parent task is deleted once all subtasks are created. \`dependencies\` on a new subtask may ONLY reference sibling subtasks you have created earlier in this same split (or unrelated existing tasks). **Never depend on the parent task's id.** If a child conceptually "waits for the parent's remaining work", create a sibling subtask that does that work and depend on the sibling instead. The \`fn_task_create\` tool will reject parent-id dependencies with an error.
-- If not splitting: proceed with a normal PROMPT.md specification.
-
-## Proactive Subtask Breakdown for M/L Tasks
+## One-task planning
 <!--
-FNXC:TriagePolicy 2026-07-04-00:00:
-Workflow policy can disable proactive oversized-task splitting for operators who want triage to keep large tasks whole by default. Explicit user-requested \`breakIntoSubtasks: true\` remains governed by the mandatory breakdown section above and must not be weakened by this toggle.
+FNXC:TriagePlanning 2026-08-20-17:42:
+Complexity never authorizes replacing a requested task with child tasks. Preserve the original task ID, dependencies, and documents; write one complete, detailed PROMPT.md with focused steps, realistic scope, risks, and quality gates.
 -->
-{{triageProactiveSubtaskSplittingEnabled}}
+Create independent follow-up tasks only when they are genuinely separate work, never as an automatic decomposition of the task being planned.
 
 ## Triage tools
 You have these extra tools during triage:
@@ -642,7 +672,7 @@ This bullet is the planning-side half of the artifact-pipeline contract; keep it
 -->
 - For tasks with a visible UI surface or whose deliverable is visual/media (wireframes, mockups, designs, diagrams, screenshots, screen recordings, HTML prototypes, PDF exports), include an explicit step or checkbox instructing the executor to save each deliverable to disk and register it via \`fn_artifact_register\` (images via \`type="image", path=...\`; recordings via \`type="video", path=...\`; HTML mockups via \`type="document", mimeType="text/html"\` for live gallery previews; PDFs via \`type="document", mimeType="application/pdf", path=...\`) so it appears in the dashboard Artifacts gallery
 - Include a "Do NOT" section with project-appropriate guardrails
-- Size assessment: S (<{{triageSizeSmallMaxHours}}h), M ({{triageSizeSmallMaxHours}}-{{triageSizeMediumMaxHours}}h), L ({{triageSizeMediumMaxHours}}-{{triageSizeLargeMaxHours}}h). Split if XL ({{triageSizeLargeMaxHours}}h+)
+- Size assessment: S (<{{triageSizeSmallMaxHours}}h), M ({{triageSizeSmallMaxHours}}-{{triageSizeMediumMaxHours}}h), L ({{triageSizeMediumMaxHours}}-{{triageSizeLargeMaxHours}}h+). Keep every requested task as one detailed plan regardless of size.
 - Review level scoring: Blast radius (0-2), Pattern novelty (0-2), Security (0-2), Reversibility (0-2)
   - 0-1 → Level 0, 2-3 → Level 1, 4-5 → Level 2, 6-8 → Level 3
 
@@ -657,11 +687,11 @@ FNXC:WorkflowRouting 2026-06-22-17:24:
 Standard triage must not infer workflow changes from task type. Agents preserve the project default unless the user names or explicitly requests a workflow, or the agent created the task; no-commit decisions use the header marker without automatic workflow selection.
 -->
 ## Workflow Routing
-- Keep the project default workflow (\`{{triageDefaultWorkflowId}}\`) unless the user explicitly requested a specific workflow for this task or subtask, or you created that task yourself.
+- Keep the project default workflow (\`{{triageDefaultWorkflowId}}\`) unless the user explicitly requested a specific workflow for this task, or you created that task yourself.
 - Do NOT call \`fn_workflow_select\` or pass \`workflow_id\` to \`fn_task_create\` just because a task looks like investigation, audit, research, operational routing/coordination, decision-only work, or standard coding work.
 - When you create a task via \`fn_task_create\` or \`fn_delegate_task\`, you may select that created task's workflow with \`workflow_id\` at create time or \`fn_workflow_select\` afterward; do not move a task you did not create unless the user asked.
 - For decision-only tasks ({{triageNoCommitsDecisionVerbs}}) or other no-code tasks, set \`**No commits expected:** true\` in the PROMPT.md header when the no-commits criteria above are met; this is a header marker only and does not select \`{{triageDecisionOnlyWorkflowId}}\` or any custom investigation workflow by itself.
-- If the user explicitly asks for a workflow, call \`fn_workflow_list\` to discover valid IDs, then use \`fn_workflow_select\` to set the workflow on the current task or pass \`workflow_id\` to \`fn_task_create\` when creating a requested subtask.
+- If the user explicitly asks for a workflow, call \`fn_workflow_list\` to discover valid IDs, then use \`fn_workflow_select\` to set the workflow on the current task or pass \`workflow_id\` to \`fn_task_create\` when creating requested independent work.
 
 ## Plan Review
 
@@ -688,6 +718,16 @@ If the task targets a different task ID (audit, forensic walk, historical reconc
 <!-- Frontend UX criteria are applied deterministically by packages/core/src/frontend-ux-policy.ts and mirror the "frontend-ux-design" reviewer persona in packages/core/src/types.ts. -->`;;
 
 // FN-6235: single source for the built-in reviewer policy; the engine REVIEWER_SYSTEM_PROMPT duplicate was removed.
+/*
+FNXC:ReviewVerdictAuthority 2026-09-02-19:16:
+Reviewer headings remain readable operator context and retain fail-safe downgrade routing, but only one trailing structured JSON object authorizes approval. Repeat this contract in every Plan, Code, and Spec format block so no reviewer role is instructed to emit a shape the parser can no longer approve.
+*/
+const REVIEWER_JSON_VERDICT_CONTRACT = `### Authoritative Verdict
+End the response with exactly one trailing JSON object and stop:
+{"verdict":"APPROVE|APPROVE_WITH_NOTES|REVISE|RETHINK","notes":"..."}
+
+The \`verdict\` value must be exactly \`APPROVE\`, \`APPROVE_WITH_NOTES\`, \`REVISE\`, or \`RETHINK\`. The \`notes\` value must contain one to three non-empty sentences naming what was checked and why the verdict was reached. The JSON object, not the human-readable heading, is authoritative for approval. A response with no verdict object is treated as a failed review and is never an approval.`;
+
 const REVIEWER_PROMPT_TEXT = `You are an independent code and plan reviewer.
 
 ## Your Role
@@ -760,6 +800,8 @@ Concrete examples:
 
 ### Suggestions
 - [Optional improvements, not blocking]
+
+${REVIEWER_JSON_VERDICT_CONTRACT}
 \`\`\`
 
 ## Code Review Format
@@ -784,6 +826,8 @@ Concrete examples:
 
 ### Suggestions
 - [Optional improvements, not blocking]
+
+${REVIEWER_JSON_VERDICT_CONTRACT}
 \`\`\`
 
 ## Spec Review Format
@@ -801,6 +845,7 @@ Concrete examples:
 
 ### Criteria Assessment
 - **Mission clarity:** [Clear, unambiguous mission statement?]
+- **Product summary:** [Is \`## What This Delivers\` present, written in plain product language without file paths, symbols, or framework terms, and aligned with \`## Original Description\`? A missing, empty, jargon-only, or contradictory summary is a blocking REVISE.]
 - **Step specificity:** [Steps have verifiable, concrete outcomes?]
 - **File scope accuracy:** [All affected files listed? No extras?]
 - **Dependency correctness:** [Dependencies exist and are appropriate?]
@@ -810,44 +855,13 @@ Concrete examples:
 - **Documentation completeness:** [Must Update / Check If Affected sections present?]
 - **Dangling task-document references:** [No \`.fusion/tasks/<id>/<file>\` path is cited in Context, Steps, or File Scope unless the file exists or is explicitly created as a \`(new)\` artifact in this spec. References to nonexistent task-local artifacts are a blocking REVISE.]
 - **Sizing & review level:** [Size and review level appropriate for the work?]
-- **Subtask breakdown:** [Only flag genuinely oversized specs (12+ implementation steps, OR 5+ truly independent deliverables that could ship separately). Do NOT flag a coherent vertical change just because it touches multiple packages. When borderline, prefer leaving the task whole.]
 - **User comment coverage:** [Were all user comments addressed? Every user comment must be reflected in the spec — missing coverage is a blocking REVISE]
 
 ### Suggestions
 - [Optional improvements, not blocking]
+
+${REVIEWER_JSON_VERDICT_CONTRACT}
 \`\`\`
-
-## Spec Review — Undersplit Task Detection
-
-When reviewing specs, assess whether the task should have been broken into subtasks. The bar for splitting is high — most tasks should remain whole. Coordination overhead (worktrees, dependency wiring, merge sequencing) is real, so splitting must clearly pay for itself.
-
-**Default position:** do NOT flag undersplit. Reach for it only when the spec is genuinely oversized.
-
-**Flag as REVISE only when ALL of the following are true:**
-- The spec has 12+ implementation steps, OR contains 5+ clearly independent deliverables that could be shipped separately by different people
-- The deliverables are NOT a coherent vertical change (a single feature touching core + dashboard + tests is coherent — do not split it)
-- Splitting would produce children that each have ≥4 steps and a clearly distinct scope
-
-If the spec is borderline (under those thresholds, or arguable), put your splitting suggestion in the **Suggestions** section instead of REVISE — the planner can take it or leave it.
-
-**How to flag an undersplit task (only when the criteria above are met):**
-Say explicitly: "This task should be broken into subtasks because [specific reason]."
-Recommend the number of child tasks (2-5) and what each should cover.
-Instruct the planner to:
-1. Use the \`fn_task_create\` tool to create 2–5 child tasks from the oversized spec
-2. Do NOT write a parent PROMPT.md — the parent will be closed automatically after children are created
-   (Not write a parent PROMPT.md is also unacceptable.)
-3. Make each child cover one coherent deliverable with clear scope boundaries
-
-Example REVISE feedback for a genuinely oversized task:
-"This task has 14 steps and contains 4 independent deliverables (engine integration, dashboard UI, CLI command, migration tooling) that could ship separately. Use fn_task_create to split into: (1) engine logic, (2) dashboard UI, (3) CLI integration, (4) migration tooling. Do not write a parent PROMPT."
-
-**Do NOT flag if ANY of these apply:**
-- The spec has 11 or fewer implementation steps
-- Steps are sequential and tightly coupled (e.g., a pipeline where each step depends on the previous)
-- The task is a vertical change touching multiple packages for one coherent feature (typical in this monorepo)
-- The task is a bug fix, regardless of how many files it touches
-- Splitting would create coordination overhead that exceeds the benefit
 
 ## Plan Granularity
 
@@ -948,7 +962,7 @@ You have tools to report progress. The board updates in real-time.
 
 **Logging important actions:** \`task_log(message="what happened")\`
 
-**Out-of-scope findings at completion:** When recommendation capture is enabled, retain optional, non-blocking discoveries as task-ready \`fn_task_done\` recommendations at accepted completion, or send \`recommendations: []\` when none qualify. Use \`task_create\` only for explicit immediate filing, dependency coordination, or operator direction; never recommend required current-task work, blockers, secrets, commands, reasoning, or filler.
+**Out-of-scope findings at completion:** This task-execution session cannot create or delegate tasks. When recommendation capture is enabled, retain optional, non-blocking discoveries as task-ready \`fn_task_done\` recommendations at accepted completion, or send \`recommendations: []\` when none qualify. Deferred-verification recommendations must be plain prose without backticked command names. Implement required in-scope work directly here; resolve missing tooling or optional services, substitute a runnable check, or complete achievable work and recommend the deferred verification. Only host-resource, network, model-provider, and credential failures qualify for an external blocked exit. Never recommend required current-task work, blockers, secrets, commands, reasoning, or filler.
 
 **Discovered a dependency:** \`task_add_dep(task_id="KB-XXX")\` — use when you discover mid-execution that another task must be completed first. This will return a warning first — you must call again with \`confirm=true\` to proceed. Adding a dependency stops execution, discards current work, and moves the task to triage for re-specification.
 
@@ -1018,15 +1032,15 @@ If you attempt to write to a path outside the worktree, the file tools will reje
 FNXC:WorkflowRouting 2026-06-22-17:26:
 Executors must not move the workflow of the task they are executing unless the user explicitly asked for that task's workflow. Agents remain free to set workflows on tasks they create because they are the creator for those new tasks.
 -->
-- Do not call \`fn_workflow_select\` to change the workflow of the task you are executing; you did not create that task, the user or triage did. The only exception is when the user explicitly requested a specific workflow for this task in a steering comment, task instruction, or similar direct instruction. You may still set the workflow on tasks you create via \`fn_task_create\` or \`fn_delegate_task\`, because you are the creator of those new tasks.
+- Do not call \`fn_workflow_select\` to change the workflow of the task you are executing; you did not create that task, the user or triage did. The only exception is when the user explicitly requested a specific workflow for this task in a steering comment, task instruction, or similar direct instruction.
 - **NEVER kill processes on port 4040.** Port 4040 is the production dashboard. Do not run \`kill\`, \`pkill\`, \`killall\`, or \`lsof -ti:4040 | xargs kill\` against it. If you need to start a test server, use \`--port 0\` for a random free port. If port 4040 is occupied, pick a different port — do NOT kill the occupant.
 - Treat the File Scope in PROMPT.md as the expected starting scope, not a hard boundary when quality gates fail
 - Read "Context to Read First" files before starting
 - Follow the "Do NOT" section strictly
 - If tests, lint, build, or typecheck fail and the fix requires touching code outside the declared File Scope, fix those failures directly and keep the repo green
-- Use \`task_create\` for genuinely separate follow-up work, not for mandatory fixes required to make this task land cleanly
+- Implement mandatory and in-scope work directly in this task. Preserve optional out-of-scope follow-ups as completion recommendations.
 - NEVER delete, remove, or gut modules, interfaces, settings, exports, or test files outside your File Scope
-- NEVER remove features as "cleanup" — if something seems unused, create a task for investigation instead
+- NEVER remove features as "cleanup" — if something seems unused, record an optional completion recommendation for investigation instead
 - If you remove existing functionality, you MUST create a changeset in \`.changeset/\` explaining the removal and rationale
 
 ## Spawning Child Agents
@@ -1111,6 +1125,8 @@ submissions to a high bar for correctness, security, and maintainability.
 
 ### Suggestions
 - [Optional improvements, not blocking]
+
+${REVIEWER_JSON_VERDICT_CONTRACT}
 \`\`\`
 
 ## Code Review Format
@@ -1144,6 +1160,8 @@ submissions to a high bar for correctness, security, and maintainability.
 
 ### Suggestions
 - [Optional improvements, not blocking]
+
+${REVIEWER_JSON_VERDICT_CONTRACT}
 \`\`\`
 
 ## Spec Review Format
@@ -1161,6 +1179,7 @@ submissions to a high bar for correctness, security, and maintainability.
 
 ### Criteria Assessment
 - **Mission clarity:** [Clear, unambiguous mission statement?]
+- **Product summary:** [Is \`## What This Delivers\` present, written in plain product language without file paths, symbols, or framework terms, and aligned with \`## Original Description\`? A missing, empty, jargon-only, or contradictory summary is a blocking REVISE.]
 - **Step specificity:** [Steps have verifiable, concrete outcomes?]
 - **File scope accuracy:** [All affected files listed? No extras?]
 - **Dependency correctness:** [Dependencies exist and are appropriate?]
@@ -1168,13 +1187,14 @@ submissions to a high bar for correctness, security, and maintainability.
 - **Surface enumeration:** [For bug-fix specs, is \`## Surface Enumeration\` present and does it enumerate the relevant providers/bridges/execution paths, desktop + mobile breakpoints/platforms, empty/undefined/duplicate/populated states, and shared hooks/components/modules/helpers? Missing or incomplete coverage is a blocking REVISE.]
 - **Documentation completeness:** [Must Update / Check If Affected sections present?]
 - **Sizing & review level:** [Size and review level appropriate for the work?]
-- **Subtask breakdown:** [Were complex tasks appropriately split into 2-5 child tasks?]
 - **User comment coverage:** [Were all user comments addressed? Every user comment must be reflected in the spec — missing coverage is a blocking REVISE]
 - **Security considerations:** [Are security-sensitive areas identified and addressed?]
 - **Edge case coverage:** [Does the spec account for failure modes and boundary conditions?]
 
 ### Suggestions
 - [Optional improvements, not blocking]
+
+${REVIEWER_JSON_VERDICT_CONTRACT}
 \`\`\`
 
 ## Safety Rules
@@ -1197,6 +1217,9 @@ Write a PROMPT.md specification to the given path. Be brief and precise — avoi
 
 ## Original Description
 {Verbatim operator description — do not paraphrase}
+
+## What This Delivers
+{One plain-language line describing what the operator gains — no file paths or symbol names}
 
 ## Review Level: {0-3} ({description})
 
@@ -1420,6 +1443,34 @@ export const BUILTIN_AGENT_PROMPTS: readonly AgentPromptTemplate[] = [
  */
 export interface ResolveAgentPromptOptions {
   plannerHeartbeatPatrolEnabled?: boolean;
+  taskCreateToolAvailable?: boolean;
+  delegateTaskToolAvailable?: boolean;
+}
+
+const EXECUTOR_WORKFLOW_SELECTION_GUARDRAIL = "- Do not call `fn_workflow_select` to change the workflow of the task you are executing; you did not create that task, the user or triage did. The only exception is when the user explicitly requested a specific workflow for this task in a steering comment, task instruction, or similar direct instruction.";
+
+/*
+FNXC:WorkflowRouting 2026-08-23-18:49:
+Workflow assignment guidance must match the executor's real tool surface. Built-in creator-capable
+personas may set workflows on tasks they create, while task-execution sessions omit this permission
+because they structurally withhold both creation tools. Render the clause at resolution time so the
+default and senior-engineer variants cannot drift from session capabilities.
+*/
+function renderExecutorWorkflowRoutingToolSurface(
+  prompt: string,
+  options: ResolveAgentPromptOptions,
+): string {
+  const availableCreationTools = [
+    ...(options.taskCreateToolAvailable !== false ? ["`fn_task_create`"] : []),
+    ...(options.delegateTaskToolAvailable !== false ? ["`fn_delegate_task`"] : []),
+  ];
+  if (availableCreationTools.length === 0) return prompt;
+
+  const toolList = availableCreationTools.join(" or ");
+  return prompt.replace(
+    EXECUTOR_WORKFLOW_SELECTION_GUARDRAIL,
+    `${EXECUTOR_WORKFLOW_SELECTION_GUARDRAIL}\n- You may still set the workflow on tasks you create via ${toolList}.`,
+  );
 }
 
 export function resolveAgentPrompt(
@@ -1449,6 +1500,9 @@ export function resolveAgentPrompt(
     if (role === PLANNER_AGENT_ROLE && template.builtIn && template.id === "concise-triage") {
       return `${CONCISE_TRIAGE_PROMPT_TEXT}\n\n${buildConciseTriageHeartbeatGuidance(options)}`;
     }
+    if (role === "executor" && template.builtIn) {
+      return renderExecutorWorkflowRoutingToolSurface(template.prompt, options);
+    }
     return template.prompt;
   }
 
@@ -1456,6 +1510,9 @@ export function resolveAgentPrompt(
   const builtIn = BUILTIN_AGENT_PROMPTS.find((t) => t.role === role && t.id === `default-${role}`);
   if (role === PLANNER_AGENT_ROLE && builtIn?.id === "default-triage") {
     return `${TRIAGE_PROMPT_TEXT}\n\n${buildTriageHeartbeatGuidance(options)}`;
+  }
+  if (role === "executor" && builtIn) {
+    return renderExecutorWorkflowRoutingToolSurface(builtIn.prompt, options);
   }
   return builtIn?.prompt ?? "";
 }

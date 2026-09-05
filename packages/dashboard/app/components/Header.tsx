@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { Settings, LayoutGrid, List, Search, X, Activity, MoreHorizontal, Clock, Folder, History, GitBranch, Monitor, Workflow, Bot, Target, Grid3X3, Mail, MessageSquare, Check, Zap, Sparkles, FileText, Brain, Lock, Gauge, Lightbulb, ChevronDown, ChevronRight, PanelRight, Star } from "lucide-react";
+import { Settings, LayoutGrid, List, Search, X, Activity, MoreHorizontal, Clock, Folder, History, GitBranch, Monitor, Workflow, Bot, Target, Grid3X3, Mail, MessageSquare, Check, Zap, Sparkles, FileText, Brain, Lock, Gauge, Lightbulb, ChevronDown, ChevronRight, PanelRight, Plus, Star } from "lucide-react";
 import "./Header.css";
 // ProjectSelector styles used by the imported standalone component.
 import "./ProjectSelector.css";
@@ -74,6 +74,8 @@ export interface HeaderProps {
   filesOpen?: boolean;
   view?: TaskView;
   onChangeView?: (view: TaskView) => void;
+  /** Opens the existing App-owned full New Task modal. */
+  onNewTask?: () => void;
   /** Whether to show the skills tab in the view toggle */
   showSkillsTab?: boolean;
   /** When true, shows the Agents view tab button. Hidden by default (experimental feature). */
@@ -137,6 +139,7 @@ export function Header({
   onOpenFiles,
   view = "board",
   onChangeView,
+  onNewTask,
   showSkillsTab,
   showAgentsTab,
   searchQuery = "",
@@ -621,31 +624,6 @@ export function Header({
 
       <div className="header-actions">
         {shellConnectionControl}
-        {/* Mobile View Toggle - compact board/list switcher in header when mobile nav is active */}
-        {hideFullNav && onChangeView && (view === "board" || view === "list") && (
-          <div className="view-toggle" data-testid="mobile-view-toggle">
-            <button
-              className={`view-toggle-btn${view === "board" ? " active" : ""}`}
-              onClick={() => onChangeView("board")}
-              title={t("header.boardView", "Board view")}
-              aria-label={t("header.boardView", "Board view")}
-              aria-pressed={view === "board"}
-              data-testid="mobile-view-toggle-board"
-            >
-              <LayoutGrid size={16} />
-            </button>
-            <button
-              className={`view-toggle-btn${view === "list" ? " active" : ""}`}
-              onClick={() => onChangeView("list")}
-              title={t("header.listView", "List view")}
-              aria-label={t("header.listView", "List view")}
-              aria-pressed={view === "list"}
-              data-testid="mobile-view-toggle-list"
-            >
-              <List size={16} />
-            </button>
-          </div>
-        )}
 
         {/* Mobile Search Trigger - only on mobile, show trigger button in header */}
         {onSearchChange && isMobile && (hideFullNav || view === "board" || view === "list") && !shouldShowMobileSearch && (
@@ -923,7 +901,7 @@ export function Header({
                         data-testid="view-overflow-skills"
                       >
                         <Zap size={14} />
-                        <span>{t("header.skillsView", "Skills")}</span>
+                        <span>{t("header.skillsView", "Skills & Snippets")}</span>
                       </button>
                     )}
                     {experimentalFeatures?.memoryView && (
@@ -966,6 +944,18 @@ export function Header({
                         <span>{t("header.documentsView", "Artifacts view")}</span>
                       </button>
                     )}
+                    <button
+                      className={`view-toggle-overflow-item${view === "patchnode" ? " active" : ""}`}
+                      onClick={() => {
+                        onChangeView("patchnode");
+                        setIsViewOverflowOpen(false);
+                      }}
+                      role="menuitem"
+                      data-testid="view-overflow-patchnode"
+                    >
+                      <History size={14} />
+                      <span>{t("nav.patchnode", "History")}</span>
+                    </button>
                     {experimentalFeatures?.devServerView && (
                       <button
                         className={`view-toggle-overflow-item${view === "dev-server" || view === "devserver" ? " active" : ""}`}
@@ -1230,6 +1220,25 @@ export function Header({
               <span>{t("header.settings", "Settings")}</span>
             </button>
           </div>
+        )}
+
+        {/*
+        FNXC:MobileTaskNavigation 2026-08-20-05:47:
+        Issue #2226 moves mobile Board/List navigation to the footer so Header can expose App's single full-task modal entry point from every active project view. The Planning column keeps its separate quick-entry composer.
+
+        FNXC:MobileTaskNavigation 2026-09-03-04:56:
+        The header create-task control must remain the last child of the action cluster so it renders at the far right. Header actions deliberately have no order or row-reverse override, making DOM order the position contract.
+        */}
+        {isMobile && mobileNavEnabled && projectId && onNewTask && (
+          <button
+            className="btn-icon"
+            onClick={onNewTask}
+            title={t("newTaskModal.title", "New Task")}
+            aria-label={t("newTaskModal.title", "New Task")}
+            data-testid="mobile-header-new-task"
+          >
+            <Plus />
+          </button>
         )}
       </div>
     </header>

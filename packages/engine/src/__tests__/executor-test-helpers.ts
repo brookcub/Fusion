@@ -1,7 +1,37 @@
 import { vi } from "vitest";
 import type { Mock } from "vitest";
+import type { Task } from "@fusion/core";
 import { installTaskWorktreeIdentityGuard } from "../worktree/worktree-hooks.js";
 import type * as ReviewerModule from "../execution/reviewer.js";
+
+/*
+FNXC:EngineTests 2026-08-15-01:20:
+Graph dispatch made the agent store MANDATORY: admitWorkflowPrincipalBeforeNode (FN-8764/FN-8821,
+2026-08-07..09) fails closed with `workflow-principal-routing-unavailable:no-agent-store:<role>`
+before any model session is created, so a bare `new TaskExecutor(store, root)` never reaches
+createFnAgent and every fn_task_done/customTools capture stays undefined. Hundreds of legacy
+executor suites construct the executor bare; rather than edit each construction site, fill the
+missing agentStore at the ONE seam every such test goes through — the TaskExecutor constructor —
+with the same createWorkflowRoutingAgentStore fixture the migrated suites pass explicitly.
+An options bag that mentions `agentStore` at all (including an explicit `agentStore: undefined`)
+always wins, so suites asserting the fail-closed no-agent-store park keep that behavior by
+opting out explicitly. Mirrors the withSessionDefaults precedent below: supply only what a
+test omitted, never override what it controls.
+*/
+vi.mock("../executor.js", async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown> & {
+    TaskExecutor: new (store: unknown, rootDir: string, options?: Record<string, unknown>) => unknown;
+  };
+  class DefaultRoutedTaskExecutor extends actual.TaskExecutor {
+    constructor(store: any, rootDir: string, options: Record<string, unknown> = {}) {
+      const filled = "agentStore" in options
+        ? options
+        : { ...options, agentStore: createWorkflowRoutingAgentStore(store).agentStore };
+      super(store, rootDir, filled);
+    }
+  }
+  return { ...actual, TaskExecutor: DefaultRoutedTaskExecutor };
+});
 
 // Mock external dependencies
 vi.mock("../pi.js", () => ({
@@ -213,13 +243,6 @@ vi.mock("../agents/agent-session-helpers.js", async () => {
 
   };
 });
-vi.mock("../worktree/worktree-names.js", async () => {
-  const actual = await vi.importActual<typeof import("../worktree/worktree-names.js")>("../worktree/worktree-names.js");
-  return {
-    ...actual,
-    generateWorktreeName: vi.fn().mockReturnValue("swift-falcon"),
-  };
-});
 vi.mock("../worktree/worktree-pool.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../worktree/worktree-pool.js")>();
   const backend = await vi.importActual<typeof import("../worktree/worktree-backend.js")>("../worktree/worktree-backend.js");
@@ -229,6 +252,16 @@ vi.mock("../worktree/worktree-pool.js", async (importOriginal) => {
     RemovalReason: backend.RemovalReason,
     removeWorktree: vi.fn(actual.removeWorktree),
     classifyTaskWorktree: vi.fn().mockResolvedValue({ ok: true }),
+    /*
+    FNXC:ExecutorTests 2026-09-02-19:43:
+    Shared executor fixtures model FN-001's already-acquired pinned checkout. The acquisition boundary
+    now requires a non-empty registered branch probe in addition to classification, so provide matching
+    evidence rather than letting every session-oriented test fail before it opens an agent session.
+    */
+    getRegisteredWorktreeBranches: vi.fn().mockResolvedValue([{
+      worktreePath: "/tmp/test/.fusion/worktrees/fn-001",
+      branch: "fusion/fn-001",
+    }]),
     describeRegisteredWorktrees: vi.fn().mockResolvedValue({ rawOutput: "", canonicalized: [] }),
     isUsableTaskWorktree: vi.fn().mockResolvedValue(true),
   };
@@ -380,6 +413,14 @@ vi.mock("../execution/step-session-executor.js", () => ({
     const end = nextHeading === -1 ? prompt.length : nextHeading;
     return prompt.slice(start, end).trim();
   },
+  buildFastLanePrompt: (task: { id: string; description?: string; attachments?: Array<{ originalName: string }> }, _rootDir?: string, _settings?: unknown, worktreePath?: string) => [
+    `## Task: ${task.id}`,
+    "## Original Request",
+    task.description ?? "",
+    ...(task.attachments?.map((attachment) => attachment.originalName) ?? []),
+    `Work only inside ${worktreePath ?? "the assigned task worktree"}.`,
+    `fix(${task.id}): <short summary>`,
+  ].join("\n"),
 }));
 
 vi.mock("../errors/rate-limit-retry.js", () => ({
@@ -423,7 +464,6 @@ vi.mock("@earendil-works/pi-coding-agent", () => {
 
 import { createFnAgent } from "../pi.js";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { generateWorktreeName } from "../worktree/worktree-names.js";
 import { findWorktreeUser } from "../merger.js";
 import { StepSessionExecutor } from "../execution/step-session-executor.js";
 import { withRateLimitRetry } from "../errors/rate-limit-retry.js";
@@ -438,7 +478,6 @@ import { TaskExecutor } from "../executor.js";
 
 export const mockedCreateFnAgent = vi.mocked(createFnAgent);
 export const mockedSessionManager = vi.mocked(SessionManager);
-export const mockedGenerateWorktreeName = vi.mocked(generateWorktreeName);
 export const mockedFindWorktreeUser = vi.mocked(findWorktreeUser);
 export const mockedStepSessionExecutor = vi.mocked(StepSessionExecutor);
 export const mockedWithRateLimitRetry = vi.mocked(withRateLimitRetry);
@@ -524,6 +563,13 @@ export function createMockStore() {
   `getTask`/`updateTask` implementations replace these outright and are unaffected.
   */
   const patches = new Map<string, Record<string, unknown>>();
+  /*
+  FNXC:EngineTests 2026-08-21-08:34:
+  The shared executor store fake must preserve TaskStore's per-task atomic merge contract. Queue merge
+  calls and re-read after an async callback so sibling merges and simulated external task updates cannot
+  be overwritten by a stale workspaceWorktrees snapshot.
+  */
+  const workspaceMergeTails = new Map<string, Promise<void>>();
   const applyPatch = (id: string, patch: Record<string, unknown> | undefined) => {
     if (!patch || typeof patch !== "object") return;
     patches.set(id, { ...(patches.get(id) ?? {}), ...patch });
@@ -642,6 +688,67 @@ export function createMockStore() {
     updateTask: vi.fn(async (id: string, patch: Record<string, unknown>) => {
       applyPatch(id, patch);
       return { ...(patches.get(id) ?? {}), id };
+    }),
+    /*
+    FNXC:EngineTests 2026-09-04-03:21:
+    The shared executor store fake must model TaskStore's atomic reducer so terminal graph-failure
+    persistence can test its live-row fence without falling into production backoff retries.
+    */
+    updateTaskAtomic: vi.fn(async (
+      id: string,
+      updater: (current: Task) => Record<string, unknown> | null | Promise<Record<string, unknown> | null>,
+    ) => {
+      const current = await store.getTask(id) as Task;
+      const patch = await updater(current);
+      applyPatch(id, patch ?? undefined);
+      return store.getTask(id);
+    }),
+    mergeWorkspaceWorktreeEntry: vi.fn((
+      id: string,
+      repoRelPath: string,
+      patch: Partial<NonNullable<Task["workspaceWorktrees"]>[string]>
+        | ((current: Task) => Promise<Partial<NonNullable<Task["workspaceWorktrees"]>[string]>>),
+      options?: {
+        requireExistingEntry?: boolean;
+        clearSingularWorktree?: boolean;
+        validateBeforePersist?: (current: Task) => Promise<void>;
+      },
+    ) => {
+      const operation = (workspaceMergeTails.get(id) ?? Promise.resolve()).then(async () => {
+        const callbackTask = await store.getTask(id) as Task;
+        const callbackExisting = callbackTask.workspaceWorktrees?.[repoRelPath];
+        if (options?.requireExistingEntry && !callbackExisting) return callbackTask;
+        const resolvedPatch = typeof patch === "function" ? await patch(callbackTask) : patch;
+        const current = await store.getTask(id) as Task;
+        const workspaceWorktrees = current.workspaceWorktrees ?? {};
+        const existing = workspaceWorktrees[repoRelPath];
+        if (options?.requireExistingEntry && !existing) return current;
+        await options?.validateBeforePersist?.(current);
+        applyPatch(id, {
+          workspaceWorktrees: {
+            ...workspaceWorktrees,
+            [repoRelPath]: { ...existing, ...resolvedPatch },
+          },
+          ...(options?.clearSingularWorktree
+            ? {
+                worktree: null,
+                branch: null,
+                branchWriteOrigin: "engine",
+                executionStartBranch: null,
+                baseCommitSha: null,
+              }
+            : {}),
+        });
+        return store.getTask(id);
+      });
+      workspaceMergeTails.set(id, operation.then(() => undefined, () => undefined));
+      return operation;
+    }),
+    updateWorkspaceReviewState: vi.fn(async (id: string, _revision: number, reviewRemediation: unknown) => {
+      const current = await store.getTask(id);
+      const repositoryScope = { ...(current.repositoryScope ?? {}), reviewRemediation };
+      applyPatch(id, { repositoryScope });
+      return { task: { ...current, repositoryScope }, updated: true };
     }),
     recordActivity: vi.fn().mockResolvedValue({}),
     moveTask: makeWriteThroughMoveTask(),

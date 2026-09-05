@@ -6,7 +6,7 @@
  * blocker remains; otherwise log deferral. Uses resolved resume lanes (not literals).
  */
 import type { TaskStore } from "@fusion/core";
-import { getTaskMergeBlocker } from "@fusion/core";
+import { getTaskMergeBlocker, resolvePreMergeGateForTask } from "@fusion/core";
 import type { EngineRunContext } from "../util/run-audit.js";
 import type { ResumeLanes } from "./resolve-resume-lanes.js";
 
@@ -35,8 +35,20 @@ export async function finalizeAlreadyReviewedTask(
   unresolved blocker on any renamed board.
   */
   const resumeReviewLane = (await deps.resolveResumeLanes(taskId)).review;
+  let mergeGate;
+  try {
+    mergeGate = await resolvePreMergeGateForTask(deps.store, taskId, latestTask.enabledWorkflowSteps, latestTask);
+  } catch {
+    await deps.store.logEntry(taskId, "Task already in-review; merge deferred", "merge gate could not resolve the task workflow", deps.getRunContextFor(taskId));
+    return "blocked";
+  }
+  if (mergeGate.provenance === "default" && !mergeGate.selectionAbsent) {
+    await deps.store.logEntry(taskId, "Task already in-review; merge deferred", "merge gate could not resolve the task workflow", deps.getRunContextFor(taskId));
+    return "blocked";
+  }
   const blocker = getTaskMergeBlocker(latestTask, {
-    reviewColumns: new Set([resumeReviewLane ?? "in-review"]),
+    reviewColumns: mergeGate.reviewColumns.size > 0 ? mergeGate.reviewColumns : new Set([resumeReviewLane ?? "in-review"]),
+    requiredPreMergeStepIds: mergeGate.requiredPreMergeStepIds,
   });
   if (blocker) {
     await deps.store.logEntry(taskId, "Task already in-review; merge deferred", blocker, deps.getRunContextFor(taskId));

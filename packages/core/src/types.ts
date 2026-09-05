@@ -22,6 +22,11 @@ export type { TaskAgeStalenessLevel, TaskAgeStalenessSignal } from "./tasks/task
 // dashboard code (whose "@fusion/core" vite alias resolves to types.ts, not the
 // package barrel) can name the update channel union.
 export type { UpdateChannel } from "./i18n/app-version.js";
+/*
+FNXC:BranchNaming 2026-08-20-03:54:
+TaskForm needs the same browser-safe validator as the task store so operator feedback matches the shell-adjacent write boundary.
+*/
+export { isValidTaskBranchName } from "./branch/branch-assignment.js";
 
 export {
   computeCapacityRisk,
@@ -55,6 +60,18 @@ export type { IngestedCheckState, IngestedCheckStateValue, MergeablePrCheck } fr
  * selection. FN-7970 and FN-7969 preserve direct resolution for pre-existing
  * Brainstorming and Coding (Ideas) task selections while hiding them elsewhere.
  */
+/*
+FNXC:WorkflowDeprecation 2026-08-25-14:40:
+builtin:review-gated-coding is DELETED, not deprecated. It shipped with a success path that could
+never complete: `code-review -> documentation-delivery` put a write-capable node after a passed
+review, which `execute-workflow-graph` refuses with `workspace-review-seal-required`, and its plan
+node declared a seam `resolveSeamName` throws on. builtin:coding-ideas-v2 replaces it.
+It was briefly kept as a deprecated id so an existing selection still resolved. That is no longer
+worth its cost: it SHARED the documentation-delivery node with V2, so changing that node for V2
+silently changed this workflow too — a second consumer nobody was maintaining. A task that selected
+it now falls back to the project default workflow, which is the same outcome its own graph could
+never reach.
+*/
 export const DEPRECATED_BUILTIN_WORKFLOW_IDS: ReadonlySet<string> = new Set([
   "builtin:brainstorming",
 ]);
@@ -86,6 +103,13 @@ export {
   DEFAULT_TASK_PRIORITY,
 };
 export type { ThinkingLevel, Column, ColumnId, TaskPriority };
+export type {
+  PatchnodeEntryKind,
+  PatchnodeEntry,
+  PatchnodeDay,
+  PatchnodeFeed,
+  PatchnodeQuery,
+} from "./types/task/patchnode.js";
 
 import {
   MERGE_REQUEST_STATES,
@@ -275,6 +299,7 @@ import type {
   WorkflowReviewFindingSeverity,
   WorkflowReviewFindingResolution,
   WorkflowReviewFinding,
+  WorkflowRepositoryReviewOutcome,
   WorkflowStep,
   NtfyNotificationEvent,
   NotificationEvent,
@@ -298,6 +323,7 @@ export type {
   WorkflowReviewFindingSeverity,
   WorkflowReviewFindingResolution,
   WorkflowReviewFinding,
+  WorkflowRepositoryReviewOutcome,
   WorkflowStep,
   NtfyNotificationEvent,
   NotificationEvent,
@@ -341,18 +367,6 @@ export type {
   TaskSourceIssue,
 };
 
-/*
-FNXC:GitHubSourceIssueSplitClose 2026-08-01-09:24:
-When triage closes an imported parent after splitting it into child tasks, the authoritative
-in-process `task:deleted` event carries only this typed, ids-only reason so the GitHub owner can
-explain the close. PostgreSQL cannot observe the SQLite polling replica path, so this context is
-intentionally delivered only by the deleting store instance; cross-process delivery needs a separate
-outbox or event bridge.
-*/
-export interface TaskDeleteClosureContext {
-  kind: "split-into-subtasks";
-  childTaskIds: string[];
-}
 
 export interface BatchStatusRequest {
   taskIds: string[];
@@ -387,6 +401,7 @@ import type {
   AgentLogType,
   ArchiveAgentLogMode,
   TaskStep,
+  TaskStepReport,
   RunMutationContext,
   TaskLogLevel,
   TaskLogEntryWriteOptions,
@@ -407,6 +422,7 @@ export type {
   AgentLogType,
   ArchiveAgentLogMode,
   TaskStep,
+  TaskStepReport,
   RunMutationContext,
   TaskLogLevel,
   TaskLogEntryWriteOptions,
@@ -555,6 +571,16 @@ export type {
   GoalCitationFilter,
 };
 
+export {
+  EXTERNAL_BLOCK_STATUS,
+  EXTERNAL_BLOCK_PAUSE_REASON,
+  isTaskExternallyBlocked,
+  buildTaskExternalBlockPatch,
+  buildTaskExternalBlockClearPatch,
+  formatTaskExternalBlockReason,
+} from "./tasks/task-external-block.js";
+export type { TaskExternalBlock, TaskExternalBlockOrigin } from "./tasks/task-external-block.js";
+
 // ── task-core ──────────────────────────────────────────────────────────
 // FNXC:CodeOrganization 2026-07-22-14:00: Peels live in types/task-core.ts
 
@@ -614,6 +640,9 @@ import type {
   TaskRecommendationCategory,
   TaskRecommendationListItem,
   TaskRecommendationListPage,
+  WorkspaceLandFailure,
+  WorkspaceWorktreeEntry,
+  TaskRepositoryScope,
   Task,
   TaskReleaseGateVerdict,
   TaskVerificationResultSummary,
@@ -661,6 +690,9 @@ export type {
   TaskRecommendationCategory,
   TaskRecommendationListItem,
   TaskRecommendationListPage,
+  WorkspaceLandFailure,
+  WorkspaceWorktreeEntry,
+  TaskRepositoryScope,
   Task,
   TaskReleaseGateVerdict,
   TaskVerificationResultSummary,
@@ -719,6 +751,13 @@ import {
   resolvePersistAgentThinkingLog,
   sanitizeCliAgentSettings,
   sanitizeCliAgentsSettings,
+  normalizeChatSnippetName,
+  normalizeChatSnippets,
+  readChatSnippets,
+  CHAT_SNIPPET_RESERVED_NAMES,
+  CHAT_SNIPPET_MAX_ENTRIES,
+  CHAT_SNIPPET_MAX_NAME_LENGTH,
+  CHAT_SNIPPET_MAX_PROMPT_LENGTH,
   sanitizeMcpServers,
   CLI_AGENT_ADAPTER_IDS,
   CLI_AGENT_AUTONOMY_MODES,
@@ -740,6 +779,13 @@ export {
   resolvePersistAgentThinkingLog,
   sanitizeCliAgentSettings,
   sanitizeCliAgentsSettings,
+  normalizeChatSnippetName,
+  normalizeChatSnippets,
+  readChatSnippets,
+  CHAT_SNIPPET_RESERVED_NAMES,
+  CHAT_SNIPPET_MAX_ENTRIES,
+  CHAT_SNIPPET_MAX_NAME_LENGTH,
+  CHAT_SNIPPET_MAX_PROMPT_LENGTH,
   sanitizeMcpServers,
   CLI_AGENT_ADAPTER_IDS,
   CLI_AGENT_AUTONOMY_MODES,
@@ -785,6 +831,7 @@ import type {
   DashboardKeyboardShortcuts,
   BackupSettingsMigrationCandidate,
   BackupSettingsMigrationConflict,
+  ChatSnippet,
   GlobalSettings,
   CliAgentSettings,
   RemoteAccessProvidersConfig,
@@ -836,6 +883,7 @@ export type {
   DashboardKeyboardShortcuts,
   BackupSettingsMigrationCandidate,
   BackupSettingsMigrationConflict,
+  ChatSnippet,
   GlobalSettings,
   CliAgentSettings,
   RemoteAccessProvidersConfig,
@@ -1101,6 +1149,12 @@ FNXC:AutomationTools 2026-06-26-00:00:
 Dashboard source-checkout builds alias @fusion/core to this frontend-safe module, so mirror the automation AI-step tool catalog here as a runtime export for UI selectors.
 */
 export const AUTOMATION_SELECTABLE_TOOLS = ["Read", "Bash", "Edit", "Write", "Grep", "Find", "Ls"] as const;
+
+/*
+FNXC:TaskMessageLength 2026-08-29-08:02:
+Operator-authored task text for steering comments, task comments, refinement, and spec-revision feedback must not be capped below direct chat, which has no character limit and is bounded by its 2 MiB JSON envelope. This 100,000-character limit matches the task-document content cap and stays inside that envelope even for worst-case multibyte, JSON-escaped input.
+*/
+export const MAX_TASK_MESSAGE_LENGTH = 100_000;
 
 /** Snapshot of the last blocked state for a task, used for dedup comparison. */
 export interface BlockedStateSnapshot {
@@ -1555,6 +1609,13 @@ export { PROMPT_KEY_CATALOG } from "./tasks/prompt-overrides.js";
 // Re-exported here so the dashboard's `@fusion/core` → types.ts alias resolves
 // client-side consumers (see packages/dashboard/vite.config.ts).
 export { getErrorMessage } from "./process/error-message.js";
+
+/*
+FNXC:ChatMemoryFocus 2026-08-24-04:21:
+Dashboard client imports resolve @fusion/core to this browser-safe leaf, so expose the pure
+experimental flag reader here. Its Settings dependency is type-only and introduces no browser runtime cycle.
+*/
+export { isExperimentalFeatureEnabled, CHAT_FOCUS_FLAG } from "./config/experimental-features.js";
 export {
   resolveExecutionSettingsModel,
   resolvePlanningSettingsModel,
@@ -1594,7 +1655,7 @@ sorter here so Board, Lane, and ListView share core policy without importing a N
 The sorter and its transitive role/merge/priority helpers are browser-safe.
 */
 export { sortTasksForDisplayColumn } from "./tasks/task-priority.js";
-export type { DoneColumnSortMode, DisplayColumnSortOptions } from "./tasks/task-priority.js";
+export type { TaskColumnSortMode, ColumnSortMode, DoneColumnSortMode, DisplayColumnSortOptions } from "./tasks/task-priority.js";
 
 /*
 FNXC:MissionValidationRepair 2026-08-11-00:10:

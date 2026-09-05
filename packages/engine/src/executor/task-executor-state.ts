@@ -24,6 +24,7 @@ import { StepSessionExecutor } from "../execution/step-session-executor.js";
 import type { PausedAbortProvenance } from "./paused-abort-provenance.js";
 import type { ActiveExecutorSessionState, TaskExecutorOptions } from "./task-executor-options.js";
 import type { WorkflowAgentCapacity } from "../agents/workflow-agent-capacity.js";
+import { invalidateWorkspaceConfigCache } from "./workspace-config-resolver.js";
 
 export abstract class TaskExecutorState {
   /**
@@ -62,12 +63,23 @@ export abstract class TaskExecutorState {
    * `agent` is the admission-time row so session identity does not depend on a second getAgent round-trip.
    */
   protected activeWorkflowPrincipals = new Map<string, { agentId: string; nodeInstanceId: string; agent?: Agent }>();
+  /**
+   * FNXC:AgentActivityStream 2026-08-09-13:59 (restored 2026-08-15-22:15 after wave-18 shell-ification dropped it):
+   * Node-scoped routed-principal retention (`taskId\0nodeId` -> agentId) that outlives release-principal,
+   * because the graph can emit a terminal gate result AFTER the per-attempt reservation is released while
+   * the activity outbox must still attribute that gate to the exact routed principal (FN-8864).
+   */
+  protected workflowGateActivityPrincipals = new Map<string, string>();
   protected executing = new Set<string>();
+  /** Deferred terminal-park callbacks currently in flight (restart-recovery intent chain). */
+  protected deferredTerminalParksInFlight = new Set<string>();
   protected resumingUnpaused = new Set<string>();
   protected approvalSuspended = new Set<string>();
   protected approvalResumeAfterUnwind = new Set<string>();
   protected recoveringCompleted = new Set<string>();
   protected capturedReflectionTaskIds = new Set<string>();
+  /** Task ids that already had their Stash memory capture attempted (completion-gated). */
+  protected capturedMemoryTaskIds = new Set<string>();
   protected workflowRerunPending = new Set<string>();
   protected workflowLifecycleMovesInFlight = new Set<string>();
   protected pendingTaskDisposals = new Map<string, Promise<void>>();
@@ -102,6 +114,11 @@ export abstract class TaskExecutorState {
   protected workflowRerunWatchdogs = new Map<string, ReturnType<typeof setTimeout>>();
   protected pendingEphemeralDeletions = new Set<string>();
   protected workspaceConfig: WorkspaceConfig | null | undefined = undefined;
+  /** Workspace mode is memoized per executor host; a real settings transition must refresh it live. */
+  public invalidateWorkspaceConfig(): void {
+    this.workspaceConfig = undefined;
+    invalidateWorkspaceConfigCache(this);
+  }
   protected childSessions = new Map<string, AgentSession>();
   protected totalSpawnedCount = 0;
   protected tokenCapDetector = new TokenCapDetector();

@@ -3,6 +3,8 @@ import type { Task } from "@fusion/core";
 
 const createIssueMock = vi.fn();
 const searchIssuesMock = vi.fn();
+const getIssueMock = vi.fn();
+const setIssueStateMock = vi.fn();
 const resolveAuthMock = vi.fn();
 const summarizeTitleMock = vi.fn();
 
@@ -19,6 +21,8 @@ vi.mock("../github.js", async (importOriginal) => ({
   GitHubClient: vi.fn().mockImplementation(function () { return {
     createIssue: createIssueMock,
     searchIssues: searchIssuesMock,
+    getIssue: getIssueMock,
+    setIssueState: setIssueStateMock,
   }; }),
 }));
 
@@ -163,6 +167,8 @@ describe("maybeCreateTrackingIssue", () => {
     });
     summarizeTitleMock.mockResolvedValue(null);
     searchIssuesMock.mockResolvedValue([]);
+    getIssueMock.mockResolvedValue({ state: "open" });
+    setIssueStateMock.mockResolvedValue(undefined);
   });
 
   it("returns tracking_disabled when not enabled", async () => {
@@ -227,6 +233,49 @@ describe("maybeCreateTrackingIssue", () => {
     expect(result).toEqual({ created: false, reason: "no_repo_configured" });
     expect(recordActivity).toHaveBeenCalledTimes(1);
     expect(createIssueMock).not.toHaveBeenCalled();
+  });
+
+  it("closes a newly created tracking issue when the task is already done", async () => {
+    const linkGithubIssue = vi.fn();
+    const recordActivity = vi.fn();
+    const logEntry = vi.fn();
+
+    const result = await maybeCreateTrackingIssue(buildTask({
+      title: "Already finished",
+      column: "done",
+      executionCompletedAt: "2026-08-15T04:34:26.712Z",
+      githubTracking: { enabled: true },
+    }), {
+      taskStore: { linkGithubIssue, recordActivity, logEntry } as any,
+      projectSettings: {},
+      globalSettings: { githubTrackingDefaultRepo: "o/r" } as any,
+      rootDir,
+      logger: { warn: vi.fn(), info: vi.fn() },
+    });
+
+    expect(result).toMatchObject({ created: true });
+    expect(createIssueMock).toHaveBeenCalledTimes(1);
+    expect(setIssueStateMock).toHaveBeenCalledWith("o", "r", 12, "closed", "completed");
+    expect(logEntry).toHaveBeenCalledWith("FN-1", "Closed linked GitHub tracking issue", "o/r#12");
+  });
+
+  it("does not close a tracking issue created for an in-progress task", async () => {
+    const linkGithubIssue = vi.fn();
+    const recordActivity = vi.fn();
+
+    await maybeCreateTrackingIssue(buildTask({
+      title: "Still running",
+      column: "in-progress",
+      githubTracking: { enabled: true },
+    }), {
+      taskStore: { linkGithubIssue, recordActivity } as any,
+      projectSettings: {},
+      globalSettings: { githubTrackingDefaultRepo: "o/r" } as any,
+      rootDir,
+      logger: { warn: vi.fn(), info: vi.fn() },
+    });
+
+    expect(setIssueStateMock).not.toHaveBeenCalled();
   });
 
   it("creates issue, links metadata, and records activity", async () => {
@@ -690,7 +739,7 @@ describe("maybeCreateTrackingIssue", () => {
       logger: { warn: vi.fn(), info: vi.fn() },
     });
 
-    expect(summarizeTitleMock).toHaveBeenCalledWith(longDescription, rootDir, "anthropic", "claude");
+    expect(summarizeTitleMock).toHaveBeenCalledWith(longDescription, rootDir, "anthropic", "claude", expect.objectContaining({ mode: "english", locale: "en" }));
     expect(updateTask).toHaveBeenCalledWith("FN-1", { title: "AI generated title" });
     expect(createIssueMock).toHaveBeenCalledWith(expect.objectContaining({ title: "[FN-1] AI generated title" }));
     expect(recordActivity).toHaveBeenCalledWith(expect.objectContaining({ metadata: { type: "github-tracking-title-summarized" } }));
@@ -777,17 +826,21 @@ describe("maybeCreateTrackingIssue", () => {
     expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("AI title summarizer failed"));
   });
 
-  it("does not invoke the summarizer when the description is too short", async () => {
+  it("invokes the configured summarizer for a short titleless description", async () => {
+    summarizeTitleMock.mockResolvedValue("AI short title");
+    const updateTask = vi.fn().mockImplementation(async (_id, updates) => buildTask({ title: updates.title, description: "Short title fallback" }));
+
     await maybeCreateTrackingIssue(buildTask({ title: "", description: "Short title fallback", githubTracking: { enabled: true } }), {
-      taskStore: { linkGithubIssue: vi.fn(), recordActivity: vi.fn(), updateTask: vi.fn() } as any,
+      taskStore: { linkGithubIssue: vi.fn(), recordActivity: vi.fn(), updateTask } as any,
       projectSettings: { titleSummarizerProvider: "anthropic", titleSummarizerModelId: "claude" } as any,
       globalSettings: { githubTrackingDefaultRepo: "o/r" } as any,
       rootDir,
       logger: { warn: vi.fn(), info: vi.fn() },
     });
 
-    expect(summarizeTitleMock).not.toHaveBeenCalled();
-    expect(createIssueMock).toHaveBeenCalledWith(expect.objectContaining({ title: "[FN-1] Short title fallback" }));
+    expect(summarizeTitleMock).toHaveBeenCalledWith("Short title fallback", rootDir, "anthropic", "claude", expect.objectContaining({ mode: "english", locale: "en" }));
+    expect(updateTask).toHaveBeenCalledWith("FN-1", { title: "AI short title" });
+    expect(createIssueMock).toHaveBeenCalledWith(expect.objectContaining({ title: "[FN-1] AI short title" }));
   });
 
   it("does not invoke the summarizer when no summarizer model is configured", async () => {

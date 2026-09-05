@@ -20,7 +20,7 @@ import { existsSync, mkdirSync, realpathSync, renameSync } from "node:fs";
 import type { ConfigChangedBy, ConfigKind, ConfigurationRevision, ConfigurationTarget, GlobalSettings } from "../types.js";
 import { CONFIG_CHANGED_BY_SYSTEM } from "../types.js";
 import { DEFAULT_GLOBAL_SETTINGS } from "../types.js";
-import { sanitizeCliAgentsSettings } from "./settings-schema.js";
+import { normalizeChatSnippets, sanitizeCliAgentsSettings } from "./settings-schema.js";
 import type { AsyncDataLayer } from "../postgres/data-layer.js";
 import { GLOBAL_CONFIGURATION_OWNER_ID, appendGlobalConfigurationRevision, createConfigurationRevision, getGlobalConfigurationRevision, listGlobalConfigurationRevisions } from "../async-stores/async-configuration-revision-store.js";
 
@@ -33,6 +33,19 @@ immutable global revision partition. Unit-only filesystem tests deliberately
 remain layerless; production always initializes the central PostgreSQL layer.
 */
 const directGlobalRevisionLayers = new Map<string, Promise<AsyncDataLayer>>();
+
+/** Process-local settings-file generations keep independently constructed stores coherent. */
+const settingsCacheEpochs = new Map<string, number>();
+
+function getSettingsCacheEpoch(settingsPath: string): number {
+  return settingsCacheEpochs.get(settingsPath) ?? 0;
+}
+
+function bumpSettingsCacheEpoch(settingsPath: string): number {
+  const next = getSettingsCacheEpoch(settingsPath) + 1;
+  settingsCacheEpochs.set(settingsPath, next);
+  return next;
+}
 
 function getHomeDir(): string {
   return process.env.HOME || process.env.USERPROFILE || homedir();
@@ -152,6 +165,7 @@ export class GlobalSettingsStore {
 
   /** Write-through cache for settings. Invalidated on every updateSettings() call. */
   private cachedSettings: GlobalSettings | null = null;
+  private cachedSettingsEpoch = 0;
 
   /** Promise chain for serializing read-modify-write cycles */
   private lock: Promise<void> = Promise.resolve();
@@ -199,6 +213,7 @@ export class GlobalSettingsStore {
     await mkdir(this.dir, { recursive: true });
     if (!existsSync(this.settingsPath)) {
       await this.atomicWrite(DEFAULT_GLOBAL_SETTINGS);
+      bumpSettingsCacheEpoch(this.settingsPath);
       return true;
     }
     return false;
@@ -248,12 +263,27 @@ export class GlobalSettingsStore {
    * If the file doesn't exist or is invalid, returns defaults without throwing.
    */
   async getSettings(): Promise<GlobalSettings> {
-    if (this.cachedSettings !== null) {
+    for (;;) {
+      const currentEpoch = getSettingsCacheEpoch(this.settingsPath);
+      if (this.cachedSettings !== null && this.cachedSettingsEpoch === currentEpoch) {
+        return this.cachedSettings;
+      }
+
+      const parsed = await this.readRaw();
+      if (getSettingsCacheEpoch(this.settingsPath) !== currentEpoch) {
+        /*
+        FNXC:RemoteAccessAuth 2026-08-18-07:06:
+        A remote-token writer can finish while another store is reading settings.
+        Retry instead of caching the pre-write snapshot at the new generation,
+        because /remote-login must immediately accept the freshly minted token.
+        */
+        continue;
+      }
+
+      this.cachedSettings = { ...DEFAULT_GLOBAL_SETTINGS, ...parsed } as GlobalSettings;
+      this.cachedSettingsEpoch = currentEpoch;
       return this.cachedSettings;
     }
-    const parsed = await this.readRaw();
-    this.cachedSettings = { ...DEFAULT_GLOBAL_SETTINGS, ...parsed } as GlobalSettings;
-    return this.cachedSettings;
   }
 
   /**
@@ -299,6 +329,8 @@ export class GlobalSettingsStore {
           // unknown adapter ids and invalid fields are dropped before persist so
           // a malformed `cliAgents` payload can never reach launch resolution.
           merged[key] = sanitizeCliAgentsSettings(value);
+        } else if (key === "chatSnippets") {
+          merged[key] = normalizeChatSnippets(value);
         } else {
           // normal value → set it
           merged[key] = value;
@@ -330,7 +362,14 @@ export class GlobalSettingsStore {
         await mkdir(this.dir, { recursive: true });
         await this.atomicWrite(withDefaults);
       }
+      /*
+      FNXC:RemoteAccessAuth 2026-08-18-06:49:
+      Remote-token writers and /remote-login use separate GlobalSettingsStore
+      instances. Publish a settings-file generation after the atomic write so a
+      primed reader cannot reject a newly minted token or write it back stale.
+      */
       this.cachedSettings = withDefaults;
+      this.cachedSettingsEpoch = bumpSettingsCacheEpoch(this.settingsPath);
       return this.cachedSettings;
     });
   }
@@ -392,6 +431,7 @@ export class GlobalSettingsStore {
    */
   invalidateCache(): void {
     this.cachedSettings = null;
+    this.cachedSettingsEpoch = bumpSettingsCacheEpoch(this.settingsPath);
   }
 
   // ── Private helpers ─────────────────────────────────────────────

@@ -200,20 +200,28 @@ export function CustomModelDropdown({
   const hasNoChangeOption = typeof noChangeValue === "string" && noChangeValue.length > 0;
   const shouldShowThinking = showThinkingLevel ?? Boolean(onThinkingLevelChange);
   const normalizedThinkingLevel = thinkingLevel ?? "";
+  const selectedModel = useMemo(() => {
+    if (!value || (hasNoChangeOption && value === noChangeValue)) return undefined;
+    const slashIdx = value.indexOf("/");
+    if (slashIdx <= 0) return undefined;
+    return models.find((model) => model.provider === value.slice(0, slashIdx) && model.id === value.slice(slashIdx + 1));
+  }, [hasNoChangeOption, models, noChangeValue, value]);
   const hasDefaultThinkingOption = typeof defaultThinkingLevel === "string";
   const thinkingSelectId = id ? `${id}-thinking-level` : `${generatedThinkingId}-thinking-level`;
 
   /*
-  FNXC:Settings-ThinkingLevel 2026-07-10-00:00:
-  The shared model dropdown can optionally embed a thinking-level selector so task and agent model pickers expose one consistent reasoning-effort affordance, including `xhigh`. The selector stays inert unless a caller opts in with `showThinkingLevel` or `onThinkingLevelChange`, preserving every settings, insights, schedule, workflow, planning, onboarding, and bulk-edit surface that only needs model selection.
+  FNXC:Settings-ThinkingLevel 2026-08-18-23:38:
+  The shared model dropdown can optionally embed a thinking-level selector so task and agent model pickers expose one consistent reasoning-effort affordance, including the canonical `xhigh` and `max` levels. Model metadata narrows the list only when documented capabilities are available; missing metadata keeps the canonical fallback. The selector stays inert unless a caller opts in with `showThinkingLevel` or `onThinkingLevelChange`, preserving every settings, insights, schedule, workflow, planning, onboarding, and bulk-edit surface that only needs model selection.
   */
-  const thinkingOptions = useMemo(() => THINKING_LEVELS.map((level) => ({
+  const thinkingOptions = useMemo(() => (selectedModel?.supportedThinkingLevels ?? THINKING_LEVELS).map((level) => ({
     value: level,
     label: t(`models.options.${level}`, level === "xhigh" ? "Very High" : level.charAt(0).toUpperCase() + level.slice(1)),
-  })), [t]);
+  })), [selectedModel, t]);
+  const hasStaleThinkingLevel = Boolean(normalizedThinkingLevel) && !thinkingOptions.some((option) => option.value === normalizedThinkingLevel);
+  const shouldRenderThinking = shouldShowThinking && (thinkingOptions.length > 0 || hasStaleThinkingLevel || hasDefaultThinkingOption);
 
   const thinkingBadgeLabel = useMemo(() => {
-    if (!shouldShowThinking) return "";
+    if (!shouldRenderThinking) return "";
     if (normalizedThinkingLevel) {
       return thinkingOptions.find((option) => option.value === normalizedThinkingLevel)?.label ?? normalizedThinkingLevel;
     }
@@ -221,7 +229,7 @@ export function CustomModelDropdown({
       return t("modelSelection.thinkingDefault", "Default ({{level}})", { level: defaultThinkingLevel });
     }
     return thinkingOptions.find((option) => option.value === "off")?.label ?? "Off";
-  }, [defaultThinkingLevel, hasDefaultThinkingOption, normalizedThinkingLevel, shouldShowThinking, t, thinkingOptions]);
+  }, [defaultThinkingLevel, hasDefaultThinkingOption, normalizedThinkingLevel, shouldRenderThinking, t, thinkingOptions]);
 
   // Get current provider from value
   const currentProvider = useMemo(() => {
@@ -521,18 +529,18 @@ export function CustomModelDropdown({
   /*
   FNXC:ModelDropdown 2026-08-12-21:56:
   Every dashboard host must treat the document.body model-menu portal as inside its model control. Stop native pointer and mouse events at the portal boundary before document-level outside-close listeners run, so provider collapse/expand remains interactive on desktop and mobile without requiring each consumer to duplicate the portal exemption.
+
+  FNXC:ModelDropdown 2026-08-15-12:27:
+  Mobile hosts may close from touchstart before a virtual-keyboard re-anchor sends the synthesized click to a backdrop. Stop touchstart and touchend too, but never click: React option and favorite handlers dispatch through this body portal.
   */
   useEffect(() => {
     const dropdown = dropdownRef.current;
     if (!dropdown) return;
 
     const stopPortalOutsideClose = (event: Event) => event.stopPropagation();
-    dropdown.addEventListener("pointerdown", stopPortalOutsideClose);
-    dropdown.addEventListener("mousedown", stopPortalOutsideClose);
-    return () => {
-      dropdown.removeEventListener("pointerdown", stopPortalOutsideClose);
-      dropdown.removeEventListener("mousedown", stopPortalOutsideClose);
-    };
+    const events = ["pointerdown", "mousedown", "touchstart", "touchend"] as const;
+    events.forEach((eventName) => dropdown.addEventListener(eventName, stopPortalOutsideClose));
+    return () => events.forEach((eventName) => dropdown.removeEventListener(eventName, stopPortalOutsideClose));
   }, [dropdownPosition, isOpen]);
 
   // Keyboard navigation
@@ -660,6 +668,7 @@ export function CustomModelDropdown({
       className="model-combobox-dropdown model-combobox-dropdown--portal"
       role="listbox"
       data-testid="model-combobox-portal"
+      data-portal-surface="model-menu"
       data-menu-width={menuWidth}
       onKeyDown={handleKeyDown}
       style={{
@@ -718,7 +727,7 @@ export function CustomModelDropdown({
         </div>
       )}
 
-      {shouldShowThinking && (
+      {shouldRenderThinking && (
         <div className="model-combobox-thinking" onMouseDown={(e) => e.stopPropagation()} onClick={(e) => e.stopPropagation()}>
           <label className="model-combobox-thinking-label" htmlFor={thinkingSelectId}>
             {t("models.labels.thinkingLevel", "Thinking Level")}
@@ -735,6 +744,11 @@ export function CustomModelDropdown({
             {hasDefaultThinkingOption && (
               <option value="">{t("modelSelection.thinkingDefault", "Default ({{level}})", { level: defaultThinkingLevel })}</option>
             )}
+            {hasStaleThinkingLevel ? (
+              <option value={normalizedThinkingLevel} disabled>
+                {t("models.options.unavailable", "Unavailable: {{level}}", { level: normalizedThinkingLevel })}
+              </option>
+            ) : null}
             {thinkingOptions.map((option) => (
               <option key={option.value} value={option.value}>{option.label}</option>
             ))}
@@ -910,7 +924,7 @@ export function CustomModelDropdown({
             </span>
           )}
           <span className="model-combobox-trigger-text">{selectedDisplayText || placeholder}</span>
-          {shouldShowThinking && (
+          {shouldRenderThinking && (
             <span className={`model-badge ${normalizedThinkingLevel ? "model-badge-custom" : "model-badge-default"} model-combobox-thinking-badge`} data-testid="custom-model-dropdown-thinking-badge">
               {thinkingBadgeLabel}
             </span>

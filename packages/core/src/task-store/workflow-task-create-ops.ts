@@ -41,7 +41,7 @@ import {getTaskMovedCountsByDay as getTaskMovedCountsByDayAsync} from "../task-s
 import {getAllDocuments as getAllDocumentsAsync} from "../task-store/async/async-comments-attachments.js";
 import {recordGoalCitations as recordGoalCitationsAsync} from "../task-store/async/async-events.js";
 import type { WorkflowWorkItemRow } from "../task-store/row-types.js";
-import { projectScopeFor } from "../postgres/data-layer.js";
+import { projectScopeFor, type DbTransaction } from "../postgres/data-layer.js";
 
 export async function recordGoalCitationsImpl(store: TaskStore, inputs: GoalCitationInput[]): Promise<GoalCitation[]> {
         const layer = store.asyncLayer!;
@@ -71,7 +71,12 @@ export async function assertTaskIdAvailableImpl(store: TaskStore, id: string): P
     }
   }
 
-export async function atomicWriteTaskJsonImpl2(store: TaskStore, dir: string, task: Task): Promise<void> {
+export async function atomicWriteTaskJsonImpl2(
+  store: TaskStore,
+  dir: string,
+  task: Task,
+  options?: { withinTransaction?: (tx: DbTransaction) => Promise<void> },
+): Promise<void> {
     const id = store.getTaskIdFromDir(dir);
     // FNXC:RuntimeTaskOrchestrationAsync 2026-06-24-14:05:
     // Backend mode: upsert the task row via async Drizzle instead of sync SQLite.
@@ -145,6 +150,7 @@ export async function atomicWriteTaskJsonImpl2(store: TaskStore, dir: string, ta
       } else {
         await persist();
       }
+      await options?.withinTransaction?.(tx);
     });
     await store.writeTaskJsonFile(dir, task);
     return;
@@ -447,6 +453,37 @@ export async function listWorkflowWorkItemsForTaskImpl(store: TaskStore, taskId:
           .where(and(scope, eq(schema.project.workflowWorkItems.taskId, taskId), inArray(schema.project.workflowWorkItems.kind, opts.kinds)))
       : await q;
     return (rows as WorkflowWorkItemRow[]).map((row) => store.rowToWorkflowWorkItem(row));
+}
+
+/*
+FNXC:MergeAuthority 2026-08-23-20:05 (FN-9191/FN-9193 follow-up, review finding #10):
+BATCHED sibling of `listWorkflowWorkItemsForTaskImpl`. The in-review merge sweep asks "where is this
+card's graph?" for EVERY review-lane card on every 15s poll; per-task reads made that 1 query per
+card per poll. One `inArray` over the candidate ids answers the whole sweep in a single round trip.
+Returns a Map keyed by taskId so a caller can look up a card with no result (empty array) without
+distinguishing it from a card that was never asked about.
+*/
+export async function listWorkflowWorkItemsForTasksImpl(
+  store: TaskStore,
+  taskIds: readonly string[],
+  opts: { kinds?: WorkflowWorkItemKind[] } = {},
+): Promise<Map<string, WorkflowWorkItem[]>> {
+    const byTask = new Map<string, WorkflowWorkItem[]>();
+    for (const taskId of taskIds) byTask.set(taskId, []);
+    if (taskIds.length === 0) return byTask;
+    const layer = store.asyncLayer!;
+    const scope = projectScopeFor(schema.project.workflowWorkItems.projectId, layer.projectId);
+    const conditions = [scope, inArray(schema.project.workflowWorkItems.taskId, [...taskIds])];
+    if (opts.kinds?.length) conditions.push(inArray(schema.project.workflowWorkItems.kind, opts.kinds));
+    const rows = await layer.db
+      .select()
+      .from(schema.project.workflowWorkItems)
+      .where(and(...conditions));
+    for (const row of rows as WorkflowWorkItemRow[]) {
+      const item = store.rowToWorkflowWorkItem(row);
+      byTask.get(item.taskId)?.push(item);
+    }
+    return byTask;
 }
 
 export async function listDueWorkflowWorkItemsImpl(store: TaskStore, filter: WorkflowWorkItemDueFilter = {}): Promise<WorkflowWorkItem[]> {

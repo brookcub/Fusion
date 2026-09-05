@@ -9,16 +9,13 @@ import {
 
 const searchTranslations: Record<string, string> = {
   "settings.projectModels.chatHeading": "Chat",
-  "settings.projectModels.chatDescription": "Choose the default target for new Direct chats and whether New Chat should prompt or immediately use that default.",
-  "settings.projectModels.chatNewSessionMode": "New Chat behavior",
-  "settings.projectModels.chatNewSessionModePrompt": "Prompt for model each time",
-  "settings.projectModels.chatNewSessionModeAlwaysDefault": "Always use configured default",
+  "settings.projectModels.chatDescription": "Choose the default target for new Direct chats. New Chat always creates the conversation immediately from this default.",
   "settings.projectModels.chatDefaultKind": "Chat default target",
   "settings.projectModels.chatDefaultModel": "Chat Default Model",
   "settings.projectModels.chatDefaultAgent": "Chat Default Agent",
   "settings.projectModels.aITitleAndGitCommitMessageSummarization": "AI Title and Git Commit Message Summarization",
-  "settings.projectModels.autoSummarizeLongDescriptionsAsTitles": "Auto-summarize long descriptions as titles",
-  "settings.projectModels.whenEnabledTasksCreatedWithoutATitleBut": "When enabled, tasks created without a title but with descriptions over 200 characters will automatically get an AI-generated title",
+  "settings.projectModels.autoSummarizeLongDescriptionsAsTitles": "Auto-summarize task titles",
+  "settings.projectModels.whenEnabledTasksCreatedWithoutATitleBut": "When enabled, every non-empty task description created without a title receives an AI-generated title",
   "settings.projectModels.aIMergeCommitSummaries": "AI merge commit summaries",
   "settings.projectModels.whenEnabledMergeCommitMessagesIncludeAnAI": "When enabled, merge commit messages include an AI-generated subject plus body summary",
 };
@@ -48,6 +45,7 @@ describe("SettingsModal Settings search index", () => {
     "summarize",
     "auto summarize",
     "auto-summarize titles",
+    "task titles",
     "title summarization",
     "autoSummarizeTitles",
     "AI title",

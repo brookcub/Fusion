@@ -32,11 +32,12 @@ The previously documented https://github.com/superagent-ai/grok-cli contract is 
 Fusion's `GrokRuntimeAdapter` drives Grok as an ACP (Agent Client Protocol) agent over JSON-RPC/stdio, following [xAI Headless & Scripting](https://docs.x.ai/build/cli/headless-scripting#acp):
 
 ```bash
-# Official automation shape (docs.x.ai): suppress update checks in CI/scripts
-grok --no-auto-update agent stdio
+grok agent stdio
 # with optional model + session skills plugin:
-grok --no-auto-update agent --plugin-dir <session-plugin> -m grok-4.6 stdio
+grok agent --plugin-dir <session-plugin> -m grok-4.6 stdio
 ```
+
+xAI's [Headless & Scripting docs](https://docs.x.ai/build/cli/headless-scripting#acp) suggest `--no-auto-update`, but released Grok CLI v1.0.0 exits with "unexpected argument" when it is passed. Fusion therefore defaults it OFF and exposes it only as the opt-in `buildGrokAcpArgs({ noAutoUpdate: true })` argument, which prepends the flag before `agent`.
 
 ACP session lifecycle (official contract):
 

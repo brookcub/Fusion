@@ -160,6 +160,7 @@ describe("TaskDetailModal", () => {
       expect(modelBlock).toContain("inline-size: calc(var(--space-2xl) - var(--space-xs));");
       expect(modelBlock).not.toContain("text-overflow: ellipsis;");
       expect(css).toMatch(/\.task-planner-chat-empty\s*\{[^}]*margin:\s*0 auto auto;/);
+      expect(composerBlock).toContain("position: relative;");
       expect(composerBlock).toContain("display: flex;");
       expect(composerBlock).toContain("flex-wrap: wrap;");
       expect(composerBlock).toContain("align-items: stretch;");
@@ -169,11 +170,18 @@ describe("TaskDetailModal", () => {
       expect(inputBlock).toContain("min-height: calc(var(--space-2xl) + var(--space-sm));");
       expect(inputBlock).not.toContain("min-height: 5rem;");
       expect(mobileComposerBlock).toContain("flex-direction: row;");
-      expect(mobileComposerBlock).toContain("flex-wrap: nowrap;");
+      expect(mobileComposerBlock).toContain("flex-wrap: wrap;");
+      expect(css).not.toContain(".task-planner-chat-target-controls");
+      expect(css).toMatch(/\.task-planner-chat-composer \.chat-thinking-popover\s*\{[^}]*left:\s*var\(--space-md\);[^}]*right:\s*var\(--space-md\);[^}]*width:\s*auto;/);
       expect(mobileComposerBlock).toContain("align-items: flex-end;");
-      expect(mobileInputBlock).toContain("height: calc(var(--space-2xl) + var(--space-lg));");
+      /*
+      FNXC:ChatComposerHeight 2026-08-23-20:15:
+      FN-024 made every chat composer autosize through five lines in JS, so the narrow Planner
+      composer keeps only its one-line floor and explicitly drops the fixed CSS cap
+      (`max-height: none`); manual resizing stays desktop/tablet-only.
+      */
       expect(mobileInputBlock).toContain("min-height: calc(var(--space-2xl) + var(--space-lg));");
-      expect(mobileInputBlock).toContain("max-height: calc(var(--space-2xl) + var(--space-lg));");
+      expect(mobileInputBlock).toContain("max-height: none;");
       expect(mobileInputBlock).toContain("resize: none;");
       expect(mobileSendBlock).toContain("justify-content: center;");
       expect(mobileSendBlock).toContain("inline-size: calc(var(--space-2xl) + var(--space-lg));");
@@ -722,7 +730,6 @@ describe("TaskDetailModal", () => {
         ".task-detail-content--embedded .modal-header,\n.task-detail-content--embedded .detail-body,\n.task-detail-content--embedded .detail-tabs,\n.task-detail-content--embedded .modal-actions",
       );
 
-      expect(css).toContain("FNXC:TaskDetailFeed 2026-08-04-08:12:");
       expect(rootBlock).toContain("height: 100%;");
       expect(rootBlock).toContain("min-height: 0;");
       expect(detailBodyBlock).toContain("flex: 1;");
@@ -905,26 +912,27 @@ describe("TaskDetailModal", () => {
 
     it("keeps the floating task header symmetric without sacrificing its resize targets", () => {
       const floatingCss = readFileSync(resolve(__dirname, "../FloatingWindow.css"), "utf8");
-      const desktopTaskSelector = ".floating-window--task-detail:not(.floating-window--tablet-viewport)";
-      const taskPopupBody = getExactCssRuleBlock(floatingCss, `${desktopTaskSelector} .floating-window__body`);
+      const desktopWindowSelector = ".floating-window:not(.floating-window--tablet-viewport)";
       const sharedBody = getExactCssRuleBlock(floatingCss, ".floating-window__body");
       const header = getExactCssRuleBlock(readDashboardStylesSource(), ".modal-header");
-      const eastResize = getExactCssRuleBlock(floatingCss, `${desktopTaskSelector} .floating-window__resize-handle--e`);
-      const northEastResize = getExactCssRuleBlock(floatingCss, `${desktopTaskSelector} .floating-window__resize-handle--ne`);
-      const southEastResize = getExactCssRuleBlock(floatingCss, `${desktopTaskSelector} .floating-window__resize-handle--se`);
+      const eastResize = getExactCssRuleBlock(floatingCss, `${desktopWindowSelector} .floating-window__resize-handle--e`);
+      const cornerResize = floatingCss.match(
+        /\.floating-window:not\(\.floating-window--tablet-viewport\) \.floating-window__resize-handle--ne,[\s\S]*?\}/
+      )?.[0] ?? "";
       const onRequestClose = vi.fn();
 
       /*
-      FNXC:TaskDetailLayout 2026-08-03-19:36:
-      The shared body reserves desktop scrollbar clearance. Task Detail moves only its resize
-      hit areas outboard, so the embedded header retains matching tokenized edges.
+      FNXC:TaskDetailLayout 2026-08-18-00:26:
+      The shared body reserves NOTHING on its inline end any more — FN-8015's gutter is deleted for
+      every caller, so this popup's symmetric edge no longer depends on a local zeroing that undoes
+      it. FN-8766's outboard resize targets that make the scrollbar grabbable are likewise no longer
+      task-detail-scoped: they are the shared desktop rule, and this popup inherits them.
       */
-      expect(sharedBody).toContain("margin-inline-end: var(--space-lg);");
-      expect(taskPopupBody).toContain("margin-inline-end: 0;");
+      expect(sharedBody).not.toMatch(/margin-inline-end\s*:/);
       expect(header).toContain("padding: var(--modal-padding);");
       expect(eastResize).toContain("right: calc(var(--space-sm) * -1);");
-      expect(northEastResize).toContain("right: calc(var(--space-lg) * -1);");
-      expect(southEastResize).toContain("right: calc(var(--space-lg) * -1);");
+      expect(cornerResize).toContain("resize-handle--se");
+      expect(cornerResize).toContain("right: calc(var(--space-lg) * -1);");
 
       const { baseElement, unmount } = render(
         <FloatingWindow
@@ -938,7 +946,6 @@ describe("TaskDetailModal", () => {
         >
           <TaskDetailContent
             task={makeTask({ id: "FN-8766", title: "A task title long enough to exercise header alignment" })}
-            onMoveTask={noopMove}
             onDeleteTask={noopDelete}
             onMergeTask={noopMerge}
             onOpenDetail={noopOpenDetail}
@@ -965,7 +972,6 @@ describe("TaskDetailModal", () => {
         <TaskDetailModal
           task={makeTask({ column: "in-progress" as Column })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -999,7 +1005,6 @@ describe("TaskDetailModal", () => {
           <TaskDetailModal
             task={makeTask({ column: "in-progress" as Column })}
             onClose={noop}
-            onMoveTask={noopMove}
             onDeleteTask={noopDelete}
             onMergeTask={noopMerge}
             onOpenDetail={noopOpenDetail}
@@ -1024,7 +1029,6 @@ describe("TaskDetailModal", () => {
         <TaskDetailModal
           task={makeTask({ column: "in-progress" as Column })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1038,21 +1042,22 @@ describe("TaskDetailModal", () => {
       expect(container.querySelector(".detail-timestamps")).toBeTruthy();
       expect(container.querySelectorAll(".detail-timestamp-item").length).toBe(2);
       const tabs = container.querySelectorAll(".detail-tab");
-      // FNXC:TaskDetailTabs 2026-07-15-23:23: Keep this responsive-order expectation aligned with peer tab tests: the always-available Terminal (FN-7826) and Cost (FN-7820) tabs belong between Comments and Artifacts.
+      // FN-244 keeps the responsive strip aligned with the consolidated desktop inventory.
       expect(Array.from(tabs).map((tab) => tab.textContent?.trim())).toEqual([
         "Activity",
         "Chat",
         "Plan",
         "Changes",
+        "Summary",
+        "Stats",
         "Review",
         "Comments",
-        "Terminal",
-        "Cost",
+        "Dependencies",
         "Artifacts",
         "Model",
         "Workflow",
-        "Stats",
-        "Routing",
+        "Details",
+        "Terminal",
       ]);
       expect(tabs[0].classList.contains("detail-tab-active")).toBe(true);
       expect(Array.from(tabs).slice(1).every((t) => !t.classList.contains("detail-tab-active"))).toBe(true);
@@ -1067,17 +1072,9 @@ describe("TaskDetailModal", () => {
       const mobileBlock = getCssAtRuleBlockContainingExactRule(css, "@media (max-width: 768px)", ".task-detail-content .modal-actions");
       const footerBlock = getExactCssRuleBlock(mobileBlock, ".task-detail-content .modal-actions");
       const spacerBlock = getExactCssRuleBlock(mobileBlock, ".task-detail-content .modal-actions-spacer");
-      const inReviewBlock = getExactCssRuleBlock(mobileBlock, ".task-detail-content .detail-move-actions-in-review");
       const buttonBlock = getExactCssRuleBlock(mobileBlock, ".task-detail-content .modal-actions .btn");
-      const labelBlock = getExactCssRuleBlock(
-        mobileBlock,
-        ".task-detail-content .detail-footer-button-label,\n  .task-detail-content .detail-move-btn__label",
-      );
-      const dropdownBlock = getExactCssRuleBlock(
-        mobileBlock,
-        ".task-detail-content .detail-actions-dropdown,\n  .task-detail-content .detail-move-dropdown",
-      );
-      const desktopMoveDropdownBlock = getExactCssRuleBlock(css, ".detail-move-dropdown");
+      const labelBlock = getExactCssRuleBlock(mobileBlock, ".task-detail-content .detail-footer-button-label");
+      const dropdownBlock = getExactCssRuleBlock(mobileBlock, ".task-detail-content .detail-actions-dropdown");
       const expandedChatBlock = getExactCssRuleBlock(css, ".task-detail-content--chat-expanded .modal-actions");
 
       /*
@@ -1094,17 +1091,7 @@ describe("TaskDetailModal", () => {
       expect(spacerBlock).toContain("min-width: 0;");
       expect(dropdownBlock).toContain("min-width: 0;");
       expect(dropdownBlock).toContain("flex-shrink: 1;");
-      // FNXC:TaskDetailModalResponsive 2026-07-22-17:12: The Actions + Move
-      // symptom regressed when Move grew into the spacer's middle region. This
-      // mobile-only contract leaves all surplus width to the spacer, making the
-      // move control trailing-aligned without changing desktop dropdown layout.
-      expect(mobileBlock).toMatch(/\.task-detail-content \.detail-move-dropdown\s*\{\s*flex:\s*0 1 auto;/);
-      expect(mobileBlock).not.toMatch(/\.task-detail-content \.detail-move-dropdown\s*\{\s*flex:\s*1 1 auto;/);
-      expect(desktopMoveDropdownBlock).not.toContain("flex:");
-      expect(inReviewBlock).toContain("display: flex;");
-      expect(inReviewBlock).toContain("flex-wrap: nowrap;");
-      expect(inReviewBlock).toContain("min-width: 0;");
-      expect(inReviewBlock).toContain("gap: var(--space-xs);");
+      expect(css).not.toContain(".detail-move-");
       expect(buttonBlock).toContain("flex: 0 1 auto;");
       expect(buttonBlock).toContain("min-width: 0;");
       expect(buttonBlock).toContain("padding-inline: var(--space-xs);");
@@ -1125,7 +1112,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ column: "in-review" as Column })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1136,8 +1122,8 @@ describe("TaskDetailModal", () => {
 
       expect(inReviewFooter).toBeTruthy();
       expect(inReviewFooter?.contains(screen.getByRole("button", { name: "Actions" }))).toBe(true);
-      expect(inReviewFooter?.querySelector(".detail-move-btn")).toBeTruthy();
       expect(inReviewFooter?.contains(screen.getByRole("button", { name: "Merge & Close" }))).toBe(true);
+      expect(inReviewFooter?.querySelector(".detail-move-dropdown, .detail-move-btn, .detail-move-menu")).toBeNull();
 
       unmount();
 
@@ -1146,7 +1132,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ column: "in-progress" as Column })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1157,28 +1142,24 @@ describe("TaskDetailModal", () => {
 
       expect(standardFooter).toBeTruthy();
       expect(standardFooter?.contains(screen.getByRole("button", { name: "Actions" }))).toBe(true);
-      expect(standardFooter?.querySelector(".detail-move-btn")).toBeTruthy();
-
       const footerChildren = Array.from(standardFooter?.children ?? []);
       const actionsIndex = footerChildren.findIndex((child) => child.classList.contains("detail-actions-dropdown"));
       const spacerIndex = footerChildren.findIndex((child) => child.classList.contains("modal-actions-spacer"));
-      const moveIndex = footerChildren.findIndex((child) => child.classList.contains("detail-move-dropdown"));
 
-      // The shared modal, embedded panel, dock, and mobile sheet all mount this
-      // canonical footer order: leading Actions, flexible spacer, trailing Move.
       expect(actionsIndex).toBeGreaterThanOrEqual(0);
       expect(spacerIndex).toBeGreaterThan(actionsIndex);
-      expect(moveIndex).toBeGreaterThan(spacerIndex);
+      expect(standardFooter?.querySelector(".detail-move-dropdown, .detail-move-btn, .detail-move-menu")).toBeNull();
     });
 
-    it("keeps the triage footer usable when Actions is absent", () => {
+    it("keeps the triage footer recoverable through Actions", () => {
       const { baseElement: container } = render(
         <TaskDetailModal
           initialTab="definition"
           task={makeTask({ column: "triage" as Column })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
+          onRetryTask={async () => makeTask()}
+          onResetTask={async () => makeTask()}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
           addToast={noop}
@@ -1186,10 +1167,13 @@ describe("TaskDetailModal", () => {
       );
       const footer = container.querySelector(".modal-actions");
 
-      expect(footer?.querySelector(".detail-actions-dropdown")).toBeNull();
+      expect(footer?.querySelector(".detail-actions-dropdown")).toBeTruthy();
       expect(footer?.querySelector(".modal-actions-spacer")).toBeTruthy();
-      expect(footer?.querySelector(".detail-move-dropdown .detail-move-btn")).toBeTruthy();
-      expect(screen.getByRole("button", { name: "Delete task" })).toBeTruthy();
+      expect(footer?.querySelector(".detail-move-dropdown, .detail-move-btn, .detail-move-menu")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Actions" }));
+      expect(screen.getByRole("menuitem", { name: "Retry" })).toBeTruthy();
+      expect(screen.getByRole("menuitem", { name: "Reset" })).toBeTruthy();
+      expect(screen.getAllByRole("menuitem", { name: "Delete" })).toHaveLength(1);
     });
 
     it("modal-actions contains Delete and Pause buttons for non-done tasks (via Actions dropdown)", () => {
@@ -1198,7 +1182,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ column: "in-progress" as Column })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1243,7 +1226,6 @@ describe("TaskDetailModal", () => {
             },
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={onDeleteTask}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1270,7 +1252,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ githubTracking: { enabled: true, issue: { owner: "owner", repo: "repo", number: 42, url: "https://github.com/owner/repo/issues/42", createdAt: "2026-01-01T00:00:00.000Z" } } })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={onDeleteTask}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1297,7 +1278,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ githubTracking: { enabled: true, issue: { owner: "owner", repo: "repo", number: 42, url: "https://github.com/owner/repo/issues/42", createdAt: "2026-01-01T00:00:00.000Z" } } })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={onDeleteTask}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1322,7 +1302,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask()}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={onDeleteTask}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1361,7 +1340,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ githubTracking: { enabled: true, issue: { owner: "owner", repo: "repo", number: 42, url: "https://github.com/owner/repo/issues/42", createdAt: "2026-01-01T00:00:00.000Z" } } })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={onDeleteTask}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1423,7 +1401,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask()}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={onDeleteTask}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1460,7 +1437,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ githubTracking: { enabled: true, issue: { owner: "owner", repo: "repo", number: 42, url: "https://github.com/owner/repo/issues/42", createdAt: "2026-01-01T00:00:00.000Z" } } })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={onDeleteTask}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1497,7 +1473,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask()}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={onDeleteTask}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1540,7 +1515,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ githubTracking: { enabled: true, issue: { owner: "owner", repo: "repo", number: 42, url: "https://github.com/owner/repo/issues/42", createdAt: "2026-01-01T00:00:00.000Z" } } })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={onDeleteTask}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1570,7 +1544,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ column: "todo" as any })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onArchiveTask={onArchiveTask}
           onMergeTask={noopMerge}
@@ -1607,7 +1580,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ column: "done" as any })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onArchiveTask={onArchiveTask}
           onMergeTask={noopMerge}
@@ -1641,7 +1613,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ column: "done" as any })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onArchiveTask={onArchiveTask}
           onMergeTask={noopMerge}
@@ -1659,13 +1630,12 @@ describe("TaskDetailModal", () => {
       });
     });
 
-    it("in-review modal-actions contains Merge & Close and Back to In Progress buttons", () => {
+    it("keeps the in-review Merge & Close action in the footer without relocation controls", () => {
       render(
         <TaskDetailModal
           initialTab="definition"
           task={makeTask({ column: "in-review" as Column })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1673,11 +1643,8 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      expect(screen.getByText("Merge & Close")).toBeTruthy();
-
-      // Back to In Progress is in secondary move options
-      fireEvent.click(document.querySelector(".detail-move-btn__arrow")!);
-      expect(screen.getByRole("menuitem", { name: "Back to In Progress" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Merge & Close" })).toBeTruthy();
+      expect(document.querySelector(".detail-move-dropdown, .detail-move-btn, .detail-move-menu")).toBeNull();
     });
 
     it("keeps Merge & Close when pull-request strategy has autoMerge enabled", async () => {
@@ -1695,7 +1662,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ column: "in-review" as Column })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1725,7 +1691,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ column: "in-review" as Column })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={onMergeTask}
           onOpenDetail={noopOpenDetail}
@@ -1782,7 +1747,6 @@ describe("TaskDetailModal", () => {
             },
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={onMergeTask}
           onOpenDetail={noopOpenDetail}
@@ -1832,7 +1796,6 @@ describe("TaskDetailModal", () => {
             },
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={onMergeTask}
           onOpenDetail={noopOpenDetail}
@@ -1879,7 +1842,6 @@ describe("TaskDetailModal", () => {
             },
           })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1905,7 +1867,6 @@ describe("TaskDetailModal", () => {
             commentCount: 0,
           } })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1935,7 +1896,6 @@ describe("TaskDetailModal", () => {
           initialTab="summary"
           task={task}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1943,7 +1903,7 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      expect(summary.baseElement.querySelector(".merge-details-card a")).toHaveAttribute("href", "https://github.com/owner/repo/pull/42");
+      expect(summary.baseElement.querySelector(".detail-section--summary .merge-details-card a")).toHaveAttribute("href", "https://github.com/owner/repo/pull/42");
       summary.unmount();
 
       render(
@@ -1951,7 +1911,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={task}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1976,7 +1935,6 @@ describe("TaskDetailModal", () => {
             commentCount: 0,
           } })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -1995,7 +1953,6 @@ describe("TaskDetailModal", () => {
           initialTab="definition"
           task={makeTask({ column: "in-review" as Column, status: "creating-pr" })}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2020,11 +1977,10 @@ describe("TaskDetailModal", () => {
     function renderWithSearch(taskOverrides: Partial<TaskDetail> = {}) {
       return render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="dependencies"
           task={makeTask(taskOverrides)}
           tasks={searchTasks}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2122,11 +2078,10 @@ describe("TaskDetailModal", () => {
 
       const { baseElement: container } = render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="dependencies"
           task={makeTask({ dependencies: ["FN-001", "FN-002"] })}
           tasks={allTasks}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2157,11 +2112,10 @@ describe("TaskDetailModal", () => {
 
       const { baseElement: container } = render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="dependencies"
           task={makeTask({ dependencies: ["FN-001"] })}
           tasks={allTasks}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2177,11 +2131,10 @@ describe("TaskDetailModal", () => {
     it("renders dependency ID as label when no title or description available", () => {
       const { baseElement: container } = render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="dependencies"
           task={makeTask({ dependencies: ["FN-001"] })}
           // No tasks prop - dependency not found
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2204,11 +2157,10 @@ describe("TaskDetailModal", () => {
 
       const { baseElement: container } = render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="dependencies"
           task={makeTask({ dependencies: ["FN-001"] })}
           tasks={allTasks}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2231,11 +2183,10 @@ describe("TaskDetailModal", () => {
 
       const { baseElement: container } = render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="dependencies"
           task={makeTask({ dependencies: ["FN-001"] })}
           tasks={allTasks}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           onOpenDetail={noopOpenDetail}
@@ -2270,12 +2221,11 @@ describe("TaskDetailModal", () => {
       });
       const { baseElement: container } = render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="dependencies"
           projectId={projectId}
           task={task}
           onOpenDetail={onOpenDetail}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}
@@ -2302,11 +2252,10 @@ describe("TaskDetailModal", () => {
       mockFetch.mockResolvedValue(mockDetail);
       const { baseElement: container } = render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="dependencies"
           task={task}
           onOpenDetail={onOpenDetail}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}
@@ -2331,12 +2280,11 @@ describe("TaskDetailModal", () => {
       mockFetch.mockResolvedValue(fullTask);
       const { baseElement: container } = render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="dependencies"
           projectId={projectId}
           task={slimTask}
           onOpenDetail={noopOpenDetail}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}
@@ -2373,12 +2321,11 @@ describe("TaskDetailModal", () => {
       });
       const { baseElement: container } = render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="dependencies"
           projectId={projectId}
           task={task}
           onOpenDetail={onOpenDetail}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={addToast}
@@ -2415,13 +2362,12 @@ describe("TaskDetailModal", () => {
       });
       const { baseElement: container } = render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="dependencies"
           projectId={projectId}
           task={task}
           tasks={[task, makeTask({ id: "FN-100", dependencies: [task.id] })]}
           onOpenDetail={onOpenDetail}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}
@@ -2449,11 +2395,10 @@ describe("TaskDetailModal", () => {
 
       render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="dependencies"
           task={task}
           onOpenDetail={onOpenDetail}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}
@@ -2481,12 +2426,11 @@ describe("TaskDetailModal", () => {
 
       const { baseElement: container } = render(
         <TaskDetailModal
-          initialTab="definition"
+          initialTab="dependencies"
           task={tasks[0]}
           tasks={tasks}
           onOpenDetail={noopOpenDetail}
           onClose={noop}
-          onMoveTask={noopMove}
           onDeleteTask={noopDelete}
           onMergeTask={noopMerge}
           addToast={noop}

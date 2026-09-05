@@ -12,7 +12,9 @@ import {
   Gauge,
   GitBranch,
   Grid3X3,
+  History,
   LayoutGrid,
+  List,
   Lightbulb,
   Loader2,
   Lock,
@@ -440,11 +442,16 @@ export function MobileNavBar({
     badge?: number;
   }> = {
     "command-center": { icon: <Gauge />, labelKey: "nav.commandCenter", fallback: "Dashboard", moreTestId: "mobile-more-item-command-center", isActive: view === "command-center", isAvailable: true, navigate: () => onChangeView("command-center") },
-    tasks: { icon: <LayoutGrid />, labelKey: "nav.tasks", fallback: "Tasks", moreTestId: "mobile-more-item-tasks", isActive: view === "board" || view === "list", isAvailable: true, navigate: () => onChangeView(view === "board" || view === "list" ? view : "board") },
+    /*
+    FNXC:MobileTaskNavigation 2026-08-20-05:47:
+    Issue #2226 requires independent mobile footer destinations: Tasks always returns to Board and List remains directly reachable without restoring Header's retired segmented switcher.
+    */
+    tasks: { icon: <LayoutGrid />, labelKey: "nav.tasks", fallback: "Tasks", moreTestId: "mobile-more-item-tasks", isActive: view === "board", isAvailable: true, navigate: () => onChangeView("board") },
     agents: { icon: <Bot />, labelKey: "nav.agents", fallback: "Agents", moreTestId: "mobile-more-item-agents", isActive: view === "agents", isAvailable: true, navigate: () => onChangeView("agents") },
     missions: { icon: <Target />, labelKey: "nav.missions", fallback: "Missions", moreTestId: "mobile-more-item-missions", isActive: view === "missions", isAvailable: true, navigate: () => onChangeView("missions") },
     chat: { icon: <MessageSquare />, labelKey: "nav.chat", fallback: "Chat", moreTestId: "mobile-more-item-chat", isActive: view === "chat", isAvailable: true, navigate: () => onChangeView("chat"), indicator: chatHasUnreadResponse && view !== "chat", indicatorLabel: t("nav.chatUnreadAriaLabel", "Unread chat response") },
     mailbox: { icon: <Mail />, labelKey: "nav.mailbox", fallback: "Mailbox", moreTestId: "mobile-more-item-mailbox", isActive: view === "mailbox", isAvailable: true, navigate: () => onChangeView("mailbox"), indicator: mailboxPendingApprovalCount > 0 && view !== "mailbox", indicatorLabel: t("nav.mailboxPendingAriaLabel", "Pending approvals"), badge: mailboxUnreadCount },
+    patchnode: { icon: <History />, labelKey: "nav.patchnode", fallback: "History", moreTestId: "mobile-more-item-patchnode", isActive: view === "patchnode", isAvailable: true, navigate: (surface) => surface === "primary" ? onChangeView("patchnode") : handleMoreAction(() => onChangeView("patchnode")) },
     planning: { icon: <Lightbulb />, labelKey: "nav.planning", fallback: "Planning", moreTestId: "mobile-more-item-planning", isActive: view === "planning", isAvailable: true, navigate: (surface) => surface === "primary" ? planningHandler?.() : handleMoreAction(planningHandler), indicator: planningNeedsInput && view !== "planning", indicatorLabel: t("nav.planningNeedsInputAriaLabel", "Planning needs your input"), badge: activePlanningSessionCount },
     activity: { icon: <Activity />, labelKey: "nav.activityLog", fallback: "Activity Log", moreTestId: "mobile-more-item-activity", isActive: false, isAvailable: true, navigate: (surface) => surface === "primary" ? onOpenActivityLog?.() : handleMoreAction(onOpenActivityLog) },
     git: { icon: <GitBranch />, labelKey: "nav.gitManager", fallback: "Git Manager", moreTestId: "mobile-more-item-git", isActive: false, isAvailable: true, navigate: (surface) => surface === "primary" ? onOpenGitManager?.() : handleMoreAction(onOpenGitManager), badge: stashOrphanCount },
@@ -457,7 +464,7 @@ export function MobileNavBar({
     documents: { icon: <FileText />, labelKey: "nav.documents", fallback: "Artifacts", moreTestId: "mobile-more-item-documents", isActive: view === "documents", isAvailable: true, navigate: (surface) => surface === "primary" ? onChangeView("documents") : handleMoreAction(() => onChangeView("documents")) },
     secrets: { icon: <Lock />, labelKey: "nav.secrets", fallback: "Secrets", moreTestId: "mobile-more-item-secrets", isActive: view === "secrets", isAvailable: true, navigate: (surface) => surface === "primary" ? onChangeView("secrets") : handleMoreAction(() => onChangeView("secrets")) },
     settings: { icon: <Settings />, labelKey: "nav.settings", fallback: "Settings", moreTestId: "mobile-more-item-settings", isActive: false, isAvailable: true, navigate: (surface) => surface === "primary" ? onOpenSettings?.() : handleMoreAction(onOpenSettings) },
-    skills: { icon: <Zap />, labelKey: "nav.skills", fallback: "Skills", moreTestId: "mobile-more-item-skills", isActive: view === "skills", isAvailable: skillsEnabled, navigate: (surface) => surface === "primary" ? onChangeView("skills") : handleMoreAction(() => onChangeView("skills")) },
+    skills: { icon: <Zap />, labelKey: "nav.skills", fallback: "Skills & Snippets", moreTestId: "mobile-more-item-skills", isActive: view === "skills", isAvailable: skillsEnabled, navigate: (surface) => surface === "primary" ? onChangeView("skills") : handleMoreAction(() => onChangeView("skills")) },
     insights: { icon: <Sparkles />, labelKey: "nav.insights", fallback: "Insights", moreTestId: "mobile-more-item-insights", isActive: view === "insights", isAvailable: Boolean(experimentalFeatures?.insights), navigate: (surface) => surface === "primary" ? onChangeView("insights") : handleMoreAction(() => onChangeView("insights")) },
     memory: { icon: <Brain />, labelKey: "nav.memory", fallback: "Memory", moreTestId: "mobile-more-item-memory", isActive: view === "memory", isAvailable: Boolean(experimentalFeatures?.memoryView), navigate: (surface) => surface === "primary" ? onChangeView("memory") : handleMoreAction(() => onChangeView("memory")) },
     research: { icon: <Search />, labelKey: "nav.research", fallback: "Research", moreTestId: "mobile-more-item-research", isActive: view === "research", isAvailable: Boolean(experimentalFeatures?.researchView), navigate: (surface) => surface === "primary" ? onChangeView("research") : handleMoreAction(() => onChangeView("research")) },
@@ -489,8 +496,17 @@ export function MobileNavBar({
         aria-label={t("nav.primaryNavAriaLabel", "Primary navigation")}
       >
         {effectivePrimaryItems.map((item) => renderSelectableItem(item, "primary"))}
-
-
+        <button
+          type="button"
+          className={`mobile-nav-tab${view === "list" ? " mobile-nav-tab--active" : ""}`}
+          data-testid="mobile-nav-tab-list"
+          role="tab"
+          aria-selected={view === "list"}
+          onClick={() => onChangeView("list")}
+        >
+          <span className="mobile-nav-tab-icon-wrapper"><List /></span>
+          <span className="mobile-nav-tab-label">{t("nav.list", "List")}</span>
+        </button>
 
         {topLevelPrimaryPluginViews.map((entry) => {
           const pluginTaskView = buildPluginTaskViewId(entry.pluginId, entry.view.viewId);

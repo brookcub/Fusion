@@ -1,4 +1,4 @@
-import type { Task, TaskStore } from "@fusion/core";
+import type { Task, TaskStore, WorkspaceConfig } from "@fusion/core";
 /**
  * FNXC:CodeOrganization 2026-08-03-17:30:
  * Free builders for TaskExecutor deps bags that wire peeled worktree/session helpers (U4).
@@ -17,6 +17,7 @@ import type { WorktreeInvariantDeps } from "./worktree-verify-invariants.js";
 import type { NonContinuableSessionDeps } from "./non-continuable-session.js";
 import { facadeFields, facadeMethods } from "./facade-methods.js";
 import * as pure from "./pure-bindings.js";
+import { resolveWorkspaceConfigOnce } from "./workspace-config-resolver.js";
 import {
   MAX_WORKTREE_RETRIES,
   WORKTREE_RETRY_DELAYS,
@@ -89,20 +90,23 @@ export type WorktreeInvariantDepsSource = {
   rootDir: string;
   store: TaskStore;
   workspaceConfig: unknown | null | undefined;
+  ensureWorkspaceConfig?: () => Promise<unknown | null>;
   getActiveWorktreePaths: (taskId: string) => string[];
   getRunContextFor: (taskId: string) => EngineRunContext | undefined;
   emitWorktreeReanchoredAudit: WorktreeInvariantDeps["emitWorktreeReanchoredAudit"];
 };
 
 export function buildWorktreeInvariantDeps(src: WorktreeInvariantDepsSource): WorktreeInvariantDeps {
-  return {
+  const bag = {
     rootDir: src.rootDir,
     store: src.store,
-    workspaceConfig: src.workspaceConfig,
+    ensureWorkspaceConfig: src.ensureWorkspaceConfig,
     getActiveWorktreePaths: src.getActiveWorktreePaths,
     getRunContextFor: src.getRunContextFor,
     emitWorktreeReanchoredAudit: src.emitWorktreeReanchoredAudit,
   };
+  // FNXC:Workspace 2026-08-14-21:06: Workspace mode must remain live through every bag re-projection; a getter/setter preserves host writes in strict-mode callers.
+  return defineLiveWorkspaceConfig(bag, src);
 }
 
 export type NonContinuableSessionDepsSource = NonContinuableSessionDeps;
@@ -140,8 +144,13 @@ export function buildExecuteWorkflowGraphDeps(host: any): any {
       "graphRethinkNarrations", "graphRouting", "graphSeamGoverningNodeId", "graphSeamSkillName",
       "graphSeamThinkingLevel", "graphStepActiveContext", "graphStepRunOnce", "graphStepSessionPinned",
       "graphToolFailureRunCursors", "graphUnattendedRuns", "outerConcurrencyClaims",
+      // FNXC:AgentActivityStream 2026-08-15-22:15: FN-8864 gate-attribution retention map (restored post-wave-18).
+      "workflowGateActivityPrincipals",
+      // FNXC:WorkflowLifecycle 2026-08-31-06:41: per-run abort-marker reset at run birth.
+      "userCanceledTaskIds",
     ]),
     ...facadeMethods(host, [
+      "clearPausedAborted",
       "getRunContextFor", "advanceNoMergeWorkflowToCompleteColumn", "applyGraphRethinkReset",
       "buildBranchPersistence", "buildCodeNodeRunner", "buildColumnBoundaryHooks", "buildForeachWorktreeDeps",
       "buildParseStepsDeps", "buildStepInstancePersistence", "createAuthoritativeWorkflowPrimitives",
@@ -159,9 +168,15 @@ export function buildHandleGraphFailureDeps(host: any): any {
     store: host.store,
     rootDir: host.rootDir,
     options: host.options as { stuckTaskDetector?: { untrackTask?: (taskId: string) => void }; [k: string]: unknown },
+    // FNXC:WorkflowLifecycle 2026-08-15-22:15: liveness surfaces for the transient-resume fire-time guard
+    // (restored post-wave-18 — the peel replaced the guarded scheduled retry with an unguarded execute()).
+    processWideGraphRouting: host.constructor.processWideGraphRouting as Set<string>,
     ...facadeFields(host, [
       "activeWorktrees", "completionFinalizedTaskIds", "graphExecuteSelfRequeued",
       "graphToolFailureRunCursors", "pausedAborted", "pausedAbortProvenance", "userCanceledTaskIds",
+      "executing", "resumingUnpaused", "activeSessions", "activeStepExecutors",
+      "deferredTerminalParksInFlight",
+      "activeWorkflowStepSessions", "activeCliTaskSessions", "activeWorkflowGraphAbortControllers",
     ]),
     ...facadeMethods(host, [
       "getRunContextFor", "clearCompletedTaskWatchdog", "clearPausedAborted", "execute",
@@ -173,7 +188,7 @@ export function buildHandleGraphFailureDeps(host: any): any {
       "isRequiredArtifactRecoveryProtected", "isRetryableBenignMergePauseAbort",
       "parkCompletedBlockedTask", "persistTokenUsage", "reenterPausedAbortedWorkflowNode",
       "resolveResumeLanes", "routeGraphFailureToExecutionResume", "routeGraphMergeFailureToRetry",
-      "routeImplementationIncompleteMergeGraphFailure", "routeResetParsePinMismatchToRetry",
+      "requestPreMergeOptionalStepFix", "routeImplementationIncompleteMergeGraphFailure", "routeResetParsePinMismatchToRetry",
       "routeRetryableRemediationGraphFailureToPreMergeFix", "routeUnusableWorktreeGraphFailureToRecovery",
       "safeLogEntry",
     ]),
@@ -185,12 +200,74 @@ export function buildHandleGraphFailureDeps(host: any): any {
  * runImplementation deps bag peeled from TaskExecutor (U4). Constants are injected by the
  * façade so the free builder stays free of executor-constants coupling.
  */
+function defineLiveWorkspaceConfig<T extends object>(bag: T, owner: { workspaceConfig: unknown }): T & { workspaceConfig: unknown } {
+  Object.defineProperty(bag, "workspaceConfig", {
+    enumerable: true,
+    configurable: true,
+    get: () => owner.workspaceConfig,
+    set: (value: unknown) => { owner.workspaceConfig = value; },
+  });
+  return bag as T & { workspaceConfig: unknown };
+}
+
+function withWorkspaceResolver(host: any): () => Promise<unknown | null> {
+  return () => resolveWorkspaceConfigOnce({
+    rootDir: host.rootDir,
+    workspaceConfigOwner: host,
+    getWorkspaceConfig: () => host.workspaceConfig,
+    setWorkspaceConfig: (config) => { host.workspaceConfig = config; },
+  });
+}
+
+const workspaceRefreshes = new WeakMap<object, Promise<WorkspaceConfig | null>>();
+
+/*
+FNXC:Workspace 2026-08-20-02:03:
+Membership is disk-authoritative and can grow during an execution. A failed or empty refresh restores
+this host's last known-good multi-repo snapshot so shared consumers never fall back to single-repo mode.
+*/
+function withWorkspaceRefresher(host: any): () => Promise<WorkspaceConfig | null> {
+  return () => {
+    const active = workspaceRefreshes.get(host);
+    if (active) return active;
+    const refresh = (async (): Promise<WorkspaceConfig | null> => {
+      const previous = host.workspaceConfig as WorkspaceConfig | null | undefined;
+      try {
+        host.invalidateWorkspaceConfig();
+        const resolved = await withWorkspaceResolver(host)() as WorkspaceConfig | null;
+        if (resolved === null && previous && previous.repos.length > 0) {
+          host.workspaceConfig = previous;
+          return previous;
+        }
+        /*
+        FNXC:Workspace 2026-08-20-02:25:
+        A settings listener can invalidate during this awaited read. The resolver declines the stale
+        epoch write, so this refresh publishes its successful result to prevent shared consumers from
+        observing the cleared single-repo sentinel.
+        */
+        host.workspaceConfig = resolved;
+        return resolved;
+      } catch {
+        host.workspaceConfig = previous;
+        return previous ?? null;
+      }
+    })();
+    workspaceRefreshes.set(host, refresh);
+    void refresh.finally(() => {
+      if (workspaceRefreshes.get(host) === refresh) workspaceRefreshes.delete(host);
+    });
+    return refresh;
+  };
+}
+
 export function buildRunImplementationDeps(
   host: any,
   constants: { BRANCH_CONFLICT_TRIPWIRE_THRESHOLD: number; MAX_AUTO_RECOVERY_ATTEMPTS: number },
 ): any {
-  return {
-    ...facadeFields(host, ["store", "rootDir", "workspaceConfig"]),
+  const bag = {
+    ...facadeFields(host, ["store", "rootDir"]),
+    ensureWorkspaceConfig: withWorkspaceResolver(host),
+    refreshWorkspaceConfig: withWorkspaceRefresher(host),
     options: host.options as any,
     BRANCH_CONFLICT_TRIPWIRE_THRESHOLD: constants.BRANCH_CONFLICT_TRIPWIRE_THRESHOLD,
     MAX_AUTO_RECOVERY_ATTEMPTS: constants.MAX_AUTO_RECOVERY_ATTEMPTS,
@@ -210,7 +287,7 @@ export function buildRunImplementationDeps(
       "shouldDeferCompletionForGlobalPause", "clearCompletedTaskWatchdog", "resolveResumeLanes",
       "transitionReviewAddressing", "buildActionGateContext", "buildPermanentAgentGatingContext",
       "resolveMcpServers", "captureModifiedFiles", "handleNonContinuableSessionError",
-      "signalTaskComplete", "getAutoRecoveryDispatcher", "registerConfiguredCommandController",
+      "signalTaskComplete", "signalTaskTerminalFailed", "getAutoRecoveryDispatcher", "registerConfiguredCommandController",
       "unregisterConfiguredCommandController", "tryBootstrapMisbindingRecovery", "addActiveWorktree",
       "getAuthoritativeAssignedAgent", "resolveSeamColumnAgent", "sendTaskBackForFix",
       "runWithExecutorSemaphore", "resetStepsIfWorkLost", "recoverMissingWorktreeSessionStartFailure",
@@ -221,20 +298,29 @@ export function buildRunImplementationDeps(
       "finalizeMergeConfirmedWorkflowGraphTask", "cleanupMergeStateForReverification", "createWorktree",
       "emitWorktreeReanchoredAudit", "buildInjectedRuntimeEnv", "reconcileStepsFromGitHistory",
       "setActiveStepExecutor", "captureWorkspaceModifiedFiles", "runExecutorDeterministicVerification",
+      /* FNXC:VerificationRemediation 2026-08-26-04:58: the FN-3345 gate needs the named-remediation authority for `stepReopenPolicy: "none"` workflows. */
+      "appendReviewRemediationSteps",
       "attemptExecutorVerificationFix", "deleteActiveStepExecutor", "createTaskUpdateTool",
-      "createTaskAddDepTool", "createTaskDoneTool", "createSpawnAgentTool",
+      "createTaskAddDepTool", "createTaskDoneTool", "createReviewDisputeTool", "createSpawnAgentTool",
       "resolveInstructionsForRole", "finalizeAlreadyReviewedTask",
       "handleBranchConflict", "handleNonContinuableSessionRetry", "resumeApprovalAfterUnwindIfNeeded",
     ]),
+    reexecuteTaskInPlace: async (taskId: string) => {
+      const live = await host.store.getTask(taskId);
+      setTimeout(() => { void host.execute(live); }, 0);
+    },
     sharedWorkerTools: buildSharedWorkerToolsDeps(host),
   };
+  return defineLiveWorkspaceConfig(bag, host);
 }
 
 export function buildRunGraphCustomNodeDeps(host: any): any {
-  return {
-    ...facadeFields(host, ["store", "rootDir", "workspaceConfig"]),
+  const bag = {
+    ...facadeFields(host, ["store", "rootDir"]),
+    ensureWorkspaceConfig: withWorkspaceResolver(host),
     options: host.options as { pluginRunner?: unknown; [k: string]: unknown },
     graphUnattendedRuns: host.graphUnattendedRuns,
+    runConfiguredCommand: pure.runConfiguredCommand,
     ...facadeMethods(host, [
       "getRunContextFor",
       "adoptColumnAgentForNode", "buildInjectedRuntimeEnv", "ensureGraphCustomNodeWorktree",
@@ -243,15 +329,17 @@ export function buildRunGraphCustomNodeDeps(host: any): any {
       "runRawCliCommand",
     ]),
   };
+  return defineLiveWorkspaceConfig(bag, host);
 }
 
 export function buildCreateAuthoritativeWorkflowSeamsDeps(host: any): any {
-  return {
+  const bag = {
     store: host.store,
     rootDir: host.rootDir,
+    ensureWorkspaceConfig: withWorkspaceResolver(host),
     options: host.options as { mergeRequester?: unknown; pluginRunner?: unknown; [k: string]: unknown },
     ...facadeFields(host, [
-      "workspaceConfig", "activeWorkflowPrincipals", "graphSeamGoverningNodeId", "graphSeamThinkingLevel",
+      "activeWorkflowPrincipals", "graphSeamGoverningNodeId", "graphSeamThinkingLevel",
       "graphStepActiveContext", "graphRethinkNarrations", "pausedAborted",
       "mergeRequester",
     ]),
@@ -263,6 +351,7 @@ export function buildCreateAuthoritativeWorkflowSeamsDeps(host: any): any {
       "unregisterSubagentSession",
     ]),
   };
+  return defineLiveWorkspaceConfig(bag, host);
 }
 
 export function buildCreateSpawnAgentToolDeps(host: any): any {
@@ -320,9 +409,9 @@ export function buildFinalizeAcceptedNoOpCompletionDeps(host: any): any {
 }
 
 export function buildMarkStuckAbortedDeps(host: any): any {
-  return {
+  const bag = {
     ...facadeFields(host, [
-      "store", "rootDir", "workspaceConfig",
+      "store", "rootDir",
       "activeStepExecutors", "stuckAborted", "executing",
       "activeWorktrees", "loopRecoveryState",
     ]),
@@ -331,7 +420,13 @@ export function buildMarkStuckAbortedDeps(host: any): any {
       "awaitAbortInFlightTaskWork", "clearPausedAborted", "resetStepsIfWorkLost",
       "hasActiveWorktreeBinding",
     ]),
+    ensureWorkspaceConfig: withWorkspaceResolver(host),
+    reexecuteTaskInPlace: async (taskId: string) => {
+      const live = await host.store.getTask(taskId);
+      setTimeout(() => { void host.execute(live); }, 0);
+    },
   };
+  return defineLiveWorkspaceConfig(bag, host);
 }
 
 export function buildRunGraphTaskStepDeps(host: any): any {
@@ -377,12 +472,12 @@ export function buildEnsureGraphCustomNodeWorktreeDeps(host: any, runConfiguredC
   return {
     store: host.store,
     rootDir: host.rootDir,
+    workspaceConfigOwner: host,
     getWorkspaceConfig: () => host.workspaceConfig,
     setWorkspaceConfig: (c: unknown) => { host.workspaceConfig = c; },
     ...facadeMethods(host, [
       "getRunContextFor", "addActiveWorktree", "registerConfiguredCommandController", "unregisterConfiguredCommandController",
     ]),
-    pool: host.options.pool,
     secretsStore: host.options.secretsStore,
     createWorktree: (
       branch: string, path: string, taskId: string, startPoint?: string, allowSibling?: boolean,
@@ -422,12 +517,14 @@ export function buildRunRawCliCommandDeps(host: any, runConfiguredCommand: any =
 }
 
 export function buildEvaluateTaskDoneScopeLeakDeps(host: any): any {
-  return {
-    ...facadeFields(host, ["store", "workspaceConfig"]),
+  const bag = {
+    ...facadeFields(host, ["store"]),
+    ensureWorkspaceConfig: withWorkspaceResolver(host),
     ...facadeMethods(host, [
       "getRunContextFor", "captureUncommittedModifiedFiles", "captureModifiedFiles",
     ]),
   };
+  return defineLiveWorkspaceConfig(bag, host);
 }
 
 export function buildScheduleCompletedTaskWatchdogDeps(
@@ -466,9 +563,6 @@ export function buildDispatchUnpauseResumeDeps(host: any): any {
 export function buildHoldForSessionContentionDeps(host: any): any {
   return {
     ...buildStoreRunContextDeps(host),
-    getHoldAttempts: (taskId: string) => host.sessionContentionHoldAttempts.get(taskId) ?? 0,
-    setHoldAttempts: (taskId: string, attempt: number) => { host.sessionContentionHoldAttempts.set(taskId, attempt); },
-    clearHold: (taskId: string) => host.clearSessionContentionHold(taskId),
     reexecute: (t: unknown) => host.execute(t),
   };
 }
@@ -478,6 +572,7 @@ export function buildCreateAuthoritativeWorkflowPrimitivesFromExecutorDeps(host:
     ...facadeFields(host, [
       "store", "rootDir", "graphSeamGoverningNodeId",
       "graphStepActiveContext", "pausedAborted", "mergeRequester",
+      "workflowLifecycleMovesInFlight",
     ]),
     ...facadeMethods(host, [
       "getRunContextFor",
@@ -586,8 +681,15 @@ export function buildRequestPreMergeOptionalStepFixDeps(host: any): any {
     ...facadeFields(host, ["store", "workflowLifecycleMovesInFlight"]),
     ...facadeMethods(host, [
       "getRunContextFor", "recoverMissingRequiredArtifacts", "parkPlanReviewReplanCapExhausted",
-      "clearPausedAborted", "sendTaskBackForFix",
+      "clearPausedAborted", "readTaskArtifact", "appendReviewRemediationSteps", "sendTaskBackForFix",
     ]),
+  };
+}
+
+export function buildAppendReviewRemediationStepsDeps(host: any): any {
+  return {
+    ...facadeFields(host, ["store"]),
+    ...facadeMethods(host, ["readTaskArtifact", "sendTaskBackForFix"]),
   };
 }
 
@@ -652,11 +754,13 @@ export function buildHandleImplicitTaskDoneRefusalDeps(host: any): any {
 }
 
 export function buildCleanupTaskWorktreeDeps(host: any): any {
-  return {
-    ...facadeFields(host, ["store", "workspaceConfig", "activeWorktrees"]),
+  const bag = {
+    ...facadeFields(host, ["store", "activeWorktrees"]),
+    ensureWorkspaceConfig: withWorkspaceResolver(host),
     getActiveWorktreePaths: (id: string) => host.getActiveWorktreePaths(id),
     removeOwnWorktreeWithReconcile: (...args: unknown[]) => host.removeOwnWorktreeWithReconcile(...args),
   };
+  return defineLiveWorkspaceConfig(bag, host);
 }
 
 export function buildResumeTaskForAgentDeps(host: any): any {
@@ -687,6 +791,7 @@ export function buildBuildActionGateContextDeps(host: any): any {
     agentStore: host.options.agentStore,
     // Lazy getter: only construct the PostgreSQL-backed store when a gate needs it.
     get approvalRequestStore() { return host.approvalRequestStore; },
+    messageStore: host.options.messageStore,
     activeWorkflowAuthorities: host.activeWorkflowAuthorities,
     activeWorkflowGraphAbortControllers: host.activeWorkflowGraphAbortControllers,
   };
@@ -705,12 +810,13 @@ export function buildHandleStaleInReviewPlanPauseAbortReplayDeps(host: any): any
 
 export function buildExecuteCoreDeps(host: any): any {
   return {
+    store: host.store,
     completionFinalizedTaskIds: host.completionFinalizedTaskIds,
     graphRouting: host.graphRouting,
     releaseSemaphore: () => { host.options.semaphore?.release(); },
     ...facadeMethods(host, [
       "clearStalePauseAbortBeforeDispatch", "blockOuterDispatchWhenDependenciesUnmet",
-      "executeWorkflowGraph",
+      "blockOuterDispatchWhenFileScopeLeaseHeld", "executeWorkflowGraph",
     ]),
   };
 }
@@ -837,6 +943,7 @@ export function buildBuildPermanentAgentGatingContextDeps(host: any): any {
     ...buildStoreRunContextDeps(host),
     approvalSuspended: host.approvalSuspended,
     get approvalRequestStore() { return host.approvalRequestStore; },
+    messageStore: host.options.messageStore,
   };
 }
 
@@ -860,6 +967,7 @@ export function buildBuildForeachWorktreeDepsDeps(host: any): any {
   return {
     ...facadeFields(host, ["store", "rootDir"]),
     ...facadeMethods(host, ["createWorktree"]),
+    ensureWorkspaceConfig: withWorkspaceResolver(host),
     semaphoreAvailableCount: () => host.options.semaphore?.availableCount ?? 1,
   };
 }
@@ -975,6 +1083,10 @@ export function buildMarkPausedAbortedDeps(host: any): any {
 export function buildResumeOrphanedDeps(host: any): any {
   return {
     ...facadeFields(host, ["store", "executing", "recoveringCompleted"]),
+    // FNXC:MergeRetryReliability 2026-08-29-17:00 (CodeRabbit L1331): the
+    // deferred-park intent reader must resolve the same tasks dir fallback
+    // the handleGraphFailure writer uses when the store has no getTasksDir.
+    rootDir: host.rootDir,
     processWideGraphRouting: host.constructor.processWideGraphRouting as Set<string>,
     ...facadeMethods(host, [
       "listWipLaneTasks", "clearResumeFailureState", "recoverApprovedStepsOnResume",
@@ -991,8 +1103,24 @@ export function buildSignalTaskCompleteDeps(host: any): any {
   return {
     store: host.store,
     capturedReflectionTaskIds: host.capturedReflectionTaskIds,
+    rootDir: host.rootDir,
+    capturedMemoryTaskIds: host.capturedMemoryTaskIds,
     reflectionService: host.options.reflectionService,
     onComplete: host.options.onComplete,
+  };
+}
+
+/*
+FNXC:StashSessionCapture 2026-08-19-05:09:
+(RUFU-122) Minimal deps bag for the terminal-failure transcript capture seam:
+store/rootDir plus the SAME capturedMemoryTaskIds gate the completion seam
+uses — triggerTaskMemoryCapture picks exactly the fields it needs.
+*/
+export function buildSignalTaskTerminalFailedDeps(host: any): any {
+  return {
+    store: host.store,
+    rootDir: host.rootDir,
+    capturedMemoryTaskIds: host.capturedMemoryTaskIds,
   };
 }
 
@@ -1059,6 +1187,7 @@ export function buildEnsureTaskWorktreeForPlanningDeps(host: any): any {
   return {
     store: host.store,
     rootDir: host.rootDir,
+    workspaceConfigOwner: host,
     getWorkspaceConfig: () => host.workspaceConfig,
     setWorkspaceConfig: (cfg: unknown) => { host.workspaceConfig = cfg; },
     ensureGraphCustomNodeWorktree: (t: unknown, s: unknown, nodeId: string, refresh?: boolean) =>
@@ -1068,7 +1197,10 @@ export function buildEnsureTaskWorktreeForPlanningDeps(host: any): any {
 
 export function buildPrepareGraphNodeExecutionDeps(host: any): any {
   return {
-    ...facadeFields(host, ["store"]),
+    ...facadeFields(host, ["rootDir", "store"]),
+    workspaceConfigOwner: host,
+    getWorkspaceConfig: () => host.workspaceConfig,
+    setWorkspaceConfig: (cfg: unknown) => { host.workspaceConfig = cfg; },
     ...facadeMethods(host, ["getRunContextFor", "ensureGraphCustomNodeWorktree"]),
   };
 }
@@ -1191,12 +1323,15 @@ export function buildAdoptColumnAgentForNodeDeps(host: any): any {
 }
 
 export function buildWorktreeInvariantFacadeDeps(host: any): any {
-  return buildWorktreeInvariantDeps({
-    ...facadeFields(host, ["rootDir", "store", "workspaceConfig"]),
+  const facade = {
+    ...facadeFields(host, ["rootDir", "store"]),
+    ensureWorkspaceConfig: withWorkspaceResolver(host),
     ...facadeMethods(host, [
       "getActiveWorktreePaths", "getRunContextFor", "emitWorktreeReanchoredAudit",
     ]),
-  });
+  };
+  // FNXC:Workspace 2026-08-14-21:06: Object spread snapshots accessors, so the invariant's two-hop facade explicitly re-projects the live getter/setter.
+  return buildWorktreeInvariantDeps(defineLiveWorkspaceConfig(facade, host));
 }
 
 export function buildHandleDepAbortCleanupDeps(host: any): any {
@@ -1252,8 +1387,9 @@ export function buildPauseAbortMarkerDeps(host: any): any {
     ...facadeFields(host, [
       "pausedAborted", "pausedAbortProvenance", "completionFinalizedTaskIds",
     ]),
-    markPausedAborted: (id: string, provenance?: unknown, source?: string) =>
-      host.markPausedAborted(id, provenance, source),
+    /* FNXC:PausedAbortProvenance 2026-08-26-09:52: forward the quiet flag so the breadcrumb can wait for evidence. */
+    markPausedAborted: (id: string, provenance?: unknown, source?: string, options?: { quiet?: boolean }) =>
+      host.markPausedAborted(id, provenance, source, options),
   };
 }
 
@@ -1302,7 +1438,12 @@ export function buildRouteResetParsePinMismatchToRetryDeps(host: any): any {
 export function buildCreateWorktreeFacadeDeps(host: any, tryCreateWorktree: any): any {
   return buildCreateWorktreeDeps(
     host,
-    { maxWorktreeRetries: MAX_WORKTREE_RETRIES, worktreeRetryDelaysMs: [...WORKTREE_RETRY_DELAYS] },
+    /*
+    FNXC:CodeOrganization 2026-08-15-22:15: pre-peel executor.ts read `this.MAX_WORKTREE_RETRIES`
+    (a private instance field), so an instance-level override was part of the contract (tests pin it
+    to 1 to keep retry-exhaustion paths fast). Honor that override before the module constant.
+    */
+    { maxWorktreeRetries: (host as { MAX_WORKTREE_RETRIES?: number }).MAX_WORKTREE_RETRIES ?? MAX_WORKTREE_RETRIES, worktreeRetryDelaysMs: [...WORKTREE_RETRY_DELAYS] },
     tryCreateWorktree,
   );
 }
@@ -1359,7 +1500,9 @@ export function buildStaleLockRecoveryDeps(host: any): any {
 export function buildRecoverFailedPreMergeWorkflowStepDeps(host: any): any {
   return {
     store: host.store,
-    ...facadeMethods(host, ["getRunContextFor", "resolveFailedPreMergeWorkflowStepBudget", "sendTaskBackForFix"]),
+    ...facadeMethods(host, [
+      "getRunContextFor", "resolveFailedPreMergeWorkflowStepBudget", "appendReviewRemediationSteps", "sendTaskBackForFix",
+    ]),
   };
 }
 

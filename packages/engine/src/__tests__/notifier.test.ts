@@ -9,6 +9,7 @@ import {
   sendNtfyNotificationWithResult,
 } from "../util/notifier.js";
 import { NtfyNotificationProvider } from "../notification/ntfy-provider.js";
+import { NotificationService } from "../notification/notification-service.js";
 import { MockTaskStore, createTask, flushAsyncWork } from "./notifier.test-harness.js";
 
 vi.mock("../logger.js", () => ({
@@ -663,30 +664,28 @@ describe("NtfyNotifier", () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
-    it("allows a new gridlock notification immediately after resolution reset", async () => {
+    // FNXC:Notifications 2026-08-16-16:03: A transient clear must not re-arm the
+    // same gridlock notification while the wall-clock cooldown is still active.
+    it("suppresses the same gridlock after a transient resolution during cooldown", async () => {
       store.setSettings({ ntfyEnabled: true, ntfyTopic: "test-topic", ntfyEvents: ["gridlock"] });
       fetchMock.mockResolvedValue({ ok: true });
       notifier = new NtfyNotifier(store);
       await notifier.start();
 
-      notifier.notifyGridlock({
+      const event = {
         blockedTaskCount: 1,
-        reasons: { "FN-001": "dependency" },
+        reasons: { "FN-001": "dependency" as const },
         blockedTaskIds: ["FN-001"],
         blockingTaskIds: ["FN-002"],
-      });
+      };
+      notifier.notifyGridlock(event);
 
       vi.advanceTimersByTime(60_000);
       notifier.notifyGridlock(null);
-      notifier.notifyGridlock({
-        blockedTaskCount: 1,
-        reasons: { "FN-009": "overlap" },
-        blockedTaskIds: ["FN-009"],
-        blockingTaskIds: ["FN-010"],
-      });
+      notifier.notifyGridlock(event);
 
       await flushAsyncWork();
-      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -731,7 +730,15 @@ describe("NtfyNotifier", () => {
     });
 
     it("sends a high-priority wedge notification when a task terminally fails", async () => {
-      notifier = new NtfyNotifier(store);
+      /*
+      FNXC:TaskWedgeNotifications 2026-08-23-22:50:
+      FN-8953 put a durable SETTLE WINDOW in front of wedge delivery (default 5 minutes): the first
+      classification arms a pending hold instead of pushing, so this case asserted a push that no
+      longer happens on the same turn. Use the service's documented settle test hook to keep the
+      subject of this case — the content and priority of the delivered wedge push — intact; the hold
+      and its expiry are covered by self-healing-pending-wedge-notification.test.ts.
+      */
+      notifier = new NtfyNotifier(store, {}, new NotificationService(store as never, { wedgeNotificationSettleMs: 0 }));
       await notifier.start();
 
       const failedTask = createTask("FN-001", "Test Task", "failed");

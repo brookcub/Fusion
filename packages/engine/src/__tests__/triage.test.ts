@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { Agent, TaskStore, Task, TaskDetail, Settings } from "@fusion/core";
-import { applyOriginalDescription, builtinSeamPrompt, buildBootstrapPrompt, computePlanApprovalFingerprint, MAX_TASK_LIST_TEXT_CHARS, renderTriagePolicyPlaceholders, resolveAgentPrompt } from "@fusion/core";
+import { applyOriginalDescription, builtinSeamPrompt, buildBootstrapPrompt, computePlanApprovalFingerprint, deriveFallbackTaskTitle, MAX_TASK_LIST_TEXT_CHARS, renderTriagePolicyPlaceholders, resolveAgentPrompt } from "@fusion/core";
 import {
   TriageProcessor,
   buildSpecificationPrompt,
@@ -162,6 +162,16 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
       return { task: task as Task, moved: true };
     }),
     withTaskLock: vi.fn(async (_id, callback) => callback()),
+    /*
+    FNXC:TriageTestMock 2026-08-23-18:35:
+    FN-151's reset-fenced planning artifact write (`persistResetFencedPlanningArtifact`) holds the
+    non-reentrant planning lifecycle lock unconditionally, so a store fixture without it makes every
+    plan persistence throw. Production TaskStore always exposes this surface; model it as a
+    pass-through so triage unit tests exercise the real persistence path.
+    */
+    withPlanningLifecycleLock: vi.fn(async (_id, callback) => callback()),
+    updateTaskUnlocked: vi.fn(async (id, patch) => ({ ...((await store.getTask?.(id)) ?? { id }), ...patch }) as Task),
+    isBackendMode: vi.fn(() => false),
     readTaskForMove: vi.fn(async (id) => (await store.getTask?.(id)) ?? ({ id, column: "triage", status: "planning" } as Task)),
     updateTask: vi.fn().mockResolvedValue(undefined),
     deleteTask: vi.fn(),
@@ -305,7 +315,7 @@ describe("buildSpecificationPrompt", () => {
 
       expect(prompt).toContain("## Task Definition Language");
       expect(prompt).toContain(`${displayName} (${locale})`);
-      expect(prompt).toContain("Keep every `##`/`###` section heading");
+      expect(prompt).toContain("every `##`/`###` heading");
       expect(prompt).toContain("`## Original Description`");
     });
 
@@ -333,14 +343,15 @@ describe("buildSpecificationPrompt", () => {
       ["short input", languageSettings, "Très court"],
       ["low-confidence input", languageSettings, "Atypical vocabulary provides no familiar stopwords despite being long enough for language detection to inspect this ambiguous prose sample."],
       ["unsupported Japanese input", languageSettings, "ユーザーが作業内容と必要な手順を日本語で詳細に説明し、すべての利用者が理解できるように要件と確認方法を記載しています。"],
-    ])("keeps English behavior when %s", (_reason, settings, description) => {
+    ])("uses the explicit English contract when %s", (_reason, settings, description) => {
       const prompt = buildSpecificationPrompt(
         { ...baseTask, description },
         ".fusion/tasks/KB-001/PROMPT.md",
         settings,
       );
 
-      expect(prompt).not.toContain("## Task Definition Language");
+      expect(prompt).toContain("## Task Definition Language");
+      expect(prompt).toContain(settings.taskDefinitionInInputLanguage ? "same language as the original user input" : "in English");
     });
   });
 
@@ -364,6 +375,46 @@ describe("buildSpecificationPrompt", () => {
     expect(prompt).toContain("Project Commands");
     expect(prompt).toContain("pnpm test");
     expect(prompt).toContain("pnpm build");
+  });
+
+  it("includes a healthy environment capability inventory for planning", () => {
+    const prompt = buildSpecificationPrompt(
+      baseTask,
+      ".fusion/tasks/KB-001/PROMPT.md",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        environmentCapabilities: {
+          capabilities: [
+            { name: "node", available: true },
+            { name: "python3", available: false },
+          ],
+          degraded: false,
+        },
+      },
+    );
+
+    expect(prompt).toContain("## Environment Capabilities");
+    expect(prompt).toContain("Unavailable commands: python3");
+    expect(prompt).toContain("## Environment Constraints");
+  });
+
+  it("omits environment capabilities when the probe is degraded or absent", () => {
+    const degraded = buildSpecificationPrompt(
+      baseTask,
+      ".fusion/tasks/KB-001/PROMPT.md",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { environmentCapabilities: { capabilities: [], degraded: true } },
+    );
+    const absent = buildSpecificationPrompt(baseTask, ".fusion/tasks/KB-001/PROMPT.md");
+
+    expect(degraded).not.toContain("## Environment Capabilities");
+    expect(absent).not.toContain("## Environment Capabilities");
   });
 
   describe("completionDocumentationMode setting", () => {
@@ -530,44 +581,72 @@ describe("buildSpecificationPrompt", () => {
     expect(prompt).toContain("FN-002, FN-003");
   });
 
-  it("handles task without title", () => {
-    const taskWithoutTitle: TaskDetail = {
-      ...baseTask,
-      title: undefined,
-    };
+  describe("short titleless task title fallback", () => {
+    it.each([1, 199, 200, 201, 4001])("uses the deterministic description title at the %i-character boundary", (length) => {
+      const description = "a".repeat(length);
+      const prompt = buildSpecificationPrompt(
+        { ...baseTask, title: undefined, description },
+        ".fusion/tasks/KB-001/PROMPT.md",
+      );
+      const fallbackTitle = deriveFallbackTaskTitle(description);
 
-    const prompt = buildSpecificationPrompt(
-      taskWithoutTitle,
-      ".fusion/tasks/KB-001/PROMPT.md",
-    );
+      expect(prompt).toContain(`- **Title:** ${fallbackTitle}`);
+      expect(prompt).not.toContain("- **Title:** (none)");
+    });
 
-    expect(prompt).toContain("(none)");
+    it("preserves an explicit nonblank title", () => {
+      const prompt = buildSpecificationPrompt(
+        { ...baseTask, title: "Operator-provided title", description: "short request" },
+        ".fusion/tasks/KB-001/PROMPT.md",
+      );
+
+      expect(prompt).toContain("- **Title:** Operator-provided title");
+      expect(prompt).not.toContain("- **Title:** Short request");
+    });
+
+    it.each([
+      ["", "empty"],
+      ["   \n\t", "whitespace-only"],
+    ])("keeps (none) for %s descriptions", (description) => {
+      const prompt = buildSpecificationPrompt(
+        { ...baseTask, title: undefined, description },
+        ".fusion/tasks/KB-001/PROMPT.md",
+      );
+
+      expect(prompt).toContain("- **Title:** (none)");
+    });
+
+    it("keeps the deterministic fallback above the former AI threshold", () => {
+      const description = "a".repeat(201);
+      const prompt = buildSpecificationPrompt(
+        { ...baseTask, title: undefined, description },
+        ".fusion/tasks/KB-001/PROMPT.md",
+      );
+
+      expect(prompt).toContain(`- **Title:** ${deriveFallbackTaskTitle(description)}`);
+      expect(prompt).not.toContain("- **Title:** (none)");
+    });
+
+    it("uses the helper-safe first meaningful line for markdown and multiline text", () => {
+      const description = "\n### Restore the short task title\n\nAdditional details stay in the description.";
+      const prompt = buildSpecificationPrompt(
+        { ...baseTask, title: undefined, description },
+        ".fusion/tasks/KB-001/PROMPT.md",
+      );
+      const fallbackTitle = deriveFallbackTaskTitle(description);
+
+      expect(fallbackTitle).toBe("Restore the short task title");
+      expect(prompt).toContain(`- **Title:** ${fallbackTitle}`);
+      expect(prompt).not.toContain("- **Title:** (none)");
+    });
   });
 
-  it("includes proactive subtask guidance when breakdown was not explicitly requested", () => {
-    const prompt = buildSpecificationPrompt(
-      baseTask,
-      ".fusion/tasks/KB-001/PROMPT.md",
-    );
+  it("keeps complex tasks in one detailed planning prompt", () => {
+    const prompt = buildSpecificationPrompt(baseTask, ".fusion/tasks/KB-001/PROMPT.md");
 
-    expect(prompt).toContain("## Subtask Consideration");
-    expect(prompt).toContain("MORE THAN 7 implementation steps");
-    expect(prompt).toContain("GOOD TO SPLIT");
-    expect(prompt).not.toContain("## Subtask Breakdown Requested");
-  });
-
-  it("keeps explicit breakIntoSubtasks flow mandatory when requested", () => {
-    const prompt = buildSpecificationPrompt(
-      {
-        ...baseTask,
-        breakIntoSubtasks: true,
-      },
-      ".fusion/tasks/KB-001/PROMPT.md",
-    );
-
-    expect(prompt).toContain("## Subtask Breakdown Requested");
-    expect(prompt).toContain("If splitting: use the \\\`fn_task_create\\\` tool");
-    expect(prompt).not.toContain("## Subtask Consideration");
+    expect(prompt).toContain("## One-task planning");
+    expect(prompt).toContain("Keep this task intact regardless of complexity");
+    expect(prompt).not.toContain("Subtask Breakdown");
   });
 
   describe("memoryEnabled setting", () => {
@@ -878,34 +957,12 @@ describe("canonical triage policy prompt", () => {
 });
 
 describe("canonical triage policy prompt", () => {
-  it("includes proactive M/L subtask breakdown guidance", () => {
-    expect(TRIAGE_POLICY_PROMPT).toContain(
-      "## Proactive Subtask Breakdown for M/L Tasks",
-    );
-    expect(TRIAGE_POLICY_PROMPT).toContain("{{triageProactiveSubtaskSplittingEnabled}}");
-    expect(RENDERED_TRIAGE_POLICY_PROMPT).toContain(
-      "Even when `breakIntoSubtasks` is not set to `true`",
-    );
-    expect(RENDERED_TRIAGE_POLICY_PROMPT).toContain(
-      "Size S tasks should NOT be split",
-    );
+  it("requires one detailed plan for complex work", () => {
+    expect(TRIAGE_POLICY_PROMPT).toContain("Complexity never authorizes replacing a requested task with child tasks");
+    expect(RENDERED_TRIAGE_POLICY_PROMPT).toContain("Keep every requested task as one detailed plan regardless of size");
+    expect(RENDERED_TRIAGE_POLICY_PROMPT).not.toContain("breakIntoSubtasks");
   });
 
-  it("includes explicit rendered subtask breakdown thresholds", () => {
-    expect(RENDERED_TRIAGE_POLICY_PROMPT).toContain("MORE THAN 7 implementation steps");
-    expect(RENDERED_TRIAGE_POLICY_PROMPT).toContain(
-      "MORE THAN 3 different packages/modules",
-    );
-    expect(RENDERED_TRIAGE_POLICY_PROMPT).not.toContain("{{triageSubtaskStepThreshold}}");
-  });
-
-  it("biases toward keeping tasks whole and acknowledges coordination overhead", () => {
-    expect(RENDERED_TRIAGE_POLICY_PROMPT).toContain("Default to keeping the task whole");
-    expect(RENDERED_TRIAGE_POLICY_PROMPT).toContain("Coordination overhead");
-    expect(RENDERED_TRIAGE_POLICY_PROMPT).toContain(
-      "7-10 focused steps within a coherent scope is fine as one unit",
-    );
-  });
 });
 
 describe("FN-5893 invariant regression wording", () => {
@@ -933,21 +990,35 @@ describe("FN-5893 invariant regression wording", () => {
     expect(FAST_PLANNING_PROMPT).not.toContain("## Proactive Subtask Breakdown");
   });
 
-  it("places Before → After Transformation at the top of the definition, ahead of Mission and Review Level (FN-7593)", () => {
+  it("places the product summary before Before → After, Mission, and Review Level", () => {
+    const standardOriginalIdx = STANDARD_PLANNING_PROMPT.indexOf("## Original Description");
+    const standardSummaryIdx = STANDARD_PLANNING_PROMPT.indexOf("## What This Delivers");
     const standardTransformationIdx = STANDARD_PLANNING_PROMPT.indexOf("## Before → After Transformation");
     const standardReviewLevelIdx = STANDARD_PLANNING_PROMPT.indexOf("## Review Level");
-    const standardMissionIdx = STANDARD_PLANNING_PROMPT.indexOf("## Mission");
+    const standardMissionIdx = STANDARD_PLANNING_PROMPT.indexOf("\n## Mission");
+    expect(standardOriginalIdx).toBeGreaterThan(-1);
+    expect(standardSummaryIdx).toBeGreaterThan(-1);
     expect(standardTransformationIdx).toBeGreaterThan(-1);
+    expect(standardOriginalIdx).toBeLessThan(standardSummaryIdx);
+    expect(standardSummaryIdx).toBeLessThan(standardTransformationIdx);
     expect(standardReviewLevelIdx).toBeGreaterThan(-1);
     expect(standardMissionIdx).toBeGreaterThan(-1);
     expect(standardTransformationIdx).toBeLessThan(standardReviewLevelIdx);
     expect(standardTransformationIdx).toBeLessThan(standardMissionIdx);
 
+    const fastOriginalIdx = FAST_PLANNING_PROMPT.indexOf("## Original Description");
+    const fastSummaryIdx = FAST_PLANNING_PROMPT.indexOf("## What This Delivers");
     const fastTransformationIdx = FAST_PLANNING_PROMPT.indexOf("## Before → After Transformation");
     const fastMissionIdx = FAST_PLANNING_PROMPT.indexOf("## Mission");
+    expect(fastOriginalIdx).toBeLessThan(fastSummaryIdx);
+    expect(fastSummaryIdx).toBeLessThan(fastTransformationIdx);
     expect(fastTransformationIdx).toBeGreaterThan(-1);
     expect(fastMissionIdx).toBeGreaterThan(-1);
     expect(fastTransformationIdx).toBeLessThan(fastMissionIdx);
+    for (const prompt of [TRIAGE_POLICY_PROMPT, STANDARD_PLANNING_PROMPT, FAST_PLANNING_PROMPT]) {
+      expect(prompt).toContain("plain product language");
+      expect(prompt).toContain("verify at a glance");
+    }
   });
 
   it("requires invariant-level regression coverage in standard, fast, and core triage prompts", () => {
@@ -1036,20 +1107,17 @@ describe("FN-5893 invariant regression wording", () => {
   });
 });
 
-describe("fast-mode triage", () => {
-  it("exports a lean FAST_PLANNING_PROMPT", () => {
+describe("lean-planning and Fast admission", () => {
+  it("keeps the lean planning prompt available independently of Fast task execution", () => {
     expect(typeof FAST_PLANNING_PROMPT).toBe("string");
     expect(FAST_PLANNING_PROMPT.length).toBeGreaterThan(0);
-    expect(FAST_PLANNING_PROMPT).toContain("This task is running in **fast mode**");
-    expect(FAST_PLANNING_PROMPT).toContain("workflow Plan Review");
-    expect(FAST_PLANNING_PROMPT).toContain("Do not call `fn_review_spec()`");
     expect(FAST_PLANNING_PROMPT).not.toContain("## Review Level");
     expect(FAST_PLANNING_PROMPT).not.toContain("## Triage subtask breakdown");
     expect(FAST_PLANNING_PROMPT).not.toContain("## Proactive Subtask Breakdown");
     expect(FAST_PLANNING_PROMPT).not.toContain("Frontend UX Criteria");
   });
 
-  it("documents explicit-request-only workflow routing in standard and fast prompts", () => {
+  it("documents explicit-request-only workflow routing in standard and lean prompts", () => {
     const required = ["## Workflow Routing", "Keep the project default workflow", "unless the user explicitly requested a specific workflow", "or you created that task yourself", "When you create a task via `fn_task_create`", "do not move a task you did not create unless the user asked", "Do NOT call `fn_workflow_select` or pass `workflow_id`", "If the user explicitly", "fn_workflow_list", "fn_workflow_select", "workflow_id", "**No commits expected:** true", "builtin:coding"];
     const forbidden = ["use workflow descriptions as the routing signal", "select an appropriate lightweight workflow", "prefer `builtin:quick-fix` or a custom investigation workflow", "Match the task nature to the workflow description", "descriptions are authoritative for routing decisions"];
     for (const prompt of [RENDERED_TRIAGE_POLICY_PROMPT, FAST_PLANNING_PROMPT]) {
@@ -1069,10 +1137,11 @@ describe("fast-mode triage", () => {
     expect(FAST_PLANNING_PROMPT).toContain("forensic");
   });
 
-  it("selects FAST_PLANNING_PROMPT for fast tasks", async () => {
-    const task = createTriageTask({ id: "FN-FAST-001", executionMode: "fast" });
+  it("selects FAST_PLANNING_PROMPT when leanPlanning is enabled", async () => {
+    const task = createTriageTask({ id: "FN-LEAN-001", executionMode: "standard" });
     const store = createMockStore({
       getTask: vi.fn().mockResolvedValue({ ...mockTaskDetail, id: task.id, attachments: [], comments: [] }),
+      getSettings: vi.fn().mockResolvedValue({ maxConcurrent: 2, maxWorktrees: 4, pollIntervalMs: 10_000, autoMerge: true, leanPlanning: true } as Settings),
     });
 
     let capturedSystemPrompt = "";
@@ -1092,7 +1161,7 @@ describe("fast-mode triage", () => {
     const processor = new TriageProcessor(store, "/tmp/root");
     await processor.specifyTask(task);
 
-    expect(capturedSystemPrompt).toContain("This task is running in **fast mode**");
+    expect(capturedSystemPrompt).toContain("Do not call `fn_review_spec()`");
     expect(capturedSystemPrompt).not.toContain("## Review Level");
   });
 
@@ -1189,53 +1258,6 @@ describe("fast-mode triage", () => {
     expect(capturedSystemPrompt).not.toContain("Keep the project default workflow (`WF-005`)");
   });
 
-  it("renders disabled proactive splitting while preserving explicit breakIntoSubtasks prompts", async () => {
-    const task = createTriageTask({ id: "FN-FAST-003", executionMode: "standard", breakIntoSubtasks: true });
-    const rootDir = await createTriageFixtureRoot("fn-7491-triage-");
-    const detail = { ...mockTaskDetail, id: task.id, breakIntoSubtasks: true, attachments: [], comments: [] };
-    const store = createMockStore({
-      getTask: vi.fn().mockResolvedValue(detail),
-      getSettings: vi.fn().mockResolvedValue({
-        maxConcurrent: 2,
-        maxWorktrees: 4,
-        pollIntervalMs: 10000,
-        groupOverlappingFiles: false,
-        autoMerge: true,
-        triageProactiveSubtaskSplittingEnabled: false,
-      } as Settings),
-    });
-
-    let capturedSystemPrompt = "";
-    const { promptWithFallback } = await import("../pi.js");
-    (promptWithFallback as ReturnType<typeof vi.fn>).mockImplementationOnce(async (_session: unknown, prompt: string) => {
-      await mkdir(join(rootDir, ".fusion", "tasks", "FN-FAST-003"), { recursive: true }).catch(() => undefined);
-      await writeFile(join(rootDir, ".fusion", "tasks", "FN-FAST-003", "PROMPT.md"), "# Task: FN-FAST-003 - Split\n\n## Mission\n\nDone.", { flag: "w" }).catch(() => undefined);
-      expect(prompt).toContain("## Subtask Breakdown Requested");
-      expect(prompt).toContain("The user has requested that this task be broken into smaller subtasks");
-      expect(prompt).not.toContain("## Subtask Consideration");
-    });
-    mockCreateFnAgent.mockImplementationOnce(async (opts: any) => {
-      capturedSystemPrompt = opts.systemPrompt;
-      return {
-        session: {
-          state: {},
-          sessionManager: { getLeafId: vi.fn().mockReturnValue(null) },
-          prompt: vi.fn().mockResolvedValue(undefined),
-          dispose: vi.fn(),
-          navigateTree: vi.fn(),
-        },
-      };
-    });
-
-    const processor = new TriageProcessor(store, rootDir);
-    await processor.specifyTask(task);
-
-    expect(capturedSystemPrompt).toContain("Proactive oversized-task splitting is DISABLED");
-    expect(capturedSystemPrompt).toContain("Only create child tasks when `breakIntoSubtasks: true` is explicitly present");
-    expect(capturedSystemPrompt).not.toContain("Even when `breakIntoSubtasks` is not set to `true`, apply these thresholds proactively");
-    expect(promptWithFallback).toHaveBeenCalled();
-    await cleanupTriageFixtureRoot(rootDir);
-  });
 
   it("includes triage plugin contributions when provided", async () => {
     const task = createTriageTask({ id: "FN-FAST-PLUGIN-001", executionMode: "standard" });
@@ -1301,10 +1323,11 @@ describe("fast-mode triage", () => {
     expect(capturedSystemPrompt).not.toContain("## Plugin:");
   });
 
-  it("applies triage plugin contributions in fast mode too", async () => {
-    const task = createTriageTask({ id: "FN-FAST-PLUGIN-003", executionMode: "fast" });
+  it("applies triage plugin contributions in lean planning", async () => {
+    const task = createTriageTask({ id: "FN-LEAN-PLUGIN-003", executionMode: "standard" });
     const store = createMockStore({
       getTask: vi.fn().mockResolvedValue({ ...mockTaskDetail, id: task.id, attachments: [], comments: [] }),
+      getSettings: vi.fn().mockResolvedValue({ maxConcurrent: 2, maxWorktrees: 4, pollIntervalMs: 10_000, autoMerge: true, leanPlanning: true } as Settings),
     });
     const pluginRunner = {
       getPromptContributionsForSurface: vi.fn().mockReturnValue([
@@ -1330,69 +1353,22 @@ describe("fast-mode triage", () => {
     const processor = new TriageProcessor(store, "/tmp/root", { pluginRunner: pluginRunner as any });
     await processor.specifyTask(task);
 
-    expect(capturedSystemPrompt).toContain("This task is running in **fast mode**");
     expect(capturedSystemPrompt).toContain("## Plugin: plugin-fast");
   });
 
-  it("finalizes fast planning without exposing a separate spec-review tool", async () => {
-    const rootDir = await createTriageFixtureRoot("fusion-triage-fast-gate-");
-    try {
-      const task = createTriageTask({ id: "FN-FAST-004", executionMode: "fast" });
-      const promptPath = join(rootDir, ".fusion", "tasks", task.id, "PROMPT.md");
-      await mkdir(join(rootDir, ".fusion", "tasks", task.id), { recursive: true });
+  it("does not start a planning session for a Fast task", async () => {
+    mockCreateFnAgent.mockClear();
+    const task = createTriageTask({ id: "FN-FAST-004", executionMode: "fast" });
+    const store = createMockStore();
 
-      const store = createMockStore({
-        getSettings: vi.fn().mockResolvedValue({
-          maxConcurrent: 2,
-          maxWorktrees: 4,
-          pollIntervalMs: 10000,
-          groupOverlappingFiles: false,
-          autoMerge: true,
-          experimentalFeatures: { researchView: true },
-        } as Settings),
-        getTask: vi.fn().mockResolvedValue({ ...mockTaskDetail, id: task.id, attachments: [], comments: [] }),
-        parseDependenciesFromPrompt: vi.fn().mockResolvedValue([]),
-        parseStepsFromPrompt: vi.fn().mockResolvedValue([]),
-        parseFileScopeFromPrompt: vi.fn().mockResolvedValue([]),
-      });
+    await new TriageProcessor(store, "/tmp/root").specifyTask(task);
 
-      let capturedTools: any[] = [];
-      mockCreateFnAgent.mockImplementationOnce(async (opts: any) => {
-        capturedTools = opts.customTools;
-        return {
-          session: {
-            state: {},
-            sessionManager: { getLeafId: vi.fn().mockReturnValue(null) },
-            prompt: vi.fn().mockResolvedValue(undefined),
-            dispose: vi.fn(),
-            navigateTree: vi.fn(),
-          },
-        };
-      });
-
-      const { promptWithFallback } = await import("../pi.js");
-      (promptWithFallback as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
-        expect(capturedTools.some((tool: any) => tool.name === "fn_research_run")).toBe(true);
-        expect(capturedTools.some((tool: any) => tool.name === "fn_research_list")).toBe(true);
-        expect(capturedTools.some((tool: any) => tool.name === "fn_research_get")).toBe(true);
-        expect(capturedTools.some((tool: any) => tool.name === "fn_research_cancel")).toBe(true);
-        expect(capturedTools.some((tool: any) => tool.name === "fn_research_retry")).toBe(true);
-        expect(capturedTools.some((tool: any) => tool.name === "fn_review_spec")).toBe(false);
-        await writeFile(promptPath, "# Task: FN-FAST-004 - Fast\n\n## Mission\n\nShip it.");
-      });
-
-      const processor = new TriageProcessor(store, rootDir);
-      await processor.specifyTask(task);
-
-      expect(mockReviewStep).not.toHaveBeenCalled();
-      expect(store.moveTask).toHaveBeenCalledWith("FN-FAST-004", "todo");
-    } finally {
-      await cleanupTriageFixtureRoot(rootDir);
-    }
+    expect(mockCreateFnAgent).not.toHaveBeenCalled();
+    expect(store.logEntry).toHaveBeenCalledWith(task.id, "Fast mode intentionally skips specification planning");
   });
 
   it("omits research tools and prompt guidance when researchView experimental flag is disabled", async () => {
-    const task = createTriageTask({ id: "FN-FAST-005", executionMode: "fast" });
+    const task = createTriageTask({ id: "FN-LEAN-005", executionMode: "standard" });
     const store = createMockStore({
       getSettings: vi.fn().mockResolvedValue({
         maxConcurrent: 2,
@@ -1400,6 +1376,7 @@ describe("fast-mode triage", () => {
         pollIntervalMs: 10000,
         groupOverlappingFiles: false,
         autoMerge: true,
+        leanPlanning: true,
         experimentalFeatures: { researchView: false },
       } as Settings),
       getTask: vi.fn().mockResolvedValue({ ...mockTaskDetail, id: task.id, attachments: [], comments: [] }),
@@ -1433,7 +1410,7 @@ describe("fast-mode triage", () => {
   });
 
   it("includes research prompt guidance when researchView experimental flag is enabled", async () => {
-    const task = createTriageTask({ id: "FN-FAST-006", executionMode: "fast" });
+    const task = createTriageTask({ id: "FN-LEAN-006", executionMode: "standard" });
     const store = createMockStore({
       getSettings: vi.fn().mockResolvedValue({
         maxConcurrent: 2,
@@ -1441,6 +1418,7 @@ describe("fast-mode triage", () => {
         pollIntervalMs: 10000,
         groupOverlappingFiles: false,
         autoMerge: true,
+        leanPlanning: true,
         experimentalFeatures: { researchView: true },
       } as Settings),
       getTask: vi.fn().mockResolvedValue({ ...mockTaskDetail, id: task.id, attachments: [], comments: [] }),
@@ -1713,7 +1691,7 @@ Planner rewrote mission without the raw request.
 
 ## Steps
 
-### Step 1: Implement
+### Step 0: Implement
 
 - [ ] Do the work
 `;
@@ -1751,7 +1729,7 @@ Planner rewrote mission without the raw request.
     try {
       const taskDir = join(tempRoot, ".fusion", "tasks", task.id);
       await mkdir(taskDir, { recursive: true });
-      const written = `# Task: ${task.id} - Missing release artifact\n\n## Steps\n\n### Step 1: Implement\n\n- [ ] Do the work\n`;
+      const written = `# Task: ${task.id} - Missing release artifact\n\n## Steps\n\n### Step 0: Implement\n\n- [ ] Do the work\n`;
       await writeFile(join(taskDir, "PROMPT.md"), written, "utf-8");
       const localStore = createMockStore({
         getTask: vi.fn().mockResolvedValue({ ...task, prompt: "" }),
@@ -1894,6 +1872,7 @@ Planner rewrote mission without the raw request.
 
     expect(projectAdmissionCoordinator.inspectProjectStateForTests(projectId)).toEqual({
       reservedCount: 0,
+      reservedWorktreeCount: 0,
       draining: false,
       providerIds: [],
     });
@@ -2651,8 +2630,8 @@ describe("requirePlanApproval setting", () => {
    * awaiting-approval a second time; the fix must move straight to todo instead.
    */
   describe("FN-7569: plan approval fingerprint idempotency", () => {
-    const planText = "# Task: FN-IDEMPOTENT - Idempotent plan\n\n## Mission\n\nDo the thing.\n\n## File Scope\n\n- a.ts\n\n## Steps\n\n### Step 1: Implement\n\nDo the thing.\n";
-    const changedPlanText = "# Task: FN-IDEMPOTENT - Idempotent plan\n\n## Mission\n\nDo the thing, differently.\n\n## File Scope\n\n- a.ts\n- b.ts\n\n## Steps\n\n### Step 1: Implement differently\n\nDo the changed thing.\n";
+    const planText = "# Task: FN-IDEMPOTENT - Idempotent plan\n\n## Mission\n\nDo the thing.\n\n## File Scope\n\n- a.ts\n\n## Steps\n\n### Step 0: Implement\n\nDo the thing.\n";
+    const changedPlanText = "# Task: FN-IDEMPOTENT - Idempotent plan\n\n## Mission\n\nDo the thing, differently.\n\n## File Scope\n\n- a.ts\n- b.ts\n\n## Steps\n\n### Step 0: Implement differently\n\nDo the changed thing.\n";
 
     /*
     FNXC:PlanApproval 2026-07-15-14:05:
@@ -3036,7 +3015,7 @@ describe("requirePlanApproval setting", () => {
       finalizeApprovedTask(task: Task, writtenInput: string, settings: Settings): Promise<void>;
     }).finalizeApprovedTask(
       task,
-      "# Task: FN-7224 - Rebuilt plan task\n\n## Steps\n\n### Step 1: Fresh step\n- Execute the fresh plan.\n",
+      "# Task: FN-7224 - Rebuilt plan task\n\n## Steps\n\n### Step 0: Fresh step\n- Execute the fresh plan.\n",
       { requirePlanApproval: false } as Settings,
     );
 
@@ -3190,7 +3169,7 @@ describe("specified triage recovery", () => {
   it("recovers a structured implementation plan without a no-commits marker", async () => {
     await writeFile(
       join(rootDir, ".fusion", "tasks", "FN-001", "PROMPT.md"),
-      "# Task: FN-001 - Implement change\n\n**Size:** M\n\n## Steps\n\n### Step 1: Implement\n\nMake the change.\n",
+      "# Task: FN-001 - Implement change\n\n**Size:** M\n\n## Steps\n\n### Step 0: Implement\n\nMake the change.\n",
     );
     const store = createMockStore({
       getSettings: vi.fn().mockResolvedValue({
@@ -3559,7 +3538,7 @@ Forbidden paths / non-goals:
 
 ## Steps
 
-### Step 1: Fix poisoned scope
+### Step 0: Fix poisoned scope
 
 Apply the scoped implementation changes.
 `,
@@ -3620,10 +3599,58 @@ Apply the scoped implementation changes.
     expect(metadataPatch.intentSignature.filePaths).not.toContain("AtlasNotes.xcodeproj/**");
   });
 
+  it("writes the short deterministic planning title through normal heading finalization", async () => {
+    const description = "Restore the short task title after planning";
+    const planningPrompt = buildSpecificationPrompt(
+      {
+        ...mockTaskDetail,
+        id: "FN-001",
+        title: undefined,
+        description,
+      },
+      ".fusion/tasks/FN-001/PROMPT.md",
+    );
+    const fallbackTitle = deriveFallbackTaskTitle(description);
+    expect(planningPrompt).toContain(`- **Title:** ${fallbackTitle}`);
+
+    await writeFile(
+      join(rootDir, ".fusion", "tasks", "FN-001", "PROMPT.md"),
+      `# Task: FN-001 - ${fallbackTitle}\n\n**Size:** M\n\n## Steps\n\n### Step 0: Preserve the title\n\nKeep the planned title.`,
+    );
+
+    const store = createMockStore({
+      getSettings: vi.fn().mockResolvedValue({
+        maxConcurrent: 2,
+        maxWorktrees: 4,
+        pollIntervalMs: 10000,
+        groupOverlappingFiles: false,
+        autoMerge: true,
+        requirePlanApproval: false,
+      } as Settings),
+    });
+
+    const processor = new TriageProcessor(store, rootDir);
+    const recovered = await processor.recoverApprovedTask({
+      id: "FN-001",
+      description,
+      column: "triage",
+      status: "planning",
+      dependencies: [],
+      steps: [],
+      currentStep: 0,
+      log: [{ timestamp: "2026-01-01T00:00:00.000Z", action: "Spec review: APPROVE" }],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:02:00.000Z",
+    });
+
+    expect(recovered).toBe(true);
+    expect(store.updateTask).toHaveBeenCalledWith("FN-001", expect.objectContaining({ title: fallbackTitle }));
+  });
+
   it("updates malformed metadata title from prompt heading when task ID matches", async () => {
     await writeFile(
       join(rootDir, ".fusion", "tasks", "FN-001", "PROMPT.md"),
-      "# Task: FN-001 - Experimental AI Agent Onboarding Flow\n\n**Size:** M\n\n## Review Level: 2\n\nRecovered specification\n\n## Steps\n\n### Step 1: Implement onboarding flow\n\nMake the change.",
+      "# Task: FN-001 - Experimental AI Agent Onboarding Flow\n\n**Size:** M\n\n## Review Level: 2\n\nRecovered specification\n\n## Steps\n\n### Step 0: Implement onboarding flow\n\nMake the change.",
     );
 
     const store = createMockStore({
@@ -3662,7 +3689,7 @@ Apply the scoped implementation changes.
   it("does not overwrite title when heading task ID does not match", async () => {
     await writeFile(
       join(rootDir, ".fusion", "tasks", "FN-001", "PROMPT.md"),
-      "# Task: FN-999 - Wrong Task\n\n**Size:** M\n\n## Review Level: 2\n\nRecovered specification\n\n## Steps\n\n### Step 1: Implement change\n\nMake the change.",
+      "# Task: FN-999 - Wrong Task\n\n**Size:** M\n\n## Review Level: 2\n\nRecovered specification\n\n## Steps\n\n### Step 0: Implement change\n\nMake the change.",
     );
 
     const store = createMockStore({
@@ -3712,7 +3739,7 @@ Apply the scoped implementation changes.
   it("preserves imported GitHub issue titles during planning recovery", async () => {
     await writeFile(
       join(rootDir, ".fusion", "tasks", "FN-001", "PROMPT.md"),
-      "# Task: FN-001 - Different AI-generated planning title\n\n**Size:** M\n\n## Review Level: 2\n\nRecovered specification\n\n## Steps\n\n### Step 1: Implement issue fix\n\nMake the change.",
+      "# Task: FN-001 - Different AI-generated planning title\n\n**Size:** M\n\n## Review Level: 2\n\nRecovered specification\n\n## Steps\n\n### Step 0: Implement issue fix\n\nMake the change.",
     );
 
     const store = createMockStore({
@@ -3990,414 +4017,6 @@ describe("taskCreate tool model inheritance", () => {
     }));
   });
 
-  describe("proactive subtask creation (fn_task_create always available)", () => {
-    it("fn_task_create tool is included in triage tools regardless of breakIntoSubtasks", () => {
-      const store = createMockStore();
-      const processor = new TriageProcessor(store, "/test/root");
-      const createdSubtasksRef = { current: [] };
-
-      const tools = (processor as any).createTriageTools({
-        parentTaskId: "FN-400",
-        allowTaskCreate: true,
-        createdSubtasksRef,
-      });
-
-      const toolNames = tools.map((t: any) => t.name);
-      expect(toolNames).toContain("fn_task_create");
-      expect(toolNames).toContain("fn_task_list");
-      expect(toolNames).toContain("fn_task_search");
-      expect(toolNames).toContain("fn_task_show");
-      expect(tools).toHaveLength(4);
-    });
-
-    it("fn_task_create tool succeeds and tracks created subtask", async () => {
-      const parentTask: Task = {
-        id: "FN-400",
-        description: "Large task without breakIntoSubtasks",
-        column: "triage",
-        dependencies: [],
-        steps: [],
-        currentStep: 0,
-        log: [],
-        createdAt: "2026-01-01T00:00:00.000Z",
-        updatedAt: "2026-01-01T00:00:00.000Z",
-      };
-
-      const createdSubtask: Task = {
-        id: "FN-401",
-        description: "Child task",
-        column: "triage",
-        dependencies: [],
-        steps: [],
-        currentStep: 0,
-        log: [],
-        createdAt: "2026-01-01T00:00:00.000Z",
-        updatedAt: "2026-01-01T00:00:00.000Z",
-      };
-
-      const store = createMockStore({
-        getTask: vi.fn().mockResolvedValue(parentTask),
-        createTask: vi.fn().mockResolvedValue(createdSubtask),
-      });
-
-      const processor = new TriageProcessor(store, "/test/root");
-      const createdSubtasksRef = { current: [] };
-
-      const tools = (processor as any).createTriageTools({
-        parentTaskId: "FN-400",
-        allowTaskCreate: true,
-        createdSubtasksRef,
-      });
-
-      const taskCreateTool = tools.find((t: any) => t.name === "fn_task_create");
-      const result = await taskCreateTool.execute("call-1", {
-        description: "Child task description",
-        title: "Child Task",
-        dependencies: [],
-      });
-
-      // Should NOT return an error about task creation being disabled
-      const text = result.content[0].text;
-      expect(text).not.toContain("ERROR");
-      expect(text).not.toContain("not enabled");
-      expect(text).toContain("Created child task FN-401");
-
-      // Subtask should be tracked in the ref
-      expect(createdSubtasksRef.current).toContain("FN-401");
-
-      // Should inherit parent model settings
-      expect(store.createTask).toHaveBeenCalledWith(expect.objectContaining({
-        title: "Child Task",
-        description: "Child task description",
-      }), expect.objectContaining({
-        settings: expect.objectContaining({
-          maxConcurrent: 2,
-          maxWorktrees: 4,
-        }),
-      }));
-    });
-
-    it("fn_task_create passes workflow_id and noCommitsExpected through to child tasks", async () => {
-      const parentTask: Task = {
-        id: "FN-410",
-        description: "Parent task",
-        column: "triage",
-        dependencies: [],
-        steps: [],
-        currentStep: 0,
-        log: [],
-        createdAt: "2026-01-01T00:00:00.000Z",
-        updatedAt: "2026-01-01T00:00:00.000Z",
-      };
-
-      const createdSubtask: Task = {
-        ...parentTask,
-        id: "FN-411",
-        description: "Decision child task",
-        workflowId: "builtin:quick-fix",
-        noCommitsExpected: true,
-      };
-
-      const store = createMockStore({
-        getTask: vi.fn().mockResolvedValue(parentTask),
-        createTask: vi.fn().mockResolvedValue(createdSubtask),
-      });
-      const processor = new TriageProcessor(store, "/test/root");
-      const createdSubtasksRef = { current: [] };
-
-      const tools = (processor as any).createTriageTools({
-        parentTaskId: "FN-410",
-        allowTaskCreate: true,
-        createdSubtasksRef,
-      });
-      const taskCreateTool = tools.find((t: any) => t.name === "fn_task_create");
-
-      const result = await taskCreateTool.execute("call-1", {
-        description: "Investigate and report the routing decision",
-        workflow_id: "builtin:quick-fix",
-        noCommitsExpected: true,
-      });
-
-      expect(result.content[0].text).toContain("Created child task FN-411");
-      expect(store.createTask).toHaveBeenCalledWith(expect.objectContaining({
-        description: "Investigate and report the routing decision",
-        workflowId: "builtin:quick-fix",
-        noCommitsExpected: true,
-      }), expect.objectContaining({
-        settings: expect.objectContaining({
-          maxConcurrent: 2,
-          maxWorktrees: 4,
-        }),
-      }));
-      expect(createdSubtasksRef.current).toContain("FN-411");
-    });
-
-    it("fn_task_create rejects a dependency on the parent task being split", async () => {
-      // Regression: triage used to accept any id in `dependencies`. If the AI
-      // named the parent, the parent got deleted after the split and the child
-      // was blocked forever by a nonexistent dep (FN-2163/FN-2164 incident).
-      const parentTask: Task = {
-        id: "FN-600",
-        description: "Parent about to be split",
-        column: "triage",
-        dependencies: [],
-        steps: [],
-        currentStep: 0,
-        log: [],
-        createdAt: "2026-01-01T00:00:00.000Z",
-        updatedAt: "2026-01-01T00:00:00.000Z",
-      };
-
-      const store = createMockStore({
-        getTask: vi.fn().mockResolvedValue(parentTask),
-        createTask: vi.fn(),
-      });
-      const processor = new TriageProcessor(store, "/test/root");
-      const createdSubtasksRef = { current: [] };
-
-      const tools = (processor as any).createTriageTools({
-        parentTaskId: "FN-600",
-        allowTaskCreate: true,
-        createdSubtasksRef,
-      });
-      const taskCreateTool = tools.find((t: any) => t.name === "fn_task_create");
-
-      const result = await taskCreateTool.execute("call-1", {
-        description: "Child that tries to wait for the parent",
-        dependencies: ["FN-600"],
-      });
-
-      const text = result.content[0].text;
-      expect(text).toContain("ERROR");
-      expect(text).toContain("FN-600");
-      expect(text).toContain("parent task is deleted after splitting");
-      // Must not create the child — the caller has to fix the deps and retry.
-      expect(store.createTask).not.toHaveBeenCalled();
-      expect(createdSubtasksRef.current).toEqual([]);
-    });
-
-    it("fn_task_create accepts dependencies on sibling subtasks created earlier in the same split", async () => {
-      // The valid case: two siblings where the second depends on the first.
-      const parentTask: Task = {
-        id: "FN-700",
-        description: "Parent to split",
-        column: "triage",
-        dependencies: [],
-        steps: [],
-        currentStep: 0,
-        log: [],
-        createdAt: "2026-01-01T00:00:00.000Z",
-        updatedAt: "2026-01-01T00:00:00.000Z",
-      };
-      const sibling1: Task = { ...parentTask, id: "FN-701", description: "Sibling 1" };
-      const sibling2: Task = { ...parentTask, id: "FN-702", description: "Sibling 2" };
-
-      const createTaskMock = vi
-        .fn()
-        .mockResolvedValueOnce(sibling1)
-        .mockResolvedValueOnce(sibling2);
-
-      const store = createMockStore({
-        getTask: vi.fn().mockResolvedValue(parentTask),
-        createTask: createTaskMock,
-      });
-      const processor = new TriageProcessor(store, "/test/root");
-      const createdSubtasksRef = { current: [] };
-
-      const tools = (processor as any).createTriageTools({
-        parentTaskId: "FN-700",
-        allowTaskCreate: true,
-        createdSubtasksRef,
-      });
-      const taskCreateTool = tools.find((t: any) => t.name === "fn_task_create");
-
-      const firstRes = await taskCreateTool.execute("c1", {
-        description: "Sibling 1",
-        dependencies: [],
-      });
-      expect(firstRes.content[0].text).toContain("Created child task FN-701");
-
-      const secondRes = await taskCreateTool.execute("c2", {
-        description: "Sibling 2 depending on sibling 1",
-        dependencies: ["FN-701"],
-      });
-      expect(secondRes.content[0].text).toContain("Created child task FN-702");
-      expect(secondRes.content[0].text).not.toContain("ERROR");
-
-      // The second createTask call should have the resolved sibling id preserved.
-      expect(createTaskMock).toHaveBeenLastCalledWith(
-        expect.objectContaining({ dependencies: ["FN-701"] }),
-        expect.objectContaining({
-          settings: expect.objectContaining({
-            maxConcurrent: 2,
-            maxWorktrees: 4,
-          }),
-        }),
-      );
-      expect(createdSubtasksRef.current).toEqual(["FN-701", "FN-702"]);
-    });
-
-    it("fn_task_create rejects an unknown dependency id that is neither sibling nor existing task", async () => {
-      const parentTask: Task = {
-        id: "FN-800",
-        description: "Parent",
-        column: "triage",
-        dependencies: [],
-        steps: [],
-        currentStep: 0,
-        log: [],
-        createdAt: "2026-01-01T00:00:00.000Z",
-        updatedAt: "2026-01-01T00:00:00.000Z",
-      };
-      // getTask returns the parent when asked, but throws for unknown ids.
-      const store = createMockStore({
-        getTask: vi.fn(async (id: string) => {
-          if (id === "FN-800") return parentTask;
-          throw new Error(`Task ${id} not found`);
-        }) as unknown as TaskStore["getTask"],
-        createTask: vi.fn(),
-      });
-      const processor = new TriageProcessor(store, "/test/root");
-      const createdSubtasksRef = { current: [] };
-
-      const tools = (processor as any).createTriageTools({
-        parentTaskId: "FN-800",
-        allowTaskCreate: true,
-        createdSubtasksRef,
-      });
-      const taskCreateTool = tools.find((t: any) => t.name === "fn_task_create");
-
-      const result = await taskCreateTool.execute("c1", {
-        description: "Child naming a nonexistent dep",
-        dependencies: ["FN-9999"],
-      });
-
-      expect(result.content[0].text).toContain("ERROR");
-      expect(result.content[0].text).toContain("FN-9999");
-      expect(result.content[0].text).toContain("task not found");
-      expect(store.createTask).not.toHaveBeenCalled();
-    });
-
-    it("closes parent after proactive split even when breakIntoSubtasks is undefined", async () => {
-      // Test that the post-session closure path doesn't gate on breakIntoSubtasks.
-      // Strategy: capture the customTools from createFnAgent, then have
-      // promptWithFallback invoke the fn_task_create tool to simulate the agent
-      // proactively splitting an oversized task.
-      const task: Task = {
-        id: "FN-500",
-        description: "Oversized task without breakIntoSubtasks flag",
-        column: "triage",
-        dependencies: [],
-        steps: [],
-        currentStep: 0,
-        log: [],
-        createdAt: "2026-01-01T00:00:00.000Z",
-        updatedAt: "2026-01-01T00:00:00.000Z",
-      };
-
-      const childTask1: Task = {
-        id: "FN-501",
-        description: "Child part 1",
-        column: "triage",
-        dependencies: [],
-        steps: [],
-        currentStep: 0,
-        log: [],
-        createdAt: "2026-01-01T00:00:00.000Z",
-        updatedAt: "2026-01-01T00:00:00.000Z",
-      };
-      const childTask2: Task = {
-        id: "FN-502",
-        description: "Child part 2",
-        column: "triage",
-        dependencies: [],
-        steps: [],
-        currentStep: 0,
-        log: [],
-        createdAt: "2026-01-01T00:00:00.000Z",
-        updatedAt: "2026-01-01T00:00:00.000Z",
-      };
-
-      const taskDetail: TaskDetail = {
-        ...task,
-        prompt: "",
-        attachments: [],
-        // breakIntoSubtasks is explicitly undefined
-      };
-
-      const store = createMockStore({
-        getTask: vi.fn().mockResolvedValue(taskDetail),
-        createTask: vi.fn()
-          .mockResolvedValueOnce(childTask1)
-          .mockResolvedValueOnce(childTask2),
-      });
-
-      // Capture customTools from createFnAgent call
-      let capturedCustomTools: any[] = [];
-      const mockDispose = vi.fn();
-      mockCreateFnAgent.mockImplementation(async (opts: any) => {
-        capturedCustomTools = opts.customTools || [];
-        return {
-          session: {
-            prompt: vi.fn().mockResolvedValue(undefined),
-            dispose: mockDispose,
-            subscribe: vi.fn(),
-            sessionManager: {
-              getLeafId: vi.fn().mockReturnValue(null),
-              navigateTree: vi.fn(),
-            },
-          },
-        };
-      });
-
-      // Make promptWithFallback invoke the fn_task_create tool twice to simulate
-      // the agent proactively splitting the oversized task
-      const { promptWithFallback } = await import("../pi.js");
-      (promptWithFallback as ReturnType<typeof vi.fn>).mockImplementationOnce(
-        async () => {
-          const taskCreateTool = capturedCustomTools.find(
-            (t: any) => t.name === "fn_task_create",
-          );
-          expect(taskCreateTool).toBeDefined();
-          // Simulate agent creating two child tasks
-          await taskCreateTool.execute("call-1", {
-            description: "Child part 1",
-            title: "Part 1",
-            dependencies: [],
-          });
-          await taskCreateTool.execute("call-2", {
-            description: "Child part 2",
-            title: "Part 2",
-            dependencies: [],
-          });
-        },
-      );
-
-      const processor = new TriageProcessor(store, "/test/root", {
-        pollIntervalMs: 100_000,
-      });
-
-      await processor.specifyTask(task);
-
-      // The parent task should be deleted because subtasks were created,
-      // even though breakIntoSubtasks was NOT set
-      expect(store.logEntry).toHaveBeenCalledWith(
-        "FN-500",
-        expect.stringContaining("Converted into subtasks: FN-501, FN-502"),
-      );
-      expect(store.deleteTask).toHaveBeenCalledWith("FN-500", expect.objectContaining({
-        removeLineageReferences: true,
-        closureContext: {
-          kind: "split-into-subtasks",
-          childTaskIds: ["FN-501", "FN-502"],
-        },
-        auditContext: expect.objectContaining({
-          agentId: "triage",
-          runId: expect.stringMatching(/^triage-delete-FN-500-/),
-        }),
-      }));
-    });
-  });
 
   describe("bounded recovery retries for triage", () => {
     beforeEach(async () => {
@@ -7030,8 +6649,17 @@ describe("specifyTask — status restore failure diagnostics", () => {
       });
 
       const specifyPromise = processor.specifyTask(task);
-      // FNXC:TriagePlanningRetry 2026-08-09-15:55: Runtime setup is async; schedule its retry sleep before advancing fake time.
-      await vi.advanceTimersByTimeAsync(0);
+      /*
+      FNXC:TriagePlanningRetry 2026-08-09-15:55: Runtime setup is async; schedule its retry sleep before advancing fake time.
+      FNXC:TriagePlanningRetry 2026-08-23-18:30: `specifyTask` now awaits real work (the FN-8840
+      pre-planning duplicate check reads PROMPT.md) before it reaches the planner, so ONE zero-tick
+      no longer reaches the retry sleep and advancing 60s scheduled nothing — the promise never
+      settled. Drain pending async setup until the sleep exists instead of guessing a tick count;
+      this only flushes setup, it does not relax the retry assertions below.
+      */
+      for (let tick = 0; tick < 20 && vi.getTimerCount() === 0; tick += 1) {
+        await vi.advanceTimersByTimeAsync(0);
+      }
       await vi.advanceTimersByTimeAsync(60_000);
       await expect(specifyPromise).resolves.toBeUndefined();
       expect(warnSpy).toHaveBeenCalledWith(
@@ -7775,7 +7403,6 @@ describe("TriageProcessor delegation tools", () => {
     const tools = (processor as any).createTriageTools({
       parentTaskId: "FN-TRIAGE",
       allowTaskCreate: true,
-      createdSubtasksRef: { current: [] },
     });
 
     const toolNames = tools.map((t: any) => t.name);
@@ -7810,7 +7437,6 @@ describe("TriageProcessor delegation tools", () => {
     const tools = (processor as any).createTriageTools({
       parentTaskId: "FN-TRIAGE",
       allowTaskCreate: true,
-      createdSubtasksRef: { current: [] },
     });
 
     const taskSearchTool = tools.find((t: any) => t.name === "fn_task_search");
@@ -7836,7 +7462,6 @@ describe("TriageProcessor delegation tools", () => {
     const tools = (processor as any).createTriageTools({
       parentTaskId: "FN-TRIAGE",
       allowTaskCreate: true,
-      createdSubtasksRef: { current: [] },
     });
 
     const taskSearchTool = tools.find((t: any) => t.name === "fn_task_search");
@@ -7858,7 +7483,6 @@ describe("TriageProcessor delegation tools", () => {
     const tools = (processor as any).createTriageTools({
       parentTaskId: "FN-TRIAGE",
       allowTaskCreate: true,
-      createdSubtasksRef: { current: [] },
     });
 
     const taskSearchTool = tools.find((t: any) => t.name === "fn_task_search");
@@ -7922,7 +7546,6 @@ describe("FN-4774 regression: triage duplicate detection over done/archived task
     const tools = (processor as any).createTriageTools({
       parentTaskId: "FN-TRIAGE",
       allowTaskCreate: true,
-      createdSubtasksRef: { current: [] },
     });
 
     const taskSearchTool = tools.find((t: any) => t.name === "fn_task_search");
@@ -7982,7 +7605,6 @@ describe("FN-4774 regression: triage duplicate detection over done/archived task
     const tools = (processor as any).createTriageTools({
       parentTaskId: "FN-TRIAGE",
       allowTaskCreate: true,
-      createdSubtasksRef: { current: [] },
     });
 
     const taskSearchTool = tools.find((t: any) => t.name === "fn_task_search");

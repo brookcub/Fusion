@@ -48,6 +48,9 @@ vi.mock("../../api", () => ({
   fetchGitRemotesDetailed: (...args: unknown[]) => mockFetchGitRemotesDetailed(...args),
   fetchDashboardHealth: (...args: unknown[]) => mockFetchDashboardHealth(...args),
   checkForUpdates: (...args: unknown[]) => mockCheckForUpdates(...args),
+  /* FNXC:DashboardTests 2026-08-23-17:45: SettingsModal now pulls the cached update-check hooks, which import the singular `checkForUpdate`; a mock missing it fails the whole module. */
+  checkForUpdate: vi.fn(() => Promise.resolve({ currentVersion: "0.0.0", latestVersion: null, updateAvailable: false })),
+  refreshUpdateCheck: vi.fn(() => Promise.resolve({ currentVersion: "0.0.0", latestVersion: null, updateAvailable: false })),
   fetchRemoteSettings: (...args: unknown[]) => mockFetchRemoteSettings(...args),
   updateRemoteSettings: vi.fn(),
   fetchRemoteStatus: vi.fn(),
@@ -125,8 +128,6 @@ const baseSettings = {
   mergeStrategy: "direct",
   pushAfterMerge: false,
   pushRemote: "origin",
-  recycleWorktrees: false,
-  worktreeNaming: "random",
   includeTaskIdInCommit: true,
 };
 
@@ -158,7 +159,7 @@ describe("SettingsModal Node Routing section", () => {
     mockFetchSettingsByScope.mockResolvedValue({ global: baseSettings, project: {} });
     mockFetchAuthStatus.mockResolvedValue({ providers: [] });
     mockFetchModels.mockResolvedValue({ models: [], favoriteProviders: [], favoriteModels: [] });
-    mockFetchBackups.mockResolvedValue({ backups: [], totalSize: 0 });
+    mockFetchBackups.mockResolvedValue({ backups: [], count: 0, totalSize: 0, schedule: { enabled: false, cronExpression: "0 2 * * *", routineRegistered: false } });
     mockFetchMemoryFiles.mockResolvedValue({ files: [] });
     mockFetchMemoryFile.mockResolvedValue({ path: ".fusion/memory/MEMORY.md", content: "" });
     mockFetchGlobalConcurrency.mockResolvedValue({ globalMaxConcurrent: 10 });

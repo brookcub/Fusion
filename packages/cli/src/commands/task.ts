@@ -1,5 +1,5 @@
-import { TaskStore, COLUMNS, COLUMN_LABELS, resolveProjectColumnsForRoles, TERMINAL_ROLES, resolveReviewColumns, resolveTaskLifecycleColumns, resolveWorkflowIrForTask, CentralCore, buildAutoPauseClearPatch, buildManualRetryResetPatch, extractIntentSignature, findNearDuplicates, getTaskDuplicateLineage, isWorkspaceTask, reconcileDeterministicDuplicate, resolveTaskGithubTracking, runDeterministicDuplicateGuard, type Settings, type Column, type ColumnId, type StepStatus, type AgentLogType, type AgentLogEntry, type IntentSignature, type NearDuplicateCandidate, type NearDuplicateMatch, type TaskDependencyMutation } from "@fusion/core";
-import { isInReviewMissingWorktreeSessionStartFailure, runAiMerge, landWorkspaceTask, installBaselineArchiveWorktreeDisposer } from "@fusion/engine";
+import { TaskStore, COLUMNS, COLUMN_LABELS, MAX_TASK_MESSAGE_LENGTH, resolveProjectColumnsForRoles, TERMINAL_ROLES, resolveReviewColumns, resolveTaskLifecycleColumns, resolveWorkflowIrForTask, CentralCore, buildAutoPauseClearPatch, buildManualRetryResetPatch, extractIntentSignature, findNearDuplicates, getTaskDuplicateLineage, isValidRepoSlug, isWorkspaceTask, reconcileDeterministicDuplicate, resolveTaskGithubTracking, runDeterministicDuplicateGuard, evaluateArchiveTaskLiveness, describeArchiveLiveness, TaskIsLiveError, type Settings, type Column, type ColumnId, type StepStatus, type AgentLogType, type AgentLogEntry, type IntentSignature, type NearDuplicateCandidate, type NearDuplicateMatch, type TaskDependencyMutation } from "@fusion/core";
+import { isInReviewMissingWorktreeSessionStartFailure, runAiMerge, landWorkspaceTask, withWorkspaceMergeDispatchLease, installBaselineArchiveWorktreeDisposer, clearOwnedMergeStamp, reconcileUnownedStaleMergeStamp } from "@fusion/engine";
 import { createInterface } from "node:readline/promises";
 import type { PlanningQuestion, PlanningSummary } from "@fusion/core";
 import { createSession, createTaskFromPlanSession, ensureDurablePlanningSessionStore, getSession as getPlanningSession, submitResponse, validateSession, RateLimitError, SessionNotFoundError, InvalidSessionStateError } from "@fusion/dashboard/planning";
@@ -18,6 +18,13 @@ import { findNodeByNameOrId } from "./node.js";
 import { retryOnLock, LockRetryExhaustedError } from "../lock-retry.js";
 
 const STEP_STATUSES: StepStatus[] = ["pending", "in-progress", "done", "skipped"];
+let archiveForceOverride = false;
+
+/*
+FNXC:TaskMessageLength 2026-08-29-08:02:
+CLI refine, comment, and steer commands must use the same shared upper bound as dashboard routes and
+composers, so pasted operator instructions are admitted consistently on every task-text surface.
+*/
 
 /** #1403: display a column's label, falling back to the raw id for
  *  workflow-defined custom columns that have no legacy label. */
@@ -185,7 +192,7 @@ async function getBoardCommandContext(projectName?: string): Promise<ProjectCont
     if (!context) {
       throw new Error(`Project ${projectName} not found`);
     }
-    installBaselineArchiveWorktreeDisposer(context.store, {rootDir: context.projectPath, getSettings: () => context.store.getSettings()});
+    installBaselineArchiveWorktreeDisposer(context.store, {rootDir: context.projectPath, getSettings: () => context.store.getSettings(), allowLiveRemoval: () => archiveForceOverride});
     return context;
   }
 
@@ -194,7 +201,7 @@ async function getBoardCommandContext(projectName?: string): Promise<ProjectCont
     if (!context) {
       throw new Error("No project context");
     }
-    installBaselineArchiveWorktreeDisposer(context.store, {rootDir: context.projectPath, getSettings: () => context.store.getSettings()});
+    installBaselineArchiveWorktreeDisposer(context.store, {rootDir: context.projectPath, getSettings: () => context.store.getSettings(), allowLiveRemoval: () => archiveForceOverride});
     return context;
   } catch {
     // FNXC:PostgresCutover 2026-07-05-12:00: the cwd fallback must boot through
@@ -202,7 +209,7 @@ async function getBoardCommandContext(projectName?: string): Promise<ProjectCont
     // resolves to the removed SQLite runtime, which throws on first DB access.
     const store = await createLocalStore(process.cwd());
     const context = asLocalProjectContext(store);
-    installBaselineArchiveWorktreeDisposer(store, {rootDir: context.projectPath, getSettings: () => store.getSettings()});
+    installBaselineArchiveWorktreeDisposer(store, {rootDir: context.projectPath, getSettings: () => store.getSettings(), allowLiveRemoval: () => archiveForceOverride});
     return context;
   }
 }
@@ -444,8 +451,22 @@ async function runCliNearDuplicateCheck(args: {
   process.exit(0);
 }
 
-export async function runTaskCreate(descriptionArg?: string, attachFiles?: string[], depends?: string[], projectName?: string, nodeName?: string, noDedup = false) {
+export async function runTaskCreate(descriptionArg?: string, attachFiles?: string[], depends?: string[], projectName?: string, nodeName?: string, noDedup = false, githubOpts?: { github?: boolean; githubRepo?: string }) {
   let description = descriptionArg;
+
+  /*
+  FNXC:GithubTracking 2026-08-15-03:50:
+  `fn task create --github [--github-repo owner/repo]` decides tracking at CREATE time,
+  because the tracking lifecycle keys off the persisted `task.githubTracking.enabled === true`
+  flag and never re-resolves project/global defaults for existing tasks. Before this flag,
+  CLI-created tasks could not opt in at all (only the dashboard and fn_task_create could).
+  Explicit `--no-github` persists `enabled:false` so a later default flip cannot re-enable it.
+  */
+  const githubRepoOverride = githubOpts?.githubRepo?.trim() || undefined;
+  if (githubRepoOverride && !isValidRepoSlug(githubRepoOverride)) {
+    console.error(`Invalid --github-repo "${githubRepoOverride}" — expected "owner/repo".`);
+    process.exit(1);
+  }
 
   if (!description) {
     const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
@@ -511,15 +532,59 @@ export async function runTaskCreate(descriptionArg?: string, attachFiles?: strin
           id, so a stale value can never make CLI create throw.
           */
           const originWorkflowId = await store.resolveOriginWorkflowOverrideId("task-create");
+          /*
+          FNXC:GithubTracking 2026-08-15-03:50:
+          Same create-time resolution as fn_task_create: CLI flag > project default >
+          global default. Also fixes CLI creates silently ignoring a project's
+          "GitHub tracking enabled by default" setting (the persisted flag is the only
+          thing the tracking lifecycle reads).
+          */
+          const globalSettingsForTracking = await store.getGlobalSettingsStore().getSettings();
+          const resolvedTracking = resolveTaskGithubTracking(
+            {
+              githubTracking:
+                githubOpts?.github !== undefined || githubRepoOverride
+                  ? {
+                      ...(githubOpts?.github !== undefined ? { enabled: githubOpts.github } : {}),
+                      ...(githubRepoOverride ? { repoOverride: githubRepoOverride } : {}),
+                    }
+                  : undefined,
+            },
+            await store.getSettings(),
+            globalSettingsForTracking,
+          );
+          const githubTracking = resolvedTracking.enabled
+            ? {
+                enabled: true as const,
+                ...(resolvedTracking.repo
+                  ? { repoOverride: `${resolvedTracking.repo.owner}/${resolvedTracking.repo.repo}` }
+                  : {}),
+              }
+            : githubOpts?.github === false
+              ? { enabled: false as const }
+              : undefined;
+          /*
+          FNXC:GithubTracking 2026-08-15-04:50:
+          Suppress the task-created hook here and invoke tracking-issue creation
+          DIRECTLY after the create block instead. With autoSummarizeTitles on, a
+          long, title-less description routes the hook onto the deferred
+          fire-and-forget summarize chain, and the short-lived CLI process closes
+          the store and exits before it runs — the task ends up with
+          githubTracking.enabled=true but no issue ever created (observed:
+          FN-9045..FN-9061). A synchronous post-create call is exactly-once and
+          deterministic; maybeCreateTrackingIssue does its own title summarization
+          when the task has none.
+          */
           const created = await store.createTask({
             description: trimmedDescription,
             dependencies: depends,
             ...(originWorkflowId ? { workflowId: originWorkflowId } : {}),
+            ...(githubTracking ? { githubTracking } : {}),
             source: {
               sourceType: "cli",
               sourceMetadata: Object.keys(sourceMetadata).length > 0 ? sourceMetadata : undefined,
             },
-          });
+          }, { invokeTaskCreatedHook: false });
 
           const reconcileResult = await reconcileDeterministicDuplicate(store, {
             createdTask: created,
@@ -576,6 +641,26 @@ export async function runTaskCreate(descriptionArg?: string, attachFiles?: strin
       console.log(`    Node: ${resolvedNode.name || resolvedNode.id}`);
     }
     console.log(`    Path:   .fusion/tasks/${resolvedTask.id}/`);
+
+    /*
+    FNXC:GithubTracking 2026-08-15-04:50:
+    Create the tracking issue synchronously before the CLI exits (the create
+    call above suppressed the task-created hook; see the create-site note).
+    Runs only for fresh creates: a linked-existing canonical already had its
+    own create-time pass.
+    */
+    if (!linkedExisting && resolvedTask.githubTracking?.enabled === true && !resolvedTask.githubTracking?.issue) {
+      try {
+        await dashboard.createTrackingIssueForTask?.(store, resolvedTask);
+        const refreshed = await store.getTask(resolvedTask.id).catch(() => undefined);
+        const issue = refreshed?.githubTracking?.issue;
+        if (issue) {
+          console.log(`    GitHub: ${issue.owner}/${issue.repo}#${issue.number}`);
+        }
+      } catch (error) {
+        console.error(`    ✗ GitHub tracking issue not created: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
 
     if (attachFiles && attachFiles.length > 0) {
       const { readFile } = await import("node:fs/promises");
@@ -762,7 +847,7 @@ export async function runTaskUpdate(id: string, stepStr: string, status: string,
   // wrap resolution+write in one retryable unit via `withBoardWrite`, closing
   // the resolved store on every attempt.
   await withBoardWrite(projectName, { id, action: "update step" }, async (context) => {
-    const task = await context.store.updateStep(id, stepIndex, status as StepStatus);
+    const task = await context.store.updateStep(id, stepIndex, status as StepStatus, { operatorOverride: true });
 
     const step = task.steps[stepIndex];
     console.log();
@@ -837,6 +922,9 @@ const ANSI = {
   gray: "\x1b[90m",
 };
 
+/** Maximum single-line tool detail length that stays compact beside its header. */
+const CLI_INLINE_DETAIL_MAX = 120;
+
 /**
  * Format a timestamp for display (locale time string)
  */
@@ -844,9 +932,21 @@ function formatTimestamp(timestamp: string): string {
   return new Date(timestamp).toLocaleTimeString();
 }
 
-/**
- * Format a single agent log entry for display
- */
+function formatToolDetail(detail: string | undefined): string {
+  if (!detail) return "";
+  if (!detail.includes("\n") && detail.length <= CLI_INLINE_DETAIL_MAX) {
+    return ` (${detail})`;
+  }
+  const block = detail.split(/\r?\n/).map((line) => `    ${line}`).join("\n");
+  return `\n${ANSI.dim}${ANSI.gray}${block}${ANSI.reset}`;
+}
+
+/*
+FNXC:CliTaskLogs 2026-08-29-04:55:
+FN-253 makes tool arguments and results default-persisted. Keep short single-line details inline,
+but render longer or multiline payloads as one indented, dimmed block so each log entry remains one
+console.log call while terminal readers can scan the complete bounded durable payload.
+*/
 function formatLogEntry(entry: AgentLogEntry): string {
   const ts = formatTimestamp(entry.timestamp);
   const agent = entry.agent ? `[${entry.agent.toUpperCase()}] ` : "";
@@ -857,11 +957,11 @@ function formatLogEntry(entry: AgentLogEntry): string {
     case "thinking":
       return `${ANSI.dim}${ANSI.gray}  ${ts} ${agent}[THINK] ${entry.text}${ANSI.reset}`;
     case "tool":
-      return `  ${ts} ${agent}[TOOL] ${entry.text}${entry.detail ? ` (${entry.detail})` : ""}`;
+      return `  ${ts} ${agent}[TOOL] ${entry.text}${formatToolDetail(entry.detail)}`;
     case "tool_result":
-      return `  ${ts} ${agent}[RESULT] ${entry.text}${entry.detail ? ` (${entry.detail})` : ""}`;
+      return `  ${ts} ${agent}[RESULT] ${entry.text}${formatToolDetail(entry.detail)}`;
     case "tool_error":
-      return `${ANSI.red}  ${ts} ${agent}[ERROR] ${entry.text}${entry.detail ? ` (${entry.detail})` : ""}${ANSI.reset}`;
+      return `${ANSI.red}  ${ts} ${agent}[ERROR] ${entry.text}${formatToolDetail(entry.detail)}${ANSI.reset}`;
     default:
       return `  ${ts} ${agent}${entry.text}`;
   }
@@ -1167,80 +1267,147 @@ async function runTaskShowWithStore(id: string, store: TaskStore) {
 }
 
 export async function runTaskMerge(id: string, projectName?: string) {
-  // FNXC:CliBoardMutation 2026-07-09-00:00 (FN-7734): resolve context ONCE
-  // (retried — replaces the previous double resolution via `getStore` +
-  // `getProjectPath`, each of which independently called `getCommandContext`)
-  // and close it in a `finally` covering EVERY exit path, including the
-  // `process.exit(1)` calls below. The AI merge (`runAiMerge`) and
-  // workspace-land (`landWorkspaceTask`) subflows are deliberately NOT
-  // retry-wrapped — they drive non-idempotent external git/AI operations,
-  // so retrying the whole flow on a lock blip could double-drive a merge or
-  // land (Step 1 audit decision).
+  // FNXC:CliBoardMutation 2026-07-09-00:00 (FN-7734): resolve context ONCE.
   const context = await resolveBoardContext(projectName, id, "resolve project");
   const store = context.store;
   const projectPath = context.projectPath;
+  const abortController = new AbortController();
+  let wroteLocalMergeStamp = false;
+  let handlingSignal = false;
+  let handlersInstalled = false;
+  let storeClosed = false;
+  let signalShutdown: Promise<void> | undefined;
+
+  const closeStoreOnce = async () => {
+    if (storeClosed) return;
+    storeClosed = true;
+    await closeProjectStore(context).catch(() => undefined);
+  };
+
+  /*
+  FNXC:MergeReliability 2026-08-20-02:41:
+  Authorization B requires proof that this one-shot process wrote the stamp; a signal can arrive
+  after handlers install but before a merge body claims anything. Observe a successful local
+  `merging` write instead of inferring ownership from an indistinguishable row status, so cleanup
+  cannot clear another process's fresh generation. A write whose database outcome is unknown stays
+  unowned and is recoverable later only through authorization C's age evidence.
+  */
+  const mergeStore = new Proxy(store, {
+    get(target, property) {
+      if (property === "updateTask") {
+        return async (...args: Parameters<TaskStore["updateTask"]>) => {
+          const result = await target.updateTask(...args);
+          const patch = args[1];
+          if (args[0] === id && patch?.status === "merging") wroteLocalMergeStamp = true;
+          return result;
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as TaskStore;
+
+  const removeSignalHandlers = () => {
+    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.off(signal, onSignal);
+    handlersInstalled = false;
+  };
+  const onSignal = (signal: NodeJS.Signals) => {
+    if (handlingSignal) return;
+    handlingSignal = true;
+    const exitCode = signal === "SIGINT" ? 130 : signal === "SIGTERM" ? 143 : 129;
+    // FNXC:MergeReliability 2026-08-20-02:00: A signal can make the merge body reject
+    // before its owner-clear settles. Share this promise with catch so only the signal
+    // path exits and it cannot terminate before authorization-B cleanup commits.
+    signalShutdown = (async () => {
+      abortController.abort();
+      if (wroteLocalMergeStamp) {
+        await clearOwnedMergeStamp(store, id, "MergeAborted").catch(() => undefined);
+      }
+      await closeStoreOnce();
+      removeSignalHandlers();
+      process.exit(exitCode);
+    })();
+  };
 
   console.log(`\n  Merging ${id} with AI...\n`);
 
   try {
     /*
-    FNXC:GrokCliRouting 2026-07-15-10:17:
-    `fn task merge` is a bare CLI door: ProjectContext only has store/path, not a live ProjectEngine, so no engine.getPluginRunner() is available. Do not invent a full PluginRunner bootstrap here (that belongs to InProcessRuntime / ProjectEngineManager). Omitting pluginRunner is intentional — grok-cli/no-key merge selections surface the dual-remediation error. Engine-backed merge already forwards this.getPluginRunner().
+    FNXC:MergeReliability 2026-08-20-02:00:
+    Authorization C applies before this one-shot CLI claims a merge: residue may belong to a hard-
+    killed process, so age evidence (not an indistinguishable `merging` compare) is required.
     */
+    if (await reconcileUnownedStaleMergeStamp(store, id)) {
+      console.log("  Cleared an age-proven stale merge status before claiming the task.");
+    }
 
-    // FNXC:Workspace 2026-06-21-23:40 (Phase C U1, KTD2):
-    // User-triggered `fn task merge`. A workspace-mode task routes through the
-    // ENGINE per-repo merge loop `landWorkspaceTask` (each sub-repo lands on its own
-    // LOCAL integration ref, no push) instead of throwing — manual merge works in
-    // Phase C (user decision). U0's R7 throw is replaced here by routing; the
-    // engine chokepoint + store.mergeTask/aiMergeTask keep throwing.
+    /*
+    FNXC:MergeReliability 2026-08-20-02:00:
+    Terminal closure is a named interruption. Unlike long-lived serve/dashboard/daemon processes,
+    this foreground command handles SIGHUP by aborting, owner-clearing (authorization B), closing,
+    and exiting 129; ignoring it would leave an invisible detached merge and Node otherwise exits.
+    */
+    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(signal, onSignal);
+    handlersInstalled = true;
+
     const mergeTaskRecord = await store.getTask(id).catch(() => null);
-    // FNXC:Workspace 2026-06-22-09:30 (Phase C review B10): use the exported `isWorkspaceTask`
-    // (the engine/CLI canonical predicate) instead of re-inlining the workspaceWorktrees check.
     const isWorkspaceMerge = !!mergeTaskRecord && isWorkspaceTask(mergeTaskRecord);
     if (isWorkspaceMerge) {
-      const workspaceResult = await landWorkspaceTask(store, mergeTaskRecord!, projectPath, {
-        onAgentText: (delta) => process.stdout.write(delta),
-      });
+      const workspaceResult = await withWorkspaceMergeDispatchLease(mergeStore, id, (workspaceDispatchFence) =>
+        landWorkspaceTask(mergeStore, mergeTaskRecord!, projectPath, {
+          onAgentText: (delta) => process.stdout.write(delta),
+          signal: abortController.signal,
+          workspaceDispatchFence,
+          manual: true,
+        }),
+      );
       console.log();
       for (const repo of workspaceResult.repos) {
-        const label =
-          repo.status === "landed" ? `landed ${repo.landedSha?.slice(0, 8) ?? ""} → ${repo.integrationBranch}`
-          : repo.status === "empty" ? "no net changes"
-          : `failed: ${repo.error ?? "unknown"}`;
+        const label = repo.status === "landed" ? `landed ${repo.landedSha?.slice(0, 8) ?? ""} → ${repo.integrationBranch}` : repo.status === "empty" ? "no net changes" : `failed: ${repo.error ?? "unknown"}`;
         console.log(`  ${repo.status === "failed" ? "✗" : "✓"} ${repo.repo}: ${label}`);
       }
-      // FNXC:Workspace 2026-06-22-05:10 (Phase C review B3):
-      // landWorkspaceTask now finalizes the workspace task to done on allLanded (Phase C U2),
-      // so report it as merged rather than "remains in review until U2". A partial land leaves
-      // the task in review (landed repos stay landed locally) and exits non-zero.
-      console.log(
-        `\n  ${workspaceResult.allLanded ? "✓ All sub-repos landed — task finalized to done" : "✗ Partial land — see failures above (task remains in review; landed repos stay landed locally)"}\n`,
-      );
-      if (!workspaceResult.allLanded) await closeBoardContextAndExit(context, 1);
+      const workspaceMerged = workspaceResult.allLanded && workspaceResult.finalized;
+      console.log(`\n  ${workspaceMerged ? "✓ All sub-repos landed — task finalized to done" : workspaceResult.allLanded ? `✗ Merge blocked — ${workspaceResult.finalizeBlockedReason ?? "workspace finalize was blocked"} (task moved back with progress preserved)` : "✗ Partial land — see failures above (task remains in review; landed repos stay landed locally)"}\n`);
+      if (!workspaceMerged) await closeBoardContextAndExit(context, 1);
       return;
     }
 
-    const result = await runAiMerge(store, projectPath, id, {
-      onAgentText: (delta) => process.stdout.write(delta),
-    });
+    /*
+    FNXC:GrokCliRouting 2026-07-15-10:17:
+    `fn task merge` is a bare CLI door: ProjectContext only has store/path, not a live ProjectEngine, so no engine.getPluginRunner() is available. Do not invent a full PluginRunner bootstrap here (that belongs to InProcessRuntime / ProjectEngineManager). Omitting pluginRunner is intentional — grok-cli/no-key merge selections surface the dual-remediation error. Engine-backed merge already forwards this.getPluginRunner().
 
+    FNXC:GrokCliRouting 2026-08-23-16:30:
+    RESTORED, NOT REWRITTEN. FN-9167's merge-stamp work replaced this comment block wholesale while
+    leaving the behavior it documents untouched (no `pluginRunner` is forwarded below), so the
+    routing decision lost its only record. `grok-runtime-bootstrap.test.ts` pins it here for exactly
+    that reason.
+    */
+    const result = await runAiMerge(mergeStore, projectPath, id, {
+      onAgentText: (delta) => process.stdout.write(delta),
+      signal: abortController.signal,
+    });
     console.log();
     if (result.merged) {
       console.log(`  ✓ Merged ${result.task.id}`);
       console.log(`    Branch:   ${result.branch}`);
       console.log(`    Worktree: ${result.worktreeRemoved ? "removed" : "not found"}`);
       console.log(`    Branch:   ${result.branchDeleted ? "deleted" : "kept"}`);
-    } else {
-      console.log(`  ✓ Closed ${result.task.id} (${result.error})`);
-    }
-    console.log(`    Status:   done`);
-    console.log();
+    } else console.log(`  ✓ Closed ${result.task.id} (${result.error})`);
+    console.log("    Status:   done\n");
   } catch (err) {
+    // FNXC:MergeReliability 2026-08-20-02:27: A signal owns shutdown once installed;
+    // await its cleanup promise rather than racing a generic exit(1) against its clear.
+    if (signalShutdown) {
+      await signalShutdown;
+      return;
+    }
+    abortController.abort();
+    if (wroteLocalMergeStamp) await clearOwnedMergeStamp(store, id, "MergeAborted");
     console.error(`\n  ✗ ${err instanceof Error ? err.message : String(err)}\n`);
     await closeBoardContextAndExit(context, 1);
   } finally {
-    await closeProjectStore(context).catch(() => {});
+    if (handlersInstalled) removeSignalHandlers();
+    await closeStoreOnce();
   }
 }
 
@@ -1379,13 +1546,11 @@ export async function runTaskRefine(id: string, feedbackArg?: string, projectNam
     process.exit(1);
   }
 
-  // Validate length (matches API validation)
-  if (feedback.length > 2000) {
-    console.error("Feedback must be 2000 characters or less");
+  const trimmedFeedback = feedback.trim();
+  if (trimmedFeedback.length > MAX_TASK_MESSAGE_LENGTH) {
+    console.error(`Feedback must be ${MAX_TASK_MESSAGE_LENGTH} characters or less`);
     process.exit(1);
   }
-
-  const trimmedFeedback = feedback.trim();
 
   // FNXC:CliBoardMutation 2026-07-09-00:00 (FN-7734): single board write.
   await withBoardWrite(projectName, { id, action: "refine task" }, async (context) => {
@@ -1393,22 +1558,44 @@ export async function runTaskRefine(id: string, feedbackArg?: string, projectNam
 
     console.log();
     console.log(`  ✓ Created refinement ${newTask.id} for ${id}`);
-    console.log(`    Column: triage`);
+    console.log(`    Column: ${newTask.column}`);
     console.log(`    Dependency: ${id}`);
     console.log(`    Path: .fusion/tasks/${newTask.id}/`);
     console.log();
   });
 }
 
-export async function runTaskArchive(id: string, projectName?: string) {
-  // FNXC:CliBoardMutation 2026-07-09-00:00 (FN-7734): single board write.
-  await withBoardWrite(projectName, { id, action: "archive task" }, async (context) => {
-    const task = await context.store.archiveTask(id);
-
-    console.log();
-    console.log(`  ✓ Archived ${task.id} → ${columnLabel(task.column)}`);
-    console.log();
-  });
+export async function runTaskArchive(id: string, projectName?: string, options: {force?: boolean} = {}) {
+  /* FNXC:CliBoardMutation 2026-08-15-06:35: force is scoped to this command's disposer lifetime; every other CLI archive stays protective by default. */
+  archiveForceOverride = options.force === true;
+  try {
+    await withBoardWrite(projectName, { id, action: "archive task" }, async (context) => {
+      // Compatibility test/store doubles may expose archiveTask without the advisory reader.
+      const current = typeof (context.store as unknown as {getTask?: unknown}).getTask === "function" ? await context.store.getTask(id) : undefined;
+      const refuseLiveArchive = async (verdict: Parameters<typeof describeArchiveLiveness>[1]) => {
+        /*
+        FNXC:CliBoardMutation 2026-08-15-07:07:
+        A CLI liveness refusal is an operator-facing safety result, not an uncaught stack trace.
+        Exit through the established board-context path so the command is non-zero while its store closes.
+        */
+        console.error(`\n  ✗ ${describeArchiveLiveness(id, verdict, {workspaceWorktreeCount: Object.keys(current?.workspaceWorktrees ?? {}).length})}\n`);
+        await closeBoardContextAndExit(context, 1);
+      };
+      if (current && !options.force) {
+        const verdict = await evaluateArchiveTaskLiveness(context.store, current);
+        if (verdict.live) await refuseLiveArchive(verdict);
+      }
+      try {
+        const task = await context.store.archiveTask(id, {liveExecutionGuard: options.force ? "off" : "refuse"});
+        console.log();
+        console.log(`  ✓ Archived ${task.id} → ${columnLabel(task.column)}`);
+        console.log();
+      } catch (error) {
+        if (error instanceof TaskIsLiveError) await refuseLiveArchive({live: true, reasons: error.reasons});
+        throw error;
+      }
+    });
+  } finally { archiveForceOverride = false; }
 }
 
 export async function runTaskUnarchive(id: string, projectName?: string) {
@@ -1533,7 +1720,7 @@ export async function runTaskRetry(id: string, projectName?: string) {
         status: null,
         error: null,
         worktree: null,
-        branch: null,
+        branch: null, branchWriteOrigin: "engine" as const,
         sessionFile: null,
         ...autoPauseClearPatch,
         ...buildManualRetryResetPatch({ resetMergeRetries: true }),
@@ -1605,7 +1792,7 @@ export async function runTaskRetry(id: string, projectName?: string) {
       status: null,
       error: null,
       worktree: null,
-      branch: null,
+      branch: null, branchWriteOrigin: "engine" as const,
       baseBranch: null,
       baseCommitSha: null,
       ...autoPauseClearPatch,
@@ -2110,8 +2297,8 @@ export async function runTaskComment(id: string, message?: string, author = "use
   }
 
   const trimmed = text.trim();
-  if (trimmed.length > 2000) {
-    console.error("Error: Comment must be between 1 and 2000 characters");
+  if (trimmed.length > MAX_TASK_MESSAGE_LENGTH) {
+    console.error(`Error: Comment must be between 1 and ${MAX_TASK_MESSAGE_LENGTH} characters`);
     process.exit(1);
   }
 
@@ -2168,8 +2355,8 @@ export async function runTaskSteer(id: string, message?: string, projectName?: s
   }
 
   const trimmed = text.trim();
-  if (trimmed.length > 2000) {
-    console.error("Error: Message must be between 1 and 2000 characters");
+  if (trimmed.length > MAX_TASK_MESSAGE_LENGTH) {
+    console.error(`Error: Message must be between 1 and ${MAX_TASK_MESSAGE_LENGTH} characters`);
     process.exit(1);
   }
 

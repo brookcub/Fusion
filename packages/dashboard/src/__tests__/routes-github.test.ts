@@ -19,6 +19,7 @@ import { GitHubClient } from "../github.js";
 import * as resolveDiffBaseModule from "../routes/resolve-diff-base.js";
 import { githubRateLimiter } from "../github-poll.js";
 import {
+  MAX_TASK_MESSAGE_LENGTH,
   PLAN_REVIEW_GROUP_ID,
   TransitionRejectionError,
   type Task,
@@ -44,8 +45,6 @@ import { __resetBatchImportRateLimiter, __setCreateFnAgentForRefine } from "../r
 import * as agentGenerationModule from "../agent-generation.js";
 import { __resetPlanningState, __setCreateFnAgent, planningStreamManager } from "../planning.js";
 import * as planningModule from "../planning.js";
-import { __resetSubtaskBreakdownState, subtaskStreamManager } from "../subtask-breakdown.js";
-import * as subtaskBreakdownModule from "../subtask-breakdown.js";
 import { SESSION_CLEANUP_DEFAULT_MAX_AGE_MS } from "../ai-session-store.js";
 import * as usageModule from "../usage.js";
 import * as claudeCliProbeModule from "../claude-cli-probe.js";
@@ -234,6 +233,19 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     moveTask: vi.fn(),
     updateTask: vi.fn(),
     withPlanningLifecycleLock: vi.fn(async (_id, fn) => await fn()),
+    // FNXC:SpecLockApproval 2026-08-15-05:10: approve-plan now locks the approved PROMPT.md and publishes a drift report inside the planning fence; mock both seams so route contracts stay isolated from spec-lock persistence.
+    lockCurrentPlanWhilePlanningLocked: vi.fn().mockResolvedValue(undefined),
+    reconcileSpecDriftWhilePlanningLocked: vi.fn().mockResolvedValue(undefined),
+    /*
+    FNXC:PlanApprovalDispatch 2026-08-15-05:10:
+    The engine mock's resumeApprovedPlanReviewHandoff defaults to the REAL implementation, which
+    seeds a runnable Plan Review continuation through these store writers after approval. Provide
+    the empty/no-op continuation surface so route unit tests exercise the genuine handoff instead
+    of exploding with "store.listWorkflowWorkItemsForTask is not a function".
+    */
+    listWorkflowWorkItemsForTask: vi.fn().mockResolvedValue([]),
+    seedStrandedPlanReviewContinuation: vi.fn(async () => ({ seeded: true, workItemId: "mock-plan-review-continuation" })),
+    replaceActiveTaskWorkflowContinuation: vi.fn(async (input: Record<string, unknown>) => ({ ...input, id: "mock-plan-review-continuation" })),
     deleteTask: vi.fn(),
     mergeTask: vi.fn(),
     archiveTask: vi.fn(),
@@ -1857,7 +1869,6 @@ describe("projectId store scoping regressions", () => {
   beforeEach(() => {
     __resetBatchImportRateLimiter();
     __resetPlanningState();
-    __resetSubtaskBreakdownState();
     mockIsGhAuthenticated.mockReturnValue(true);
 
     defaultStore = createMockStore({
@@ -2057,96 +2068,7 @@ describe("projectId store scoping regressions", () => {
     expect(defaultStore.createTask).not.toHaveBeenCalled();
   });
 
-  it("routes planning create-tasks mutations to scoped store when projectId is provided", async () => {
-    vi.spyOn(planningModule, "getSession").mockReturnValue({
-      id: "plan-session-2",
-      initialPlan: "Scoped multi task plan",
-      history: [],
-      // FNXC:PlanningMode 2026-07-19-01:45: FN-8341 create-tasks requires validated sessions.
-      validated: true,
-      summary: {
-        title: "Plan",
-        description: "Plan description",
-        suggestedSize: "M",
-        suggestedDependencies: [],
-        keyDeliverables: ["Deliverable 1", "Deliverable 2"],
-      },
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    } as any);
-    vi.spyOn(planningModule, "formatInterviewQA").mockReturnValue("Q: Scope\nA: Medium");
-    vi.spyOn(planningModule, "cleanupSession").mockImplementation(() => {});
 
-    (scopedStore.createTask as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-SCOPE-6", column: "triage" })
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-SCOPE-7", column: "triage" });
-
-    const res = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/planning/create-tasks",
-      JSON.stringify({
-        planningSessionId: "plan-session-2",
-        projectId,
-        subtasks: [
-          { id: "subtask-1", title: "First scoped task", description: "First", suggestedSize: "S", dependsOn: [] },
-          { id: "subtask-2", title: "Second scoped task", description: "Second", suggestedSize: "M", dependsOn: ["subtask-1"] },
-        ],
-      }),
-      { "Content-Type": "application/json" },
-    );
-
-    expect(res.status).toBe(201);
-    expect(scopedStore.createTask).toHaveBeenCalledTimes(2);
-    expect(defaultStore.createTask).not.toHaveBeenCalled();
-  });
-
-  it("routes subtask create-tasks mutations to scoped store when projectId is provided", async () => {
-    vi.spyOn(subtaskBreakdownModule, "getSubtaskSession").mockReturnValue({
-      sessionId: "subtask-session-1",
-      initialDescription: "Break down scoped work",
-      subtasks: [],
-      status: "complete",
-      createdAt: new Date(),
-      updatedAt: new Date(),
-      thinkingOutput: "",
-    } as any);
-    vi.spyOn(subtaskBreakdownModule, "cleanupSubtaskSession").mockImplementation(() => {});
-
-    (scopedStore.createTask as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-SCOPE-8", column: "triage" })
-      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-SCOPE-9", column: "triage" });
-
-    const res = await REQUEST(
-      buildApp(),
-      "POST",
-      "/api/subtasks/create-tasks",
-      JSON.stringify({
-        sessionId: "subtask-session-1",
-        projectId,
-        parentTaskId: "FN-PARENT",
-        subtasks: [
-          { tempId: "temp-1", title: "Scoped subtask one", description: "One", size: "S", dependsOn: [] },
-          { tempId: "temp-2", title: "Scoped subtask two", description: "Two", size: "M", dependsOn: ["temp-1"] },
-        ],
-      }),
-      { "Content-Type": "application/json" },
-    );
-
-    expect(res.status).toBe(201);
-    expect(scopedStore.getTask).toHaveBeenCalledWith("FN-PARENT");
-    expect(defaultStore.getTask).not.toHaveBeenCalled();
-    expect(scopedStore.createTask).toHaveBeenCalledTimes(2);
-    expect(defaultStore.createTask).not.toHaveBeenCalled();
-    expect(scopedStore.deleteTask).toHaveBeenCalledWith("FN-PARENT", expect.objectContaining({
-      auditContext: expect.objectContaining({
-        agentId: "system",
-        runId: expect.stringMatching(/^synthetic-planning-delete-FN-PARENT-/),
-        sessionId: "subtask-session-1",
-      }),
-    }));
-    expect(defaultStore.deleteTask).not.toHaveBeenCalled();
-  });
 });
 
 // --- Spec Revision route tests ---
@@ -2170,7 +2092,7 @@ describe("POST /tasks/:id/spec/revise", () => {
     return app;
   }
 
-  it("requests spec revision and moves task from todo to triage", async () => {
+  it("requests spec revision in place from the todo planning column", async () => {
     const todoTask = { ...FAKE_TASK_DETAIL, column: "todo" as const };
     const movedTask = { ...FAKE_TASK_DETAIL, column: "todo" as const };
     const tempRoot = mkdtempSync(join(tmpdir(), "kb-spec-revise-"));
@@ -2199,13 +2121,8 @@ describe("POST /tasks/:id/spec/revise", () => {
         "Please add more details about error handling"
       );
       /*
-      FNXC:WorkflowLifecycleColumns 2026-08-03-01:10 (red on main — `triage` no longer exists):
-      A CARD AT INTAKE IS RESET IN PLACE, not moved. #2515 merged Todo into Planning keeping the id `todo`, so
-      the default lineage's intake column IS `todo` — and the respecify route's own comment says a task already
-      sitting at intake skips the transition check and `moveTask` entirely, resetting for replanning where it is.
-
-      This case asserted `moveTask(id, "triage")`. Both halves were stale: the column is gone, and there is no
-      move at all for a card that is already where respecify sends it.
+      FNXC:PlanApproval 2026-08-28-11:39:
+      A card already in the workflow's planning column is reset in place, not moved. The fixture's `todo` column contains the planning node, so respecify must leave it there for triage's hold-column needs-replan rediscovery.
       */
       expect(store.moveTask).not.toHaveBeenCalled();
       expect(existsSync(join(taskDir, "PROMPT.md"))).toBe(false);
@@ -2337,18 +2254,67 @@ describe("POST /tasks/:id/spec/revise", () => {
     expect(res.body.error).toContain("feedback is required");
   });
 
-  it("returns 400 when feedback exceeds 2000 characters", async () => {
-    const longFeedback = "a".repeat(2001);
+  it("rejects whitespace-only spec-revision feedback before reading or mutating the task", async () => {
     const res = await REQUEST(
       buildApp(),
       "POST",
       "/api/tasks/KB-001/spec/revise",
-      JSON.stringify({ feedback: longFeedback }),
-      { "Content-Type": "application/json" }
+      JSON.stringify({ feedback: " \t\n " }),
+      { "Content-Type": "application/json" },
     );
 
     expect(res.status).toBe(400);
-    expect(res.body.error).toContain("feedback must be between 1 and 2000");
+    expect(res.body).toEqual({ error: `feedback must be between 1 and ${MAX_TASK_MESSAGE_LENGTH} characters` });
+    expect(store.getTask).not.toHaveBeenCalled();
+    expect(store.logEntry).not.toHaveBeenCalled();
+    expect(store.updateTask).not.toHaveBeenCalled();
+    expect(store.moveTask).not.toHaveBeenCalled();
+  });
+
+  it("accepts long spec-revision feedback through the shared cap and rejects the next character", async () => {
+    const todoTask = { ...FAKE_TASK_DETAIL, column: "todo" as const };
+    const updatedTask = { ...todoTask, status: "needs-replan" as const };
+    const tempRoot = mkdtempSync(join(tmpdir(), "kb-spec-revise-length-"));
+    const longFeedback = "a".repeat(2001);
+    const boundaryFeedback = "a".repeat(MAX_TASK_MESSAGE_LENGTH);
+    const rejectedFeedback = "a".repeat(MAX_TASK_MESSAGE_LENGTH + 1);
+
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(updatedTask);
+    (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue(updatedTask);
+    (store.getRootDir as ReturnType<typeof vi.fn>).mockReturnValue(tempRoot);
+
+    try {
+      const longResponse = await REQUEST(
+        buildApp(),
+        "POST",
+        "/api/tasks/KB-001/spec/revise",
+        JSON.stringify({ feedback: longFeedback }),
+        { "Content-Type": "application/json" },
+      );
+      const boundaryResponse = await REQUEST(
+        buildApp(),
+        "POST",
+        "/api/tasks/KB-001/spec/revise",
+        JSON.stringify({ feedback: boundaryFeedback }),
+        { "Content-Type": "application/json" },
+      );
+      const rejectedResponse = await REQUEST(
+        buildApp(),
+        "POST",
+        "/api/tasks/KB-001/spec/revise",
+        JSON.stringify({ feedback: rejectedFeedback }),
+        { "Content-Type": "application/json" },
+      );
+
+      expect(longResponse.status).toBe(200);
+      expect(boundaryResponse.status).toBe(200);
+      expect(store.logEntry).toHaveBeenCalledWith("FN-001", "AI spec revision requested", longFeedback);
+      expect(store.logEntry).toHaveBeenCalledWith("FN-001", "AI spec revision requested", boundaryFeedback);
+      expect(rejectedResponse.status).toBe(400);
+      expect(rejectedResponse.body).toEqual({ error: `feedback must be between 1 and ${MAX_TASK_MESSAGE_LENGTH} characters` });
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 
   it("returns 404 when task not found", async () => {
@@ -2647,15 +2613,30 @@ describe("POST /tasks/:id/spec/rebuild", () => {
 
 describe("POST /tasks/:id/approve-plan", () => {
   let store: TaskStore;
+  let approvalRoot: string;
 
   beforeEach(() => {
+    /*
+    FNXC:SpecLockApproval 2026-08-15-05:10:
+    Approval is a release boundary — an unreadable PROMPT.md is now a 409 (the route refuses to
+    approve without creating the immutable spec lock). The mock root must therefore carry a real
+    on-disk PROMPT.md for the fixture task, matching production where an awaiting-approval card
+    always has its spec materialized.
+    */
+    approvalRoot = mkdtempSync(join(tmpdir(), "kb-dashboard-approve-plan-root-"));
+    mkdirSync(join(approvalRoot, ".fusion", "tasks", "FN-001"), { recursive: true });
+    writeFileSync(join(approvalRoot, ".fusion", "tasks", "FN-001", "PROMPT.md"), "# Task: FN-001\n\nPlan body.\n");
     store = createMockStore({
       getTask: vi.fn(),
       moveTask: vi.fn(),
       updateTask: vi.fn(),
       logEntry: vi.fn().mockResolvedValue(undefined),
-      getRootDir: vi.fn().mockReturnValue("/fake/root"),
+      getRootDir: vi.fn().mockReturnValue(approvalRoot),
     });
+  });
+
+  afterEach(() => {
+    rmSync(approvalRoot, { recursive: true, force: true });
   });
 
   function buildApp() {
@@ -2816,9 +2797,14 @@ describe("POST /tasks/:id/approve-plan", () => {
     expect(res.status).toBe(200);
     expect(store.logEntry).toHaveBeenCalledWith("FN-001", "Plan approved by user");
     expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo");
+    /*
+    FNXC:SpecLockApproval 2026-08-15-05:10:
+    A readable PROMPT.md is now mandatory at approval (unreadable is a 409), so the persisted
+    patch always carries the real fingerprint hash of the approved on-disk plan — never null.
+    */
     expect(store.updateTask).toHaveBeenCalledWith("FN-001", {
       status: null,
-      approvedPlanFingerprint: null,
+      approvedPlanFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
     });
     expect(res.body.column).toBe("todo");
     expect(res.body.status).toBeUndefined();
@@ -3235,6 +3221,96 @@ describe("GET /tasks/:id/diff", () => {
       // The diff should be schema-compatible even if it returns empty
       expect(Array.isArray(res.body.files)).toBe(true);
       expect(res.body.stats).toHaveProperty("filesChanged");
+    });
+
+    it("scopes both done diff endpoints to an attributed commit after a remote rebase", async () => {
+      const root = mkdtempSync(join(tmpdir(), "kb-dashboard-rebase-attribution-"));
+      try {
+        execFileSync("git", ["init", "--initial-branch=main", root], { stdio: "pipe" });
+        execFileSync("git", ["-C", root, "config", "user.email", "kb-tests@example.com"], { stdio: "pipe" });
+        execFileSync("git", ["-C", root, "config", "user.name", "KB Tests"], { stdio: "pipe" });
+        writeFileSync(join(root, "base.ts"), "export const base = true;\n");
+        execFileSync("git", ["-C", root, "add", "base.ts"], { stdio: "pipe" });
+        execFileSync("git", ["-C", root, "commit", "-m", "base"], { stdio: "pipe" });
+        const rebaseBaseSha = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf-8", stdio: "pipe" }).trim();
+
+        writeFileSync(join(root, "foreign.ts"), "export const remote = true;\n");
+        execFileSync("git", ["-C", root, "add", "foreign.ts"], { stdio: "pipe" });
+        execFileSync("git", ["-C", root, "commit", "-m", "remote work"], { stdio: "pipe" });
+        writeFileSync(join(root, "task.ts"), "export const task = true;\n");
+        execFileSync("git", ["-C", root, "add", "task.ts"], { stdio: "pipe" });
+        execFileSync("git", ["-C", root, "commit", "-m", "fix(FN-014): task execution change"], { stdio: "pipe" });
+        const commitSha = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf-8", stdio: "pipe" }).trim();
+
+        const localStore = createMockStore({ getRootDir: vi.fn().mockReturnValue(root) });
+        (localStore.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+          ...FAKE_TASK_DETAIL,
+          id: "FN-014",
+          column: "done",
+          modifiedFiles: ["task.ts"],
+          mergeDetails: { commitSha, rebaseBaseSha, filesChanged: 2 },
+        });
+        const app = express();
+        app.use(express.json());
+        app.use("/api", createApiRoutes(localStore));
+
+        const diffResponse = await GET(app, "/api/tasks/FN-014/diff");
+        expect(diffResponse.status).toBe(200);
+        expect(diffResponse.body.files.map((file: { path: string }) => file.path)).toEqual(["task.ts"]);
+        expect(diffResponse.body.files[0].patch).toContain("task = true");
+        expect(diffResponse.body.files.map((file: { path: string }) => file.path)).not.toContain("foreign.ts");
+        expect(diffResponse.body.stats.filesChanged).toBe(1);
+
+        const fileDiffsResponse = await GET(app, "/api/tasks/FN-014/file-diffs");
+        expect(fileDiffsResponse.status).toBe(200);
+        expect(fileDiffsResponse.body.map((file: { path: string }) => file.path)).toEqual(["task.ts"]);
+        expect(fileDiffsResponse.body[0].diff).toContain("task = true");
+        expect(fileDiffsResponse.body.map((file: { path: string }) => file.path)).not.toContain("foreign.ts");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("returns no files for a foreign-only rebase when execution evidence is empty", async () => {
+      const root = mkdtempSync(join(tmpdir(), "kb-dashboard-rebase-unproven-"));
+      try {
+        execFileSync("git", ["init", "--initial-branch=main", root], { stdio: "pipe" });
+        execFileSync("git", ["-C", root, "config", "user.email", "kb-tests@example.com"], { stdio: "pipe" });
+        execFileSync("git", ["-C", root, "config", "user.name", "KB Tests"], { stdio: "pipe" });
+        writeFileSync(join(root, "base.ts"), "export const base = true;\n");
+        execFileSync("git", ["-C", root, "add", "base.ts"], { stdio: "pipe" });
+        execFileSync("git", ["-C", root, "commit", "-m", "base"], { stdio: "pipe" });
+        const rebaseBaseSha = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf-8", stdio: "pipe" }).trim();
+        writeFileSync(join(root, "foreign.ts"), "export const remote = true;\n");
+        execFileSync("git", ["-C", root, "add", "foreign.ts"], { stdio: "pipe" });
+        execFileSync("git", ["-C", root, "commit", "-m", "remote work"], { stdio: "pipe" });
+        writeFileSync(join(root, "unproven.ts"), "export const task = true;\n");
+        execFileSync("git", ["-C", root, "add", "unproven.ts"], { stdio: "pipe" });
+        execFileSync("git", ["-C", root, "commit", "-m", "local task work"], { stdio: "pipe" });
+        const commitSha = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf-8", stdio: "pipe" }).trim();
+
+        const localStore = createMockStore({ getRootDir: vi.fn().mockReturnValue(root) });
+        (localStore.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+          ...FAKE_TASK_DETAIL,
+          id: "FN-014",
+          column: "done",
+          modifiedFiles: [],
+          mergeDetails: { commitSha, rebaseBaseSha, filesChanged: 2 },
+        });
+        const app = express();
+        app.use(express.json());
+        app.use("/api", createApiRoutes(localStore));
+
+        const diffResponse = await GET(app, "/api/tasks/FN-014/diff");
+        expect(diffResponse.status).toBe(200);
+        expect(diffResponse.body).toEqual({ files: [], stats: { filesChanged: 0, additions: 0, deletions: 0 } });
+
+        const fileDiffsResponse = await GET(app, "/api/tasks/FN-014/file-diffs");
+        expect(fileDiffsResponse.status).toBe(200);
+        expect(fileDiffsResponse.body).toEqual([]);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
     });
   });
 

@@ -1,6 +1,7 @@
 import { memo } from "react";
 import { useTranslation } from "react-i18next";
 import type { Task, TaskDetail, MergeResult, GithubIssueAction, ColumnId } from "@fusion/core";
+import type { WorktreeGroupData } from "../utils/worktreeGrouping";
 import { isNearDuplicateCanonicalInactive } from "../../../core/src/duplicates/near-duplicate-canonical";
 import { ClipboardList, GitBranch } from "lucide-react";
 import { TaskCard } from "./TaskCard";
@@ -10,7 +11,9 @@ import type { BlockerFanoutEntry } from "../hooks/useBlockerFanout";
 import type { TaskContextMenuColumnMetadata } from "./TaskContextMenu";
 
 interface WorktreeGroupProps {
+  kind: WorktreeGroupData["kind"];
   label: string;
+  repoCount?: number;
   activeTasks: Task[];
   queuedTasks: Task[];
   allTasks?: Task[];
@@ -19,7 +22,7 @@ interface WorktreeGroupProps {
   onPlanningMode?: (initialPlan: string, workflowId?: string | null) => void;
   workflowId?: string | null;
   onOpenRefine?: (task: Task | TaskDetail) => void;
-  onMoveTask?: (id: string, column: ColumnId, optionsOrPosition?: { preserveProgress?: boolean } | number) => Promise<Task>;
+  onMoveTask?: (id: string, column: ColumnId, optionsOrPosition?: { preserveProgress?: boolean; expectedColumn?: string } | number) => Promise<Task>;
   addToast: (message: string, type?: ToastType) => void;
   globalPaused?: boolean;
   onUpdateTask?: (
@@ -28,9 +31,10 @@ interface WorktreeGroupProps {
   ) => Promise<Task>;
   onPauseTask?: (id: string) => Promise<Task>;
   onRetryTask?: (id: string) => Promise<Task>;
+  onOpenChatWithPrefill?: (prefillText: string) => void;
   onUnpauseTask?: (id: string) => Promise<Task>;
-  onResetTask?: (id: string) => Promise<Task>;
-  onDuplicateTask?: (id: string) => Promise<Task>;
+  onResetTask?: (id: string, options?: { description?: string }) => Promise<Task>;
+  onDuplicateTask?: (id: string, options?: { workflowId?: string }) => Promise<Task>;
   onMergeTask?: (id: string) => Promise<MergeResult>;
   onArchiveTask?: (id: string, options?: { removeLineageReferences?: boolean }) => Promise<Task>;
   onUnarchiveTask?: (id: string) => Promise<Task>;
@@ -42,8 +46,6 @@ interface WorktreeGroupProps {
     githubIssueAction?: GithubIssueAction;
   }) => Promise<Task>;
   onOpenDetailWithTab?: (task: Task | TaskDetail, initialTab: "changes" | "retries" | "workflow") => void;
-  /** Project-level stuck task timeout in milliseconds (undefined = disabled) */
-  taskStuckTimeoutMs?: number;
   /** Called when user clicks a mission badge on a task card */
   onOpenMission?: (missionId: string) => void;
   /** Timestamp (ms) when task data was last confirmed fresh from the server. Used for freshness-aware stuck detection. */
@@ -67,7 +69,9 @@ interface WorktreeGroupProps {
 }
 
 function WorktreeGroupComponent({
+  kind,
   label,
+  repoCount,
   activeTasks,
   queuedTasks,
   allTasks,
@@ -82,16 +86,16 @@ function WorktreeGroupComponent({
   onUpdateTask,
   onPauseTask,
   onRetryTask,
+  onOpenChatWithPrefill,
   onUnpauseTask,
   onResetTask,
-  onDuplicateTask,
+    onDuplicateTask,
   onMergeTask,
   onArchiveTask,
   onUnarchiveTask,
   onRevertTask,
   onDeleteTask,
   onOpenDetailWithTab,
-  taskStuckTimeoutMs,
   onOpenMission,
   lastFetchTimeMs,
   taskCardFieldDefs,
@@ -104,8 +108,15 @@ function WorktreeGroupComponent({
   taskContextMenuColumnsByTaskId,
 }: WorktreeGroupProps) {
   const { t } = useTranslation("app");
-  const upNextLabel = t("worktree.upNext", "Up Next");
-  const unassignedLabel = t("worktree.unassigned", "Unassigned");
+  /*
+  FNXC:Workspace 2026-08-15-03:35:
+  Group labels originate in a pure utility as English display values, while this component
+  translates headers. Comparing those strings selected the wrong icon in non-English locales;
+  the stable group kind is the locale-independent header contract.
+  */
+  const headerLabel = kind === "workspace"
+    ? t("worktree.workspaceRepos", "{{label}} · {{count}} repos", { label, count: repoCount ?? 0 })
+    : label;
   const resolveNearDuplicateCanonicalInactive = (task: Task): boolean | undefined => {
     const nearDuplicateOf = task.sourceMetadata?.nearDuplicateOf;
     if (typeof nearDuplicateOf !== "string" || !allTasks) return undefined;
@@ -127,9 +138,9 @@ function WorktreeGroupComponent({
     <div className="worktree-group">
       <div className="worktree-group-header">
         <span className="worktree-icon">
-          {label === upNextLabel || label === unassignedLabel ? <ClipboardList size={14} /> : <GitBranch size={14} />}
+          {kind === "unassigned" || kind === "up-next" ? <ClipboardList size={14} /> : <GitBranch size={14} />}
         </span>
-        <span className="worktree-label">{label}</span>
+        <span className="worktree-label">{headerLabel}</span>
       </div>
       {activeTasks.map((task) => (
         <TaskCard
@@ -148,8 +159,9 @@ function WorktreeGroupComponent({
           onUpdateTask={onUpdateTask}
           onPauseTask={onPauseTask}
           onRetryTask={onRetryTask}
+          onOpenChatWithPrefill={onOpenChatWithPrefill}
           onUnpauseTask={onUnpauseTask}
-          onResetTask={onResetTask}
+                  onResetTask={onResetTask}
           onDuplicateTask={onDuplicateTask}
           onMergeTask={onMergeTask}
           onArchiveTask={onArchiveTask}
@@ -157,7 +169,6 @@ function WorktreeGroupComponent({
           onRevertTask={onRevertTask}
           onDeleteTask={onDeleteTask}
           onOpenDetailWithTab={onOpenDetailWithTab}
-          taskStuckTimeoutMs={taskStuckTimeoutMs}
           onOpenMission={onOpenMission}
           lastFetchTimeMs={lastFetchTimeMs}
           cardFieldDefs={taskCardFieldDefs?.get(task.id)}
@@ -187,8 +198,9 @@ function WorktreeGroupComponent({
           onUpdateTask={onUpdateTask}
           onPauseTask={onPauseTask}
           onRetryTask={onRetryTask}
+          onOpenChatWithPrefill={onOpenChatWithPrefill}
           onUnpauseTask={onUnpauseTask}
-          onResetTask={onResetTask}
+                  onResetTask={onResetTask}
           onDuplicateTask={onDuplicateTask}
           onMergeTask={onMergeTask}
           onArchiveTask={onArchiveTask}
@@ -196,7 +208,6 @@ function WorktreeGroupComponent({
           onRevertTask={onRevertTask}
           onDeleteTask={onDeleteTask}
           onOpenDetailWithTab={onOpenDetailWithTab}
-          taskStuckTimeoutMs={taskStuckTimeoutMs}
           onOpenMission={onOpenMission}
           lastFetchTimeMs={lastFetchTimeMs}
           cardFieldDefs={taskCardFieldDefs?.get(task.id)}

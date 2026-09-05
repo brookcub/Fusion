@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { Dispatch, SetStateAction } from "react";
-import { formatProviderInstanceKey, removeProviderInstance, renameProviderInstance, setProviderDefaultInstance, newProviderInstanceId } from "../../../api";
+import { formatProviderInstanceKey, refreshBuiltInModels, removeProviderInstance, renameProviderInstance, setProviderDefaultInstance, newProviderInstanceId } from "../../../api";
 import type { AuthProvider, ManualOAuthCodeInfo, OAuthDeviceCodeInfo, ProviderCredentialInstance } from "../../../api";
 import type { ToastType } from "../../../hooks/useToast";
 import { useTranslation } from "react-i18next";
@@ -42,6 +42,13 @@ export interface AuthenticationSectionData {
     manualCodeInputs: Record<string, string>;
     setManualCodeInputs: Dispatch<SetStateAction<Record<string, string>>>;
     manualCodeSubmitInProgress: string | null;
+    /*
+    FNXC:ProviderAuth 2026-08-18-06:10:
+    stateKey whose login is showing in the persistent ProviderLoginDialog, or null. That dialog
+    already renders the instructions and paste field, so the row must not render its own copies —
+    two inputs for the same code, one of them behind the dialog.
+    */
+    activeLoginDialogKey?: string | null;
     loadAuthStatus: () => void | Promise<void>;
     handleLogin: (providerId: string, instanceId?: string, label?: string) => void;
     handleLogout: (providerId: string, instanceId?: string) => void;
@@ -87,8 +94,9 @@ const compareAuthProviderDisplayOrder = (a: AuthProvider, b: AuthProvider) => {
 };
 export function AuthenticationSection({ auth, form, setForm }: AuthenticationSectionProps) {
     const { t } = useTranslation("app");
-    const { projectId, addToast, authProviders, authLoading, authActionInProgress, apiKeyInputs, setApiKeyInputs, apiKeyErrors, opencodeApiKeyRefreshStatus, deviceCodes, loginInstructions, manualCodeConfigs, manualCodeInputs, setManualCodeInputs, manualCodeSubmitInProgress, loadAuthStatus, handleLogin, handleLogout, handleCancelLogin, handleSaveApiKey, handleClearApiKey, handleSubmitManualCode, onReopenOnboarding, } = auth;
+    const { projectId, addToast, authProviders, authLoading, authActionInProgress, apiKeyInputs, setApiKeyInputs, apiKeyErrors, opencodeApiKeyRefreshStatus, deviceCodes, loginInstructions, manualCodeConfigs, manualCodeInputs, setManualCodeInputs, manualCodeSubmitInProgress, activeLoginDialogKey, loadAuthStatus, handleLogin, handleLogout, handleCancelLogin, handleSaveApiKey, handleClearApiKey, handleSubmitManualCode, onReopenOnboarding, } = auth;
     const [pendingInstances, setPendingInstances] = useState<Record<string, { instanceId: string; label: string }>>({});
+    const [builtInRefreshStatus, setBuiltInRefreshStatus] = useState<"idle" | "pending" | "completed" | "timed_out" | "failed" | "stale_in_flight">("idle");
     const isAuthActionActive = (stateKey: string) => typeof authActionInProgress === "string"
         ? authActionInProgress === stateKey
         : Boolean(authActionInProgress?.[stateKey]);
@@ -125,6 +133,23 @@ export function AuthenticationSection({ auth, form, setForm }: AuthenticationSec
     const handleCliProviderToggled = () => {
         void loadAuthStatus();
         void refreshModelsCache();
+    };
+    /*
+    FNXC:BuiltInModelRefresh 2026-08-18-23:11:
+    Keep built-in catalog refresh manual and panel-local: disable only this action while its request runs, propagate a completed catalog through the shared models cache, and keep the previous picker rows for every deferred or failed outcome.
+    */
+    const handleBuiltInModelsRefresh = async () => {
+        if (builtInRefreshStatus === "pending") return;
+        setBuiltInRefreshStatus("pending");
+        try {
+            const result = await refreshBuiltInModels();
+            setBuiltInRefreshStatus(result.outcome);
+            if (result.outcome === "completed") {
+                await refreshModelsCache();
+            }
+        } catch {
+            setBuiltInRefreshStatus("failed");
+        }
     };
     const renderCliProviderCard = (provider: AuthProvider) => {
         if (provider.id === "claude-cli") {
@@ -274,10 +299,13 @@ export function AuthenticationSection({ auth, form, setForm }: AuthenticationSec
     };
     /*
     FNXC:ProviderAuth 2026-07-14-15:54:
-    Provider authentication failures must remain visible on the affected card. Toasts are transient and can fire while Settings is closed, so render the server's loginError beside the provider actions as the durable re-auth remediation.
+    Provider authentication failures must remain visible on the affected card. Toasts are transient and can fire while Settings is closed, so render the server's loginError as the durable re-auth remediation.
+
+    FNXC:ProviderAuth 2026-08-15-22:08:
+    The loginError used to sit inline beside Login as `<small class="form-error">`. On a narrow Settings card that flex item sized to the sentence's min-content width, so the Anthropic expiry copy overflowed the card and the leaked global `.form-error` border painted as a broken per-line box. Keep it a wrapping block under the header so the banner stays inside the card at every Settings width.
     */
     const renderProviderAuthError = (provider: AuthProvider) => provider.loginError
-        ? (<small className="form-error" role="alert">{provider.loginError}</small>)
+        ? (<p className="auth-provider-login-error" role="alert">{provider.loginError}</p>)
         : null;
     const renderApiKeySection = (provider: AuthProvider, selectedInstanceId?: string, pendingLabel?: string, isPending = false) => {
       const instanceId = selectedInstanceId ?? provider.instanceId;
@@ -309,16 +337,21 @@ export function AuthenticationSection({ auth, form, setForm }: AuthenticationSec
         {isAuthActionActive(stateKey) ? <div className="auth-provider-actions-row"><button className="btn btn-sm" disabled>{t("settings.auth.waitingForLogin", "Waiting for login…")}</button><button className="btn btn-sm" onClick={() => instanceId ? handleCancelLogin(provider.id, instanceId) : handleCancelLogin(provider.id)}>{t("settings.actions.cancel", "Cancel")}</button></div>
           : provider.loginInProgress ? <div className="auth-provider-actions-row"><button className="btn btn-sm" disabled>{t("settings.auth.waitingForLogin", "Waiting for login…")}</button><button className="btn btn-sm" onClick={() => instanceId ? handleCancelLogin(provider.id, instanceId) : handleCancelLogin(provider.id)}>{t("settings.actions.cancel", "Cancel")}</button></div>
             : <button className="btn btn-primary btn-sm" onClick={() => instanceId ? handleLogin(provider.id, instanceId, pendingLabel) : handleLogin(provider.id)}>{t("settings.auth.login", "Login")}</button>}
-        {provider.id === "github-copilot" && deviceCodes[stateKey] && isActive && <div className="auth-device-code-panel" data-testid={`auth-device-code-${stateKey}`}>
-          <strong>{t("settings.auth.enterCodeOnGitHub", "Enter this code on GitHub")}</strong>
+        {/*
+        FNXC:ProviderAuth 2026-09-01-08:30:
+        Any OAuth provider may notify a device code. Render the code and verification link instead
+        of a paste form, and leave opening the link to the operator after they have read the code.
+        */}
+        {deviceCodes[stateKey] && isActive && <div className="auth-device-code-panel" data-testid={`auth-device-code-${stateKey}`}>
+          <strong>{provider.id === "github-copilot" ? t("settings.auth.enterCodeOnGitHub", "Enter this code on GitHub") : t("settings.auth.enterCodeToContinue", "Enter this code to continue")}</strong>
           <div className="auth-device-code-pill">{deviceCodes[stateKey].userCode}</div>
           <div className="auth-provider-actions-row">
             <button className="btn btn-sm" onClick={() => void copyTextToClipboard(deviceCodes[stateKey].userCode).then((copied) => addToast(copied ? t("settings.auth.copiedCodeToClipboard", "Copied code to clipboard") : t("settings.auth.failedToCopyCode", "Failed to copy code — copy it manually from the box above"), copied ? "success" : "error"))}>{t("settings.auth.copyCode", "Copy code")}</button>
-            <button className="btn btn-sm" onClick={() => openExternalUrl(appendTokenQuery(deviceCodes[stateKey].verificationUri))}>{t("settings.auth.openGitHub", "Open GitHub")}</button>
+            <button className="btn btn-sm" onClick={() => openExternalUrl(appendTokenQuery(deviceCodes[stateKey].verificationUri))}>{provider.id === "github-copilot" ? t("settings.auth.openGitHub", "Open GitHub") : t("settings.auth.openVerificationPage", "Open verification page")}</button>
           </div>
         </div>}
-        {loginInstructions[stateKey] && isActive && <LoginInstructions instructions={loginInstructions[stateKey]} data-testid={`auth-login-instructions-${stateKey}`}/>}
-        {manualCodeConfigs[stateKey] && isActive && <OAuthManualCodeForm value={manualCodeInputs[stateKey] ?? ""} onChange={(value) => setManualCodeInputs((prev) => ({ ...prev, [stateKey]: value }))} onSubmit={() => void handleSubmitManualCode(provider.id, instanceId)} prompt={manualCodeConfigs[stateKey].prompt} placeholder={manualCodeConfigs[stateKey].placeholder} helpText={manualCodeConfigs[stateKey].helpText} disabled={manualCodeSubmitInProgress === stateKey} submitLabel={manualCodeSubmitInProgress === stateKey ? "Submitting…" : "Submit code"} data-testid={`auth-manual-code-${stateKey}`}/>}
+        {loginInstructions[stateKey] && isActive && activeLoginDialogKey !== stateKey && <LoginInstructions instructions={loginInstructions[stateKey]} data-testid={`auth-login-instructions-${stateKey}`}/>}
+        {manualCodeConfigs[stateKey] && isActive && activeLoginDialogKey !== stateKey && <OAuthManualCodeForm value={manualCodeInputs[stateKey] ?? ""} onChange={(value) => setManualCodeInputs((prev) => ({ ...prev, [stateKey]: value }))} onSubmit={() => void handleSubmitManualCode(provider.id, instanceId)} prompt={manualCodeConfigs[stateKey].prompt} placeholder={manualCodeConfigs[stateKey].placeholder} helpText={manualCodeConfigs[stateKey].helpText} disabled={manualCodeSubmitInProgress === stateKey} submitLabel={manualCodeSubmitInProgress === stateKey ? "Submitting…" : "Submit code"} data-testid={`auth-manual-code-${stateKey}`}/>}
       </div>;
     };
     /*
@@ -331,6 +364,23 @@ export function AuthenticationSection({ auth, form, setForm }: AuthenticationSec
       <div className="settings-field-label-row">
         <h4 className="settings-section-heading">{t("settings.auth.title", "Authentication")}</h4>
         <SettingsHelpTip settingKey="auth-section">{t("settings.auth.hint", "Authentication changes take effect immediately — no need to save.")}</SettingsHelpTip>
+      </div>
+      <div className="auth-model-refresh" data-testid="built-in-model-refresh">
+        <button
+          type="button"
+          className="btn btn-sm"
+          onClick={() => void handleBuiltInModelsRefresh()}
+          disabled={builtInRefreshStatus === "pending"}
+          aria-busy={builtInRefreshStatus === "pending"}
+        >
+          {builtInRefreshStatus === "pending"
+            ? t("settings.auth.refreshModelsPending", "Refreshing models…")
+            : t("settings.auth.refreshModels", "Refresh Models")}
+        </button>
+        {builtInRefreshStatus === "completed" && <span className="auth-model-refresh-feedback auth-model-refresh-feedback--success" role="status">{t("settings.auth.refreshModelsSuccess", "Models refreshed.")}</span>}
+        {builtInRefreshStatus === "timed_out" && <span className="auth-model-refresh-feedback auth-model-refresh-feedback--warning" role="status">{t("settings.auth.refreshModelsTimedOut", "Refresh timed out; showing the last available models. Try again.")}</span>}
+        {builtInRefreshStatus === "stale_in_flight" && <span className="auth-model-refresh-feedback auth-model-refresh-feedback--warning" role="status">{t("settings.auth.refreshModelsDeferred", "Another refresh is still running; showing the last available models. Try again shortly.")}</span>}
+        {builtInRefreshStatus === "failed" && <span className="auth-model-refresh-feedback auth-model-refresh-feedback--error" role="alert">{t("settings.auth.refreshModelsFailed", "Refresh failed; showing the last available models. Try again.")}</span>}
       </div>
       {authLoading ? (<div className="settings-empty-state"><LoadingSpinner label={t("settings.auth.loadingStatus", "Loading authentication status…")} /></div>) : authProviders.length === 0 ? (<div className="settings-empty-state settings-muted">
           {t("settings.auth.noProviders", "No providers available")}
@@ -355,10 +405,20 @@ export function AuthenticationSection({ auth, form, setForm }: AuthenticationSec
                       </span>
                       {renderAnthropicPrecedenceBadge(provider)}
                       {provider.authenticated && provider.keyHint && (<span className="auth-key-hint">{t("settings.authentication.key", "Key: ")}{provider.keyHint}</span>)}
+                      {/*
+                      FNXC:ProviderAuth 2026-09-01-06:38:
+                      FN-9229 suppresses the hidden legacy Anthropic OAuth row when a Claude subscription account is stored. Show its continued presence only on that account card so operators can understand an authentication failure without exposing token material or rendering an empty shell.
+                      */}
+                      {provider.id === "anthropic-subscription" && provider.legacyAnthropicOAuthPresent && (
+                        <span className="auth-key-hint" data-testid="auth-legacy-anthropic-oauth-notice">
+                          {t("settings.auth.legacyAnthropicOAuthNotice", "A legacy Anthropic sign-in from an earlier version is still stored outside this account list. It is no longer used while an account is listed here — sign in again or re-select an account if authentication fails.")}
+                        </span>
+                      )}
                     </div>
-                    {provider.type !== "api_key" && !hasMultipleInstances(provider) && <div>{renderAuthenticatedOAuthActions(provider)}{renderProviderAuthError(provider)}</div>}
+                    {provider.type !== "api_key" && !hasMultipleInstances(provider) && <div className="auth-provider-actions">{renderAuthenticatedOAuthActions(provider)}</div>}
                     {providerSupportsApiKey(provider) && !hasMultipleInstances(provider) && renderApiKeySection(provider)}
                   </div>
+                  {provider.type !== "api_key" && !hasMultipleInstances(provider) && renderProviderAuthError(provider)}
                   {renderInstanceControls(provider)}
                 </div>))}
               {renderAnthropicPrecedenceRow()}
@@ -378,16 +438,17 @@ export function AuthenticationSection({ auth, form, setForm }: AuthenticationSec
                       </span>
                       {provider.keyHint && (<span className="auth-key-hint">{t("settings.authentication.key", "Key: ")}{provider.keyHint}</span>)}
                     </div>
-                    {provider.type !== "api_key" && !hasMultipleInstances(provider) && <div>{renderAvailableOAuthActions(provider)}{renderProviderAuthError(provider)}</div>}
+                    {provider.type !== "api_key" && !hasMultipleInstances(provider) && <div className="auth-provider-actions">{renderAvailableOAuthActions(provider)}</div>}
                     {providerSupportsApiKey(provider) && !hasMultipleInstances(provider) && renderApiKeySection(provider)}
                   </div>
+                  {provider.type !== "api_key" && !hasMultipleInstances(provider) && renderProviderAuthError(provider)}
                   {renderInstanceControls(provider)}
                 </div>))}
             </div>)}
         </div>)}
       {/*
       FNXC:SettingsHelp 2026-07-16-12:45:
-      The provider cards' `<small>`s stay inline: they are all live state (save progress, key errors, provider loginError, OpenCode refresh status) that must stay visible where the operator is acting. The two DESCRIPTIVE blurbs this section carried — the panel-level "changes take effect immediately" hint and the reopen-onboarding hint — moved behind the shared "?" affordance per the operator requirement that no inline description paragraphs remain in Settings.
+      Save-progress, API-key, and OpenCode refresh `<small>`s stay inline on the control they describe. Provider loginError is a wrapping block banner under the card header so a long OAuth expiry message cannot overflow the card. The two DESCRIPTIVE blurbs this section carried — the panel-level "changes take effect immediately" hint and the reopen-onboarding hint — moved behind the shared "?" affordance per the operator requirement that no inline description paragraphs remain in Settings.
       */}
       {onReopenOnboarding && (<div className="form-group" style={{ marginTop: "var(--space-md)" }}>
           <div className="settings-field-label-row">

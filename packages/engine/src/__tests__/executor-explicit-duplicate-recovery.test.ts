@@ -29,10 +29,13 @@ function task(overrides: Partial<Task> = {}): Task {
 FNXC:DuplicateIntake 2026-08-09-01:54:
 FN-8840 must recover an already-admitted title-only redirect at the graph failure boundary.
 This fixture deliberately keeps PROMPT.md executable-looking, proving the title—not a prompt marker—
-routes parse failure to replan before generic retry/terminal failure handling can run.
+routes parse failure to an in-place repair before generic terminal handling.
+FNXC:LifecycleContainment 2026-09-05-07:34:
+Upstream no longer permits automatic backward moves. A missing implementation
+plan stays visibly failed in its current lane instead of bouncing indefinitely.
 */
 describe("executor explicit duplicate redirect parse recovery", () => {
-  it("rebounds a title-only custom-prefix redirect after a parse failure", async () => {
+  it("contains a title-only custom-prefix redirect in its current lane after a parse failure", async () => {
     resetExecutorMocks();
     const tasksDir = await mkdtemp(join(tmpdir(), "fusion-duplicate-parse-"));
     const store = createMockStore();
@@ -52,14 +55,14 @@ describe("executor explicit duplicate redirect parse recovery", () => {
         context: { "node:parse:value": "parse-error" },
       });
 
-      expect(store.moveTask).toHaveBeenCalledWith(liveTask.id, "todo", { preserveWorktree: true });
+      expect(store.moveTask).not.toHaveBeenCalled();
       expect(store.updateTask).toHaveBeenCalledWith(liveTask.id, {
-        status: "needs-replan",
+        status: null,
         error: null,
       }, undefined);
       expect(store.logEntry).toHaveBeenCalledWith(
         liveTask.id,
-        "Parse node failed on duplicate redirect — rebounded to todo for re-specification",
+        "Parse node failed on duplicate redirect — retained in the current execution lane for repair",
         expect.stringContaining("task title"),
         undefined,
       );
@@ -73,7 +76,7 @@ describe("executor explicit duplicate redirect parse recovery", () => {
     }
   });
 
-  it("rebounds missing implementation steps to replan instead of parking failed", async () => {
+  it("parks missing implementation steps visibly without an automatic backward move", async () => {
     resetExecutorMocks();
     const tasksDir = await mkdtemp(join(tmpdir(), "fusion-missing-steps-"));
     const store = createMockStore();
@@ -98,26 +101,15 @@ describe("executor explicit duplicate redirect parse recovery", () => {
         context: { "node:parse:value": "missing-implementation-steps" },
       });
 
-      expect(store.moveTask).toHaveBeenCalledWith(liveTask.id, "todo", { preserveWorktree: true });
-      expect(store.updateTask).toHaveBeenCalledWith(liveTask.id, {
-        status: "needs-replan",
-        error: null,
-      }, undefined);
+      expect(store.moveTask).not.toHaveBeenCalled();
+      expect(await store.getTask(liveTask.id)).toMatchObject({
+        column: "in-progress", status: "failed",
+        error: "Workflow graph terminated with failure at node 'parse'",
+      });
       expect(store.logEntry).toHaveBeenCalledWith(
         liveTask.id,
-        "AI spec revision requested",
-        expect.stringContaining("no executable Step headings"),
+        "Workflow graph terminated with failure at node 'parse'",
         undefined,
-      );
-      expect(store.logEntry).toHaveBeenCalledWith(
-        liveTask.id,
-        "Parse node failed with missing implementation steps — rebounded to todo for re-specification",
-        "missing-implementation-steps",
-        undefined,
-      );
-      expect(store.updateTask).not.toHaveBeenCalledWith(
-        liveTask.id,
-        expect.objectContaining({ status: "failed" }),
         undefined,
       );
     } finally {

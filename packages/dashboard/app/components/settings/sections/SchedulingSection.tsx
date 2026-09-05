@@ -1,4 +1,5 @@
 import { useTranslation } from "react-i18next";
+import { DEFAULT_PROJECT_SETTINGS } from "@fusion/core";
 import { MovedSettingsStub } from "./MovedSettingsStub";
 import { SettingsToggleRow } from "../SettingsToggleRow";
 import { SettingsSelectRow } from "../SettingsSelectRow";
@@ -45,10 +46,10 @@ export function SchedulingSection({ form, setForm, concurrencyLoading = false, o
         descriptor={{
           key: "maxConcurrent",
           label: t("settings.scheduling.maxConcurrentTasks", "Max Concurrent Tasks"),
-          help: t("settings.scheduling.maxConcurrentTasksHint", "Default: 2."),
+          help: t("settings.scheduling.maxConcurrentTasksHint", `Default: ${DEFAULT_PROJECT_SETTINGS.maxConcurrent}. Caps every AI-active task, including planning, independently of Max Worktrees.`),
           scope: "project",
           min: 1,
-          max: 10,
+          max: 50,
           disabled: concurrencyLoading,
         }}
         value={form.maxConcurrent ?? null}

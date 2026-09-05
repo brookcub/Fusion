@@ -140,6 +140,13 @@ async function loadCommandHandlers() {
   const { runGoalsList, runGoalsCreate, runGoalsArchive, runGoalsCitations } = await import("./commands/goals.js");
   const { runProjectList, runProjectAdd, runProjectRemove, runProjectShow, runProjectInfo, runProjectSetDefault, runProjectDetect } = await import("./commands/project.js");
   const { runNodeList, runNodeConnect, runNodeDisconnect, runNodeShow, runNodeHealth, runMeshStatus } = await import("./commands/node.js");
+  const {
+    runCloudPairStart,
+    runCloudPairComplete,
+    runCloudHeartbeat,
+    runCloudStatus,
+    runCloudUnlink,
+  } = await import("./commands/cloud.js");
   const { runInit } = await import("./commands/init.js");
   const { runOnboard } = await import("./commands/onboard.js");
   const { runAgentStop, runAgentStart } = await import("./commands/agent.js");
@@ -258,6 +265,11 @@ async function loadCommandHandlers() {
     runNodeShow,
     runNodeHealth,
     runMeshStatus,
+    runCloudPairStart,
+    runCloudPairComplete,
+    runCloudHeartbeat,
+    runCloudStatus,
+    runCloudUnlink,
     runInit,
     runOnboard,
     runAgentStop,
@@ -342,7 +354,7 @@ Usage:
   fn task merge <id>                  Merge an in-review task and close it
   fn task duplicate <id>              Duplicate a task (creates copy in triage)
   fn task refine <id> [opts]          Create a refinement task from done/in-review
-  fn task archive <id>                Archive a task (from any column)
+  fn task archive <id> [--force]      Archive a task; --force permits live-worktree removal
   fn task unarchive <id>              Unarchive an archived task
   fn task delete <id> [--force] [--allow-resurrection]
                                       Delete a task (use --force to skip confirmation; --allow-resurrection permits intentional ID recreation)
@@ -413,6 +425,14 @@ PR:
   fn node show | info [name] [--json] Show node details
   fn node health <name>               Health check a node
   fn mesh status [--json]              Show full mesh state
+  fn cloud pair-start [--http <url>] [--name <name>]
+                                      Start cloud-link pairing (prints code)
+  fn cloud pair-complete [--http <url>] [--code <code>]
+                                      Finish pairing after console claim (pending file, or FUSION_CLOUD_PENDING_SECRET)
+  fn cloud heartbeat [--url <origin>] [--port <n>] [--no-tunnel]
+                                      One-shot publish. Without --url, start a Cloudflare tunnel until Ctrl+C. --no-tunnel publishes LAN only.
+  fn cloud status [--json]             Show local cloud-link state
+  fn cloud unlink                      Clear ~/.fusion/cloud-link.json
   fn settings                          Show current Fusion configuration
   fn settings set <key> <value>        Update a configuration setting
   fn settings set defaultNodeId <node-id>
@@ -518,6 +538,9 @@ Options:
   --attach <file>            Attach file(s) on task create (repeatable)
   --depends <id>             Declare dependency on task create (repeatable)
   --no-dedup                 Bypass deterministic duplicate guard on task create
+  --github                   Enable GitHub issue tracking for the created task
+  --no-github                Disable GitHub issue tracking (overrides project default)
+  --github-repo <owner/repo> Repository override for the task's tracking issue
   --feedback <text>          Refinement feedback (non-interactive mode)
   --yes                      Skip confirmation prompts (planning mode)
   --limit, -l <n>            Max issues to import (default: 30, max: 100)
@@ -785,6 +808,11 @@ async function main() {
     runNodeShow,
     runNodeHealth,
     runMeshStatus,
+    runCloudPairStart,
+    runCloudPairComplete,
+    runCloudHeartbeat,
+    runCloudStatus,
+    runCloudUnlink,
     runInit,
     runOnboard,
     runAgentStop,
@@ -1152,6 +1180,69 @@ async function main() {
         break;
       }
 
+      case "cloud": {
+        /*
+        FNXC:CloudLink 2026-08-24-02:17:
+        Thin client for cloud-link Mode A pairing and presence. pair-complete
+        takes the pending secret from the 0600 pending file or FUSION_CLOUD_PENDING_SECRET, never argv.
+        */
+        const subcommand = args[1];
+        switch (subcommand) {
+          case "pair-start": {
+            await runCloudPairStart({
+              http: getFlagValue(args, "--http"),
+              name: getFlagValue(args, "--name"),
+            });
+            break;
+          }
+          case "pair-complete": {
+            /*
+             * FNXC:CloudLink 2026-09-04-03:44:
+             * `--pending-secret` is a hard error in space and equals forms, so a copied
+             * command cannot leak the credential through process listings or shell history.
+             * getFlagValue is index-based and silently ignores --flag=value; without this
+             * token-form guard, an equals-form credential would leak while appearing to work.
+             */
+            if (args.some((arg) => arg === "--pending-secret" || arg.startsWith("--pending-secret="))) {
+              console.error(
+                "Do not pass --pending-secret (it appears in process listings). Run fn cloud pair-start first, or set FUSION_CLOUD_PENDING_SECRET.",
+              );
+              process.exit(1);
+            }
+            const pendingFromEnv = process.env.FUSION_CLOUD_PENDING_SECRET?.trim();
+            await runCloudPairComplete({
+              http: getFlagValue(args, "--http"),
+              code: getFlagValue(args, "--code"),
+              pendingSecret: pendingFromEnv || undefined,
+            });
+            break;
+          }
+          case "heartbeat": {
+            await runCloudHeartbeat({
+              url: getFlagValue(args, "--url"),
+              port: getFlagValueNumber(args, "--port"),
+              tunnel: !args.includes("--no-tunnel"),
+            });
+            break;
+          }
+          case "status": {
+            await runCloudStatus({ json: args.includes("--json") });
+            break;
+          }
+          case "unlink": {
+            await runCloudUnlink();
+            break;
+          }
+          default:
+            console.error(`Unknown subcommand: cloud ${subcommand || ""}`);
+            console.log(
+              "Try: fn cloud pair-start | pair-complete | heartbeat | status | unlink",
+            );
+            process.exit(1);
+        }
+        break;
+      }
+
       case "research": {
         const subcommand = args[1];
         switch (subcommand) {
@@ -1268,6 +1359,8 @@ async function main() {
             const dependsIds: string[] = [];
             let nodeName: string | undefined;
             let noDedup = false;
+            let github: boolean | undefined;
+            let githubRepo: string | undefined;
             const descParts: string[] = [];
             for (let i = 0; i < createArgs.length; i++) {
               if (createArgs[i] === "--attach" && i + 1 < createArgs.length) {
@@ -1281,12 +1374,19 @@ async function main() {
                 i++; // skip the value
               } else if (createArgs[i] === "--no-dedup") {
                 noDedup = true;
+              } else if (createArgs[i] === "--github") {
+                github = true;
+              } else if (createArgs[i] === "--no-github") {
+                github = false;
+              } else if (createArgs[i] === "--github-repo" && i + 1 < createArgs.length) {
+                githubRepo = createArgs[i + 1];
+                i++; // skip the value
               } else {
                 descParts.push(createArgs[i]);
               }
             }
             const title = descParts.join(" ");
-            await runTaskCreate(title || undefined, attachFiles.length > 0 ? attachFiles : undefined, dependsIds.length > 0 ? dependsIds : undefined, projectName, nodeName, noDedup);
+            await runTaskCreate(title || undefined, attachFiles.length > 0 ? attachFiles : undefined, dependsIds.length > 0 ? dependsIds : undefined, projectName, nodeName, noDedup, github !== undefined || githubRepo !== undefined ? { github, githubRepo } : undefined);
             break;
           }
           case "plan": {
@@ -1413,8 +1513,8 @@ async function main() {
           }
           case "archive": {
             const id = args[2];
-            if (!id) { console.error("Usage: fn task archive <id>"); process.exit(1); }
-            await runTaskArchive(id, projectName);
+            if (!id) { console.error("Usage: fn task archive <id> [--force]"); process.exit(1); }
+            await runTaskArchive(id, projectName, {force: args.includes("--force")});
             break;
           }
           case "unarchive": {

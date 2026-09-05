@@ -18,12 +18,21 @@ fails with 400 instead of succeeding, because these cards are in `todo`.
 */
 import { describe, it, expect, vi } from "vitest";
 import express from "express";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { TaskStore, TaskDetail } from "@fusion/core";
 import { createApiRoutes } from "../routes.js";
 import { request as performRequest } from "../test-request.js";
+
+vi.mock("@fusion/engine", async () => {
+  const actual = await vi.importActual<typeof import("@fusion/engine")>("@fusion/engine");
+  return {
+    ...actual,
+    planTaskResetBranchCleanup: vi.fn().mockResolvedValue({ deleted: [], retained: [], blocked: [] }),
+    deleteTaskResetBranches: vi.fn().mockResolvedValue({ deleted: [], retained: [], blocked: [] }),
+  };
+});
 
 /** The post-#2515 default lineage: ONE pre-implementation column, id `todo`. */
 const MERGED_CODING_IR = {
@@ -36,6 +45,23 @@ const MERGED_CODING_IR = {
   ],
   nodes: [{ id: "start", kind: "start", column: "todo" }, { id: "end", kind: "end", column: "done" }],
   edges: [{ from: "start", to: "end" }],
+};
+
+const SPLIT_CODING_IR = {
+  version: "v2",
+  name: "split-coding",
+  columns: [
+    { id: "ideas", name: "Ideas", traits: [{ trait: "intake", config: { autoTriage: false } }] },
+    { id: "todo", name: "Planning", traits: [{ trait: "hold" }] },
+    { id: "in-progress", name: "In progress", traits: [{ trait: "wip" }] },
+    { id: "done", name: "Done", traits: [{ trait: "complete" }] },
+  ],
+  nodes: [
+    { id: "start", kind: "start", column: "ideas" },
+    { id: "planning", kind: "prompt", column: "todo", config: { seam: "planning" } },
+    { id: "end", kind: "end", column: "done" },
+  ],
+  edges: [{ from: "start", to: "planning" }, { from: "planning", to: "end" }],
 };
 
 /** A card parked awaiting approval on the merged planning column. */
@@ -56,13 +82,33 @@ const PLANNING_TASK: TaskDetail = {
 } as unknown as TaskDetail;
 
 function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
+  /*
+  FNXC:SpecLockApproval 2026-08-15-05:10:
+  approve-plan now refuses (409) when the approved card's PROMPT.md is unreadable — approval is
+  the spec-lock release boundary. Materialize the fixture card's on-disk plan so the merged-intake
+  approval case exercises the success path, and mock the spec-lock/drift seams the route calls
+  inside the planning fence.
+  */
+  const root = mkdtempSync(join(tmpdir(), "kb-plan-approval-"));
+  mkdirSync(join(root, ".fusion", "tasks", "FN-200"), { recursive: true });
+  writeFileSync(join(root, ".fusion", "tasks", "FN-200", "PROMPT.md"), "# Plan\n");
   return {
     getSettings: vi.fn().mockResolvedValue({}),
-    getRootDir: vi.fn().mockReturnValue(mkdtempSync(join(tmpdir(), "kb-plan-approval-"))),
+    getRootDir: vi.fn().mockReturnValue(root),
+    lockCurrentPlanWhilePlanningLocked: vi.fn().mockResolvedValue(undefined),
+    reconcileSpecDriftWhilePlanningLocked: vi.fn().mockResolvedValue(undefined),
+    // FNXC:TaskWedgeNotifications 2026-08-15-05:10: dashboard Retry clears the generic-terminal auto-recovery budget before mutating task state.
+    resetTerminalFailureAutoRecoveryBudget: vi.fn().mockResolvedValue(undefined),
     getTask: vi.fn().mockResolvedValue(PLANNING_TASK),
     updateTask: vi.fn().mockResolvedValue(PLANNING_TASK),
+    updateTaskAtomic: vi.fn(async (_id: string, updater: (current: Task) => Partial<Task> | null | undefined | Promise<Partial<Task> | null | undefined>) => {
+      const current = await (overrides.getTask ?? vi.fn().mockResolvedValue(PLANNING_TASK))(_id);
+      const patch = await updater(structuredClone(current));
+      return patch ? { ...current, ...patch } : current;
+    }),
     withPlanningLifecycleLock: vi.fn(async (_id, fn) => await fn()),
     moveTask: vi.fn().mockResolvedValue(PLANNING_TASK),
+    resetTaskPublication: vi.fn(async (id: string, intake: string) => ({ ...PLANNING_TASK, id, column: intake, status: undefined })),
     logEntry: vi.fn().mockResolvedValue(undefined),
     // Resolve the merged workflow so the routes see its real intake column.
     getTaskWorkflowSelectionAsync: vi.fn().mockResolvedValue({ workflowId: "builtin:stepwise-coding" }),
@@ -71,6 +117,10 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     on: vi.fn(),
     off: vi.fn(),
     getProjectScopedPluginMcpServers: vi.fn().mockResolvedValue([]),
+    listWorkflowWorkItemsForTask: vi.fn().mockResolvedValue([]),
+    cancelActiveWorkflowWorkItemsForTask: vi.fn().mockResolvedValue(undefined),
+    replaceActiveTaskWorkflowContinuation: vi.fn().mockResolvedValue(undefined),
+    pauseTask: vi.fn().mockResolvedValue(PLANNING_TASK),
     ...overrides,
   } as unknown as TaskStore;
 }
@@ -96,6 +146,17 @@ describe("plan approval on the merged planning column (post-#2515)", () => {
 
   it("does NOT reject reject-plan for a card in the merged intake column", async () => {
     const res = await performRequest(createApp(createMockStore()), "POST", "/api/tasks/FN-200/reject-plan");
+    expect(res.status).toBe(200);
+  });
+
+  it("accepts approval in a distinct hold column instead of only the intake column", async () => {
+    const store = createMockStore({
+      getTaskWorkflowSelectionAsync: vi.fn().mockResolvedValue({ workflowId: "wf-split" }),
+      getWorkflowDefinition: vi.fn().mockResolvedValue({ id: "wf-split", name: "Split", ir: SPLIT_CODING_IR }),
+    });
+
+    const res = await performRequest(createApp(store), "POST", "/api/tasks/FN-200/approve-plan");
+
     expect(res.status).toBe(200);
   });
 
@@ -130,32 +191,24 @@ describe("plan approval on the merged planning column (post-#2515)", () => {
 });
 
 /*
-FNXC:WorkflowResolvedColumns 2026-07-29-00:00 (U12 — R8 drift conversion):
-Reset must verify against the column it actually TARGETED.
-
-`resolveReboundColumnForTask` picks the rebound column from the task's workflow, but both
-post-reset checks compared against the literal `todo`. On any workflow whose rebound
-column is not `todo` — Coding (Ideas), any custom or renamed lineage — a reset that
-SUCCEEDED was reported as a "limbo state" conflict: the mover and its own verification
-disagreed about where the card was supposed to land.
-
-REVERT CHECK: restore either `updated.column !== "todo"` and this fails with a 409,
-because the card lands in `backlog`, which is where its workflow says a reset belongs.
+FNXC:TaskReset 2026-08-28-20:50:
+Reset applies the manual-intake carve-out used by automatic replanning: manual capture lanes restart in the workflow hold lane, while auto-triage intake workflows retain their intake destination. The atomic publisher still owns the complete durable reset after the route resolves that target.
 */
-describe("reset verification uses the resolved rebound column", () => {
+describe("reset publishes the resolved workflow planning target", () => {
   const REBOUND_IR = {
     version: "v2",
     name: "custom",
     columns: [
-      { id: "backlog", name: "Backlog", traits: [{ trait: "intake" }, { trait: "hold" }] },
+      { id: "planning", name: "Planning", traits: [{ trait: "intake" }] },
+      { id: "backlog", name: "Backlog", traits: [{ trait: "hold" }] },
       { id: "building", name: "Building", traits: [{ trait: "wip" }] },
       { id: "shipped", name: "Shipped", traits: [{ trait: "complete" }] },
     ],
-    nodes: [{ id: "start", kind: "start", column: "backlog" }, { id: "end", kind: "end", column: "shipped" }],
+    nodes: [{ id: "start", kind: "start", column: "planning" }, { id: "end", kind: "end", column: "shipped" }],
     edges: [{ from: "start", to: "end" }],
   };
 
-  it("does not report a limbo-state conflict when the card lands in its own rebound column", async () => {
+  it("keeps an auto-triage custom workflow on intake rather than its distinct hold column", async () => {
     const resetTask = {
       ...PLANNING_TASK,
       id: "FN-300",
@@ -183,61 +236,24 @@ describe("reset verification uses the resolved rebound column", () => {
       JSON.stringify({ confirm: true }),
       { "content-type": "application/json" },
     );
-    /*
-    Assert SUCCESS, not "not 409" (PR #2582 review — greptile). A negative assertion also
-    passes on a 404 or 500, so it would stay green while the route failed some other way.
-    */
     expect(res.status).toBe(200);
+    expect((store.resetTaskPublication as ReturnType<typeof vi.fn>).mock.calls[0]?.[1]).toBe("planning");
+    expect((store.moveTask as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+    expect((store.updateTask as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
   });
 
-  it("routes drift correction to the resolved rebound column, not `todo`", async () => {
-    /*
-    FNXC:WorkflowResolvedColumns 2026-07-29-00:00 (PR #2582 review — greptile):
-    The drift-correction path is where fixing the CHECK without fixing the WRITER just
-    moved the bug: `RESET_DRIFT_CORRECTION_FIELDS` hardcoded `column: "todo"`, so a card
-    with stale reset metadata was forced to `todo` and the final check — now comparing
-    against `resetColumn` — raised the very 409 this change removes.
-
-    REVERT CHECK: restore `column: "todo"` in the constant and this fails, because the
-    correction writes `todo` while the workflow's rebound column is `backlog`.
-    */
-    const driftedTask = {
-      ...PLANNING_TASK,
-      id: "FN-301",
-      column: "backlog",
-      // Stale binding: this is what triggers drift correction.
-      worktree: "/tmp/stale",
-      branch: null,
-      checkedOutBy: null,
-    } as unknown as TaskDetail;
-    const corrected = { ...driftedTask, worktree: null } as unknown as TaskDetail;
-
-    const updateTask = vi.fn().mockResolvedValue(corrected);
-    let reads = 0;
+  it("does not publish when a worktree path is unsafe", async () => {
     const store = createMockStore({
-      /*
-      The route reads the task before the move AND after it; both must still show the
-      stale worktree for drift correction to trigger. Only reads after the correction
-      writes see the cleaned task.
-      */
-      getTask: vi.fn().mockImplementation(async () => (reads++ < 2 ? driftedTask : corrected)),
-      moveTask: vi.fn().mockResolvedValue(driftedTask),
-      updateTask,
+      getTask: vi.fn().mockResolvedValue({ ...PLANNING_TASK, id: "FN-301", column: "backlog", worktree: "/tmp/stale" }),
       getTaskWorkflowSelectionAsync: vi.fn().mockResolvedValue({ workflowId: "wf-custom" }),
       getWorkflowDefinition: vi.fn().mockResolvedValue({ id: "wf-custom", name: "Custom", ir: REBOUND_IR }),
     });
 
-    await performRequest(
-      createApp(store),
-      "POST",
-      "/api/tasks/FN-301/reset",
-      JSON.stringify({ confirm: true }),
-      { "content-type": "application/json" },
-    );
-
-    const correctionCall = updateTask.mock.calls.find(([, patch]) => patch && "column" in patch);
-    expect(correctionCall).toBeDefined();
-    expect((correctionCall![1] as { column: string }).column).toBe("backlog");
+    const res = await performRequest(createApp(store), "POST", "/api/tasks/FN-301/reset", JSON.stringify({ confirm: true }), { "content-type": "application/json" });
+    expect(res.status).toBe(400);
+    expect((store.resetTaskPublication as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+    expect((store.moveTask as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+    expect((store.updateTask as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
   });
 });
 

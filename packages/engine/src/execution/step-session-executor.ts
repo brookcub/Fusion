@@ -18,8 +18,10 @@ const execAsync = promisify(exec);
 import { existsSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
-import type { AgentHeartbeatRun, AgentStore, MessageStore, PermanentAgentGatingContext, ProviderInstanceRef, ResolvedMcpServerDefinition, TaskDetail, Settings, SteeringComment, TaskStore } from "@fusion/core";
-import { isValidProviderInstanceId, resolvePersistAgentThinkingLog, resolveExecutorFallbackModel } from "@fusion/core";
+import type { AgentHeartbeatRun, AgentStore, MessageStore, PermanentAgentGatingContext, ProviderInstanceRef, ResolvedMcpServerDefinition, TaskDetail, Settings, SteeringComment, TaskStore, TaskStep } from "@fusion/core";
+import { isFastExecutionMode, isValidProviderInstanceId, resolvePersistAgentThinkingLog, resolveExecutorFallbackModel, resolveTrailingVerificationStepIndex, resolveAuthoredStepHeadingOffset } from "@fusion/core";
+
+export { resolveAuthoredStepHeadingOffset };
 
 import {
   createResolvedAgentSession,
@@ -31,8 +33,8 @@ import {
 } from "../agents/agent-session-helpers.js";
 import type { AgentActionGateContext } from "../agents/agent-action-gate.js";
 import type { SkillSelectionContext } from "../cli-runtime/skill-resolver.js";
-import { generateWorktreeName } from "../worktree/worktree-names.js";
 import { resolveTaskWorktreePath } from "../worktree/worktree-paths.js";
+import { canonicalStepInstanceBranchName } from "../worktree/worktree-names.js";
 import { installTaskWorktreeIdentityGuard } from "../worktree/worktree-hooks.js";
 import { AgentSemaphore } from "../concurrency/concurrency.js";
 import { StuckTaskDetector } from "../healing/stuck-task-detector.js";
@@ -44,22 +46,19 @@ import { createRunAuditor, generateSyntheticRunId } from "../util/run-audit.js";
 import { isContextLimitError } from "../errors/context-limit-detector.js";
 import { checkSessionError, isUsageLimitError } from "../errors/usage-limit-detector.js";
 import {
-  createDelegateTaskTool,
   createTaskAssignTool,
   createListAgentsTool,
   createMemoryTools,
   createWebFetchTool,
   createReadMessagesTool,
   createSendMessageTool,
-  createTaskCreateTool,
-  isAgentTaskCreateToolAvailable,
-  isAgentDelegateTaskToolAvailable,
   createTaskDocumentReadTool,
   createTaskDocumentWriteTool,
   createTaskLogTool,
   createTaskLogsReadTool,
 } from "../agent-tools.js";
 import { RemovalReason, removeWorktree } from "../worktree/worktree-backend.js";
+import { resolveWorkflowStepRunAgentId } from "./resolve-activity-run-agent-id.js";
 import { pruneWorktreeAdminEntries } from "../worktree/worktree-prune.js";
 import { activeSessionRegistry } from "../agents/active-session-registry.js";
 
@@ -146,7 +145,7 @@ export interface StepSessionExecutorOptions {
    */
   onStepStart?: (stepIndex: number) => void | boolean | Promise<void | boolean>;
   /** Callback invoked when a step completes (success or failure). */
-  onStepComplete?: (stepIndex: number, result: StepResult) => void;
+  onStepComplete?: (stepIndex: number, result: StepResult) => void | Promise<void>;
   /** Optional skill selection context for session creation. */
   skillSelection?: SkillSelectionContext;
   /** Optional extra skill body directories for session resource discovery. */
@@ -175,9 +174,9 @@ export interface StepSessionExecutorOptions {
    * binds an agent that supersedes the task's `assignedAgentId` (override, or
    * defer with no own settings), the executor passes the column agent's id here so
    * the per-step run auditor attributes the session to who actually ran — not
-   * `taskDetail.assignedAgentId`. Absent → attribution falls back to
-   * `taskDetail.assignedAgentId ?? "executor"` (byte-identical legacy path). The
-   * column agent's MODEL flows separately via {@link assignedAgentRuntimeConfig}
+   * `taskDetail.assignedAgentId`. Otherwise it carries the authoritative assigned
+   * agent; absent means the run must be proven through the Executor role roster.
+   * The column agent's MODEL flows separately via {@link assignedAgentRuntimeConfig}
    * (the executor swaps it to the column agent's `runtimeConfig` at the seam).
    */
   effectiveAgentId?: string;
@@ -228,6 +227,30 @@ export function parseStepFileScopes(prompt: string): Map<number, string[]> {
   }
 
   return result;
+}
+
+/*
+FNXC:WorkflowStepControl 2026-09-04-01:38:
+PROMPT.md is model-authored and an out-of-range heading is never schedulable. Normalize the
+unambiguous 1-based legacy shape, clamp malformed keys, and retain every valid task index.
+*/
+export function normalizeAuthoredStepScopes(
+  scopes: Map<number, string[]>,
+  stepCount: number,
+): Map<number, string[]> {
+  if (stepCount === 0) return scopes;
+
+  const offset = resolveAuthoredStepHeadingOffset([...scopes.keys()]);
+  const normalized = new Map<number, string[]>();
+  for (const [heading, paths] of scopes) {
+    const index = heading - offset;
+    if (index >= 0 && index < stepCount) normalized.set(index, paths);
+  }
+  const complete = new Map<number, string[]>();
+  for (let index = 0; index < stepCount; index++) {
+    complete.set(index, normalized.get(index) ?? []);
+  }
+  return complete;
 }
 
 /**
@@ -433,13 +456,16 @@ export function buildStepPrompt(
   settings?: Settings,
   worktreePath?: string,
 ): string {
+  if (isFastExecutionMode(taskDetail)) {
+    return buildFastLanePrompt(taskDetail, rootDir, settings, worktreePath);
+  }
   const { id, title, attachments } = taskDetail;
   const prompt = scopePromptToWorktree(taskDetail.prompt, rootDir, worktreePath);
 
   // Extract step-specific section
-  const stepSection = extractStepSection(prompt, stepIndex);
   const totalSteps = countSteps(prompt);
-  const isLastStep = stepIndex === totalSteps - 1;
+  const stepSection = resolveStepSection(taskDetail, prompt, stepIndex, totalSteps);
+  const isLastStep = stepIndex === Math.max(totalSteps, taskDetail.steps.length) - 1;
 
   // Extract global sections from the prompt
   const fileScopeSection = extractSection(prompt, "File Scope");
@@ -550,6 +576,59 @@ export function buildStepPrompt(
   return parts.join("\n");
 }
 
+/*
+FNXC:FastLane 2026-08-29-03:25:
+Fast implementation is one original-request session, not a compressed plan. Keep this builder free
+of step headings, review-level framing, and PROMPT.md section extraction so a small edit receives
+only the task context it needs: request, attachments, commands, steering, and worktree boundary.
+*/
+export function buildFastLanePrompt(
+  taskDetail: TaskDetail,
+  rootDir?: string,
+  settings?: Settings,
+  worktreePath?: string,
+): string {
+  const originalRequest = taskDetail.description || taskDetail.prompt || "";
+  const parts = [
+    `## Task: ${taskDetail.id}`,
+    taskDetail.title ? `**${taskDetail.title}**` : "",
+    "",
+    "## Original Request",
+    originalRequest,
+  ];
+
+  if (taskDetail.attachments && taskDetail.attachments.length > 0 && rootDir) {
+    const imageMimes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+    parts.push("", "## Attachments", "");
+    for (const attachment of taskDetail.attachments) {
+      const path = `${rootDir}/.fusion/tasks/${taskDetail.id}/attachments/${attachment.filename}`;
+      parts.push(
+        `- **${attachment.originalName}** (${imageMimes.has(attachment.mimeType) ? "screenshot" : attachment.mimeType}): \`${path}\``,
+      );
+    }
+  }
+
+  if (settings?.testCommand || settings?.buildCommand) {
+    parts.push("", "## Project Commands", "");
+    if (settings.testCommand) parts.push(`- **Test:** \`${settings.testCommand}\``);
+    if (settings.buildCommand) parts.push(`- **Build:** \`${settings.buildCommand}\``);
+  }
+
+  const steering = buildStepSteeringCommentsSection(taskDetail.steeringComments);
+  if (steering) parts.push("", steering);
+
+  parts.push(
+    "",
+    "## Worktree Boundaries",
+    "",
+    `Work only inside \`${worktreePath ?? "the assigned task worktree"}\`; do not edit the project root or another task's worktree.${rootDir ? ` Task attachments remain readable under \`${rootDir}/.fusion/tasks/${taskDetail.id}/attachments/\`.` : ""}`,
+    "",
+    `Find the relevant code, make the requested change, commit it as \`fix(${taskDetail.id}): <short summary>\`, then stop. Do not plan, review, or start additional work.`,
+  );
+
+  return parts.filter((part) => part !== "").join("\n");
+}
+
 function buildStepSteeringCommentsSection(comments: SteeringComment[] | undefined): string {
   if (!comments || comments.length === 0) return "";
 
@@ -590,7 +669,8 @@ function extractStepSection(prompt: string, stepIndex: number): string {
     splits.push({ index: match.index, stepNum: parseInt(match[1], 10) });
   }
 
-  const targetSplit = splits.find((s) => s.stepNum === stepIndex);
+  const offset = resolveAuthoredStepHeadingOffset(splits.map((split) => split.stepNum));
+  const targetSplit = splits.find((s) => s.stepNum === stepIndex + offset);
   if (!targetSplit) return "";
 
   const splitPos = splits.indexOf(targetSplit);
@@ -607,6 +687,53 @@ function countSteps(prompt: string): number {
   const stepRegex = /^### Step \d+:/gm;
   const matches = prompt.match(stepRegex);
   return matches ? matches.length : 0;
+}
+
+/*
+FNXC:VerificationRemediation 2026-08-28-15:11:
+An appended remediation or verification occurrence has no authored PROMPT.md heading. Only indexes beyond the complete authored heading range may receive synthesized instructions; otherwise heading-number quirks could mask real authored content and the mandatory re-verification session could run with an empty body.
+*/
+function resolveStepSection(
+  taskDetail: TaskDetail,
+  prompt: string,
+  stepIndex: number,
+  authoredStepCount: number,
+): string {
+  const authoredSection = extractStepSection(prompt, stepIndex);
+  if (stepIndex < authoredStepCount) return authoredSection;
+  const liveStep = taskDetail.steps[stepIndex];
+  return liveStep ? synthesizeAppendedStepSection(liveStep) : authoredSection;
+}
+
+function synthesizeAppendedStepSection(step: TaskStep): string {
+  const lines = [
+    `### Appended Step: ${step.name}`,
+    "",
+    "Complete this appended workflow occurrence using the live task state.",
+  ];
+
+  if (step.remediation) {
+    lines.push(
+      "",
+      `- **Gate:** ${step.remediation.gate}`,
+      `- **Required fix:** ${step.remediation.detail}`,
+    );
+    if (step.remediation.filePath) lines.push(`- **File:** \`${step.remediation.filePath}\``);
+    if (step.remediation.line !== undefined) lines.push(`- **Line:** ${step.remediation.line}`);
+  }
+
+  if (resolveTrailingVerificationStepIndex([step]) === 0) {
+    lines.push(
+      "",
+      "Run a fresh verification pass after the preceding fixes:",
+      "- Run the project's configured test and build commands listed under Project Commands.",
+      "- Run the tests impacted by this task's changes.",
+      "- Fix every failure before completing this step.",
+      "- Never weaken, skip, or delete assertions merely to make verification pass.",
+    );
+  }
+
+  return lines.join("\n");
 }
 
 /**
@@ -650,7 +777,7 @@ export function buildReducedStepPrompt(taskDetail: TaskDetail, stepIndex: number
   const { prompt, id, title, attachments } = taskDetail;
 
   // Extract the step-specific section
-  const stepSection = extractStepSection(prompt, stepIndex);
+  const stepSection = resolveStepSection(taskDetail, prompt, stepIndex, countSteps(prompt));
   const hasAttachments = Boolean(attachments && attachments.length > 0);
   const attachmentDir = rootDir ? `${rootDir}/.fusion/tasks/${id}/attachments/` : `.fusion/tasks/${id}/attachments/`;
   const steeringSection = buildStepSteeringCommentsSection(taskDetail.steeringComments);
@@ -690,7 +817,7 @@ const RETRY_DELAYS_MS = [1_000, 5_000, 15_000];
 
 /** A minimal session handle stored for termination support. */
 interface SessionHandle {
-  dispose: () => void;
+  dispose: () => void | Promise<void>;
   /** Abort the session's currently-running bash command (if any) so its
    *  detached subprocess tree — including grandchildren like vitest workers —
    *  is killed via pi-coding-agent's killProcessTree. dispose() alone only
@@ -765,6 +892,8 @@ export class StepSessionExecutor {
   private credentialInstanceId: string | undefined;
   private reusablePrimaryRetargetPending = false;
   private reusablePrimaryAttemptActive = false;
+  private workflowStepRunAgentId: Promise<string | null> | undefined;
+  private warnedUnattributableWorkflowStepRun = false;
 
   private registerActiveStepSession(stepIndex: number, handle: SessionHandle, worktreePath: string): void {
     this.activeSessions.set(stepIndex, handle);
@@ -824,7 +953,7 @@ export class StepSessionExecutor {
       stepExecLog.warn(`Failed to abort reusable primary step session: ${err}`);
     }
     try {
-      this.reusablePrimarySession.dispose();
+      await this.reusablePrimarySession.dispose();
     } catch (err) {
       stepExecLog.warn(`Failed to dispose reusable primary step session: ${err}`);
     } finally {
@@ -879,17 +1008,9 @@ export class StepSessionExecutor {
     const { taskDetail } = this.options;
     const prompt = taskDetail.prompt ?? "";
 
-    // Parse file scopes and determine execution plan
-    const stepScopes = parseStepFileScopes(prompt);
-
-    // Add all step indices that don't appear in the prompt's step sections
-    // (e.g. if steps are defined in taskDetail.steps but not in the prompt)
+    // Parse file scopes and determine execution plan.
     const stepCount = taskDetail.steps?.length ?? 0;
-    for (let i = 0; i < stepCount; i++) {
-      if (!stepScopes.has(i)) {
-        stepScopes.set(i, []);
-      }
-    }
+    const stepScopes = normalizeAuthoredStepScopes(parseStepFileScopes(prompt), stepCount);
 
     /*
      * FNXC:WorkflowStepControl 2026-06-29-10:45:
@@ -1039,7 +1160,8 @@ export class StepSessionExecutor {
         stepExecLog.warn(`Failed to abort bash for step ${stepIdx}: ${err}`);
       }
       try {
-        handle.dispose();
+        // FNXC:CursorMcpBridge 2026-08-15-21:20: Abort teardown stays fire-and-forget; normal step cleanup awaits disposal before git worktree cleanup, while journal reconciliation repairs a hard-abort lease.
+        void handle.dispose();
       } catch (err) {
         stepExecLog.warn(`Failed to dispose session for step ${stepIdx}: ${err}`);
       }
@@ -1064,6 +1186,24 @@ export class StepSessionExecutor {
    * Safe to call multiple times (idempotent). Call this in a `finally` block
    * after `executeAll()`.
    */
+  /**
+   * FNXC:StepParallelWorktrees 2026-08-23-21:40:
+   * `parallelBranches` holds only branches THIS executor created in `createStepWorktree`
+   * (`fusion/step-<idx>-<worktree-name>`), so their provenance is known here rather than inferred.
+   * FN-9161's `isFusionDeletableBranch` answers by NAME and reads anything that is not
+   * `fusion/<task-id>...` as operator-supplied, so applying it here silently skipped every
+   * step branch and leaked one ref per parallel step. Protect what an operator can actually own —
+   * the task's working branch and its explicit override — and dispose of the rest.
+   */
+  private isDisposableStepBranch(branchName: string): boolean {
+    const task = this.options.taskDetail as { branch?: string; branchContext?: { branchOverride?: { branch?: string } } };
+    const operatorOwned = [task.branch, task.branchContext?.branchOverride?.branch]
+      .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      .map((value) => value.trim());
+    // Callers pass only branches recorded in `parallelBranches`, i.e. ones this executor created.
+    return !operatorOwned.includes(branchName.trim());
+  }
+
   async cleanup(): Promise<void> {
     // Terminate any remaining sessions
     if (this.activeSessions.size > 0) {
@@ -1095,6 +1235,7 @@ export class StepSessionExecutor {
     // Delete branches created for parallel worktrees
     for (const [stepIdx, branchName] of this.parallelBranches) {
       try {
+        if (!this.isDisposableStepBranch(branchName)) continue;
         await execAsync(`git branch -D "${branchName}"`, {
           cwd: this.options.rootDir,
         });
@@ -1187,10 +1328,27 @@ export class StepSessionExecutor {
     };
   }
 
-  private createWorkflowStepActivityRun(stepIndex: number, startedAt: string): WorkflowStepActivityRun {
+  private async createWorkflowStepActivityRun(stepIndex: number, startedAt: string): Promise<WorkflowStepActivityRun | null> {
     const { taskDetail } = this.options;
     const step = taskDetail.steps?.[stepIndex];
-    const agentId = this.options.effectiveAgentId ?? taskDetail.assignedAgentId ?? "executor";
+    if (typeof this.options.agentStore?.saveRun !== "function") return null;
+
+    /*
+     * FNXC:CommandCenterActivity 2026-09-04-14:11:
+     * `executor` remains a role slug for the resolver, never a persistable agent id. Skipping an
+     * unattributable run is correct: a rejected FK insert persists nothing but logs its payload at
+     * every boundary. The memoized bounded lookup permits only one telemetry wait per executor.
+     */
+    const agentIdCandidate = this.options.effectiveAgentId ?? taskDetail.assignedAgentId ?? "executor";
+    this.workflowStepRunAgentId ??= resolveWorkflowStepRunAgentId(this.options.agentStore, agentIdCandidate);
+    const agentId = await this.workflowStepRunAgentId;
+    if (!agentId) {
+      if (!this.warnedUnattributableWorkflowStepRun) {
+        this.warnedUnattributableWorkflowStepRun = true;
+        stepExecLog.warn(`Skipping unattributable workflow-step activity runs for task ${taskDetail.id} (candidate: ${agentIdCandidate})`);
+      }
+      return null;
+    }
 
     /*
      * FNXC:CommandCenterActivity 2026-07-01-00:00:
@@ -1215,6 +1373,7 @@ export class StepSessionExecutor {
         taskTitle: taskDetail.title,
         assignedAgentId: taskDetail.assignedAgentId,
         effectiveAgentId: this.options.effectiveAgentId,
+        agentIdCandidate,
         agentId,
         stepIndex,
         stepName: step?.name ?? `Step ${stepIndex}`,
@@ -1229,7 +1388,8 @@ export class StepSessionExecutor {
     };
   }
 
-  private async saveWorkflowStepActivityRun(run: WorkflowStepActivityRun): Promise<void> {
+  private async saveWorkflowStepActivityRun(run: WorkflowStepActivityRun | null): Promise<void> {
+    if (!run) return;
     const saveRun = this.options.agentStore?.saveRun?.bind(this.options.agentStore);
     if (!saveRun) return;
 
@@ -1244,10 +1404,11 @@ export class StepSessionExecutor {
   }
 
   private async completeWorkflowStepActivityRun(
-    run: WorkflowStepActivityRun,
+    run: WorkflowStepActivityRun | null,
     status: Extract<AgentHeartbeatRun["status"], "completed" | "failed" | "terminated">,
     result: StepResult,
   ): Promise<void> {
+    if (!run) return;
     const terminalRun: WorkflowStepActivityRun = {
       ...run,
       endedAt: new Date().toISOString(),
@@ -1314,8 +1475,10 @@ export class StepSessionExecutor {
     const promptTaskDetail = this.consumeTaskDetailForStepPrompt();
     const stepPrompt = buildStepPrompt(promptTaskDetail, stepIndex, this.options.rootDir, settings, worktreePath);
 
-    // Build reduced step prompt for context-limit recovery (simpler, shorter)
-    const reducedStepPrompt = buildReducedStepPrompt(promptTaskDetail, stepIndex, this.options.rootDir);
+    // Fast recovery stays in the same original-request lane instead of restoring step scaffolding.
+    const reducedStepPrompt = isFastExecutionMode(promptTaskDetail)
+      ? buildFastLanePrompt(promptTaskDetail, this.options.rootDir, settings, worktreePath)
+      : buildReducedStepPrompt(promptTaskDetail, stepIndex, this.options.rootDir);
     const reusePrimarySession = await this.shouldReusePrimarySession(worktreePath);
 
     // Acquire semaphore if provided
@@ -1323,7 +1486,7 @@ export class StepSessionExecutor {
       await semaphore.acquire();
     }
 
-    const activityRun = this.createWorkflowStepActivityRun(stepIndex, new Date().toISOString());
+    const activityRun = await this.createWorkflowStepActivityRun(stepIndex, new Date().toISOString());
     await this.saveWorkflowStepActivityRun(activityRun);
 
     const trackingKey = this.makeTrackingKey(stepIndex);
@@ -1369,7 +1532,11 @@ export class StepSessionExecutor {
          */
         const stepThinkingLevel = this.options.workflowStepThinkingLevel
           ?? (taskDetail.steps[stepIndex] as { thinkingLevel?: string } | undefined)?.thinkingLevel;
-        const effectiveThinkingLevel = resolveExecutorThinkingLevel(stepThinkingLevel ?? taskDetail.thinkingLevel, settings);
+        const effectiveThinkingLevel = resolveExecutorThinkingLevel(
+          stepThinkingLevel ?? taskDetail.thinkingLevel,
+          settings,
+          taskDetail.executionMode,
+        );
 
         try {
           // Get plugin tools from plugin runner if available
@@ -1383,7 +1550,12 @@ export class StepSessionExecutor {
               ]
             : [];
           const webFetchTool = createWebFetchTool();
-          const memoryTools = createMemoryTools(this.options.rootDir, settings);
+          // FNXC:MemoryFocusEngine 2026-08-13-16:35 (RUFU-068): a workflow
+          // step-execution lane has no per-conversation /focus topic (unless the
+          // task/session carries one) → whole-project scope today. The optional
+          // MemoryToolOptions.focus seam is wired explicitly so a step session bound
+          // to a topic-scoped conversation can scope fn_memory_search.
+          const memoryTools = createMemoryTools(this.options.rootDir, settings, { focus: undefined });
 
           // Task log and create tools — task context for step sessions.
           const taskLogTool = this.options.store
@@ -1398,9 +1570,9 @@ export class StepSessionExecutor {
           execution session: an ephemeral step worker under `deny` is never handed
           fn_task_create, rather than being handed a tool that only refuses on call.
           */
-          const taskCreateTool = this.options.store && isAgentTaskCreateToolAvailable(settings, this.options.callerIsEphemeral)
-            ? [createTaskCreateTool(this.options.store, undefined, { rootDir: this.options.rootDir, callerIsEphemeral: this.options.callerIsEphemeral, sourceTaskId: this.options.sourceTaskId ?? taskDetail.id, sourceAgentId: this.options.sourceAgentId ?? taskDetail.assignedAgentId, messageStore: this.options.messageStore })]
-            : [];
+          // FNXC:TaskExecutionTaskCreation 2026-08-21-23:16: model-node
+          // task sessions are marked and structurally withheld from task creation.
+          const taskCreateTool: never[] = [];
 
           /*
           FNXC:EphemeralAgentTaskCreation 2026-07-26-07:40:
@@ -1412,9 +1584,7 @@ export class StepSessionExecutor {
           const delegationTools = this.options.agentStore
             ? [
                 createListAgentsTool(this.options.agentStore),
-                ...(isAgentDelegateTaskToolAvailable(settings, this.options.callerIsEphemeral)
-                  ? [createDelegateTaskTool(this.options.agentStore, this.options.store!, { rootDir: this.options.rootDir, sourceTaskId: this.options.sourceTaskId ?? taskDetail.id, sourceAgentId: this.options.sourceAgentId ?? taskDetail.assignedAgentId, callerIsEphemeral: this.options.callerIsEphemeral })]
-                  : []),
+                // FN-125: delegation creates board tasks and is unavailable in this lane.
                 createTaskAssignTool(this.options.agentStore, this.options.store!),
               ]
             : [];
@@ -1427,6 +1597,16 @@ export class StepSessionExecutor {
                   createReadMessagesTool(this.options.messageStore, taskDetail.assignedAgentId),
                 ]
               : [];
+
+          const fusionTools = [
+            ...documentTools,
+            webFetchTool,
+            ...memoryTools,
+            ...taskLogTool,
+            ...taskCreateTool,
+            ...delegationTools,
+            ...messagingTools,
+          ];
 
           // Create or reuse the agent session for this attempt
           // Resolve executor model using canonical lane hierarchy:
@@ -1441,6 +1621,7 @@ export class StepSessionExecutor {
             settings,
             this.options.assignedAgentRuntimeConfig,
             this.credentialInstanceId,
+            taskDetail.executionMode,
           );
 
           attachAgentUsageTelemetry(agentLogger, { store: this.store, agentId: taskDetail.assignedAgentId ?? null, taskId: taskDetail.id, nodeId: taskDetail.effectiveNodeId ?? taskDetail.nodeId ?? null, model: executorModelId ?? null, provider: executorProvider ?? null, lane: "workflow-step", ephemeral: true });
@@ -1450,6 +1631,7 @@ export class StepSessionExecutor {
           } else {
             const createResult = await createResolvedAgentSession({
               sessionPurpose: "executor",
+            taskExecutionSession: true,
               runtimeHint: this.options.runtimeHint,
               pluginRunner: this.options.pluginRunner,
               cwd: worktreePath,
@@ -1483,16 +1665,8 @@ Follow instructions precisely and avoid unrelated changes.`,
               settings,
               // FNXC:McpConfig 2026-06-25-23:02: Workflow model-node step sessions receive the same resolved, secret-materialized MCP server set as the parent executor; runtime support is still enforced inside the pi session seam without logging server contents.
               mcpServers: this.options.mcpServers,
-              customTools: [
-                ...pluginTools,
-                ...documentTools,
-                webFetchTool,
-                ...memoryTools,
-                ...taskLogTool,
-                ...taskCreateTool,
-                ...delegationTools,
-                ...messagingTools,
-              ],
+              customTools: [...pluginTools, ...fusionTools],
+              fusionTools,
               onText: (delta) => {
                 const telemetry = reusePrimarySession ? this.selectReusableTelemetry(localTelemetry) : localTelemetry;
                 telemetry.agentLogger.onText(delta);
@@ -1604,7 +1778,7 @@ Follow instructions precisely and avoid unrelated changes.`,
             tokenUsage: await this.extractStepTokenUsage(session, reusePrimarySession),
           };
           await this.completeWorkflowStepActivityRun(activityRun, "completed", result);
-          this.options.onStepComplete?.(stepIndex, result);
+          await this.options.onStepComplete?.(stepIndex, result);
           return result;
         } catch (err: unknown) {
           // Normalize error message for consistent classification
@@ -1645,7 +1819,7 @@ Follow instructions precisely and avoid unrelated changes.`,
                 tokenUsage: await this.extractStepTokenUsage(session, reusePrimarySession),
               };
               await this.completeWorkflowStepActivityRun(activityRun, "completed", result);
-              this.options.onStepComplete?.(stepIndex, result);
+              await this.options.onStepComplete?.(stepIndex, result);
               return result;
             } catch (reducedErr: unknown) {
               const reducedErrorMessage = typeof reducedErr === "string"
@@ -1685,7 +1859,7 @@ Follow instructions precisely and avoid unrelated changes.`,
               tokenUsage: await this.extractStepTokenUsage(session, reusePrimarySession),
             };
             await this.completeWorkflowStepActivityRun(activityRun, "failed", result);
-            this.options.onStepComplete?.(stepIndex, result);
+            await this.options.onStepComplete?.(stepIndex, result);
             return result;
           }
           if (reusePrimarySession) {
@@ -1708,7 +1882,7 @@ Follow instructions precisely and avoid unrelated changes.`,
             this.reusableStepTelemetry = null;
           } else {
             try {
-              session?.dispose();
+              await session?.dispose();
             } catch (err: unknown) {
               const msg = err instanceof Error ? err.message : String(err);
               stepExecLog.warn(`Failed to dispose session for step ${stepIndex}: ${msg}`);
@@ -1841,7 +2015,7 @@ Follow instructions precisely and avoid unrelated changes.`,
             });
           }
           const branch = this.parallelBranches.get(stepIdx);
-          if (branch) {
+          if (branch && this.isDisposableStepBranch(branch)) {
             await execAsync(`git branch -D "${branch}"`, {
               cwd: this.options.rootDir,
             });
@@ -1866,10 +2040,12 @@ Follow instructions precisely and avoid unrelated changes.`,
    * @returns The path to the new worktree.
    */
   private async createStepWorktree(stepIndex: number): Promise<string> {
-    const { rootDir, settings } = this.options;
-    const name = generateWorktreeName(rootDir, settings);
+    const { rootDir, settings, taskDetail } = this.options;
+    // FNXC:TaskWorktreeNames 2026-08-29-08:51: parallel step paths remain
+    // deterministic under their owning task rather than consuming random names.
+    const name = `${taskDetail.id.toLowerCase()}-step-${stepIndex}`;
     const worktreePath = resolveTaskWorktreePath(rootDir, settings, name);
-    const branchName = `fusion/step-${stepIndex}-${name}`;
+    const branchName = canonicalStepInstanceBranchName(taskDetail.id, stepIndex);
 
     stepExecLog.log(`Creating worktree for step ${stepIndex}: ${worktreePath} (branch: ${branchName})`);
 
@@ -1900,6 +2076,7 @@ Follow instructions precisely and avoid unrelated changes.`,
       await installTaskWorktreeIdentityGuard({
         worktreePath,
         taskId: this.options.taskDetail.id,
+        expectedBranch: branchName,
         commitMsgHookEnabled: settings.commitMsgHookEnabled,
         taskPrefix: settings.taskPrefix,
         taskAttributionTrailerName: settings.taskAttributionTrailerNames?.[0],

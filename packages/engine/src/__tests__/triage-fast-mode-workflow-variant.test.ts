@@ -127,6 +127,18 @@ function createStore(task: Task, settings: Partial<Settings> = {}, overrides: Pa
     getWorkflowSettingValues: vi.fn().mockResolvedValue({}),
     getWorkflowSettingsProjectId: vi.fn().mockReturnValue("default"),
     withTaskLock: vi.fn(async (_id: string, fn: () => Promise<unknown>) => fn()),
+    /*
+    FNXC:EngineTests 2026-08-23-18:48:
+    `fn_task_prompt_write` no longer publishes through `updateTask`. When planning supplies a
+    `canPersist` generation check (FN TaskReset), it takes the planning lifecycle lock and writes
+    via `withTaskLock` + `updateTaskUnlocked` so a Reset cannot be raced. A fake missing that
+    surface makes the tool fail and PROMPT.md is never persisted, which surfaces far away as an
+    ENOENT reading the artifact. Mirror the production lock/write surface, routing the unlocked
+    write through the same `updateTask` mock so live task state stays authoritative.
+    */
+    withPlanningLifecycleLock: vi.fn(async (_id: string, fn: () => Promise<unknown>) => fn()),
+    updateTaskUnlocked: vi.fn(async (id: string, updates: Partial<Task>) => store.updateTask(id, updates)),
+    isBackendMode: vi.fn(() => false),
     readTaskForMove: vi.fn(async () => live),
     on: vi.fn(),
     emit: vi.fn(),
@@ -232,15 +244,15 @@ describe("fast-mode workflow variant resolution", () => {
     tempRoots = [];
   });
 
-  it("resolves fast tasks to the lean planning-fast workflow prompt", async () => {
-    const task = createTask({ id: "FN-6236-FAST-PROMPT", executionMode: "fast" });
-    const store = createStore(task);
+  it("resolves lean planning to the planning-fast workflow prompt", async () => {
+    const task = createTask({ id: "FN-6236-LEAN-PROMPT", executionMode: "standard" });
+    const store = createStore(task, { leanPlanning: true });
 
     await expect(captureBasePrompt(task, store)).resolves.toBe(renderedFastPlanningPrompt);
   });
 
   it("lets a selected workflow planning-fast seam override the built-in lean prompt", async () => {
-    const task = createTask({ id: "FN-6236-FAST-CUSTOM-SEAM", executionMode: "fast" });
+    const task = createTask({ id: "FN-6236-LEAN-CUSTOM-SEAM", executionMode: "standard" });
     const customFastPrompt = "custom workflow fast planning prompt";
     const customIr: WorkflowIr = {
       version: "v1",
@@ -248,7 +260,7 @@ describe("fast-mode workflow variant resolution", () => {
       nodes: [{ id: "planning-fast", kind: "prompt", config: { seam: "planning-fast", prompt: customFastPrompt } }],
       edges: [],
     };
-    const store = createStore(task, {}, {
+    const store = createStore(task, { leanPlanning: true }, {
       getTaskWorkflowSelection: vi.fn().mockReturnValue({ workflowId: "WF-fast", stepIds: [] }),
       getWorkflowDefinition: vi.fn().mockResolvedValue({ ir: customIr }),
     });
@@ -256,15 +268,15 @@ describe("fast-mode workflow variant resolution", () => {
     await expect(captureBasePrompt(task, store)).resolves.toBe(customFastPrompt);
   });
 
-  it("falls back to the built-in lean fast prompt when the selected workflow has no planning-fast seam", async () => {
-    const task = createTask({ id: "FN-6236-FAST-NO-SEAM", executionMode: "fast" });
+  it("falls back to the built-in lean prompt when the selected workflow has no planning-fast seam", async () => {
+    const task = createTask({ id: "FN-6236-LEAN-NO-SEAM", executionMode: "standard" });
     const noFastSeamIr: WorkflowIr = {
       version: "v1",
       name: "no-fast-seam-workflow",
       nodes: [{ id: "planning", kind: "prompt", config: { seam: "planning", prompt: "standard-only prompt" } }],
       edges: [],
     };
-    const store = createStore(task, {}, {
+    const store = createStore(task, { leanPlanning: true }, {
       getTaskWorkflowSelection: vi.fn().mockReturnValue({ workflowId: "WF-no-fast", stepIds: [] }),
       getWorkflowDefinition: vi.fn().mockResolvedValue({ ir: noFastSeamIr }),
     });
@@ -282,16 +294,14 @@ describe("fast-mode workflow variant resolution", () => {
     expect(basePrompt).not.toBe(renderedFastPlanningPrompt);
   });
 
-  it("finalizes fast tasks without invoking a separate spec reviewer", async () => {
-    const rootDir = await mkdtemp(join(tmpdir(), "fusion-fn-6236-fast-"));
-    tempRoots.push(rootDir);
-    const task = createTask({ id: "FN-6236-FAST-REVIEW", executionMode: "fast" });
+  it("does not start a planning session for Fast tasks", async () => {
+    const task = createTask({ id: "FN-6236-FAST-BYPASS", executionMode: "fast" });
     const store = createStore(task);
 
-    await runPlanningSession(task, store, rootDir);
+    await new TriageProcessor(store, "/tmp/root").specifyTask(task);
 
-    expect(mockReviewStep).not.toHaveBeenCalled();
-    expect(store.moveTaskIf).toHaveBeenCalledWith(task.id, "todo", expect.any(Function));
+    expect(mockCreateFnAgent).not.toHaveBeenCalled();
+    expect(store.logEntry).toHaveBeenCalledWith(task.id, "Fast mode intentionally skips specification planning");
   });
 
   it("finalizes standard tasks without invoking a separate spec reviewer", async () => {
@@ -318,10 +328,11 @@ describe("fast-mode workflow variant resolution", () => {
     expect(store.moveTaskIf).toHaveBeenCalledWith(task.id, "todo", expect.any(Function));
   });
 
-  it("preserves user triage prompt override precedence over the fast variant", async () => {
-    const task = createTask({ id: "FN-6236-OVERRIDE", executionMode: "fast" });
+  it("preserves user triage prompt override precedence over lean planning", async () => {
+    const task = createTask({ id: "FN-6236-OVERRIDE", executionMode: "standard" });
     const overridePrompt = "custom fast override prompt";
     const store = createStore(task, {
+      leanPlanning: true,
       agentPrompts: {
         templates: [{ id: "custom-triage", name: "Custom", role: "triage", prompt: overridePrompt }],
         roleAssignments: { triage: "custom-triage" },

@@ -76,11 +76,9 @@ describe("worktrees-off is structural: no unaudited maxWorktrees bound", () => {
   */
   const AUDITED_BOUNDS: Array<{ file: string; expr: string; reason: string }> = [
     {
-      file: "packages/engine/src/scheduler.ts",
-      expr: "settings.maxWorktrees ?? this.options.maxWorktrees ?? 4",
-      reason:
-        "THE admission gate's limit read, and the ONLY one: it feeds resolveWorktreeCapacityLimit, whose "
-        + "gate snapshot is optional so OFF mode constructs no gate at all.",
+      file: "packages/core/src/workflows/workflow-capacity.ts",
+      expr: "return typeof limit === \"number\" && Number.isFinite(limit) && limit > 0",
+      reason: "The canonical resolver rejects zero and invalid persisted worktree values before any admission reader can observe them.",
     },
     {
       file: "packages/engine/src/scheduler.ts",
@@ -101,7 +99,7 @@ describe("worktrees-off is structural: no unaudited maxWorktrees bound", () => {
     },
     {
       file: "packages/engine/src/self-healing.ts",
-      expr: "if (dirs.length <= cap) return;",
+      expr: "if (dirs.length <= cap) {",
       reason:
         "enforceWorktreeCap's early exit. `cap` is the alias of `(settings.maxWorktrees ?? 4) * 2` — "
         + "on-disk hygiene, not admission (see the entry below). Invisible to a line-based scan.",
@@ -126,38 +124,40 @@ describe("worktrees-off is structural: no unaudited maxWorktrees bound", () => {
     scheduler executor gate. These are intentional admission readers (or aliases of resolveWorktreeCapacityLimit),
     not raw second gates that bypass OFF mode.
     */
+    /*
+    FNXC:WorktreeCapacity 2026-08-15-22:05:
+    Wave-18 executor pure peels (#3317) moved the child-spawn budget out of executor.ts verbatim;
+    the entry follows the code so the ratchet keeps naming the SAME audited bound, not a new one.
+    */
     {
-      file: "packages/engine/src/executor.ts",
-      expr: "heldWorktrees + this.totalSpawnedCount > spawnMaxWorktrees",
+      file: "packages/engine/src/executor/create-spawn-agent-tool.ts",
+      expr: "heldWorktrees + deps.getTotalSpawnedCount() > spawnMaxWorktrees",
       reason:
-        "Child-spawn worktree budget: spawnMaxWorktrees aliases settings.maxWorktrees ?? 4; the block "
-        + "is skipped when the resolved value is non-finite (worktrees-off / unset).",
+        "Child-spawn worktree budget (moved from executor.ts by the wave-18 executor peel): "
+        + "spawnMaxWorktrees aliases settings.maxWorktrees ?? 4; the block is skipped when the "
+        + "resolved value is non-finite (worktrees-off / unset).",
+    },
+    /*
+    FNXC:WorktreeCapacity 2026-08-15-22:05:
+    Merge-claim and direct workflow-continuation admission (FN-9059-era) read the shared live-task
+    ceiling through resolveActiveTaskCapacityLimit, which returns plain maxConcurrent when
+    resolveWorktreeCapacityLimit yields null, so OFF mode never binds on worktrees. The alias-hop
+    scan flags the `limit` comparison because the resolver call names maxWorktrees inline.
+    */
+    {
+      file: "packages/engine/src/project-engine.ts",
+      expr: "if (snapshot.count >= limit) {",
+      reason:
+        "Merge-claim capacity defer: `limit` is resolveActiveTaskCapacityLimit's result, which is "
+        + "maxConcurrent alone when worktrees are OFF — an intentional admission reader of the "
+        + "sanctioned resolver, not a second raw gate.",
     },
     {
-      file: "packages/engine/src/scheduler.ts",
-      expr: "maxWorktrees !== null && maxWorktrees <= maxConcurrent",
+      file: "packages/engine/src/runtimes/in-process-runtime.ts",
+      expr: "if (snapshot.count >= limit) {",
       reason:
-        "Binding-gate discriminator after resolveWorktreeCapacityLimit: null means worktrees are not a "
-        + "capacity dimension, so this arm cannot bind in OFF mode.",
-    },
-    {
-      file: "packages/engine/src/triage.ts",
-      expr: "Math.max(0, maxWorktrees - claimed)",
-      reason:
-        "Planning admission worktreeRoom from resolveWorktreeCapacityLimit; only evaluated when the "
-        + "resolved limit is non-null.",
-    },
-    {
-      file: "packages/engine/src/triage.ts",
-      expr: "Math.min(projectRoom, worktreeRoom)",
-      reason:
-        "Planning maxToStart combines agent and worktree rooms; worktreeRoom is Infinity when limit is null.",
-    },
-    {
-      file: "packages/engine/src/triage.ts",
-      expr: "worktreeRoom <= 0 && projectRoom > 0",
-      reason:
-        "Throttle reason discriminator for plan:admission-throttled — names which gate bound, not a second limit.",
+        "Direct workflow-continuation capacity defer: same resolveActiveTaskCapacityLimit alias as "
+        + "the project-engine merge defer; OFF mode resolves to maxConcurrent only.",
     },
   ];
 
@@ -283,25 +283,69 @@ describe("worktrees-off is structural: no unaudited maxWorktrees bound", () => {
     }
   });
 
-  it("admission has exactly the known worktree-limit readers", async () => {
-    /*
-    FNXC:WorktreeCapacity 2026-08-03-02:01:
-    Scheduler execute admission and triage planning admission both resolve the same limit. A third
-    call site is a product change and must be audited here.
-    */
+  it("rejects private numeric fallbacks for shared concurrency settings", async () => {
     const { execFileSync } = await import("node:child_process");
     const { resolve } = await import("node:path");
     const root = resolve(__dirname, "../../../..");
-    // Call sites only (exclude the definition, the barrel re-exports, and prose).
-    const hits = execFileSync(
-      "git",
-      ["grep", "-n", "resolveWorktreeCapacityLimit({", "--", "packages"],
-      { cwd: root, encoding: "utf-8" },
-    ).split("\n").filter((l) => l && !l.includes("__tests__"));
+    const allowlisted = new Set([
+      "packages/core/src/central/central-core.ts", // mesh node capacity, not project admission
+      "packages/dashboard/src/routes/register-docker-provisioning-routes.ts", // provisioned node capacity
+      "packages/engine/src/self-healing.ts", // disk-hygiene retention cap
+    ]);
+    const files = execFileSync("git", ["ls-files", "--", "packages", "plugins"], { cwd: root, encoding: "utf-8" })
+      .split("\n")
+      .filter((file) => /\/src\//.test(file) && /\.tsx?$/.test(file) && !file.includes("__tests__"));
+    const { readFileSync } = await import("node:fs");
+    const offenders = files.flatMap((file) => {
+      if (allowlisted.has(file)) return [];
+      return readFileSync(resolve(root, file), "utf-8").split("\n").flatMap((line, index) =>
+        /\b(maxConcurrent|maxWorktrees)\s*\?\?\s*\d/.test(line) ? [`${file}:${index + 1}: ${line.trim()}`] : [],
+      );
+    });
+    expect(offenders, "capacity defaults must resolve through resolveEffectiveConcurrency").toEqual([]);
+  });
 
-    expect(hits.length, `expected two admission readers, got:\n${hits.join("\n")}`).toBe(2);
-    expect(hits.some((h) => h.includes("packages/engine/src/scheduler.ts"))).toBe(true);
-    expect(hits.some((h) => h.includes("packages/engine/src/triage.ts"))).toBe(true);
+  it("rejects reporting routes that emit a bare maxConcurrent literal", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { resolve } = await import("node:path");
+    const root = resolve(__dirname, "../../../..");
+    const projectRoutes = readFileSync(resolve(root, "packages/dashboard/src/routes/register-project-routes.ts"), "utf-8");
+    expect(projectRoutes).toContain("getSettingsFast()");
+    expect(projectRoutes).not.toMatch(/maxConcurrent\s*:\s*\d/);
+  });
+
+  it("separates the agent-limit reader from the worktree-holder reader", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const { resolve } = await import("node:path");
+    const root = resolve(__dirname, "../../../..");
+    const agentHits = execFileSync(
+      "git",
+      ["grep", "-n", "resolveAgentCapacityLimit", "--", "packages/engine/src"],
+      { cwd: root, encoding: "utf-8" },
+    ).split("\n").filter((line) => line && !line.includes("__tests__"));
+    const holderHits = execFileSync(
+      "git",
+      ["grep", "-n", "persistedWorktreeHolderTaskIdsFromStore", "--", "packages/engine/src"],
+      { cwd: root, encoding: "utf-8" },
+    ).split("\n").filter((line) => line && !line.includes("__tests__"));
+
+    expect(agentHits.some((line) => line.includes("packages/engine/src/concurrency/concurrency.ts"))).toBe(true);
+    expect(new Set(holderHits.map((line) => line.split(":")[0]))).toEqual(new Set([
+      "packages/engine/src/concurrency/concurrency.ts",
+      "packages/engine/src/scheduler.ts",
+    ]));
+    expect(holderHits.some((line) => line.includes("scheduler.ts") && line.includes("activeWorktreeTaskIds"))).toBe(true);
+    let legacyHits = "";
+    try {
+      legacyHits = execFileSync(
+        "git",
+        ["grep", "-n", "resolveActiveTaskCapacityLimit", "--", "packages/engine/src"],
+        { cwd: root, encoding: "utf-8" },
+      );
+    } catch (error) {
+      if ((error as { status?: number }).status !== 1) throw error;
+    }
+    expect(legacyHits.trim()).toBe("");
   });
 });
 

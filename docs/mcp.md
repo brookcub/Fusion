@@ -58,8 +58,8 @@ Fusion materializes MCP secret references only at the use seam:
 - when running a bounded validation/reachability probe;
 - when importing plaintext Claude Desktop env/header values and immediately creating Fusion secrets.
 
-<!-- FNXC:McpConfig 2026-06-26-17:06: FN-7078 extended the FN-7077 forwarding invariant to dashboard readonly planning helpers. Configured MCP servers must reach subtask breakdown (stream/retry/triage), text refinement, goal drafting, agent onboarding generation, PR metadata generation, and insight extraction whenever those helpers have a scoped TaskStore; terminal sessions and DB-row chat session creation remain non-agent-runtime surfaces and intentionally receive no MCP payload. -->
-MCP-capable AI sessions include Chat, planning, executor/Tasks, heartbeat runs, reviewer/validator/merger lanes, PR-response and PR-conflict merger helpers, manual AI-prompt workflow steps, workflow model nodes, evaluator, cron/automation, mission execution, mission and milestone/slice interviews, agent reflection, and dashboard readonly planning helpers such as subtask breakdown, text refinement/goal drafting, agent onboarding generation, PR metadata generation, and insight extraction. Non-agent runtime surfaces such as terminal sessions and `chatStore.createSession` database row creation do not receive MCP servers.
+<!-- FNXC:McpConfig 2026-08-20-17:54: FN-074 removed subtask breakdown sessions. Configured MCP servers continue to reach supported planning and readonly dashboard helpers without preserving a removed fan-out path. -->
+MCP-capable AI sessions include Chat, planning, executor/Tasks, heartbeat runs, reviewer/validator/merger lanes, PR-response and PR-conflict merger helpers, manual AI-prompt workflow steps, workflow model nodes, evaluator, cron/automation, mission execution, mission and milestone/slice interviews, agent reflection, and dashboard readonly planning helpers such as text refinement/goal drafting, agent onboarding generation, PR metadata generation, and insight extraction. Non-agent runtime surfaces such as terminal sessions and `chatStore.createSession` database row creation do not receive MCP servers.
 
 Expected outcome: API responses, CLI output, settings JSON, exports, and structured logs show secret references or counts/status metadata only; they do not include decrypted env/header values.
 
@@ -119,6 +119,10 @@ The scanner reads only these well-known paths; missing files are normal and malf
 | VS Code | Project | `<projectRootDir>/.vscode/mcp.json` | `<projectRootDir>\\.vscode\\mcp.json` |
 
 Claude Desktop, Claude Code, Cursor, and Windsurf use the Claude-style `{ "mcpServers": { ... } }` shape. VS Code project config can use `{ "servers": { ... } }`; Fusion normalizes it to the same import parser before rendering candidates.
+
+## Cursor runtime task tools
+
+Cursor runtime sessions bridge Fusion `fn_*` tools through a session-scoped project `.cursor/mcp.json` stdio entry. Fusion writes an `info/exclude` block before staging the entry, retains a durable lease manifest so concurrent sessions preserve each other's server definitions, and restores a pre-existing operator config after the last lease. The initial baseline is recorded before Fusion writes config bytes; later writes use an intent journal so crash recovery can distinguish its own atomic write from an operator edit. A tracked `.cursor/mcp.json` disables the bridge. An operator edit is preserved; an unparsable operator edit quarantines the worktree, retains the exclusion, and disables staging until the JSON is repaired and `fusion-custom-tools-*` entries are removed (or the file is deleted).
 
 Sensitive discovery follows the same no-plaintext rule as manual import. If a third-party file contains inline environment values, header values, or token-like values, the API response includes only secret descriptor metadata (`field`, `key`, `suggestedKey`, `scope`) and the candidate definition uses Fusion `McpSecretRef` placeholders. The dashboard **Add** flow opens the server editor so operators choose existing Fusion secrets or create new Fusion-managed secrets; the settings blob stores only `{ secretRef, scope }` references.
 
@@ -262,7 +266,7 @@ Expected outcome: API clients can display candidates, source labels, configured 
 
 ## How MCP servers reach AI lanes
 
-When an AI lane or readonly dashboard helper starts a session, Fusion resolves the effective `mcpServers` settings, materializes secret references through the scoped secrets store, and passes the resulting in-memory server declarations to runtimes that support MCP. The forwarding path covers chat/planning, executor, reviewer, validator, merger, workflow model nodes, summarization, evaluator, research, cron/automation, mission, reflection, subtask breakdown, text refinement/goal drafting, agent onboarding generation, PR metadata generation, and insight extraction paths.
+When an AI lane or readonly dashboard helper starts a session, Fusion resolves the effective `mcpServers` settings, materializes secret references through the scoped secrets store, and passes the resulting in-memory server declarations to runtimes that support MCP. The forwarding path covers chat/planning, executor, reviewer, validator, merger, workflow model nodes, summarization, evaluator, research, cron/automation, mission, reflection, text refinement/goal drafting, agent onboarding generation, PR metadata generation, and insight extraction paths.
 
 Runtime support is guarded. Claude/pi/ACP-compatible runtimes receive MCP servers; mock or unsupported runtimes skip forwarding and emit only structured count/provider/runtime metadata. Skipped forwarding is not a settings error: it means the selected runtime does not accept MCP server declarations.
 
@@ -284,6 +288,8 @@ After installing a build with an MCP lifecycle change, use a non-mutating config
 
 Read-only sessions do not receive MCP tools automatically. Interactive planning and mission interview lanes (planning, streaming planning, mission interview, milestone interview, and slice interview) explicitly opt in because their job is to gather context and create plans, so configured MCP documentation/context tools are available there while still passing through the same custom-tool read-only filter, allowlists, permanent-agent gating, action-gate wrapping, worktree-boundary wrapping, schema preservation, redacted logging, and teardown path. Other read-only validator/helper lanes must make their own reviewed opt-in before external MCP tools appear.
 
+A workflow prompt node can use `config.readonlyMcpServers: ["nav"]` while its `toolMode` remains `"readonly"`. Fusion connects and exposes only the named configured servers; unnamed servers are neither started nor offered to the session. The engine re-checks each tool against its recorded server origin and denies unknown origins, so sanitised MCP tool names never become a policy authority. This config is authorable wherever `toolMode: "coding"` is authorable, which already grants broader capabilities, but it can name only operator-configured server identifiers. A missing declaration leaves the lane unchanged. When configured servers are skipped for a readonly lane, Fusion records the count and fixed reason at info level without logging definitions or secrets.
+
 Expected outcome: enabling a server makes it available to subsequent supported AI sessions and explicitly opted-in planning/mission read-only sessions, while unsupported sessions and read-only sessions without the opt-in continue without MCP tools and without logging secret-bearing server definitions.
 
 See [Settings Reference](./settings-reference.md) for the `mcpServers` settings contract and [Agents](./agents.md) for runtime/model lane behavior.
@@ -291,6 +297,8 @@ See [Settings Reference](./settings-reference.md) for the `mcpServers` settings 
 ## Fusion memory built-in
 
 When MCP is enabled, Fusion automatically resolves the `fusion-memory` stdio server for project-rooted sessions. It exposes `graph_query`, `graph_neighbors`, and `graph_shortest_path` for the knowledge graph, plus `recall_search` and `recall_append` for durable recall. Graph edges preserve `provenance` (`extracted` or `inferred`) in JSON result text.
+
+Its `initialize` response advertises a conformant `serverInfo` with both `name` and `version`. MCP clients validate this response against the SDK schema; a missing required field makes them retry and then skip the server with only an opaque error category. The dashboard stdio probe currently verifies only that the process starts, not the initialize handshake, so it cannot detect this class of protocol defect.
 
 The server emits one bounded text block containing `{ tool, results, truncated, omittedCount }`. It drops complete trailing results before using a clearly marked non-JSON fallback. Its cap follows `agentToolOutputMaxChars`; `0` remains unlimited and small configured values are raised to the server's safe minimum. The budget is read from the project store once per MCP process, so restart a session after changing it. If the store is unavailable, graph tools still answer under the default cap and recall tools return an `isError` result. Protocol errors use JSON-RPC errors, while valid tool calls that fail during execution return `isError` so a model can react.
 

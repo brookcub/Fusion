@@ -183,7 +183,9 @@ pgDescribe("optional-role-parameter conversions, measured on a live store", () =
       ...read("agent-heartbeat.ts").split("evaluateParkedAgentTaskLink(").slice(1),
       ...read("self-healing.ts").split("evaluateParkedAgentTaskLink(").slice(1),
       ...read("scheduler.ts").split("evaluateParkedAgentTaskLink(").slice(1),
-      ...read("task-agent-sync.ts").split("evaluateParkedAgentTaskLink(").slice(1),
+      /* FNXC:InertSyncLaneConversions 2026-08-23-00:35: the module moved under `agents/` in the
+         package-layout waves; this audit reads sources by path, so it must follow the file. */
+      ...read("agents/task-agent-sync.ts").split("evaluateParkedAgentTaskLink(").slice(1),
     ];
     /* `task-agent-sync.ts` also DECLARES the function, so its export line is one of the splits; the
        declaration is not a call site and is excluded by requiring an options object to follow. */
@@ -212,7 +214,7 @@ pgDescribe("optional-role-parameter conversions, measured on a live store", () =
     };
 
     const sourceFor = (site: string) => [
-      read("agent-heartbeat.ts"), read("self-healing.ts"), read("scheduler.ts"), read("task-agent-sync.ts"),
+      read("agent-heartbeat.ts"), read("self-healing.ts"), read("scheduler.ts"), read("agents/task-agent-sync.ts"),
     ].find((src) => src.includes(site.slice(0, 60))) ?? "";
 
     const asyncResolved = parkedConverted.filter((s) => provenanceOf(sourceFor(s), s).includes("await"));
@@ -241,23 +243,20 @@ pgDescribe("optional-role-parameter conversions, measured on a live store", () =
     expect(schedulerParked.length).toBe(1);
     expect(provenanceOf(schedulerSource, schedulerParked[0]!)).toMatch(/await\s+resolveTaskParkedColumns\b/);
 
-    /* The lease seam's two SELF-HEALING sites. Its other two are in `scheduler.ts` and were converted
-       from the start, so 2 converted here is the seam at 4-of-4.
-
-       `&&`, not the `||` this replaces. The predicate asks two INDEPENDENT role questions, so a site
-       answering only one is still half-converted — and `||` counted it as converted. Measured, not
-       reasoned: with `||`, deleting one site's `isReviewColumn` leaves this whole file green (4/4
-       passing); with `&&` it fails. An audit that cannot tell a closed seam from a half-closed one is
-       the exact blind spot this file was written to remove. */
-    const leaseCalls = read("self-healing.ts").split("shouldHoldActiveFileScopeLease(").slice(1);
-    const leaseConverted = leaseCalls.filter((s) => {
-      const w = s.slice(0, s.indexOf("})"));
-      return w.includes("isWipColumn") && w.includes("isReviewColumn");
+    /* The two self-healing overlap mirrors classify their blockers with all three resolved role
+       answers. The dependency-waiver reconciliation also classifies leases, but it intentionally
+       passes literal WIP membership because that loop has already selected only WIP holders. */
+    const classifierCalls = read("self-healing.ts").split("classifyFileScopeLease(").slice(1);
+    const mirrorCalls = classifierCalls.filter((s) => {
+      const w = s.slice(0, s.indexOf("});"));
+      return w.includes("mergeRequestContractShadowEnabled");
+    });
+    const mirrorConverted = mirrorCalls.filter((s) => {
+      const w = s.slice(0, s.indexOf("});"));
+      return w.includes("isWipColumn") && w.includes("isReviewColumn") && w.includes("isTerminalColumn");
     });
 
-    expect(leaseCalls.length).toBe(2);
-    expect(leaseConverted.length).toBe(2); // closed by #2975. The FORM of the answer — resolved set
-                                           // membership, not a hardcoded `true` — is asserted in
-                                           // workflow-file-scope-lease-caller-gap-live-e2e.pg.test.ts
+    expect(mirrorCalls).toHaveLength(2);
+    expect(mirrorConverted).toHaveLength(2);
   });
 });

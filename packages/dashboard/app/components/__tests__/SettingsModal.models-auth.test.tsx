@@ -5,6 +5,7 @@ import path from "path";
 import { SettingsModal } from "../SettingsModal";
 import type { SettingsExportData, UpdateCheckResponse } from "../../api";
 import { ApiRequestError } from "../../api";
+import { __test_resetPendingUpdateInstall } from "../../hooks/usePendingUpdateInstall";
 import {
   mockFetchSettings,
   mockFetchSettingsByScope,
@@ -77,6 +78,7 @@ import {
   settingsModalUser,
   expectSettingPersists,
   installSettingsModalEnv,
+  flushSettingsAutoSave,
 } from "./SettingsModal.test-harness";
 
 vi.mock("../../api", async (importOriginal) => {
@@ -121,6 +123,7 @@ vi.mock("../../api", async (importOriginal) => {
     fetchProjects: (...args: unknown[]) => mockFetchProjects(...args),
     fetchDashboardHealth: (...args: unknown[]) => mockFetchDashboardHealth(...args),
     checkForUpdates: (...args: unknown[]) => mockCheckForUpdates(...args),
+    checkForUpdate: vi.fn(() => Promise.resolve({ currentVersion: "1.0.0", latestVersion: null, updateAvailable: false })),
     installUpdate: (...args: unknown[]) => mockInstallUpdate(...args),
     fetchRemoteSettings: (...args: unknown[]) => mockFetchRemoteSettings(...args),
     updateRemoteSettings: (...args: unknown[]) => mockUpdateRemoteSettings(...args),
@@ -207,10 +210,32 @@ describe("SettingsModal", () => {
   installSettingsModalEnv();
 
   beforeEach(() => {
+    __test_resetPendingUpdateInstall();
     localStorage.setItem("fusion:settings:show-advanced", "true");
   });
 
   describe("Project Models", () => {
+    it("renders the Fast & Cheap Model lane with its help in Global and Project Models", async () => {
+      mockFetchModels.mockResolvedValue({
+        models: MODEL_FIXTURE,
+        favoriteProviders: [],
+        favoriteModels: [],
+      });
+
+      renderModal({ initialSection: "global-models" });
+      await waitForSettingsModalReady();
+      expect(screen.getByLabelText("Fast & Cheap Model")).toBeInTheDocument();
+      expect(screen.getByText("Select a cheap model here for quick edits. It is used for Fast Mode when creating a task.")).toBeInTheDocument();
+      expect(document.querySelector('[data-settings-key="fastCheapGlobalModelId"]')).toBeInTheDocument();
+
+      cleanup();
+      renderModal({ initialSection: "project-models" });
+      await waitForSettingsModalReady();
+      expect(screen.getByLabelText("Fast & Cheap Model")).toBeInTheDocument();
+      expect(screen.getByText(/Select a cheap model here for quick edits\. It is used for Fast Mode when creating a task\./)).toBeInTheDocument();
+      expect(document.querySelector('[data-settings-key="fastCheapModelId"]')).toBeInTheDocument();
+    });
+
     it("saves opencode-go startup model sync toggle in global settings", async () => {
       mockFetchModels.mockResolvedValue({
         models: MODEL_FIXTURE,
@@ -228,14 +253,14 @@ describe("SettingsModal", () => {
       });
     });
 
-    it("saves the task-definition input-language toggle in the project settings payload", async () => {
+    it("saves task output language in the project settings payload", async () => {
       await expectSettingPersists({
         section: "Models · Project",
-        label: "Write task definitions in the operator's input language",
-        kind: "checkbox",
-        value: true,
+        label: "AI-authored task language",
+        kind: "select",
+        value: "input",
         scope: "project",
-        expectedKey: "taskDefinitionInInputLanguage",
+        expectedKey: "taskOutputLanguage",
       });
     });
 
@@ -349,8 +374,10 @@ describe("SettingsModal", () => {
       expect(screen.getByLabelText("OpenRouter HTTP-Referer")).toBeInTheDocument();
       expect(screen.getByLabelText("OpenRouter X-Title")).toBeInTheDocument();
 
-      await settingsModalUser.type(screen.getByLabelText("OpenRouter HTTP-Referer"), "https://example.app");
-      await settingsModalUser.type(screen.getByLabelText("OpenRouter X-Title"), "Example App");
+      // FNXC:SettingsModalTests 2026-08-16-03:46: flush the 500ms auto-save debounce on the fake clock instead of a real-timer waitFor (FN-2707); assertions unchanged. Fake timers must be enabled BEFORE the mutating edits so the debounce lands on the fake clock.
+      vi.useFakeTimers();
+      fireEvent.change(screen.getByLabelText("OpenRouter HTTP-Referer"), { target: { value: "https://example.app" } });
+      fireEvent.change(screen.getByLabelText("OpenRouter X-Title"), { target: { value: "Example App" } });
       fireEvent.change(screen.getByLabelText("OpenRouter supported_parameters filter"), {
         target: { value: "tools, structured_outputs" },
       });
@@ -358,14 +385,13 @@ describe("SettingsModal", () => {
       fireEvent.change(screen.getByLabelText("OpenRouter routing order"), { target: { value: "openai, anthropic" } });
       fireEvent.change(screen.getByLabelText("OpenRouter routing ignore"), { target: { value: "provider-x" } });
       fireEvent.change(screen.getByLabelText("OpenRouter routing only"), { target: { value: "provider-y" } });
-      await settingsModalUser.selectOptions(screen.getByLabelText("OpenRouter allow fallbacks"), "deny");
-      await settingsModalUser.selectOptions(screen.getByLabelText("OpenRouter routing sort"), "latency");
-      await settingsModalUser.click(screen.getByLabelText("Require parameters"));
+      fireEvent.change(screen.getByLabelText("OpenRouter allow fallbacks"), { target: { value: "deny" } });
+      fireEvent.change(screen.getByLabelText("OpenRouter routing sort"), { target: { value: "latency" } });
+      fireEvent.click(screen.getByLabelText("Require parameters"));
 
-
-      await waitFor(() => {
-        expect(mockUpdateGlobalSettings).toHaveBeenCalled();
-      });
+      await flushSettingsAutoSave();
+      vi.useRealTimers();
+      expect(mockUpdateGlobalSettings).toHaveBeenCalled();
 
       expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -443,11 +469,13 @@ describe("SettingsModal", () => {
 
       await settingsModalUser.click(screen.getByRole("button", { name: "Models · Project" }));
       await settingsModalUser.click(screen.getByLabelText("Project Default Model"));
-      await settingsModalUser.click(screen.getByText("GPT-4o"));
+      // FNXC:SettingsModalTests 2026-08-16-03:46: the picker is already open; the item click is the mutating edit, so it runs under fake timers and the 500ms auto-save debounce is flushed on the fake clock (FN-2707).
+      vi.useFakeTimers();
+      fireEvent.click(screen.getByText("GPT-4o"));
 
-      await waitFor(() => {
-        expect(mockUpdateSettings).toHaveBeenCalledTimes(1);
-      });
+      await flushSettingsAutoSave();
+      vi.useRealTimers();
+      expect(mockUpdateSettings).toHaveBeenCalledTimes(1);
 
       expect(mockUpdateSettings).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -547,7 +575,7 @@ describe("SettingsModal", () => {
       const onOpenWorkflowSettings = vi.fn();
       await setupWorkflowModelLaneTest({ renderProps: { onOpenWorkflowSettings } });
 
-      const workflowHeading = screen.getByRole("heading", { name: "Project workflow model lanes" });
+      const workflowHeading = screen.getByRole("heading", { name: "Workflow lanes" });
       const advancedButton = screen.getByRole("button", { name: "Advanced workflow policy" });
       const actionRow = advancedButton.closest(".settings-model-lane-actions");
       const presetsHeading = screen.getByRole("heading", { name: "Model Presets" });
@@ -612,10 +640,12 @@ describe("SettingsModal", () => {
       await setupWorkflowModelLaneTest();
 
       await settingsModalUser.click(screen.getByLabelText("Plan/Triage Model"));
-      await settingsModalUser.click(await screen.findByText("GPT-4o"));
-      await waitFor(() => {
-        expect(mockUpdateWorkflowSettingValues).toHaveBeenCalledWith("workflow-custom", expectedPatch, "proj-1");
-      });
+      const laneOption = await screen.findByText("GPT-4o");
+      vi.useFakeTimers();
+      fireEvent.click(laneOption);
+      await flushSettingsAutoSave();
+      vi.useRealTimers();
+      expect(mockUpdateWorkflowSettingValues).toHaveBeenCalledWith("workflow-custom", expectedPatch, "proj-1");
 
       cleanup();
       mockFetchWorkflow.mockClear();
@@ -966,6 +996,75 @@ describe("SettingsModal", () => {
       await waitFor(() => expect(mockInstallUpdate).toHaveBeenCalledTimes(1));
       expect(await screen.findByText("Updated to v2.0.0 — restart Fusion to apply")).toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "Update now" })).not.toBeInTheDocument();
+    });
+
+    it("preserves the installed restart state after closing and reopening Settings", async () => {
+      mockCheckForUpdates.mockResolvedValueOnce({
+        currentVersion: "1.0.0",
+        latestVersion: "2.0.0",
+        updateAvailable: true,
+      });
+      mockInstallUpdate.mockResolvedValueOnce({
+        currentVersion: "1.0.0",
+        latestVersion: "2.0.0",
+        updated: true,
+        outcome: "installed",
+      });
+
+      const firstModal = renderModal();
+      await waitForSettingsModalReady();
+      await settingsModalUser.click(screen.getByRole("button", { name: "Check for updates" }));
+      await settingsModalUser.click(await screen.findByRole("button", { name: "Update now" }));
+      expect(await screen.findByText("Updated to v2.0.0 — restart Fusion to apply")).toBeInTheDocument();
+
+      firstModal.unmount();
+      renderModal();
+      await waitForSettingsModalReady();
+
+      expect(await screen.findByText("Updated to v2.0.0 — restart Fusion to apply")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Restart Fusion" })).toBeEnabled();
+      expect(screen.queryByRole("button", { name: "Update now" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Updating…" })).not.toBeInTheDocument();
+      expect(mockCheckForUpdates).toHaveBeenCalledTimes(1);
+      expect(mockInstallUpdate).toHaveBeenCalledTimes(1);
+    });
+
+    it("retains a successful install that completes after Settings closes", async () => {
+      mockCheckForUpdates.mockResolvedValueOnce({
+        currentVersion: "1.0.0",
+        latestVersion: "2.0.0",
+        updateAvailable: true,
+      });
+      let resolveInstall: ((result: { currentVersion: string; latestVersion: string; updated: boolean; outcome: "installed" }) => void) | undefined;
+      mockInstallUpdate.mockReturnValueOnce(new Promise((resolve) => {
+        resolveInstall = resolve;
+      }));
+
+      const firstModal = renderModal();
+      await waitForSettingsModalReady();
+      await settingsModalUser.click(screen.getByRole("button", { name: "Check for updates" }));
+      await settingsModalUser.click(await screen.findByRole("button", { name: "Update now" }));
+      expect(await screen.findByRole("button", { name: "Updating…" })).toBeDisabled();
+
+      firstModal.unmount();
+      await act(async () => {
+        resolveInstall?.({
+          currentVersion: "1.0.0",
+          latestVersion: "2.0.0",
+          updated: true,
+          outcome: "installed",
+        });
+      });
+
+      renderModal();
+      await waitForSettingsModalReady();
+
+      expect(await screen.findByText("Updated to v2.0.0 — restart Fusion to apply")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Restart Fusion" })).toBeEnabled();
+      expect(screen.queryByRole("button", { name: "Update now" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Updating…" })).not.toBeInTheDocument();
+      expect(mockCheckForUpdates).toHaveBeenCalledTimes(1);
+      expect(mockInstallUpdate).toHaveBeenCalledTimes(1);
     });
 
     it("disables update-now and shows inline errors while installing", async () => {
@@ -1608,6 +1707,29 @@ describe("SettingsModal", () => {
       } finally {
         vi.useRealTimers();
       }
+    });
+
+    it("skips the manual-paste confirmation for remote Codex device code", async () => {
+      const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+      mockFetchAuthStatus.mockResolvedValueOnce({
+        providers: [{ id: "openai-codex", name: "OpenAI Codex", authenticated: false, type: "oauth", requiresManualCode: false }],
+      });
+      mockLoginProvider.mockResolvedValueOnce({
+        url: "https://auth.openai.com/codex/device",
+        deviceCode: { userCode: "ABCD-1234", verificationUri: "https://auth.openai.com/codex/device" },
+      });
+
+      render(<SettingsModal onClose={noop} addToast={vi.fn()} />);
+      await waitForSettingsModalReady();
+      await settingsModalUser.click(screen.getByRole("button", { name: "Authentication" }));
+      const codexCard = screen.getByTestId("auth-provider-icon-openai-codex").closest(".auth-provider-card") as HTMLElement;
+      await settingsModalUser.click(within(codexCard).getByRole("button", { name: "Login" }));
+
+      expect(await within(codexCard).findByText("ABCD-1234")).toBeInTheDocument();
+      expect(mockConfirm).not.toHaveBeenCalled();
+      expect(screen.queryByTestId("provider-login-dialog-openai-codex")).toBeNull();
+      expect(within(codexCard).queryByTestId("auth-manual-code-openai-codex")).not.toBeInTheDocument();
+      expect(openSpy).not.toHaveBeenCalled();
     });
 
     it("uses execCommand fallback when clipboard API is unavailable", async () => {

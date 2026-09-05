@@ -65,6 +65,13 @@ const LazyStub = lazy(async () => ({ default: () => null }));
 const LazySettingsCloseStub = lazy(async () => ({
   default: ({ onClose }: { onClose: () => void }) => <button type="button" onClick={onClose}>Close settings view</button>,
 }));
+let embeddedSettingsProps: Record<string, unknown> | undefined;
+const LazySettingsBridgeStub = lazy(async () => ({
+  default: (props: Record<string, unknown>) => {
+    embeddedSettingsProps = props;
+    return <div>Embedded settings bridge</div>;
+  },
+}));
 
 function mainContentProps(overrides: Partial<MainContentProps> = {}): MainContentProps {
   return {
@@ -94,6 +101,12 @@ function mainContentProps(overrides: Partial<MainContentProps> = {}): MainConten
     setShadcnCustomColors: vi.fn(),
     resolvedThemeMode: "light",
     setQuickChatButtonModeImmediate: vi.fn(),
+    setChatMessageLayoutImmediate: vi.fn(),
+    setOpenTasksInRightSidebarImmediate: vi.fn(),
+    setOpenMobileTasksInPopupImmediate: vi.fn(),
+    setTaskPopupsBoardListOnlyImmediate: vi.fn(),
+    setShowCostBadgeOnCardsImmediate: vi.fn(),
+    setTaskDetailChatFirstImmediate: vi.fn(),
     reopenOnboardingWithNav: vi.fn(),
     viewMode: "project",
     projects: [],
@@ -104,6 +117,23 @@ function mainContentProps(overrides: Partial<MainContentProps> = {}): MainConten
     handleResumeProject: vi.fn(),
     handleRemoveProject: vi.fn(),
     nodes: [],
+    /*
+    FNXC:TodoPluginEnablement 2026-08-15-22:20:
+    FN-8762 (5b2b31d2c9) gated plugin task views on the project-scoped
+    `pluginDashboardViews` roster (MainContent.isEnabledPluginTaskView), so this
+    harness must enroll the plugin views it renders or MainContent treats them as
+    disabled. The same commit removed the host `todosEnabled`/`TodoView` props.
+    */
+    pluginDashboardViews: [
+      {
+        pluginId: "fusion-plugin-dependency-graph",
+        view: { viewId: "graph", label: "Graph", componentPath: "./dashboard-view", icon: "Workflow", placement: "primary", order: 1 },
+      },
+      {
+        pluginId: "example",
+        view: { viewId: "dashboard", label: "Example", componentPath: "./dashboard-view", icon: "Workflow", placement: "overflow", order: 2 },
+      },
+    ] as MainContentProps["pluginDashboardViews"],
     graphPluginTaskView: "plugin:fusion-plugin-dependency-graph:graph",
     graphWorkflowSelection: null,
     setGraphWorkflowSelection: vi.fn(),
@@ -119,6 +149,12 @@ function mainContentProps(overrides: Partial<MainContentProps> = {}): MainConten
     autoMerge: true,
     mergeStrategy: "direct",
     settingsLoaded: true,
+    openTasksInRightSidebar: false,
+    openMobileTasksInPopup: false,
+    taskPopupsBoardListOnly: true,
+    showCostBadgeOnCards: false,
+    taskDetailChatFirst: false,
+    chatMessageLayout: "bubbles",
     skillsEnabled: true,
     experimentalFeatures: {},
     setQuickChatOpen: vi.fn(),
@@ -145,7 +181,6 @@ function mainContentProps(overrides: Partial<MainContentProps> = {}): MainConten
     memoryEnabled: true,
     goalsEnabled: true,
     handleOpenMission: vi.fn(),
-    todosEnabled: true,
     openPlanningWithInitialPlanWithNav: vi.fn(),
     ingestCreatedTasks: vi.fn(),
     nodesEnabled: true,
@@ -164,7 +199,6 @@ function mainContentProps(overrides: Partial<MainContentProps> = {}): MainConten
     handleBoardQuickCreate: vi.fn(),
     openNewTaskWithNav: vi.fn(),
     subtaskBreakdownEnabled: true,
-    openSubtaskBreakdownWithNav: vi.fn(),
     toggleAutoMerge: vi.fn(),
     globalPaused: false,
     updateTask: vi.fn(),
@@ -181,7 +215,6 @@ function mainContentProps(overrides: Partial<MainContentProps> = {}): MainConten
     handleOpenDetailWithTab: vi.fn(),
     handleToggleFavorite: vi.fn(),
     handleToggleModelFavorite: vi.fn(),
-    taskStuckTimeoutMs: undefined,
     staleHighFanoutBlockerAgeThresholdMs: 0,
     lastFetchTimeMs: undefined,
     openCreateWorkflowWithNav: vi.fn(),
@@ -211,7 +244,6 @@ function mainContentProps(overrides: Partial<MainContentProps> = {}): MainConten
     ResearchView: LazyStub as MainContentProps["ResearchView"],
     SecretsView: LazyStub as MainContentProps["SecretsView"],
     SkillsView: LazyStub as MainContentProps["SkillsView"],
-    TodoView: LazyStub as MainContentProps["TodoView"],
     _AutomationsView: LazyStub as MainContentProps["_AutomationsView"],
     _ImportTasksView: LazyStub as MainContentProps["_ImportTasksView"],
     _SettingsView: LazyStub as MainContentProps["_SettingsView"],
@@ -244,6 +276,54 @@ describe("MainContent graph task pop-out wiring", () => {
     expect(closeSettings).toHaveBeenCalledTimes(1);
     expect(handleChangeTaskView).toHaveBeenCalledWith("board");
     expect(refreshAppSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("forwards every live Appearance value and callback to embedded Settings", async () => {
+    embeddedSettingsProps = undefined;
+    const setters = {
+      setChatMessageLayoutImmediate: vi.fn(),
+      setOpenTasksInRightSidebarImmediate: vi.fn(),
+      setOpenMobileTasksInPopupImmediate: vi.fn(),
+      setTaskPopupsBoardListOnlyImmediate: vi.fn(),
+      setShowCostBadgeOnCardsImmediate: vi.fn(),
+      setTaskDetailChatFirstImmediate: vi.fn(),
+    };
+
+    render(<MainContent {...mainContentProps({
+      taskView: "settings",
+      chatMessageLayout: "full-width",
+      openTasksInRightSidebar: true,
+      openMobileTasksInPopup: true,
+      taskPopupsBoardListOnly: false,
+      showCostBadgeOnCards: true,
+      taskDetailChatFirst: true,
+      ...setters,
+      _SettingsView: LazySettingsBridgeStub as MainContentProps["_SettingsView"],
+    })} />);
+
+    await screen.findByText("Embedded settings bridge");
+    expect(embeddedSettingsProps).toMatchObject({
+      chatMessageLayout: "full-width",
+      openTasksInRightSidebar: true,
+      openMobileTasksInPopup: true,
+      taskPopupsBoardListOnly: false,
+      showCostBadgeOnCards: true,
+      taskDetailChatFirst: true,
+    });
+
+    (embeddedSettingsProps?.onChatMessageLayoutChange as (value: "bubbles" | "full-width") => void)("bubbles");
+    (embeddedSettingsProps?.onOpenTasksInRightSidebarChange as (value: boolean) => void)(false);
+    (embeddedSettingsProps?.onOpenMobileTasksInPopupChange as (value: boolean) => void)(false);
+    (embeddedSettingsProps?.onTaskPopupsBoardListOnlyChange as (value: boolean) => void)(true);
+    (embeddedSettingsProps?.onShowCostBadgeOnCardsChange as (value: boolean) => void)(false);
+    (embeddedSettingsProps?.onTaskDetailChatFirstChange as (value: boolean) => void)(false);
+
+    expect(setters.setChatMessageLayoutImmediate).toHaveBeenCalledWith("bubbles");
+    expect(setters.setOpenTasksInRightSidebarImmediate).toHaveBeenCalledWith(false);
+    expect(setters.setOpenMobileTasksInPopupImmediate).toHaveBeenCalledWith(false);
+    expect(setters.setTaskPopupsBoardListOnlyImmediate).toHaveBeenCalledWith(true);
+    expect(setters.setShowCostBadgeOnCardsImmediate).toHaveBeenCalledWith(false);
+    expect(setters.setTaskDetailChatFirstImmediate).toHaveBeenCalledWith(false);
   });
 
   it("routes dependency-graph bridge and rendered task-card opens to the shared pop-out", () => {

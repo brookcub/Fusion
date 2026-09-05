@@ -2796,6 +2796,11 @@ export class HeartbeatMonitor {
               agentName: agent.name,
               memory: agent.memory,
             },
+            // FNXC:MemoryFocusEngine 2026-08-13-15:57 (RUFU-068): agent heartbeat
+            // lanes are agent-scoped, not conversation-scoped; no /focus topic →
+            // whole-project scope. The optional focus seam stays wired so a heartbeat
+            // bound to a topic-scoped conversation can scope recall within the project.
+            focus: undefined,
           }));
         } catch (memorySettingsError) {
           const message = memorySettingsError instanceof Error ? memorySettingsError.message : String(memorySettingsError);
@@ -3172,6 +3177,7 @@ export class HeartbeatMonitor {
           systemPromptLayers: heartbeatLayers,
           tools: "coding",
           customTools: heartbeatTools,
+          fusionTools: heartbeatTools,
           defaultProvider: heartbeatSessionModels.defaultProvider,
           defaultModelId: heartbeatSessionModels.defaultModelId,
           ...(heartbeatSessionModels.credentialInstanceId ? { credentialInstanceId: heartbeatSessionModels.credentialInstanceId } : {}),
@@ -3727,7 +3733,7 @@ export class HeartbeatMonitor {
                 session.dispose();
                 const created = await createResolvedAgentSession({
                   sessionPurpose: "heartbeat", runtimeHint: extractRuntimeHint(agent.runtimeConfig), pluginRunner: this.pluginRunner,
-                  cwd: sessionCwd, systemPrompt: systemPromptFinal, systemPromptLayers: heartbeatLayers, tools: "coding", customTools: heartbeatTools,
+                  cwd: sessionCwd, systemPrompt: systemPromptFinal, systemPromptLayers: heartbeatLayers, tools: "coding", customTools: heartbeatTools, fusionTools: heartbeatTools,
                   defaultProvider: heartbeatSessionModels.defaultProvider, defaultModelId: heartbeatSessionModels.defaultModelId,
                   credentialInstanceId: activeInstanceId, fallbackProvider: heartbeatSessionModels.fallbackProvider,
                   fallbackModelId: heartbeatSessionModels.fallbackModelId,

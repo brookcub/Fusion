@@ -43,6 +43,7 @@ export {
   createTaskFromRecommendation,
   createTask,
   repairOverlapBlocker,
+  fetchOverlapBlockerReport,
   updateTask,
   batchUpdateTaskModels,
   moveTask,
@@ -65,6 +66,7 @@ import type {
   BranchSelectionInput,
   CreateTaskInput,
   RepairOverlapBlockerResult,
+  TaskOverlapBlockerReport,
 } from "./tasks/tasks.js";
 export type {
   DeleteTaskOptions,
@@ -83,6 +85,7 @@ export type {
   BranchSelectionInput,
   CreateTaskInput,
   RepairOverlapBlockerResult,
+  TaskOverlapBlockerReport,
 };
 
 /*
@@ -272,7 +275,22 @@ export type {
   MemoryRetrievalTestResult,
   QmdInstallResult,
 } from "./system/memory.js";
-
+export {
+  fetchKnowledgeGraphStatus,
+  queryKnowledgeGraphNodes,
+  fetchKnowledgeGraphNode,
+  fetchKnowledgeGraphNeighbors,
+  fetchKnowledgeGraphPath,
+  buildKnowledgeGraphArtifacts,
+} from "./system/knowledge-graph.js";
+export type {
+  KnowledgeGraphStatus,
+  KnowledgeGraphNode,
+  KnowledgeGraphEdge,
+  KnowledgeGraphNeighbor,
+  KnowledgeGraphNodeQuery,
+  KnowledgeGraphPathResult,
+} from "./system/knowledge-graph.js";
 
 // Re-export skills types so hooks/components keep stable import paths via this barrel.
 import type {
@@ -610,9 +628,7 @@ export {
   stopAgentOnboardingGeneration,
   cancelAgentOnboarding,
   createTaskFromPlanning,
-  startPlanningBreakdown,
-  createTasksFromPlanning,
-  getPlanningStreamUrl,
+      getPlanningStreamUrl,
   getAgentOnboardingStreamUrl,
   connectAgentOnboardingStream,
   connectPlanningStream,
@@ -775,28 +791,20 @@ export {
   REFINE_ERROR_MESSAGES,
   TRANSLATE_ERROR_MESSAGES,
   autoTranslateImportIssues,
-  cancelSubtaskBreakdown,
-  connectSubtaskStream,
-  createTasksFromBreakdown,
-  draftGoalDescription,
+        draftGoalDescription,
   fetchCachedImportTranslation,
   getRefineErrorMessage,
-  getSubtaskStreamUrl,
-  getTranslateErrorMessage,
+    getTranslateErrorMessage,
   refineText,
-  retrySubtaskSession,
-  startSubtaskBreakdown,
-  translateImportContent,
+      translateImportContent,
 } from "./planning/ai-text.js";
 export type {
   AutoTranslateImportItem,
   AutoTranslateImportResponse,
   DraftGoalDescriptionResponse,
   ImportTranslationIdentity,
-  PlanningSubtaskDraft,
   RefineTextResponse,
   RefinementType,
-  SubtaskItem,
   TranslateImportContentResponse,
   TranslateImportFields,
 } from "./planning/ai-text.js";
@@ -914,6 +922,7 @@ export type {
   BackupCreateResponse,
   BackupInfo,
   BackupListResponse,
+  BackupScheduleStatus,
   CompaniesCatalogResponse,
   CompanyEntry,
   SettingsExportData,
@@ -1221,7 +1230,6 @@ export {
   deleteChatRoom,
   deleteChatRoomMessage,
   deleteChatSession,
-  editChatMessage,
   ensureTaskPlannerChatSession,
   fetchChatMessages,
   fetchChatRoom,
@@ -1242,6 +1250,7 @@ export {
 export type {
   ChatFailureInfo,
   ChatFailureReference,
+  ChatReplacementIdentity,
   ChatMessageListResponse,
   ChatRoomListResponse,
   ChatRoomMembersResponse,
@@ -1386,6 +1395,7 @@ export {
   unarchiveInsight,
   updateInsight,
 } from "./system/insights.js";
+export { fetchPatchnode } from "./system/patchnode.js";
 export type {
   InsightsListResponse,
   RunsListResponse,
@@ -1407,6 +1417,7 @@ export {
   startFnBinaryLinkLocal,
   startFnBinaryUseGlobal,
   startSystemRebuild,
+  startSystemSourceUpdate,
 } from "./system/system-panel.js";
 export type {
   ResearchFindingPromotionInput,

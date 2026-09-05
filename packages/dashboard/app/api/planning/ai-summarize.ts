@@ -4,6 +4,11 @@
  */
 
 import { withTokenHeader } from "../../auth";
+import {
+  ApiRequestError,
+  SERVER_UNAVAILABLE_MESSAGE,
+  isGatewayUnavailableStatus,
+} from "../client/client.js";
 
 // --- AI Summarization API ---
 
@@ -13,7 +18,7 @@ export interface SummarizeTitleResponse {
 }
 
 /** Summarize a task description into a concise title using AI.
- * @param description - The task description to summarize (must be >200 chars; model input is truncated)
+ * @param description - The non-empty task description to summarize; model input is truncated
  * @param provider - Optional AI model provider (e.g., "anthropic")
  * @param modelId - Optional AI model ID (e.g., "claude-sonnet-4-5")
  * @param projectId - Optional project ID for scoped settings resolution
@@ -40,6 +45,10 @@ export async function summarizeTitle(
   const isJson = contentType.includes("application/json");
 
   if (!isJson) {
+    // FNXC:DashboardApi 2026-08-16-03:09: title summarize has its own fetch parser; gateway 5xx must match `api()`.
+    if (isGatewayUnavailableStatus(res.status)) {
+      throw new ApiRequestError(SERVER_UNAVAILABLE_MESSAGE, res.status);
+    }
     throw new Error(`API returned non-JSON response: ${bodyText.slice(0, 100)}`);
   }
 

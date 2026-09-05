@@ -36,6 +36,7 @@ function makeStore(tasksInput: Task[]) {
   const settings: Settings = {
     globalPause: false,
     enginePaused: false,
+    groupOverlappingFiles: true,
   } as Settings;
 
   const store = {
@@ -60,9 +61,70 @@ function makeStore(tasksInput: Task[]) {
       return next;
     }),
     logEntry: vi.fn().mockResolvedValue(undefined),
+    /*
+    FNXC:QueuedTaskLogging 2026-08-23-18:30:
+    The overlap-preservation path no longer writes its queued-episode line through `logEntry`: it
+    goes through the atomic `transitionQueuedEpisode` seam (queue fields + episode signature + the
+    single log entry in one transaction, deduped by signature). A fake store missing that method
+    made the sweep throw into its own catch and report zero recoveries. This fake mirrors the
+    production semantics: append only when the row is not already queued with the same blocker
+    fields and signature.
+    */
+    transitionQueuedEpisode: vi.fn().mockImplementation(async (id: string, transition: {
+      signature: string;
+      blockedBy: string | null;
+      overlapBlockedBy: string | null;
+      action: string;
+      outcome?: string;
+    }) => {
+      const current = tasks.get(id);
+      if (!current) throw new Error(`Task ${id} not found or archived while queuing`);
+      const appended = !(
+        current.status === "queued"
+        && (current.blockedBy ?? null) === transition.blockedBy
+        && (current.overlapBlockedBy ?? null) === transition.overlapBlockedBy
+        && ((current as Task & { queuedLogEpisodeSignature?: string | null }).queuedLogEpisodeSignature ?? null) === transition.signature
+      );
+      const next = {
+        ...current,
+        status: "queued",
+        blockedBy: transition.blockedBy,
+        overlapBlockedBy: transition.overlapBlockedBy,
+        queuedLogEpisodeSignature: transition.signature,
+        log: appended
+          ? [...(current.log ?? []), { timestamp: new Date().toISOString(), action: transition.action, outcome: transition.outcome }]
+          : current.log,
+      } as unknown as Task;
+      tasks.set(id, next);
+      return { appended, task: next };
+    }),
   } as unknown as TaskStore;
 
   return { tasks, store };
+}
+
+function configureTaskWorkflowSelections(
+  store: TaskStore,
+  definitions: ReadonlyArray<{ id: string; ir: unknown }>,
+  workflowIdByTaskId: Readonly<Record<string, string>>,
+): void {
+  const definitionById = new Map(definitions.map((definition) => [definition.id, definition]));
+  const mutable = store as unknown as {
+    listWorkflowDefinitions: ReturnType<typeof vi.fn>;
+    getTaskWorkflowSelection: ReturnType<typeof vi.fn>;
+    getTaskWorkflowSelectionAsync: ReturnType<typeof vi.fn>;
+    getWorkflowDefinition: ReturnType<typeof vi.fn>;
+  };
+  mutable.listWorkflowDefinitions = vi.fn(async () => definitions);
+  mutable.getTaskWorkflowSelection = vi.fn((taskId: string) => {
+    const workflowId = workflowIdByTaskId[taskId];
+    return workflowId ? { workflowId, stepIds: [] } : undefined;
+  });
+  mutable.getTaskWorkflowSelectionAsync = vi.fn(async (taskId: string) => {
+    const workflowId = workflowIdByTaskId[taskId];
+    return workflowId ? { workflowId, stepIds: [] } : undefined;
+  });
+  mutable.getWorkflowDefinition = vi.fn(async (workflowId: string) => definitionById.get(workflowId));
 }
 
 describe("SelfHealingManager FN-5488 fast-path regressions", () => {
@@ -211,6 +273,131 @@ describe("SelfHealingManager FN-5488 fast-path regressions", () => {
     );
   });
 
+  it("preserves overlapBlockedBy when a failed review holder still owns a worktree", async () => {
+    const holder = createTask("FN-254-HOLDER", {
+      column: "in-review",
+      status: "failed",
+      worktree: "/wt/fn-254-holder",
+    });
+    const dependent = createTask("FN-254-DEPENDENT", {
+      column: "todo",
+      status: "queued",
+      overlapBlockedBy: holder.id,
+    });
+    const { tasks, store } = makeStore([holder, dependent]);
+    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+
+    await manager.clearStaleBlockedBy();
+
+    expect(tasks.get(dependent.id)).toMatchObject({
+      status: "queued",
+      overlapBlockedBy: holder.id,
+    });
+    expect(store.transitionQueuedEpisode).toHaveBeenCalledWith(
+      dependent.id,
+      expect.objectContaining({ signature: `file-scope:${holder.id}` }),
+    );
+  });
+
+  it("uses the holder workflow rather than a project-wide WIP column union", async () => {
+    const holder = createTask("FN-254-HOLDER", {
+      column: "shared",
+      priority: "low",
+      worktree: "/wt/fn-254-holder",
+    });
+    const dependent = createTask("FN-254-DEPENDENT", {
+      column: "todo",
+      priority: "high",
+      status: "queued",
+      overlapBlockedBy: holder.id,
+    });
+    const { tasks, store } = makeStore([holder, dependent]);
+    configureTaskWorkflowSelections(
+      store,
+      [
+        {
+          id: "wf-holder",
+          ir: {
+            version: "v2",
+            name: "holder-workflow",
+            columns: [
+              { id: "todo", name: "Todo", traits: [{ trait: "hold" }] },
+              { id: "shared", name: "Shared", traits: [] },
+              { id: "done", name: "Done", traits: [{ trait: "complete" }] },
+            ],
+            nodes: [],
+            edges: [],
+          },
+        },
+        {
+          id: "wf-other",
+          ir: {
+            version: "v2",
+            name: "other-workflow",
+            columns: [
+              { id: "shared", name: "Shared", traits: [{ trait: "wip", config: { limitSetting: "maxConcurrent" } }] },
+            ],
+            nodes: [],
+            edges: [],
+          },
+        },
+      ],
+      { [holder.id]: "wf-holder" },
+    );
+    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+
+    await manager.clearStaleBlockedBy();
+
+    expect(tasks.get(dependent.id)).toMatchObject({
+      status: null,
+      overlapBlockedBy: null,
+    });
+    expect(store.transitionQueuedEpisode).not.toHaveBeenCalled();
+  });
+
+  it("clears overlapBlockedBy after a holder is terminal or a review worktree is gone", async () => {
+    for (const holder of [
+      createTask("FN-254-DONE", { column: "done", worktree: "/wt/fn-254-done" }),
+      createTask("FN-254-CLEAN", { column: "in-review", status: "failed" }),
+    ]) {
+      const dependent = createTask(`FN-254-DEPENDENT-${holder.id}`, {
+        column: "todo",
+        status: "queued",
+        overlapBlockedBy: holder.id,
+      });
+      const { tasks, store } = makeStore([holder, dependent]);
+      const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+
+      await manager.clearStaleBlockedBy();
+
+      expect(tasks.get(dependent.id)).toMatchObject({
+        overlapBlockedBy: null,
+        status: null,
+      });
+      expect(store.transitionQueuedEpisode).not.toHaveBeenCalled();
+    }
+  });
+
+  it("does not rebound a WIP holder whose overlap lease is waived for its dependency", async () => {
+    const dependency = createTask("FN-254-DEP", {
+      column: "todo",
+      status: "queued",
+      overlapBlockedBy: "FN-254-HOLDER",
+    });
+    const holder = createTask("FN-254-HOLDER", {
+      column: "in-progress",
+      worktree: "/wt/fn-254-holder",
+      dependencies: [dependency.id],
+    });
+    const { store } = makeStore([holder, dependency]);
+    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+    const rebound = vi.spyOn(manager as any, "reboundTask");
+
+    await expect(manager.reconcileDependencyBlockingLeases()).resolves.toBe(0);
+
+    expect(rebound).not.toHaveBeenCalled();
+  });
+
   it("preserves overlapBlockedBy + queued status when failed-retry-exhausted blocker clears", async () => {
     const blocker = createTask("FN-5498-D-BLOCKER", {
       column: "in-review",
@@ -245,17 +432,17 @@ describe("SelfHealingManager FN-5488 fast-path regressions", () => {
     expect(tasks.get(dependent.id)?.blockedBy).toBeNull();
     expect(tasks.get(dependent.id)?.status).toBe("queued");
     expect(tasks.get(dependent.id)?.overlapBlockedBy).toBe(overlap.id);
-    expect(store.logEntry).toHaveBeenCalledWith(
-      dependent.id,
-      expect.stringContaining(`${AUDIT_PREFIX} preserved queued status`),
-    );
-    expect(store.logEntry).toHaveBeenCalledWith(
-      dependent.id,
-      expect.stringContaining(`reason=${REASON_FAILED_RETRY_EXHAUSTED}`),
-    );
-    expect(store.logEntry).toHaveBeenCalledWith(
-      dependent.id,
-      expect.stringContaining(`still blocked by file scope overlap with ${overlap.id}`),
-    );
+    /*
+     * FNXC:QueuedTaskLogging 2026-08-23-18:30:
+     * The queued-episode line is now written atomically by `transitionQueuedEpisode`, so assert the
+     * transition's `action` — the same audited text this test always owned — instead of a separate
+     * `logEntry` call that no longer exists on this path.
+     */
+    const [, transition] = (store.transitionQueuedEpisode as ReturnType<typeof vi.fn>).mock.calls
+      .find(([id]) => id === dependent.id) as [string, { action: string; signature: string }];
+    expect(transition.action).toContain(`${AUDIT_PREFIX} preserved queued status`);
+    expect(transition.action).toContain(`reason=${REASON_FAILED_RETRY_EXHAUSTED}`);
+    expect(transition.action).toContain(`still blocked by file scope overlap with ${overlap.id}`);
+    expect(transition.signature).toBe(`file-scope:${overlap.id}`);
   });
 });

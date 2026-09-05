@@ -11,28 +11,34 @@ import { columnsWithFlag, declaresAnyLifecycleTrait } from "../workflows/workflo
 import { resolveWorkflowIrForTask } from "../workflows/workflow-ir-resolver.js";
 import { toTaskMoveLanes } from "../workflows/workflow-lifecycle-traits.js";
 import {getFeatureByTaskId as getMissionFeatureByTaskId, unlinkFeatureFromTaskId as unlinkMissionFeatureFromTaskId, recordGeneratedFixOperatorStop} from "../async-stores/async-mission-store-queries.js";
-import {TaskHasLineageChildrenError, TaskNotFoundError, TaskSelfDeleteError} from "./errors.js";
-import {mkdir, writeFile} from "node:fs/promises";
+import {TaskHasDependentsError, TaskHasLineageChildrenError, TaskNotFoundError, TaskSelfDeleteError} from "./errors.js";
+import {mkdir} from "node:fs/promises";
 import {join} from "node:path";
-import {and, eq} from "drizzle-orm";
+import {and, eq, inArray, sql} from "drizzle-orm";
 import * as schema from "../postgres/schema/index.js";
-import type {Task, Column, ArchivedTaskEntry, GithubIssueAction, TaskDeleteClosureContext} from "../types.js";
-import {buildDeleteCallerAuditFields, buildDeleteClosureAuditFields, type TaskDeleteAuditContext} from "../task-delete-attribution.js";
+import type {Task, Column, ArchivedTaskEntry, GithubIssueAction} from "../types.js";
+import {buildDeleteCallerAuditFields, type TaskDeleteAuditContext} from "../task-delete-attribution.js";
 import {notifyOperatorOfNonOperatorDelete} from "../task-delete-notice.js";
 import "../builtin-traits.js";
 import {normalizeTaskPriority} from "../tasks/task-priority.js";
+import type {TaskColumnSortMode} from "../tasks/task-priority.js";
 import {clearTerminalFailureAutoRecoveryBudget} from "../tasks/terminal-failure-auto-recovery.js";
 import {generateTaskLineageId} from "../tasks/task-lineage.js";
 import {sanitizeFileScopeInPromptContent} from "../task-store/file-scope.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
 import {softDeleteTaskRowInTransaction, readTaskRow as readTaskRowAsync, readTaskRowInTransaction} from "../task-store/async/async-persistence.js";
+import {supersedePlanReviewResults} from "../planner/plan-approval.js";
+import {withTaskWorkflowSerialization} from "../task-store/async/async-workflow-workitems.js";
 import {appendTaskLifecycleEventInTransaction} from "../task-store/lifecycle-outbox.js";
-import {findLiveLineageChildren as findLiveLineageChildrenAsync, projectPartition, removeLineageReferences, type LineageRemovalOutcome} from "../task-store/async/async-lifecycle.js";
+import {findLiveDependencyDependents, findLiveLineageChildren as findLiveLineageChildrenAsync, projectPartition, removeLineageReferences, type LineageRemovalOutcome} from "../task-store/async/async-lifecycle.js";
 import { classifyLineageInvalidationOutcomeError, lineageEvidenceTargetVersionForTest, recordLineageInvalidationOutcome, reconcileClearedLineageChildren, resolveAndAssertLineageCandidatesUnchanged, runLineageInvalidation } from "../task-store/lineage-approval-invalidation.js";
 import { resolveProjectColumnsForRoles } from "../project-lane-vocabulary.js";
 import {archiveParentTaskWithLineageGate, findArchivedTaskEntry, deleteArchivedTaskEntry, restoreTaskFromArchive} from "../task-store/async/async-archive-lineage.js";
+import { capturePatchnodeCompletionInTransaction } from "../task-store/async/async-patchnode.js";
 import {getArchivedRowCount, listArchivedTaskEntriesPage} from "../async-stores/async-archive-db.js";
 import {disposeArchivedWorkspaceWorktrees, disposeArchivedWorktree, prepareArchivedWorkspaceWorktrees, releasePreparedWorkspaceArchiveDisposal} from "./archive-lifecycle.js";
+import {resolveArchiveLivenessWipLanes, TaskIsLiveError} from "../tasks/task-archive-liveness.js";
+import {writePromptFileAtomic} from "./prompt-file.js";
 
 export async function taskToArchiveEntryImpl(store: TaskStore, task: Task, archivedAt: string): Promise<ArchivedTaskEntry> {
     const settings = await store.getSettingsFast();
@@ -122,7 +128,6 @@ export async function taskToArchiveEntryImpl(store: TaskStore, task: Task, archi
       mergerCredentialInstanceId: task.mergerCredentialInstanceId,
       mergerModelId: task.mergerModelId,
       mergerThinkingLevel: task.mergerThinkingLevel,
-      breakIntoSubtasks: task.breakIntoSubtasks,
       noCommitsExpected: task.noCommitsExpected,
       baseBranch: task.baseBranch,
       branch: task.branch,
@@ -140,7 +145,7 @@ export async function taskToArchiveEntryImpl(store: TaskStore, task: Task, archi
     };
   }
 
-type DeleteTaskBackendOptions = { removeDependencyReferences?: boolean; removeLineageReferences?: boolean; allowResurrection?: boolean; githubIssueAction?: GithubIssueAction; closureContext?: TaskDeleteClosureContext; auditContext?: TaskDeleteAuditContext; };
+type DeleteTaskBackendOptions = { removeDependencyReferences?: boolean; removeLineageReferences?: boolean; allowResurrection?: boolean; githubIssueAction?: GithubIssueAction; auditContext?: TaskDeleteAuditContext; };
 type DeleteTaskClaimResult = { task: Task; claimed: boolean };
 
 /*
@@ -180,6 +185,10 @@ async function deleteTaskBackendWithClaimResultImpl(store: TaskStore, id: string
     if (lineageChildIds.length > 0 && !options?.removeLineageReferences) {
       throw new TaskHasLineageChildrenError(id, lineageChildIds);
     }
+    const dependencyDependentIds = await findLiveDependencyDependents(layer.db, id, layer.projectId);
+    if (dependencyDependentIds.length > 0 && !options?.removeDependencyReferences) {
+      throw new TaskHasDependentsError(id, dependencyDependentIds);
+    }
 
     const deletedAt = new Date().toISOString();
     const allowResurrection = options?.allowResurrection === true;
@@ -195,8 +204,63 @@ async function deleteTaskBackendWithClaimResultImpl(store: TaskStore, id: string
     const executeDelete = async (context?: { candidateIds: string[]; promptByChildId: ReadonlyMap<string, string>; locksHeld: boolean; attempt: number }) => {
     let deletion: DeleteTaskClaimResult & { lineageOutcome: LineageRemovalOutcome };
     try {
-      deletion = await layer.transactionImmediate(async (tx) => {
+      deletion = await layer.transactionImmediate(async (tx) => withTaskWorkflowSerialization(tx, layer.projectId, id, async () => {
       if (context) await resolveAndAssertLineageCandidatesUnchanged(tx, id, layer.projectId, lineageArchivedLanes, context.candidateIds);
+      const liveDependencyDependents = await findLiveDependencyDependents(tx, id, layer.projectId);
+      if (liveDependencyDependents.length > 0 && !options?.removeDependencyReferences) {
+        throw new TaskHasDependentsError(id, liveDependencyDependents);
+      }
+      /*
+      FNXC:DependencyIntegrity 2026-08-20-17:27:
+      Delete and incoming-edge removal share this transaction. A dependent must never observe a
+      soft-deleted prerequisite while retaining its dependency, so forced removal clears the edge,
+      stale blocker, and plan approval before the parent tombstone can commit.
+      */
+      if (options?.removeDependencyReferences && liveDependencyDependents.length > 0) {
+        /*
+        FNXC:DependencyIntegrity 2026-08-20-17:41:
+        Forced deletion is a material dependency mutation, not a JSON-array cleanup. Reuse the
+        dependency-replan fence: supersede Plan Review evidence and cancel only unclaimed task
+        continuations in this transaction. Running and terminal continuations remain immutable.
+        */
+        for (const dependentId of liveDependencyDependents.sort()) {
+          await withTaskWorkflowSerialization(tx, layer.projectId, dependentId, async () => {
+            const dependentRow = await readTaskRowInTransaction(tx, dependentId, {}, projectId);
+            if (!dependentRow) return;
+            const dependent = store.rowToTask(store.pgRowToTaskRow(dependentRow));
+            const dependencies = dependent.dependencies.filter((dependencyId) => dependencyId !== id);
+            // Revalidation prevents a candidate that changed during deletion from losing a new edge.
+            if (dependencies.length === dependent.dependencies.length) return;
+            await tx.update(schema.project.tasks).set({
+              dependencies,
+              blockedBy: dependent.blockedBy === id ? null : dependent.blockedBy ?? null,
+              approvedPlanFingerprint: null,
+              awaitingApprovalReason: null,
+              workflowStepResults: supersedePlanReviewResults(dependent.workflowStepResults, deletedAt),
+              status: "needs-replan",
+              error: null,
+              updatedAt: deletedAt,
+            }).where(and(
+              eq(schema.project.tasks.projectId, projectId),
+              eq(schema.project.tasks.id, dependentId),
+              sql`${schema.project.tasks.dependencies} @> ${JSON.stringify([id])}::jsonb`,
+              sql`${schema.project.tasks.deletedAt} IS NULL`,
+            ));
+            await tx.update(schema.project.workflowWorkItems).set({
+              state: "cancelled",
+              leaseOwner: null,
+              leaseExpiresAt: null,
+              lastError: "cancelled-by-planning-dependency-reseed",
+              updatedAt: deletedAt,
+            }).where(and(
+              eq(schema.project.workflowWorkItems.projectId, projectId),
+              eq(schema.project.workflowWorkItems.taskId, dependentId),
+              eq(schema.project.workflowWorkItems.kind, "task"),
+              inArray(schema.project.workflowWorkItems.state, ["runnable", "held", "retrying"]),
+            ));
+          });
+        }
+      }
       /*
       FNXC:LifecycleOutbox 2026-08-01-10:33:
       The pre-transaction deletedAt read is a cross-process TOCTOU window. A conditional
@@ -266,7 +330,6 @@ async function deleteTaskBackendWithClaimResultImpl(store: TaskStore, id: string
           // FNXC:TaskDeleteAttribution 2026-07-26-14:30: caller class + calling
           // task id; `taskId` reached this function but was never persisted.
           ...buildDeleteCallerAuditFields(options?.auditContext),
-          ...buildDeleteClosureAuditFields(options?.closureContext),
         },
       });
       /*
@@ -286,7 +349,6 @@ async function deleteTaskBackendWithClaimResultImpl(store: TaskStore, id: string
           deletedAt,
           allowResurrection,
           githubIssueAction: options?.githubIssueAction ?? null,
-          closureContext: options?.closureContext ?? null,
           deletedBy: options?.auditContext?.agentId ?? null,
         },
       });
@@ -302,7 +364,7 @@ async function deleteTaskBackendWithClaimResultImpl(store: TaskStore, id: string
       const reloaded = await readTaskRowInTransaction(tx, id, { includeDeleted: true }, projectId);
       if (!reloaded) throw new TaskNotFoundError(id);
       return { claimed: true, task: store.rowToTask(store.pgRowToTaskRow(reloaded)), lineageOutcome };
-    });
+    }));
     } catch (error) {
       if (context) recordLineageInvalidationOutcome(store, {
         attempt: context.attempt, locksHeld: context.locksHeld, degraded: !context.locksHeld,
@@ -334,7 +396,6 @@ async function deleteTaskBackendWithClaimResultImpl(store: TaskStore, id: string
     store.laneCache.invalidate(task.id);
     store.emit("task:deleted", task, {
       githubIssueAction: options?.githubIssueAction ?? "auto",
-      ...(options?.closureContext ? { closureContext: options.closureContext } : {}),
     });
     /*
     FNXC:TaskDeleteNotice 2026-07-26-16:10:
@@ -361,7 +422,7 @@ export async function deleteTaskIfBackendImpl(
   store: TaskStore,
   id: string,
   predicate: (live: Task) => boolean | Promise<boolean>,
-  options?: { removeDependencyReferences?: boolean; removeLineageReferences?: boolean; allowResurrection?: boolean; githubIssueAction?: GithubIssueAction; closureContext?: TaskDeleteClosureContext; auditContext?: TaskDeleteAuditContext },
+  options?: { removeDependencyReferences?: boolean; removeLineageReferences?: boolean; allowResurrection?: boolean; githubIssueAction?: GithubIssueAction; auditContext?: TaskDeleteAuditContext },
 ): Promise<{ task: Task; deleted: boolean }> {
   if (options?.auditContext?.taskId === id) throw new TaskSelfDeleteError(id);
   return store.withTaskLock(id, async () => {
@@ -414,10 +475,11 @@ async function archivedLanesForTask(store: TaskStore, taskId: string): Promise<R
   return lanes;
 }
 
-export async function archiveTaskBackendImpl(store: TaskStore, id: string, optionsOrCleanup: boolean | { cleanup?: boolean; removeLineageReferences?: boolean },): Promise<Task> {
+export async function archiveTaskBackendImpl(store: TaskStore, id: string, optionsOrCleanup: boolean | { cleanup?: boolean; removeLineageReferences?: boolean; liveExecutionGuard?: "refuse" | "off" },): Promise<Task> {
     const layer = store.asyncLayer!;
     const cleanup = typeof optionsOrCleanup === "boolean" ? optionsOrCleanup : optionsOrCleanup.cleanup !== false;
     const removeLineageRefs = typeof optionsOrCleanup === "object" && optionsOrCleanup.removeLineageReferences === true;
+    const liveExecutionGuard = typeof optionsOrCleanup === "object" ? optionsOrCleanup.liveExecutionGuard ?? "off" : "off";
 
     // Read the task (forensic: include deleted for idempotency check).
     const task = await store.getTask(id);
@@ -440,11 +502,18 @@ export async function archiveTaskBackendImpl(store: TaskStore, id: string, optio
     const entry = await store.taskToArchiveEntry(task, archivedAt);
 
     /*
-    FNXC:SpecLockLineageInvalidation 2026-08-10-14:33:
-    Archive keeps its legacy archived-lane semantics (undefined -> "archived") but threads that
-    one value through pre-read and gate. The workspace reservation is created inside the locked body.
+    FNXC:SelfHealing 2026-08-21-15:11:
+    Runfusion/Fusion#3497 requires the retention sweep and this transactional lineage gate to share
+    the project archive vocabulary. A renamed archived child is already filed and must not make the
+    sweep issue a guaranteed TaskHasLineageChildrenError; resolution failure remains fail-soft to the
+    legacy `archived` id.
     */
-    const archiveLineageArchivedLanes: ReadonlySet<string> | undefined = undefined;
+    const archiveLineageArchivedLanes = await resolveProjectColumnsForRoles(store, ["archived"])
+      .catch(() => undefined);
+    const patchnodeCompleteColumns = await resolveProjectColumnsForRoles(store, ["complete"])
+      .catch(() => undefined);
+    // Resolve configuration before the transaction; only its durable row verdict is authoritative.
+    const livenessWipLanes = liveExecutionGuard === "refuse" ? await resolveArchiveLivenessWipLanes(store, id) : undefined;
     const archiveRun = async (context?: { candidateIds: string[]; promptByChildId: ReadonlyMap<string, string>; locksHeld: boolean; attempt: number }) => {
       const preparedWorkspace = cleanup ? await prepareArchivedWorkspaceWorktrees(store, task) : undefined;
       try {
@@ -452,6 +521,7 @@ export async function archiveTaskBackendImpl(store: TaskStore, id: string, optio
           removeLineageReferences: removeLineageRefs,
           now: archivedAt,
           archivedColumns: archiveLineageArchivedLanes,
+          ...(livenessWipLanes ? {livenessWipLanes} : {}),
           ...(context ? {
             revalidateAgainst: context.candidateIds,
             promptByChildId: context.promptByChildId,
@@ -463,6 +533,13 @@ export async function archiveTaskBackendImpl(store: TaskStore, id: string, optio
             if (linkedFeature) {
               await recordGeneratedFixOperatorStop(tx, linkedFeature, "task-archive");
               await unlinkMissionFeatureFromTaskId(tx, linkedFeature.id);
+            }
+            /*
+            FNXC:PatchnodeLedger 2026-08-28-12:16:
+            This transactional capture covers deliveries that predate live Patchnode writers. Archive is the last boundary where such a task is still identifiable by its completion lane, so a ledger failure defers the archive rather than destroying the remaining evidence.
+            */
+            if (patchnodeCompleteColumns) {
+              await capturePatchnodeCompletionInTransaction(tx, projectPartition(layer.projectId), task, patchnodeCompleteColumns);
             }
           },
         });
@@ -497,6 +574,7 @@ export async function archiveTaskBackendImpl(store: TaskStore, id: string, optio
     const preparedWorkspace = archiveExecution.preparedWorkspace;
     if (!result.archived) {
       if (preparedWorkspace) await releasePreparedWorkspaceArchiveDisposal(preparedWorkspace);
+      if ("liveVerdict" in result) throw new TaskIsLiveError(id, result.liveVerdict.reasons);
       throw new TaskHasLineageChildrenError(id, result.liveChildIds);
     }
 
@@ -510,12 +588,19 @@ export async function archiveTaskBackendImpl(store: TaskStore, id: string, optio
       successful archives still await disposal before publishing the move event.
       */
       const workspace = await disposeArchivedWorkspaceWorktrees(store, task, preparedWorkspace);
-      if (!workspace.singularDeduplicated) await disposeArchivedWorktree(store, task);
-      await store.cleanupBranchForTask(task);
-      const { rm } = await import("node:fs/promises");
-      await rm(dir, { recursive: true, force: true });
-      if (store.isWatching) {
-        store.taskCache.delete(id);
+      const singular = workspace.singularDeduplicated ? {refusedLive: false} : await disposeArchivedWorktree(store, task);
+      /*
+      FNXC:WorkflowLifecycle 2026-08-15-06:35:
+      A disposer live-refusal preserves data rather than merely reporting a failed worktree action.
+      Branch cleanup and task-directory removal are the same destructive operation and must stop together.
+      */
+      if (workspace.refusedLive || singular.refusedLive) {
+        storeLog.warn("archive-cleanup-suppressed-live-task", {taskId: id, refusedBy: workspace.refusedLive ? "workspace" : "singular"});
+      } else {
+        await store.cleanupBranchForTask(task);
+        const { rm } = await import("node:fs/promises");
+        await rm(dir, { recursive: true, force: true });
+        if (store.isWatching) store.taskCache.delete(id);
       }
     }
 
@@ -536,7 +621,8 @@ export async function archiveTaskBackendImpl(store: TaskStore, id: string, optio
     lane-less left that leak reachable through this path even after the listener itself was fixed.
     */
     const movedLanes = toTaskMoveLanes(await resolveWorkflowIrForTask(store, task.id).catch(() => undefined));
-    store.laneCache.set(task.id, movedLanes);
+    /* FNXC:WorkflowEvents 2026-08-22-00:13: an unresolved payload is unknown; retain a warm real cache answer until its TTL expires. */
+      if (movedLanes) store.laneCache.set(task.id, movedLanes);
     store.emit("task:moved", { task, from: fromColumn, to: "archived" as Column, source: "engine", lanes: movedLanes });
     store.laneCache.invalidate(task.id);
 
@@ -561,20 +647,24 @@ export async function archiveTaskBackendImpl(store: TaskStore, id: string, optio
  * (active + archived) by `createdAt ASC`, which is correct for the merged
  * consumers but wrong for the Archived column (must be newest-first) and
  * unbounded. This reads ONLY archive cold storage via a bounded LIMIT/OFFSET
- * page ordered `archivedAt DESC` — do not re-sort by createdAt and do not use
- * as a substitute for the merged path. Backend mode reads `archive.archived_tasks`
- * via async Drizzle; the sqlite path mirrors upstream's `archiveDb.listPage()`.
+ * page ordered by the requested mode — do not re-sort by createdAt and do not use as a
+ * substitute for the merged path. Backend mode reads `archive.archived_tasks` via async Drizzle.
  */
 export async function listArchivedTasksImpl(store: TaskStore, options?: {
   limit?: number;
   offset?: number;
   slim?: boolean;
+  /** Canonical public option name for Archive ordering. */
+  sort?: TaskColumnSortMode;
+  /** Compatibility alias for callers that used the internal mode name. */
+  sortMode?: TaskColumnSortMode;
 }): Promise<{ tasks: Task[]; total: number; hasMore: boolean }> {
     const rawLimit = options?.limit ?? 100;
     const limit = Math.min(500, Math.max(1, Math.trunc(rawLimit) || 100));
     const rawOffset = options?.offset ?? 0;
     const offset = Math.max(0, Math.trunc(rawOffset) || 0);
     const slim = options?.slim ?? true;
+    const sortMode = options?.sort ?? options?.sortMode ?? "completion-date-desc";
 
         const layer = store.asyncLayer!;
     // FNXC:MultiProjectIsolation 2026-07-12 (PR #2007 review): the archived
@@ -582,7 +672,7 @@ export async function listArchivedTasksImpl(store: TaskStore, options?: {
     // cold-storage table would otherwise surface every project's archived
     // tasks in every project's dashboard.
     const total = await getArchivedRowCount(layer.db, layer.projectId);
-    const entries = await listArchivedTaskEntriesPage(layer.db, limit, offset, layer.projectId);
+    const entries = await listArchivedTaskEntriesPage(layer.db, limit, offset, layer.projectId, sortMode);
     const tasks = entries.map((entry) => store.archiveEntryToTask(entry, slim));
     return { tasks, total, hasMore: offset + tasks.length < total };
 }
@@ -737,11 +827,16 @@ export async function restoreFromArchiveImpl(store: TaskStore, entry: import("..
       mergerCredentialInstanceId: entry.mergerCredentialInstanceId,
       mergerModelId: entry.mergerModelId,
       mergerThinkingLevel: entry.mergerThinkingLevel,
-      breakIntoSubtasks: entry.breakIntoSubtasks,
       noCommitsExpected: entry.noCommitsExpected,
       modifiedFiles: entry.modifiedFiles,
       declaredSymbols: entry.declaredSymbols,
-      // Intentionally NOT restoring: worktree, status, blockedBy, paused, executionStartBranch, baseCommitSha, error
+      /*
+      FNXC:ArchiveRestore 2026-08-15-05:39:
+      Cold archive entries intentionally omit per-repository worktree and landing state. Reconstructing
+      either `workspaceWorktrees` or `branch` would revive disposed paths and let the workspace
+      partial-land reconciler mistake an unarchived card for a recoverable landing.
+      */
+      // Intentionally NOT restoring: worktree, workspaceWorktrees, branch, status, blockedBy, paused, executionStartBranch, baseCommitSha, error
     };
 
     // Write task.json
@@ -754,7 +849,7 @@ export async function restoreFromArchiveImpl(store: TaskStore, entry: import("..
       storeLog.log(`[file-scope-sanitize] restore ${entry.id}: dropped=[${sanitizedPrompt.dropped.join(",")}]`);
     }
     await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, "PROMPT.md"), sanitizedPrompt.sanitized);
+    await writePromptFileAtomic(join(dir, "PROMPT.md"), sanitizedPrompt.sanitized);
 
     // Create empty attachments directory if attachments existed
     if (entry.attachments && entry.attachments.length > 0) {

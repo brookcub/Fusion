@@ -271,7 +271,25 @@ const STORE_METHOD_CLASSIFICATION: Record<string, Omit<SurfaceClassification, "m
   updatePrInfo: { kind: "writer", reason: "persists or mutates TaskStore state" },
   updatePrInfoByNumber: { kind: "writer", reason: "persists or mutates TaskStore state" },
   updateSettings: { kind: "writer", reason: "persists or mutates TaskStore state" },
+  /*
+  FNXC:DurableWriteInventory 2026-08-23-00:40:
+  Public TaskStore write surfaces added since this inventory was last regenerated. Each persists or
+  mutates task state, so each is a durable writer:
+    - dismissAiMergeReviewFinding / mutateTaskRepositoryScope / resetTaskPublication /
+      normalizeWorkspaceTaskWorktreeMetadata -> updateTask(Atomic) mutations
+    - logEntryOnce -> appends a deduplicated task log entry
+    - seedWorkspaceCodeReviewContinuationIfIdle -> inserts a workflow continuation row
+  */
+  dismissAiMergeReviewFinding: { kind: "writer", reason: "persists or mutates TaskStore state" },
+  logEntryOnce: { kind: "writer", reason: "persists or mutates TaskStore state" },
+  mutateTaskRepositoryScope: { kind: "writer", reason: "persists or mutates TaskStore state" },
+  normalizeWorkspaceTaskWorktreeMetadata: { kind: "writer", reason: "persists or mutates TaskStore state" },
+  resetTaskPublication: { kind: "writer", reason: "persists or mutates TaskStore state" },
+  seedWorkspaceCodeReviewContinuationIfIdle: { kind: "writer", reason: "persists or mutates TaskStore state" },
   updateStep: { kind: "writer", reason: "persists or mutates TaskStore state" },
+  updateTaskRepositoryScope: { kind: "writer", reason: "persists or mutates TaskStore state" },
+  publishWorkspaceCodeReviewEvidence: { kind: "writer", reason: "persists or mutates TaskStore state" },
+  updateWorkspaceReviewState: { kind: "writer", reason: "persists or mutates TaskStore state" },
   updateTaskAtomic: { kind: "writer", reason: "persists or mutates TaskStore state" },
   updateTaskComment: { kind: "writer", reason: "persists or mutates TaskStore state" },
   updateTaskCustomFields: { kind: "writer", reason: "persists or mutates TaskStore state" },
@@ -281,6 +299,8 @@ const STORE_METHOD_CLASSIFICATION: Record<string, Omit<SurfaceClassification, "m
   updateWorkflowPromptOverrides: { kind: "writer", reason: "persists or mutates TaskStore state" },
   updateWorkflowSettingValues: { kind: "writer", reason: "persists or mutates TaskStore state" },
   updateWorkflowStep: { kind: "writer", reason: "persists or mutates TaskStore state" },
+  updateWorkflowStepResultsFenced: { kind: "writer", reason: "atomically persists workflow-step results behind their durable fence" },
+  updateWorkflowStepResultsWithLogFenced: { kind: "writer", reason: "atomically persists workflow-step results and one task-log entry behind the same durable fence" },
   upsertMergeRequestRecord: { kind: "writer", reason: "persists or mutates TaskStore state" },
   upsertPrInfoByNumber: { kind: "writer", reason: "persists or mutates TaskStore state" },
   upsertTask: { kind: "writer", reason: "persists or mutates TaskStore state" },
@@ -292,6 +312,18 @@ const STORE_METHOD_CLASSIFICATION: Record<string, Omit<SurfaceClassification, "m
   writeConfig: { kind: "writer", reason: "persists or mutates TaskStore state" },
   writeTaskJsonFile: { kind: "writer", reason: "persists or mutates TaskStore state" },
   writeTaskWorkflowSelection: { kind: "writer", reason: "persists or mutates TaskStore state" },
+  /*
+  FNXC:MergeReliability 2026-08-29-01:10:
+  FN-251's inventory regeneration found six previously unclassified TaskStore methods. Patchnode
+  completion, revert, reconciliation, and feed reads can mutate the durable ledger; remediation
+  appends mutate task steps. Project identity is a synchronous scoped read and stays non-writer.
+  */
+  appendRemediationSteps: { kind: "writer", reason: "persists task remediation steps" },
+  getProjectId: { kind: "non-writer", reason: "returns the bound project identity without persistence" },
+  listPatchnodeEntries: { kind: "writer", reason: "may reconcile and persist the patchnode ledger before reading" },
+  reconcilePatchnodeLedger: { kind: "writer", reason: "reconciles durable patchnode ledger entries" },
+  recordPatchnodeCompletion: { kind: "writer", reason: "persists a patchnode completion ledger entry" },
+  recordPatchnodeRevert: { kind: "writer", reason: "persists patchnode revert and pairing state" },
   appendAgentLog: { kind: "writer", reason: "persists task-scoped agent timeline state" },
   emit: { kind: "writer", reason: "announces task lifecycle events to durable subscribers" },
   logEntry: { kind: "writer", reason: "persists task-scoped log state and refreshes updatedAt" },
@@ -300,6 +332,26 @@ const STORE_METHOD_CLASSIFICATION: Record<string, Omit<SurfaceClassification, "m
   recordRunAuditEvent: { kind: "writer", reason: "persists task-associated run audit state" },
   updateTask: { kind: "writer", reason: "persists task row mutations" },
   upsertTaskCommitAssociation: { kind: "writer", reason: "persists task commit association" },
+  /*
+  FNXC:MergeReliability 2026-08-16-05:28:
+  FN-9059 workspace coordination surface. Lease acquire/renew/release/reclaim/reconcile and
+  fence-ref recording mutate `workspaceCoordinationLeases`; land-intent record/resolve mutate the
+  write-ahead intent rows; mergeWorkspaceWorktreeEntry persists workspace worktree entries; and
+  withValidWorkspaceLease runs caller mutations transactionally under a validated lease fence.
+  An orphaned merge body reaching any of these would mutate coordination state it no longer owns.
+  */
+  acquireWorkspaceLease: { kind: "writer", reason: "persists workspace coordination lease state" },
+  mergeWorkspaceWorktreeEntry: { kind: "writer", reason: "persists workspace worktree entry state" },
+  reclaimWorkspaceLease: { kind: "writer", reason: "persists workspace coordination lease state" },
+  reconcileExpiredWorkspaceLeases: { kind: "writer", reason: "persists workspace coordination lease state" },
+  recordWorkspaceLandIntent: { kind: "writer", reason: "persists workspace land write-ahead intent state" },
+  recordWorkspaceLeaseFenceRef: { kind: "writer", reason: "persists workspace coordination lease state" },
+  releaseStaleWorkspaceLeasesForNode: { kind: "writer", reason: "persists workspace coordination lease state" },
+  releaseWorkspaceLease: { kind: "writer", reason: "persists workspace coordination lease state" },
+  renewWorkspaceLease: { kind: "writer", reason: "persists workspace coordination lease state" },
+  resolveOrphanedWorkspaceLandIntent: { kind: "writer", reason: "persists workspace land write-ahead intent state" },
+  resolveWorkspaceLandIntent: { kind: "writer", reason: "persists workspace land write-ahead intent state" },
+  withValidWorkspaceLease: { kind: "writer", reason: "runs caller mutations transactionally under a validated workspace lease fence" },
 };
 const NON_WRITER_REASONS: Record<string, string> = Object.fromEntries([
   "__invokeHandoffMergeQueueFailureInjectorForTesting",
@@ -417,6 +469,7 @@ const NON_WRITER_REASONS: Record<string, string> = Object.fromEntries([
   "findOpenRevertTaskForSource",
   "findRecentTasksByContentFingerprint",
   "findRecentTasksBySourceParentTaskId",
+  "findTaskByProposalClaimId",
   "finishTaskVerificationRequest",
   "flushAgentLogBuffer",
   "fts5Available",
@@ -471,6 +524,8 @@ const NON_WRITER_REASONS: Record<string, string> = Object.fromEntries([
   "getMergeQueuedTaskIdsAsync",
   "getMergeRequestRecord",
   "getMergeRequestRecordAsync",
+  /* FNXC:MergeAuthority 2026-08-23-00:40: batched sibling of the read above; same read-only shape. */
+  "getMergeRequestRecordsAsync",
   "getMissionStore",
   "getMutationsForRun",
   "getOrCreateForProject",
@@ -537,6 +592,7 @@ const NON_WRITER_REASONS: Record<string, string> = Object.fromEntries([
   "insertTaskWithFtsRecovery",
   "insertWorkflowDefinitionSync",
   "inspectSymbolLockConflicts",
+  "inspectWorkspaceLeases",
   "invalidateConfigCacheAfterMigration",
   "invokeTaskCreatedHook",
   "isActiveWorkflowWorkItemState",
@@ -564,12 +620,15 @@ const NON_WRITER_REASONS: Record<string, string> = Object.fromEntries([
   "listDueWorkflowWorkItems",
   "listGoalCitations",
   "listLegacyAutoMergeStampCandidates",
+  "listPendingWorkspaceLandIntents",
   "listPrThreadStates",
   "listSpecDriftReports",
   "listSpecLocks",
   "listStrandedRefinements",
+  "listTaskRecommendations",
   "listTasks",
   "listTasksByBranchGroup",
+  "listTasksBySourceLineage",
   "listTasksForGithubTrackingReconcile",
   "listTasksForGitlabTrackingReconcile",
   "listTasksModifiedSince",
@@ -579,6 +638,8 @@ const NON_WRITER_REASONS: Record<string, string> = Object.fromEntries([
   "listWorkflowSettingValuesForProject",
   "listWorkflowSteps",
   "listWorkflowWorkItemsForTask",
+  /* FNXC:MergeAuthority 2026-08-23-00:40: batched sibling of the read above; same read-only shape. */
+  "listWorkflowWorkItemsForTasks",
   "listWorkflowWorkItemsForTaskSync",
   "loadWorkflowRunBranches",
   "loadWorkflowRunStepInstances",
@@ -789,6 +850,7 @@ const NON_WRITER_REASONS: Record<string, string> = Object.fromEntries([
   "upsertTaskDocument",
   "upsertTaskWithFtsRecovery",
   "upsertWorkflowWorkItem",
+  "validateWorkspaceLeaseFence",
   "walCheckpoint",
   "watch",
   "withConfigLock",

@@ -12,8 +12,13 @@ import { getTaskCompletionBlockerForStore } from "../execution/task-completion.j
 import { buildWorkflowFailureScopeGuard } from "./workflow-failure-scope-guard.js";
 import { resolveAuthoritativeExternalExecutionRoute } from "./resolve-authoritative-external-execution-route.js";
 import { TaskExecutorWorktreePureFacades } from "./task-executor-worktree-pure-facades.js";
+import { ChatSessionMemoryCapture, createStashChatMemoryCaptureSink, type ChatEventEmitter, type RuntimeProjectIdentity } from "./memory-capture.js";
 
 export abstract class TaskExecutorSessionFacades extends TaskExecutorWorktreePureFacades {
+  /** Active complete-chat memory capture service + its emitter/detach (RUFU-068). */
+  protected chatMemoryCapture: ChatSessionMemoryCapture | null = null;
+  protected chatMemoryCaptureEmitter: ChatEventEmitter | null = null;
+  protected chatMemoryCaptureDetach: (() => void) | null = null;
   protected addActiveWorktree(taskId: string, worktreePath: string): void { impl.addActiveWorktreeImpl(this.activeWorktrees, taskId, worktreePath); }
   protected getActiveWorktreePaths(taskId: string): ReturnType<typeof impl.getActiveWorktreePathsImpl> { return impl.getActiveWorktreePathsImpl(this.activeWorktrees, taskId); }
   protected sessionRegistryPath(taskId: string, worktreePath: string): ReturnType<typeof impl.sessionRegistryPathImpl> { return impl.sessionRegistryPathImpl(this.rootDir, taskId, worktreePath); }
@@ -52,7 +57,7 @@ export abstract class TaskExecutorSessionFacades extends TaskExecutorWorktreePur
   hasLiveSessionSurface(taskId: string): boolean {
     return impl.hasLiveSessionSurfaceImpl(bags.buildHasLiveSessionSurfaceDeps(this, (id) => activeSessionRegistry.pathsForTask(id)), taskId);
   }
-  clearPhantomExecutorBinding(taskId: string, options: { preserveWorktrees?: boolean } = {}): boolean {
+  clearPhantomExecutorBinding(taskId: string, options: { preserveWorktrees?: boolean; externallyBlocked?: boolean } = {}): boolean {
     return impl.clearPhantomExecutorBindingImpl(bags.buildClearPhantomExecutorBindingDeps(this), taskId, options);
   }
   async awaitAbortInFlightTaskWork(...args: FacadeRestArgs<typeof impl.awaitAbortInFlightTaskWorkImpl>): ReturnType<typeof impl.awaitAbortInFlightTaskWorkImpl> { return impl.awaitAbortInFlightTaskWorkImpl(bags.buildAwaitAbortInFlightTaskWorkDeps(this), ...args); }
@@ -72,9 +77,50 @@ export abstract class TaskExecutorSessionFacades extends TaskExecutorWorktreePur
   protected tokenUsageWithModelSnapshot(...args: Parameters<typeof impl.tokenUsageWithModelSnapshotImpl>): ReturnType<typeof impl.tokenUsageWithModelSnapshotImpl> { return impl.tokenUsageWithModelSnapshotImpl(...args); }
   protected async extractSessionTokenUsage(...args: Parameters<typeof impl.extractSessionTokenUsageImpl>): ReturnType<typeof impl.extractSessionTokenUsageImpl> { return impl.extractSessionTokenUsageImpl(...args); }
   protected signalTaskComplete(task: import("@fusion/core").Task): ReturnType<typeof impl.signalTaskCompleteImpl> { return impl.signalTaskCompleteImpl(bags.buildSignalTaskCompleteDeps(this), task); }
+  /*
+  FNXC:StashSessionCapture 2026-08-19-05:09:
+  (RUFU-122) Terminal-failure capture seam (RUFU-122 requirement 3): the executor
+  post-loop finally calls this for terminally failed runs. It fires ONLY the
+  memory capture (no post-task reflection, no onComplete — those belong to the
+  genuine completion seam), sharing the capturedMemoryTaskIds gate with
+  signalTaskComplete so a task is captured at most once across both seams.
+  Fire-and-forget: triggerTaskMemoryCapture never throws.
+  */
+  protected signalTaskTerminalFailed(task: import("@fusion/core").Task): ReturnType<typeof impl.triggerTaskMemoryCaptureImpl> { return impl.triggerTaskMemoryCaptureImpl(bags.buildSignalTaskTerminalFailedDeps(this), task, "failure"); }
   protected triggerPostTaskReflectionCapture(task: import("@fusion/core").Task): ReturnType<typeof impl.triggerPostTaskReflectionCaptureImpl> { return impl.triggerPostTaskReflectionCaptureImpl(bags.buildTriggerPostTaskReflectionCaptureDeps(this), task); }
+  /** Live complete-chat memory capture: subscribes this executor to the project ChatStore so
+   * every conversation's messages are captured (best-effort) into the Stash memory backend.
+   * Returns a detach fn. Idempotent per executor. Never throws — capture failures are swallowed.
+   *
+   * FNXC:RUFU121AttachIdentity 2026-08-18-19:53:
+   * RUFU-121 Step 4: the optional projectIdentity is threaded to both the capture service
+   * (per-session identity cache + runtime fallback) and the stash sink factory (fallback for
+   * identity-less sink params), so captured events are stamped to the per-project Stash
+   * session folder. Omitting it preserves the legacy identity-less attach path.
+   */
+  attachChatMemoryCapture(chatStore: ChatEventEmitter, projectIdentity?: RuntimeProjectIdentity): () => void {
+    if (this.chatMemoryCapture && this.chatMemoryCaptureDetach) return this.chatMemoryCaptureDetach;
+    const capture = new ChatSessionMemoryCapture({
+      sink: createStashChatMemoryCaptureSink(this.store, projectIdentity),
+      rootDir: this.rootDir,
+      projectIdentity,
+    });
+    this.chatMemoryCapture = capture;
+    this.chatMemoryCaptureEmitter = chatStore;
+    this.chatMemoryCaptureDetach = capture.attach(chatStore);
+    return this.chatMemoryCaptureDetach;
+  }
+  /** Detach any active chat memory capture subscription (idempotent). */
+  detachChatMemoryCapture(): void {
+    if (this.chatMemoryCapture && this.chatMemoryCaptureEmitter) {
+      this.chatMemoryCapture.detach(this.chatMemoryCaptureEmitter);
+    }
+    this.chatMemoryCapture = null;
+    this.chatMemoryCaptureEmitter = null;
+    this.chatMemoryCaptureDetach = null;
+  }
   protected scheduleCompletedTaskWatchdog(taskId: string, trigger: string): void { impl.scheduleCompletedTaskWatchdogImpl(bags.buildScheduleCompletedTaskWatchdogDeps(this, constants.COMPLETED_TASK_WATCHDOG_MS), taskId, trigger); }
-  protected async clearTerminalStepFailuresForRetry(taskId: string): ReturnType<typeof impl.clearTerminalStepFailuresForRetryImpl> { return impl.clearTerminalStepFailuresForRetryImpl(bags.buildStoreRunContextDeps(this), taskId); }
+  protected async clearTerminalStepFailuresForRetry(taskId: string, mode: "archive" | "clear"): ReturnType<typeof impl.clearTerminalStepFailuresForRetryImpl> { return impl.clearTerminalStepFailuresForRetryImpl(bags.buildStoreRunContextDeps(this), taskId, mode); }
   protected async performWorkflowRerunBounce(...args: FacadeRestArgs<typeof impl.performWorkflowRerunBounceImpl>): ReturnType<typeof impl.performWorkflowRerunBounceImpl> { return impl.performWorkflowRerunBounceImpl(bags.buildPerformWorkflowRerunBounceDeps(this), ...args); }
   protected scheduleWorkflowRerun(...args: FacadeRestArgs<typeof impl.scheduleWorkflowRerunImpl>): void { impl.scheduleWorkflowRerunImpl(bags.buildScheduleWorkflowRerunDeps(this, constants.WORKFLOW_RERUN_WATCHDOG_MS), ...args); }
   protected async parkCompletedBlockedTask(...args: FacadeRestArgs<typeof impl.parkCompletedBlockedTaskImpl>): ReturnType<typeof impl.parkCompletedBlockedTaskImpl> { return impl.parkCompletedBlockedTaskImpl(bags.buildCompletionFinalizationFacadeDeps(this), ...args); }
@@ -86,9 +132,12 @@ export abstract class TaskExecutorSessionFacades extends TaskExecutorWorktreePur
   protected async executeReviewHandoff(...args: FacadeRestArgs<typeof impl.executeReviewHandoffImpl>): ReturnType<typeof impl.executeReviewHandoffImpl> { return impl.executeReviewHandoffImpl(bags.buildExecuteReviewHandoffDeps(this), ...args); }
   async recoverCompletedTask(task: import("@fusion/core").Task): Promise<boolean> { return impl.recoverCompletedTaskImpl(bags.buildRecoverCompletedTaskDeps(this), task); }
   protected async parkPlanReviewReplanCapExhausted(...args: FacadeRestArgs<typeof impl.parkPlanReviewReplanCapExhaustedImpl>): ReturnType<typeof impl.parkPlanReviewReplanCapExhaustedImpl> { return impl.parkPlanReviewReplanCapExhaustedImpl(bags.buildStoreRunContextDeps(this), ...args); }
+  protected async appendReviewRemediationSteps(...args: FacadeRestArgs<typeof impl.appendReviewRemediationStepsImpl>): ReturnType<typeof impl.appendReviewRemediationStepsImpl> { return impl.appendReviewRemediationStepsImpl(bags.buildAppendReviewRemediationStepsDeps(this), ...args); }
   protected async requestPreMergeOptionalStepFix(...args: FacadeRestArgs<typeof impl.requestPreMergeOptionalStepFixImpl>): ReturnType<typeof impl.requestPreMergeOptionalStepFixImpl> { return impl.requestPreMergeOptionalStepFixImpl(bags.buildRequestPreMergeOptionalStepFixDeps(this), ...args); }
   protected async recoverMissingRequiredArtifacts(...args: FacadeRestArgs<typeof impl.recoverMissingRequiredArtifactsImpl>): ReturnType<typeof impl.recoverMissingRequiredArtifactsImpl> { return impl.recoverMissingRequiredArtifactsImpl(bags.buildRecoverMissingRequiredArtifactsDeps(this), ...args); }
   async recoverFailedPreMergeWorkflowStep(task: import("@fusion/core").Task): Promise<boolean> { return impl.recoverFailedPreMergeWorkflowStepImpl(bags.buildRecoverFailedPreMergeWorkflowStepDeps(this), task); }
+  /* FNXC:LifecycleContainment 2026-08-30-13:36: claim-scoped entry point so self-healing's admission claim fences the recovery it authorized. */
+  async recoverFailedPreMergeWorkflowStepDetailed(...args: FacadeRestArgs<typeof impl.recoverFailedPreMergeWorkflowStepDetailedImpl>): ReturnType<typeof impl.recoverFailedPreMergeWorkflowStepDetailedImpl> { return impl.recoverFailedPreMergeWorkflowStepDetailedImpl(bags.buildRecoverFailedPreMergeWorkflowStepDeps(this), ...args); }
   protected async shouldDeferForHeartbeat(agentId: string): ReturnType<typeof impl.shouldDeferForHeartbeatImpl> { return impl.shouldDeferForHeartbeatImpl({ agentStore: this.options.agentStore }, agentId); }
   protected async getAuthoritativeAssignedAgent(...args: FacadeRestArgs<typeof impl.getAuthoritativeAssignedAgentImpl>): ReturnType<typeof impl.getAuthoritativeAssignedAgentImpl> { return impl.getAuthoritativeAssignedAgentImpl(bags.buildGetAuthoritativeAssignedAgentDeps(this), ...args); }
   protected async getAssignedAgentRuntimeConfig(...args: FacadeRestArgs<typeof impl.getAssignedAgentRuntimeConfigImpl>): ReturnType<typeof impl.getAssignedAgentRuntimeConfigImpl> { return impl.getAssignedAgentRuntimeConfigImpl(bags.buildGetAssignedAgentRuntimeConfigDeps(this), ...args); }
@@ -114,6 +163,7 @@ export abstract class TaskExecutorSessionFacades extends TaskExecutorWorktreePur
   protected async evaluateTaskDoneScopeLeak(...args: FacadeRestArgs<typeof impl.evaluateTaskDoneScopeLeakImpl>): ReturnType<typeof impl.evaluateTaskDoneScopeLeakImpl> { return impl.evaluateTaskDoneScopeLeakImpl(bags.buildEvaluateTaskDoneScopeLeakDeps(this), ...args); }
   protected async handleImplicitTaskDoneRefusal(...args: FacadeRestArgs<typeof impl.handleImplicitTaskDoneRefusalImpl>): ReturnType<typeof impl.handleImplicitTaskDoneRefusalImpl> { return impl.handleImplicitTaskDoneRefusalImpl(bags.buildHandleImplicitTaskDoneRefusalDeps(this), ...args); }
   protected createTaskDoneTool(...args: FacadeRestArgs<typeof impl.createTaskDoneToolImpl>): ReturnType<typeof impl.createTaskDoneToolImpl> { return impl.createTaskDoneToolImpl(bags.buildCreateTaskDoneToolDeps(this), ...args); }
+  protected createReviewDisputeTool(...args: FacadeRestArgs<typeof impl.createReviewDisputeToolImpl>): ReturnType<typeof impl.createReviewDisputeToolImpl> { return impl.createReviewDisputeToolImpl({ store: this.store, getRunContextFor: this.getRunContextFor.bind(this) }, ...args); }
   /*
   FNXC:CodeOrganization 2026-08-09-22:15:
   Instance method mirrors main's private helper so tests/callers that touch the executor instance keep working.

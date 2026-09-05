@@ -35,6 +35,9 @@ import {
   createFusionAuthStorage,
   createFusionModelRegistry,
   refreshFusionModelRegistry,
+  setLocalDashboardPort,
+  startCloudLinkPresence,
+  stopCloudLinkPresence,
 } from "@fusion/engine";
 import { setHostTaskStore, clearHostTaskStores } from "../extension.js";
 import { resolveServeDaemonToken } from "./serve-daemon-token.js";
@@ -56,6 +59,7 @@ import { promptForPort } from "./port-prompt.js";
 import { createReadOnlyProviderSettingsView } from "./provider-settings.js";
 import { wrapAuthStorageWithApiKeyProviders } from "./provider-auth.js";
 import { getPackageManagerAgentDir } from "./auth-paths.js";
+import { createProjectScopedPackageManagerFactory } from "./skills-package-manager.js";
 import { resolveProject } from "../project-context.js";
 import { startMigrationHoldingServer } from "./migration-holding-server.js";
 import {
@@ -80,7 +84,7 @@ import {
 import { resolveSelfExtension } from "./self-extension.js";
 import { registerCustomProviders, reregisterCustomProviders } from "./custom-provider-registry.js";
 import { handleOpencodeGoApiKeySaved, syncStartupModels } from "./startup-model-sync.js";
-import { ensureBundledDependencyGraphPluginInstalled, ensureBundledGrokRuntimePluginInstalled, ensureBundledPluginInstalled, isBundledPluginId } from "../plugins/bundled-plugin-install.js";
+import { ensureBundledCursorRuntimePluginInstalled, ensureBundledDependencyGraphPluginInstalled, ensureBundledGrokRuntimePluginInstalled, ensureBundledPluginInstalled, isBundledPluginId } from "../plugins/bundled-plugin-install.js";
 import { ensureCwdProjectRegistered } from "./ensure-project-registered.js";
 import { phaseTime } from "../startup-phase.js";
 
@@ -425,8 +429,8 @@ export async function runServe(
   const engineManager: ProjectEngineManager = startupEngineManager = new ProjectEngineManager(sharedCentralCore, {
     cliPackageVersion,
     getMergeStrategy,
-    processPullRequestMerge: (s, wd, taskId, pool, signal) =>
-      processPullRequestMergeTask(s, wd, taskId, githubClient, getTaskMergeBlocker, pool, signal),
+    processPullRequestMerge: (s, wd, taskId, signal) =>
+      processPullRequestMergeTask(s, wd, taskId, githubClient, getTaskMergeBlocker, signal),
     createGroupPr: createGroupPrCallback(githubClient),
     syncGroupPr: syncGroupPrCallback(githubClient),
     /*
@@ -655,6 +659,24 @@ export async function runServe(
     }
   } catch (err) {
     console.warn(`[plugins] Failed to auto-install bundled Grok CLI runtime plugin: ${err instanceof Error ? err.message : err}`);
+  }
+
+  /*
+   * FNXC:CursorCli 2026-08-16-04:05:
+   * FN-9093: `cursor-cli` is runtime-routed with a fail-fast missing-runtime error, but the provider card's
+   * Enable action only flips `useCursorCli` in settings — nothing registered fusion-plugin-cursor-runtime,
+   * so every Cursor selection failed with "install and enable the Cursor runtime plugin" even after enabling.
+   * Mirror the FN-7761 Grok eager bootstrap so the Cursor runtime is discoverable before any session lane starts.
+   */
+  try {
+    const installStatus = await ensureBundledCursorRuntimePluginInstalled(pluginStore, pluginLoader);
+    if (installStatus === "installed") {
+      console.log("[plugins] Installed bundled Cursor CLI runtime plugin");
+    } else if (installStatus === "missing-bundle") {
+      console.warn("[plugins] Bundled Cursor CLI runtime plugin was not found in this build");
+    }
+  } catch (err) {
+    console.warn(`[plugins] Failed to auto-install bundled Cursor CLI runtime plugin: ${err instanceof Error ? err.message : err}`);
   }
 
   // Lazy-install hook for bundled runtime plugins (Hermes/OpenClaw/Paperclip/Grok).
@@ -962,6 +984,7 @@ export async function runServe(
     ? createSkillsAdapter({
         // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dashboard's resolve() uses a looser onMissing signature than pi's DefaultPackageManager
         packageManager: packageManager as any,
+        getPackageManager: createProjectScopedPackageManagerFactory(getPackageManagerAgentDir()),
         getSettingsPath: (rootDir: string) => getProjectSettingsPath(rootDir),
         /*
          * FNXC:PluginSkills 2026-07-10-00:00:
@@ -1087,7 +1110,26 @@ export async function runServe(
   });
 
   const actualPort = (server.address() as AddressInfo).port;
+  // FNXC:RemoteAccess 2026-08-19-04:00: headless serve must publish its bound port too, or a remote
+  // tunnel started from it targets a hardcoded 4040. See local-dashboard-port.
+  setLocalDashboardPort(actualPort);
   logPhase(`startup phase time-to-listen: ${Date.now() - serveStartedAt}ms`);
+  /*
+   * FNXC:CloudLink 2026-08-22-00:40:
+   * After listen, a linked instance provisions a Cloudflare Quick Tunnel to this
+   * bound port and heartbeats the live URL (including rotations) to Cloud Link.
+   */
+  /*
+   * FNXC:CloudLink 2026-08-24-00:05:
+   * Do not publish an unauthenticated dashboard through a public Quick Tunnel.
+   */
+  if (daemonToken) {
+    void startCloudLinkPresence(actualPort, (message) => console.log(`[cloud-link] ${message}`)).catch((error) => {
+      console.warn(`[cloud-link] Presence failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  } else {
+    console.log("[cloud-link] Skipping public tunnel because dashboard auth is off.");
+  }
 
   /*
   FNXC:CustomProviders 2026-06-30-00:00:
@@ -1264,6 +1306,12 @@ export async function runServe(
     }
 
     try {
+      await stopCloudLinkPresence();
+    } catch {
+      // best-effort
+    }
+
+    try {
       server.close();
     } catch {
       // best-effort
@@ -1311,6 +1359,7 @@ export async function runServe(
   });
   } catch (error) {
     /* FNXC:PostgresServeLifecycle 2026-07-14-19:10: Any startup failure after the shared PostgreSQL boot must unwind partially-started engines and CentralCore before releasing the sole backend owner exactly once. */
+    await stopCloudLinkPresence().catch(() => undefined);
     await startupEngineManager?.stopAll().catch(() => undefined);
     await sharedCentralCore?.close().catch(() => undefined);
     await shutdownCentralBackendOnce().catch(() => undefined);

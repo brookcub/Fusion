@@ -284,6 +284,28 @@ describe("API Error Handling", () => {
 
       await expect(fetchTasks()).rejects.toThrow("API returned HTML instead of JSON");
     });
+
+    it("maps Traefik 503 text/plain to an operator-facing unavailable message", async () => {
+      globalThis.fetch = vi.fn().mockReturnValue(
+        Promise.resolve({
+          ok: false,
+          status: 503,
+          statusText: "",
+          headers: {
+            get: (name: string) =>
+              name.toLowerCase() === "content-type" ? "text/plain; charset=utf-8" : null,
+          },
+          json: () => Promise.reject(new Error("JSON parse error")),
+          text: () => Promise.resolve("no available server"),
+        } as unknown as Response),
+      );
+
+      await expect(fetchTasks()).rejects.toMatchObject({
+        name: "ApiRequestError",
+        message: "The server is temporarily unavailable. Please try again.",
+        status: 503,
+      });
+    });
   });
 
   describe("Non-JSON success responses", () => {
@@ -500,7 +522,7 @@ describe("summarizeTitle", () => {
     });
     global.fetch = mockFetch;
 
-    const result = await summarizeTitle("a".repeat(201));
+    const result = await summarizeTitle("a");
 
     expect(result).toBe("Generated Title");
     expect(mockFetch).toHaveBeenCalledWith(
@@ -510,7 +532,7 @@ describe("summarizeTitle", () => {
         // `summarizeTitle` calls `fetch()` directly, bypassing `api()`, so no attribution header.
         // See the note in test/apiRequestHeaders.ts — this is a MUTATION without attribution.
         headers: API_JSON_HEADERS_NO_ATTRIBUTION,
-        body: JSON.stringify({ description: "a".repeat(201), provider: undefined, modelId: undefined }),
+        body: JSON.stringify({ description: "a", provider: undefined, modelId: undefined }),
       })
     );
   });
@@ -873,13 +895,15 @@ describe("fetchActivityFeed", () => {
       since: "2026-01-01T00:00:00.000Z",
       projectId: "proj_abc123",
       type: "task:created",
+      taskId: "FN-066",
     });
 
     const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(call[0]).toContain("limit=50");
     expect(call[0]).toContain("since=2026-01-01T00%3A00%3A00.000Z");
     expect(call[0]).toContain("projectId=proj_abc123");
-    expect(call[0]).toContain("type=task%3Acreated");
+    expect(call[0]).toContain("types=task%3Acreated");
+    expect(call[0]).toContain("taskId=FN-066");
   });
 });
 
@@ -1105,7 +1129,6 @@ describe("ExecutorStats type", () => {
     const stats: ExecutorStats = {
       runningTaskCount: 3,
       blockedTaskCount: 2,
-      stuckTaskCount: 1,
       queuedTaskCount: 10,
       inReviewCount: 4,
       executorState: "running",
@@ -1115,7 +1138,6 @@ describe("ExecutorStats type", () => {
 
     expect(stats.runningTaskCount).toBe(3);
     expect(stats.blockedTaskCount).toBe(2);
-    expect(stats.stuckTaskCount).toBe(1);
     expect(stats.queuedTaskCount).toBe(10);
     expect(stats.inReviewCount).toBe(4);
     expect(stats.executorState).toBe("running");
@@ -1127,7 +1149,6 @@ describe("ExecutorStats type", () => {
     const idleStats: ExecutorStats = {
       runningTaskCount: 0,
       blockedTaskCount: 0,
-      stuckTaskCount: 0,
       queuedTaskCount: 5,
       inReviewCount: 0,
       executorState: "idle",
@@ -1137,7 +1158,6 @@ describe("ExecutorStats type", () => {
     const runningStats: ExecutorStats = {
       runningTaskCount: 2,
       blockedTaskCount: 1,
-      stuckTaskCount: 0,
       queuedTaskCount: 3,
       inReviewCount: 1,
       executorState: "running",
@@ -1147,7 +1167,6 @@ describe("ExecutorStats type", () => {
     const pausedStats: ExecutorStats = {
       runningTaskCount: 1,
       blockedTaskCount: 0,
-      stuckTaskCount: 0,
       queuedTaskCount: 8,
       inReviewCount: 2,
       executorState: "paused",
@@ -1163,7 +1182,6 @@ describe("ExecutorStats type", () => {
     const stats: ExecutorStats = {
       runningTaskCount: 0,
       blockedTaskCount: 0,
-      stuckTaskCount: 0,
       queuedTaskCount: 0,
       inReviewCount: 0,
       executorState: "idle",

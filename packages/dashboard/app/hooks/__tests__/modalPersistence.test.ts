@@ -11,7 +11,6 @@ import {
 import {
   STORED_PLANNING_KEY,
   STORED_PLANNING_ACTIVE_SESSION_KEY,
-  STORED_SUBTASK_KEY,
   STORED_MISSION_KEY,
   savePlanningDescription,
   getPlanningDescription,
@@ -19,9 +18,6 @@ import {
   savePlanningActiveSession,
   getPlanningActiveSession,
   clearPlanningActiveSession,
-  saveSubtaskDescription,
-  getSubtaskDescription,
-  clearSubtaskDescription,
   saveMissionGoal,
   getMissionGoal,
   clearMissionGoal,
@@ -71,10 +67,6 @@ describe("modalPersistence", () => {
       expect(STORED_PLANNING_ACTIVE_SESSION_KEY).toBe("kb-planning-active-session");
     });
 
-    it("exports subtask key", () => {
-      expect(STORED_SUBTASK_KEY).toBe("kb-subtask-last-description");
-    });
-
     it("exports mission key", () => {
       expect(STORED_MISSION_KEY).toBe("kb-mission-last-goal");
     });
@@ -120,6 +112,19 @@ describe("modalPersistence", () => {
       savePlanningDescription("First");
       savePlanningDescription("Second");
       expect(getPlanningDescription()).toBe("Second");
+    });
+  });
+
+  describe("bounded free-text persistence", () => {
+    it.each([
+      ["planning", STORED_PLANNING_KEY, savePlanningDescription],
+      ["mission", STORED_MISSION_KEY, saveMissionGoal],
+    ] as const)("does not persist an over-cap %s draft", (_name, key, save) => {
+      const projectId = "project-a";
+      localStorage.setItem(scopedKey(key, projectId), "prior value");
+
+      expect(() => save("x".repeat(64_001), projectId)).not.toThrow();
+      expect(localStorage.getItem(scopedKey(key, projectId))).toBeNull();
     });
   });
 
@@ -182,7 +187,7 @@ describe("modalPersistence", () => {
 
       expect(() => save(value, "project-a")).not.toThrow();
 
-      expect(setItem).toHaveBeenCalledTimes(2);
+      expect(setItem).toHaveBeenCalledTimes(3);
       expect(removeItem).toHaveBeenCalledTimes(1);
       expect(removeItem).toHaveBeenCalledWith(planningKey);
       expect(localStorage.getItem("unrelated-key")).toBe("preserved");
@@ -198,7 +203,7 @@ describe("modalPersistence", () => {
       });
 
       expect(() => savePlanningDescription("new description", "project-a")).not.toThrow();
-      expect(setItem).toHaveBeenCalledTimes(2);
+      expect(setItem).toHaveBeenCalledTimes(3);
       expect(removeItem).toHaveBeenCalledWith(planningKey);
 
       vi.restoreAllMocks();
@@ -242,50 +247,13 @@ describe("modalPersistence", () => {
 
       expect(removeItem).toHaveBeenCalledWith(descriptionKey);
       expect(removeItem).toHaveBeenCalledWith(activeSessionKey);
-      expect(setItem.mock.calls.filter(([key]) => key === descriptionKey)).toHaveLength(2);
-      // The durable draft hand-off and the selected-session effect each retry their same active key once.
-      expect(setItem.mock.calls.filter(([key]) => key === activeSessionKey)).toHaveLength(4);
-      expect(setItem).toHaveBeenCalledTimes(6);
-      expect(localStorage.getItem("kb:project-2:kb-planning-last-description")).toBe("other project");
+      expect(setItem.mock.calls.filter(([key]) => key === descriptionKey)).toHaveLength(3);
+      // The shared seam makes a final write after its bounded reclaim attempt for each persistence call.
+      expect(setItem.mock.calls.filter(([key]) => key === activeSessionKey)).toHaveLength(6);
+      expect(setItem).toHaveBeenCalledTimes(9);
+      expect(localStorage.getItem("kb:project-2:kb-planning-last-description")).toBeNull();
       expect(localStorage.getItem("unrelated-key")).toBe("preserved");
       expect(screen.queryByText("Quota exceeded")).toBeNull();
-    });
-  });
-
-  describe("Subtask persistence", () => {
-    it("saves and retrieves subtask description", () => {
-      saveSubtaskDescription("Implement login feature");
-      expect(getSubtaskDescription()).toBe("Implement login feature");
-    });
-
-    it("saves and retrieves subtask description per project", () => {
-      saveSubtaskDescription("Implement login feature", "proj-123");
-      expect(getSubtaskDescription("proj-123")).toBe("Implement login feature");
-      expect(localStorage.getItem(scopedKey(STORED_SUBTASK_KEY, "proj-123"))).toBe(
-        "Implement login feature",
-      );
-    });
-
-    it("returns empty string when nothing saved", () => {
-      expect(getSubtaskDescription()).toBe("");
-    });
-
-    it("clears correctly", () => {
-      saveSubtaskDescription("Test");
-      clearSubtaskDescription();
-      expect(getSubtaskDescription()).toBe("");
-    });
-
-    it("clears correctly per project", () => {
-      saveSubtaskDescription("Test", "proj-123");
-      clearSubtaskDescription("proj-123");
-      expect(getSubtaskDescription("proj-123")).toBe("");
-    });
-
-    it("overwrites previous value", () => {
-      saveSubtaskDescription("First");
-      saveSubtaskDescription("Second");
-      expect(getSubtaskDescription()).toBe("Second");
     });
   });
 
@@ -327,13 +295,6 @@ describe("modalPersistence", () => {
   });
 
   describe("Storage keys are independent", () => {
-    it("planning and subtask do not interfere", () => {
-      savePlanningDescription("planning desc");
-      saveSubtaskDescription("subtask desc");
-      expect(getPlanningDescription()).toBe("planning desc");
-      expect(getSubtaskDescription()).toBe("subtask desc");
-    });
-
     it("planning and mission do not interfere", () => {
       savePlanningDescription("planning desc");
       saveMissionGoal("mission goal");
@@ -341,22 +302,13 @@ describe("modalPersistence", () => {
       expect(getMissionGoal()).toBe("mission goal");
     });
 
-    it("subtask and mission do not interfere", () => {
-      saveSubtaskDescription("subtask desc");
-      saveMissionGoal("mission goal");
-      expect(getSubtaskDescription()).toBe("subtask desc");
-      expect(getMissionGoal()).toBe("mission goal");
-    });
-
     it("clearing one does not affect others", () => {
       savePlanningDescription("planning");
-      saveSubtaskDescription("subtask");
       saveMissionGoal("mission");
 
-      clearSubtaskDescription();
+      clearMissionGoal();
       expect(getPlanningDescription()).toBe("planning");
-      expect(getSubtaskDescription()).toBe("");
-      expect(getMissionGoal()).toBe("mission");
+      expect(getMissionGoal()).toBe("");
     });
 
     it("project-scoped values do not interfere with other projects", () => {

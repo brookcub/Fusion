@@ -62,6 +62,7 @@ export {
   clearPauseAbortStateForManualRetry as clearPauseAbortStateForManualRetryImpl,
 } from "./stale-pause-abort.js";
 export { blockOuterDispatchWhenDependenciesUnmet as blockOuterDispatchWhenDependenciesUnmetImpl } from "./dependency-dispatch-gate.js";
+export { blockOuterDispatchWhenFileScopeLeaseHeld as blockOuterDispatchWhenFileScopeLeaseHeldImpl } from "./file-scope-lease-dispatch-gate.js";
 export { finalizeMergeConfirmedWorkflowGraphTask as finalizeMergeConfirmedWorkflowGraphTaskImpl } from "./merge-confirmed-finalize.js";
 export { holdForSessionContention as holdForSessionContentionImpl } from "./session-contention-hold.js";
 export {
@@ -89,6 +90,7 @@ export {
 } from "./persist-token-usage.js";
 export { resetMergeStateIfNeeded as resetMergeStateIfNeededImpl } from "./reset-merge-state.js";
 export { recoverFailedPreMergeWorkflowStep as recoverFailedPreMergeWorkflowStepImpl } from "./recover-failed-pre-merge-step.js";
+export { recoverFailedPreMergeWorkflowStepDetailed as recoverFailedPreMergeWorkflowStepDetailedImpl } from "./recover-failed-pre-merge-step.js";
 export { reconcileStepsFromGitHistory as reconcileStepsFromGitHistoryImpl } from "./reconcile-steps-from-git-history.js";
 export { clearPhantomExecutorBinding as clearPhantomExecutorBindingImpl } from "./clear-phantom-executor-binding.js";
 export { cleanupMergeStateForReverification as cleanupMergeStateForReverificationImpl } from "./cleanup-merge-state.js";
@@ -104,6 +106,13 @@ export {
   signalTaskComplete as signalTaskCompleteImpl,
   triggerPostTaskReflectionCapture as triggerPostTaskReflectionCaptureImpl,
 } from "./signal-task-complete.js";
+/*
+FNXC:StashSessionCapture 2026-08-19-05:09:
+(RUFU-122) impl binding for the terminal-failure capture seam facade —
+triggerTaskMemoryCapture is shared verbatim with the completion seam so the
+at-most-once gate and anchor semantics can never diverge between them.
+*/
+export { triggerTaskMemoryCapture as triggerTaskMemoryCaptureImpl } from "./memory-capture.js";
 export { listWipLaneTasks as listWipLaneTasksImpl } from "./list-wip-lane-tasks.js";
 export { resolveSeamColumnAgent as resolveSeamColumnAgentImpl } from "./resolve-seam-column-agent.js";
 export { resumeOrphaned as resumeOrphanedImpl } from "./resume-orphaned.js";
@@ -136,10 +145,12 @@ export { resetStepsIfWorkLost as resetStepsIfWorkLostImpl } from "./reset-steps-
 export { routeRetryableRemediationGraphFailureToPreMergeFix as routeRetryableRemediationGraphFailureToPreMergeFixImpl } from "./route-retryable-remediation.js";
 export { buildForeachWorktreeDeps as buildForeachWorktreeDepsImpl } from "./build-foreach-worktree-deps.js";
 export { requestPreMergeOptionalStepFix as requestPreMergeOptionalStepFixImpl } from "./request-pre-merge-optional-step-fix.js";
+export { appendReviewRemediationSteps as appendReviewRemediationStepsImpl } from "./append-review-remediation-steps.js";
 export { createSpawnAgentTool as createSpawnAgentToolImpl } from "./create-spawn-agent-tool.js";
 export { createTaskUpdateTool as createTaskUpdateToolImpl } from "./create-task-update-tool.js";
 export { attemptExecutorVerificationFix as attemptExecutorVerificationFixImpl } from "./attempt-executor-verification-fix.js";
 export { createTaskDoneTool as createTaskDoneToolImpl } from "./create-task-done-tool.js";
+export { createReviewDisputeTool as createReviewDisputeToolImpl } from "./create-review-dispute-tool.js";
 export {
   finalizeAcceptedNoOpCompletion as finalizeAcceptedNoOpCompletionImpl,
   completePlanReviewNoOp as completePlanReviewNoOpImpl,
@@ -198,7 +209,6 @@ export { acquireSessionRegistryPath as acquireSessionRegistryPathImpl } from "./
 export { shouldDeferCompletionForGlobalPause as shouldDeferCompletionForGlobalPauseImpl } from "./should-defer-completion-for-global-pause.js";
 export { parkApprovalSuspension as parkApprovalSuspensionImpl } from "./park-approval-suspension.js";
 export { resumeApprovalAfterUnwindIfNeeded as resumeApprovalAfterUnwindIfNeededImpl } from "./resume-approval-after-unwind.js";
-export { ensureTaskWorktreeForPlanning as ensureTaskWorktreeForPlanningImpl } from "./ensure-task-worktree-for-planning.js";
 export { foreachActiveForTask as foreachActiveForTaskImpl } from "./foreach-active-for-task.js";
 export { buildBranchPersistence as buildBranchPersistenceImpl } from "./build-branch-persistence.js";
 export { sessionRegistryPath as sessionRegistryPathImpl } from "./session-registry-path.js";

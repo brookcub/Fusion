@@ -1,5 +1,6 @@
 import { BUILTIN_CODING_WORKFLOW_IR } from "./builtin-coding-workflow-ir.js";
 import { BUILTIN_CODING_IDEAS_WORKFLOW_IR } from "./builtin-coding-ideas-workflow-ir.js";
+import { BUILTIN_CODING_IDEAS_V2_WORKFLOW_IR } from "./builtin-coding-ideas-v2-workflow-ir.js";
 import { BUILTIN_BRAINSTORMING_WORKFLOW_IR } from "./builtin-brainstorming-workflow-ir.js";
 import { BUILTIN_LEAD_GENERATION_WORKFLOW_IR } from "./builtin-lead-generation-workflow-ir.js";
 import { BUILTIN_MARKETING_WORKFLOW_IR } from "./builtin-marketing-workflow-ir.js";
@@ -55,12 +56,72 @@ export function getRequiredPluginIdForBuiltinWorkflow(id: string): string | unde
   return PLUGIN_GATED_BUILTIN_WORKFLOWS.get(id);
 }
 
+/*
+ * FNXC:DisabledBuiltinWorkflows 2026-08-19-00:18:
+ * Project workflow toggles use the catalog's normal-workflow membership rather than a
+ * client-maintained list. Fragments and deprecated definitions remain resolvable for
+ * compatibility, but cannot be enabled for new work; plugin-gated definitions are
+ * eligible only when the settings boundary confirms their plugin is installed.
+ */
+export function isBuiltinWorkflowToggleEligible(id: string): boolean {
+  const workflow = BUILTIN_WORKFLOWS.find((candidate) => candidate.id === id);
+  return Boolean(workflow && workflow.kind !== "fragment" && !isBuiltinWorkflowDeprecated(id));
+}
+
+export function toggleEligibleBuiltinWorkflowIds(): string[] {
+  return BUILTIN_WORKFLOWS
+    .filter((workflow) => isBuiltinWorkflowToggleEligible(workflow.id))
+    .map((workflow) => workflow.id);
+}
+
 export function defaultEnabledBuiltinWorkflowIds(): string[] {
-  return BUILTIN_WORKFLOWS.filter(
-    (workflow) => workflow.kind !== "fragment"
-      && !isBuiltinWorkflowPluginGated(workflow.id)
-      && !isBuiltinWorkflowDeprecated(workflow.id),
-  ).map((workflow) => workflow.id);
+  return toggleEligibleBuiltinWorkflowIds().filter((id) => !isBuiltinWorkflowPluginGated(id));
+}
+
+/** Validate the shape and catalog membership of a persisted enablement list. */
+export function validateEnabledBuiltinWorkflowIds(value: unknown): asserts value is string[] | null | undefined {
+  if (value === undefined || value === null) return;
+  if (!Array.isArray(value)) {
+    throw new Error("enabledBuiltinWorkflowIds must be an array or null");
+  }
+  if (value.length === 0) {
+    throw new Error("enabledBuiltinWorkflowIds must keep at least one built-in workflow enabled");
+  }
+  const seen = new Set<string>();
+  for (const rawId of value) {
+    if (typeof rawId !== "string" || !isBuiltinWorkflowToggleEligible(rawId)) {
+      throw new Error(`enabledBuiltinWorkflowIds contains an unknown, deprecated, fragment, or invalid workflow id: ${String(rawId)}`);
+    }
+    if (seen.has(rawId)) {
+      throw new Error(`enabledBuiltinWorkflowIds contains duplicate workflow id: ${rawId}`);
+    }
+    seen.add(rawId);
+  }
+}
+
+/** Resolve the effective enabled set in catalog order. */
+export function effectiveEnabledBuiltinWorkflowIds(enabledIds?: readonly string[]): string[] {
+  const configured = enabledIds === undefined
+    ? new Set(defaultEnabledBuiltinWorkflowIds())
+    : new Set(enabledIds);
+  return toggleEligibleBuiltinWorkflowIds().filter((id) => configured.has(id));
+}
+
+/*
+ * FNXC:DisabledBuiltinWorkflows 2026-08-19-00:18:
+ * `DEFAULT_WORKFLOW_ID` remains the catalog identity of Coding. Routing a new or
+ * unselected task instead uses the first enabled catalog workflow when a configured
+ * built-in default is disabled; custom defaults remain explicit and untouched.
+ */
+export function resolveEffectiveDefaultWorkflowId(
+  configuredWorkflowId?: string | null,
+  enabledIds?: readonly string[],
+): string {
+  const enabled = effectiveEnabledBuiltinWorkflowIds(enabledIds);
+  const configured = configuredWorkflowId?.trim();
+  if (configured && !isBuiltinWorkflowId(configured)) return configured;
+  if (configured && enabled.includes(configured)) return configured;
+  return enabled[0] ?? defaultEnabledBuiltinWorkflowIds()[0] ?? DEFAULT_WORKFLOW_ID;
 }
 
 function ceCodeReviewOptionalGroupNode(column: string): WorkflowIrNode {
@@ -297,10 +358,20 @@ function linear(spec: BuiltinSpec): WorkflowDefinition {
         ...(hasCodeReview ? [codeReviewRemediationNode("in-progress")] : []),
       ]
     : [];
+  /*
+   * FNXC:PlanReviewNoOp 2026-08-22-03:37:
+   * Optional Plan Review is available on linear built-ins too. CLOSE_NO_OP needs an explicit
+   * terminal action rather than falling through the ordinary success path, or duplicate plans
+   * hold indefinitely despite a valid reviewer verdict.
+   */
+  const noOpTerminalNode: WorkflowIrNode | undefined = hasPlanReview
+    ? { id: "plan-review-no-op", kind: "gate", column: "todo", config: { workflowAction: "plan-review-no-op" } }
+    : undefined;
   const nodes: WorkflowIr["nodes"] = [
     { id: "start", kind: "start" },
     ...workflowNodes,
     ...remediationNodes,
+    ...(noOpTerminalNode ? [noOpTerminalNode] : []),
     { id: "end", kind: "end" },
   ];
   const edges: WorkflowIr["edges"] = [];
@@ -328,6 +399,8 @@ function linear(spec: BuiltinSpec): WorkflowDefinition {
    */
   if (hasPlanReview) {
     edges.push({ from: "plan-replan", to: "plan-review", condition: "success", kind: "rework" });
+    edges.push({ from: "plan-review", to: "plan-review-no-op", condition: "outcome:close-no-op" });
+    edges.push({ from: "plan-review-no-op", to: "end", condition: "success" });
   }
   if (hasBrowserVerification) {
     edges.push({
@@ -511,6 +584,48 @@ export const BUILTIN_WORKFLOWS: WorkflowDefinition[] = [
       "merge-manual-hold": { x: 1590, y: 240 },
       "post-merge-verification": { x: 2270, y: 160 },
       end: { x: 2440, y: 160 },
+    },
+    createdAt: BUILTIN_TS,
+    updatedAt: BUILTIN_TS,
+  },
+  /*
+   * FNXC:CodingIdeasV2Workflow 2026-08-26-05:56:
+   * Same Ideas board as builtin:coding-ideas, with one rule: in-review NEVER writes code.
+   * Implementation and its tests finish in `in-progress` — the executor's own final verification
+   * runs the project's configured test/build commands there, and a red result appends named fix
+   * steps rather than letting the card advance. `in-review` is then three read-only milestones:
+   * Code Review judges, Documentation reports, and the merge is the last thing that happens.
+   * The layout is ordered left-to-right in that same sequence so the editor's diagram reads the way
+   * the graph runs; nodes deleted from the graph must be deleted from this map too, or the editor
+   * keeps positioning ghosts.
+   */
+  {
+    id: "builtin:coding-ideas-v2",
+    name: "Coding (Ideas) V2",
+    description:
+      "Capture-first coding pipeline with a read-only review lane: park ideas in a manual intake, plan, implement and test per step, then review, document, and merge.",
+    kind: "workflow",
+    ir: BUILTIN_CODING_IDEAS_V2_WORKFLOW_IR,
+    layout: {
+      start: { x: 60, y: 160 },
+      plan: { x: 230, y: 160 },
+      "plan-review": { x: 400, y: 160 },
+      "plan-replan": { x: 400, y: 320 },
+      "plan-review-no-op": { x: 570, y: 320 },
+      parse: { x: 570, y: 160 },
+      steps: { x: 740, y: 160 },
+      "review-pending-handoff": { x: 740, y: 320 },
+      "code-review": { x: 910, y: 160 },
+      "code-review-remediation": { x: 910, y: 320 },
+      "documentation-delivery": { x: 1080, y: 160 },
+      "merge-gate": { x: 1250, y: 160 },
+      "branch-group-member-integration": { x: 1420, y: 80 },
+      "branch-group-promotion": { x: 1590, y: 80 },
+      "merge-manual-hold": { x: 1420, y: 240 },
+      "merge-attempt": { x: 1760, y: 160 },
+      "merge-retry": { x: 1930, y: 80 },
+      "recovery-router": { x: 1930, y: 240 },
+      end: { x: 2100, y: 160 },
     },
     createdAt: BUILTIN_TS,
     updatedAt: BUILTIN_TS,

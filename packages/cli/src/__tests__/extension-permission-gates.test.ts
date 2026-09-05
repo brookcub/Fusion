@@ -23,7 +23,6 @@ import { join } from "node:path";
 import {
   AgentStore,
   ApprovalRequestStore,
-  SecretsStore,
   registerFusionSessionIdentity,
   runWithFusionSessionIdentity,
   __clearFusionSessionIdentityRegistryForTests,
@@ -31,6 +30,7 @@ import {
 } from "@fusion/core";
 import {
   createPgExtensionHarness,
+  injectSecretsStore,
   createMockApi,
   registerExtension,
   requireTool,
@@ -85,32 +85,6 @@ async function buildAgentStore(): Promise<AgentStore> {
   return agentStore;
 }
 
-/**
- * FNXC:ToolPermissionGates 2026-07-26-14:20:
- * TaskStore.getSecretsStore constructs a MasterKeyManager against the real global dir,
- * which resolveGlobalDir hard-refuses under vitest. Pre-seed the store's public
- * `secretsStore` cache with a backend-mode SecretsStore using a fixed in-memory test key
- * so fn_secret_get exercises the real encrypt/reveal + approval paths without touching
- * ~/.fusion.
- */
-function injectSecretsStore(): SecretsStore {
-  const layer = h.store().getAsyncLayer();
-  if (!layer) throw new Error("harness store has no async layer");
-  const noopDb = {
-    prepare: () => {
-      throw new Error("sync DB not available in backend-mode test");
-    },
-    bumpLastModified: () => {},
-  };
-  const secretsStore = new SecretsStore(
-    noopDb as never,
-    noopDb as never,
-    async () => Buffer.alloc(32, 7),
-    { asyncLayer: layer },
-  );
-  h.store().secretsStore = secretsStore;
-  return secretsStore;
-}
 
 /** Hardcoded full-rules policy literals (never derived from core preset constants). */
 const LOCKED_DOWN_POLICY: AgentPermissionPolicy = {
@@ -468,7 +442,7 @@ pgDescribe("extension tool permission gates", () => {
     const cwd = h.rootDir();
     const api = freshApi();
     const tool = requireTool(api, "fn_secret_get");
-    const secretsStore = injectSecretsStore();
+    const secretsStore = injectSecretsStore(h);
     await secretsStore.createSecret({
       scope: "project",
       key: "API_TOKEN",
@@ -499,6 +473,7 @@ pgDescribe("extension tool permission gates", () => {
     const redeemed = await tool.execute("c3", { key: "API_TOKEN" }, undefined, undefined, agentCtx);
     expect(redeemed.isError).toBeUndefined();
     expect(redeemed.details?.value).toBe("s3cret-value");
+    expect(redeemed.content.map((part) => part.text).join("\n")).toContain("s3cret-value");
     expect(redeemed.details?.approvalRequestId).toBe(requestId);
     expect((await approvals.get(requestId))?.status).toBe("completed");
 
@@ -512,7 +487,7 @@ pgDescribe("extension tool permission gates", () => {
     const cwd = h.rootDir();
     const api = freshApi();
     const tool = requireTool(api, "fn_secret_get");
-    const secretsStore = injectSecretsStore();
+    const secretsStore = injectSecretsStore(h);
     await secretsStore.createSecret({
       scope: "project",
       key: "DENIED_TOKEN",
@@ -539,7 +514,7 @@ pgDescribe("extension tool permission gates", () => {
   it("fn_secret_get: a registered durable chat agent is persisted when pi omits immediate agentId", async () => {
     const cwd = h.rootDir();
     const tool = requireTool(freshApi(), "fn_secret_get");
-    const secretsStore = injectSecretsStore();
+    const secretsStore = injectSecretsStore(h);
     await secretsStore.createSecret({ scope: "project", key: "CHAT_TOKEN", plaintextValue: "not-in-approval", accessPolicy: "prompt" });
     const dispose = registerFusionSessionIdentity(cwd, { agentId: "agent-1a009724", agentName: "Dashboard Chat Agent", purpose: "chat" });
     try {
@@ -558,7 +533,7 @@ pgDescribe("extension tool permission gates", () => {
   it("fn_secret_get: dashboard-chat pi invocation reaches real operator approve and deny routes", async () => {
     const cwd = h.rootDir();
     const tool = requireTool(freshApi(), "fn_secret_get");
-    const secretsStore = injectSecretsStore();
+    const secretsStore = injectSecretsStore(h);
     const app = createApprovalDecisionApp();
 
     /*
@@ -604,10 +579,17 @@ pgDescribe("extension tool permission gates", () => {
   it("fn_secret_get: production dashboard chat keeps its durable principal through a host secret call", async () => {
     const cwd = h.rootDir();
     const tool = requireTool(freshApi(), "fn_secret_get");
-    const secretsStore = injectSecretsStore();
+    const secretsStore = injectSecretsStore(h);
     const app = createApprovalDecisionApp();
     const chatStore = {
-      getSession: vi.fn(() => ({ id: "chat-secret", agentId: "agent-1a009724", status: "active" })),
+      /*
+      FNXC:CliTests 2026-08-23-16:55:
+      TITLED ON PURPOSE. An untitled chat session makes `ChatManager.sendMessage` fire a
+      non-blocking title summarizer, which opens a SECOND pi session per send through the same
+      factory — the count this test pins would then measure summarizer timing, not the two chat
+      sessions under test.
+      */
+      getSession: vi.fn(() => ({ id: "chat-secret", agentId: "agent-1a009724", status: "active", title: "Secret access chat" })),
       addMessage: vi.fn((message) => ({ id: `message-${message.role}`, ...message })),
       getMessages: vi.fn(() => []),
       setInFlightGeneration: vi.fn(async () => undefined),
@@ -693,7 +675,7 @@ pgDescribe("extension tool permission gates", () => {
   it("fn_secret_get: direct human CLI remains a user requester after a session disposes", async () => {
     const cwd = h.rootDir();
     const tool = requireTool(freshApi(), "fn_secret_get");
-    const secretsStore = injectSecretsStore();
+    const secretsStore = injectSecretsStore(h);
     await secretsStore.createSecret({ scope: "project", key: "CLI_TOKEN", plaintextValue: "not-in-approval", accessPolicy: "prompt" });
     const dispose = registerFusionSessionIdentity(cwd, { agentId: "agent-disposed" });
     dispose();
@@ -706,7 +688,7 @@ pgDescribe("extension tool permission gates", () => {
   it("fn_secret_get: concurrent same-root registrations fail closed without minting a shared approval", async () => {
     const cwd = h.rootDir();
     const tool = requireTool(freshApi(), "fn_secret_get");
-    const secretsStore = injectSecretsStore();
+    const secretsStore = injectSecretsStore(h);
     await secretsStore.createSecret({ scope: "project", key: "AMBIGUOUS_TOKEN", plaintextValue: "not-in-approval", accessPolicy: "prompt" });
     const disposeA = registerFusionSessionIdentity(cwd, { agentId: "agent-a" });
     const disposeB = registerFusionSessionIdentity(cwd, { agentId: "agent-b" });

@@ -1,5 +1,57 @@
 import { CONSECUTIVE_TOOL_FAILURE_RETRY_THRESHOLD, DEFAULT_MAX_AUTO_MERGE_RETRIES } from "../tasks/in-review-stall.js";
-import type { CliAgentSettings, GlobalSettings, McpSecretRef, McpServerDefinition, ProjectSettings, Settings } from "../types.js";
+import type { ChatSnippet, CliAgentSettings, GlobalSettings, McpSecretRef, McpServerDefinition, ProjectSettings, Settings } from "../types.js";
+
+export const CHAT_SNIPPET_MAX_ENTRIES = 50;
+export const CHAT_SNIPPET_MAX_NAME_LENGTH = 48;
+export const CHAT_SNIPPET_MAX_PROMPT_LENGTH = 4_000;
+export const CHAT_SNIPPET_RESERVED_NAMES = Object.freeze([
+  "steer",
+  "focus",
+  "clear",
+  "new",
+  "skill",
+] as const);
+
+const CHAT_SNIPPET_NAME_PATTERN = /^[\p{L}\p{N}_-]+$/u;
+
+export function normalizeChatSnippetName(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const name = raw.normalize("NFKC").trim().toLowerCase();
+  if (
+    name.length === 0
+    || name.length > CHAT_SNIPPET_MAX_NAME_LENGTH
+    || !CHAT_SNIPPET_NAME_PATTERN.test(name)
+    || (CHAT_SNIPPET_RESERVED_NAMES as readonly string[]).includes(name)
+  ) {
+    return null;
+  }
+  return name;
+}
+
+/*
+FNXC:ChatSnippets 2026-09-03-15:56:
+Normalize global snippets at one shared browser/core boundary. The first valid canonical duplicate wins, prompts remain byte-for-byte operator text, and invalid entries are removed rather than truncated or silently repaired.
+*/
+export function normalizeChatSnippets(value: unknown): ChatSnippet[] {
+  if (!Array.isArray(value)) return [];
+  const snippets: ChatSnippet[] = [];
+  const seenNames = new Set<string>();
+  for (const candidate of value) {
+    if (snippets.length >= CHAT_SNIPPET_MAX_ENTRIES) break;
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+    const entry = candidate as Record<string, unknown>;
+    const name = normalizeChatSnippetName(entry.name);
+    if (!name || seenNames.has(name) || typeof entry.prompt !== "string") continue;
+    if (entry.prompt.trim().length === 0 || entry.prompt.length > CHAT_SNIPPET_MAX_PROMPT_LENGTH) continue;
+    seenNames.add(name);
+    snippets.push({ name, prompt: entry.prompt });
+  }
+  return snippets;
+}
+
+export function readChatSnippets(settings: { chatSnippets?: unknown }): ChatSnippet[] {
+  return normalizeChatSnippets(settings.chatSnippets);
+}
 
 export interface MergeRequestContractShadowSettingsSource {
   mergeRequestContractShadowEnabled?: boolean;
@@ -17,8 +69,11 @@ type CompleteSettings<T> = { [K in keyof Required<T>]: Required<T>[K] | undefine
  * split documented in `moved-settings.ts`.
  *
  * This union is NOT compile-time-enforced against `MOVED_SETTINGS_KEYS`.
- * Enforcement lives in `src/__tests__/settings-consistency.test.ts` (every key
- * must belong to exactly one regime). A STALE entry here only loosens the `Omit`
+ * Enforcement note (corrected 2026-08-23): this block long claimed enforcement lives in
+ * `src/__tests__/settings-consistency.test.ts`, but NO SUCH FILE EXISTS — the "every key belongs to
+ * exactly one regime" union has no direct guard today. What does exist:
+ * `builtin-workflow-settings-triage.test.ts` (core) pins the workflow-native catalogs key by key, and
+ * `workflow-settings-fallback-alignment.test.ts` (engine) catches a key declared in both regimes. A STALE entry here only loosens the `Omit`
  * type — at worst it lets `DEFAULT_PROJECT_SETTINGS` drop a key it should keep;
  * it can never re-add a key to the schema object. A MISSING entry surfaces as a
  * type error on `DEFAULT_PROJECT_SETTINGS` if that key still has a default.
@@ -40,6 +95,27 @@ type MovedProjectSettingsKey =
   | "maxReviewerContextRetries"
   | "maxReviewerFallbackRetries"
   | "reflectionEnabled"
+  /*
+  FNXC:ReviewConvergence 2026-08-23-23:20 (comment corrected after review):
+  FN-149 declared these six in `BUILTIN_REVIEW_REVISION_SETTINGS` but left them inside
+  `ProjectSettingsSchema`, so `DEFAULT_PROJECT_SETTINGS` had to re-declare their defaults — the
+  dual-regime drift `workflow-settings-fallback-alignment` guards. Listing them here removes them
+  from that schema `Omit`, which is the whole effect: the workflow declaration becomes the single
+  source of each default.
+
+  PRECISION, because the earlier wording of this note ("they belong to the moved regime") was read as
+  a stronger claim than the change makes: this type is consumed ONLY by the `ProjectSettingsSchema`
+  Omit. It does NOT add them to the runtime moved catalog (`BUILTIN_MOVED_WORKFLOW_SETTINGS`), so
+  `MOVED_SETTINGS_KEYS` does not contain them and they are not tombstoned on the project-settings
+  write path. That is deliberate and matches FN-149: they are workflow-native settings, not migrated
+  project settings, and `builtin-workflow-settings-triage.test.ts` asserts exactly that regime split.
+  */
+  | "reviewConvergenceEscalationEnabled"
+  | "reviewConvergenceEscalationProvider"
+  | "reviewConvergenceEscalationModelId"
+  | "reviewArbitrationEnabled"
+  | "reviewArbitrationProvider"
+  | "reviewArbitrationModelId"
   | "executionProvider"
   | "executionCredentialInstanceId"
   | "executionModelId"
@@ -145,6 +221,16 @@ export const DEFAULT_GLOBAL_SETTINGS = {
   Critical-action confirmation dialogs stay enabled by default. This global-only preference may opt an operator into primary/default auto-approval, but project settings cannot enable it for collaborators.
   */
   skipConfirmationDialogs: false,
+  /*
+  FNXC:QuickEntry 2026-08-16-03:15:
+  Quick Add keeps its historical Enter-to-submit behavior by default; only an operator's global preference may opt into newline-first entry.
+  */
+  quickAddSubmitOnEnter: true,
+  /*
+  FNXC:ChatSnippets 2026-09-03-15:56:
+  Keep the optional global key present but undefined so scope-key derivation remains complete without sharing a mutable default array. readChatSnippets supplies a fresh effective empty list.
+  */
+  chatSnippets: undefined,
   language: undefined,
   defaultProvider: undefined,
   defaultCredentialInstanceId: undefined,
@@ -204,12 +290,14 @@ export const DEFAULT_GLOBAL_SETTINGS = {
   defaultProjectId: undefined,
   setupComplete: undefined,
   cliOnboardingCompletedAt: undefined,
+  githubStarPromptDismissedAt: undefined,
   favoriteProviders: undefined,
   favoriteModels: undefined,
   openrouterModelSync: true,
   openrouterAppAttribution: undefined,
   openrouterModelFilters: undefined,
   openrouterProviderPreferences: undefined,
+  orcarouterModelSync: true,
   opencodeGoModelSync: true,
   updateCheckEnabled: true,
   fnBinaryCheckEnabled: true,
@@ -223,7 +311,19 @@ export const DEFAULT_GLOBAL_SETTINGS = {
   opt in before Fusion replaces its own binary and bounces the process under them.
   */
   autoUpdateAndRestart: false,
-  autoReloadOnVersionChange: true,
+  /*
+  FNXC:UpdateAutomation 2026-08-21-02:17:
+  Fresh installations require separate opt-ins for unattended installation and
+  restart. The legacy combined switch remains false and is only a fallback for
+  older persisted settings.
+  */
+  /* FNXC:UpdateAutomation 2026-08-21-02:48: Keep these schema keys unset because defaults merge into effective settings and `undefined` is distinct from explicit false. */
+  autoUpdateEnabled: undefined,
+  autoRestartAfterUpdate: undefined,
+  /*
+  FNXC:VersionAutoReload 2026-08-23-04:03:
+  Version-change reload is mandatory, so its key is retired. Older persisted values are ignored because GLOBAL_SETTINGS_KEYS derives from this object and rejects unknown keys before save patches.
+  */
   githubTrackingDefaultRepo: undefined,
   reportRoadmapDedupeEnabled: undefined,
   reportRoadmapLabel: undefined,
@@ -233,6 +333,13 @@ export const DEFAULT_GLOBAL_SETTINGS = {
   gitlabApiBaseUrl: undefined,
   gitlabAuthToken: undefined,
   gitlabAuthTokenType: undefined,
+  jiraEnabled: undefined,
+  jiraBaseUrl: undefined,
+  jiraApiBaseUrl: undefined,
+  jiraAuthEmail: undefined,
+  jiraAuthTokenSecretKey: undefined,
+  jiraAuthTokenSecretScope: undefined,
+  jiraBranchNameTemplate: undefined,
   modelOnboardingComplete: undefined,
   useClaudeCli: undefined,
   useDroidCli: undefined,
@@ -283,6 +390,11 @@ export const DEFAULT_GLOBAL_SETTINGS = {
   importTranslateGlobalCredentialInstanceId: undefined,
   importTranslateGlobalModelId: undefined,
   importTranslateGlobalThinkingLevel: undefined,
+  // FNXC:FastCheapModelLane 2026-08-29-02:43: The Fast & Cheap route owns an optional global lane and otherwise inherits normal execution resolution.
+  fastCheapGlobalProvider: undefined,
+  fastCheapGlobalCredentialInstanceId: undefined,
+  fastCheapGlobalModelId: undefined,
+  fastCheapGlobalThinkingLevel: undefined,
   /*
   FNXC:Settings-ThinkingLevel 2026-07-10-00:00:
   Global model lanes can override the default thinking effort independently. Undefined preserves the existing inheritance to `defaultThinkingLevel`.
@@ -313,10 +425,12 @@ export const DEFAULT_GLOBAL_SETTINGS = {
   vitestKillThresholdPct: 90,
   // Agent log persistence controls
   /*
-  FNXC:AgentLogs 2026-06-23-00:00:
-  Verbose tool arguments and results are default-off to reduce persisted log volume and payload exposure. Operators who need saved tool details can explicitly opt in with persistAgentToolOutput: true; tool timeline rows remain logged either way.
+  FNXC:AgentLogs 2026-08-29-04:32:
+  FN-253 makes complete tool arguments and results visible by default: AgentLogger redacts them at
+  its single write boundary, persistence and delivery lanes bound each row, and operators can retain
+  the previous low-volume behavior by explicitly setting persistAgentToolOutput: false.
   */
-  persistAgentToolOutput: false,
+  persistAgentToolOutput: true,
   /*
   FNXC:ToolOutputBudget 2026-08-03-16:00:
   FN-8616 lets operators raise, lower, or disable the FN-8614 per-result tool-output
@@ -424,6 +538,8 @@ export const DEFAULT_GLOBAL_SETTINGS = {
 export const DEFAULT_PROJECT_SETTINGS = {
   // FNXC:TaskRecommendations 2026-08-08-05:02: completion follows-ups stay bounded by default; 0 disables writing them.
   maxRecommendationsPerTask: 3,
+  // FNXC:TaskRecommendations 2026-08-19-13:05: explicit recommendation evaluation is opt-in and only applies while the positive cap enables capture; relevance always outranks count.
+  requireTaskRecommendations: false,
   // FNXC:TaskRecommendations 2026-08-13-03:56: surface completed-task proposals by default; operators can suppress the notice without suppressing capture.
   recommendationMailboxNoticeEnabled: true,
   globalPause: false,
@@ -443,19 +559,24 @@ export const DEFAULT_PROJECT_SETTINGS = {
   approvedCliAutonomyAdapters: undefined,
   enginePaused: false,
   engineLastActiveAt: undefined,
+  /*
+  FNXC:CapacityModel 2026-09-01-14:49:
+  Max Concurrent Tasks limits every AI-active task, including checkout-free planning. It is the
+  provider/LLM-load dimension and remains independent from execution-worktree capacity.
+  */
   maxConcurrent: 2,
   /*
   FNXC:VerificationConcurrency 2026-07-15-03:35:
   Default one verification at a time process-wide so concurrent tasks cannot each run verify:fast / full builds simultaneously and peg the host. Operators with spare cores may raise this in Scheduling settings (clamped 1–8 at runtime).
   */
   maxConcurrentVerifications: 1,
+  /* Execution-worktree holders only; planning runs read-only on the project root. */
   maxWorktrees: 4,
   /*
-  FNXC:CapacityModel 2026-07-28-11:20:
-  Worktrees ON is the default and the supported shape — everything (planning
-  included) runs in a worktree. OFF drops maxWorktrees from the dispatch gate so
-  capacity is total agents only; it is a counting statement, not permission for
-  concurrent agents to share one checkout.
+  FNXC:CapacityModel 2026-09-01-14:49:
+  Worktree limiting is ON by default and independently caps tasks that hold or are entering an
+  execution checkout. OFF removes that gate structurally; write-capable execution remains isolated
+  in task worktrees while checkout-free planning continues to count only against maxConcurrent.
   */
   worktreeLimitEnabled: true,
   pollIntervalMs: 15000,
@@ -516,7 +637,6 @@ export const DEFAULT_PROJECT_SETTINGS = {
   worktreeCopyFiles: [],
   testCommand: undefined,
   buildCommand: undefined,
-  recycleWorktrees: false,
   showWorktreeGrouping: false,
   openTasksInRightSidebar: false,
   /*
@@ -535,12 +655,16 @@ export const DEFAULT_PROJECT_SETTINGS = {
   */
   showCostBadgeOnCards: false,
   /*
+  FNXC:ChatMessageLayout 2026-08-18-20:27:
+  The project preference applies one reversible layout choice to every standard and task chat surface. Explicitly seed the historical bubbles presentation so upgraded projects preserve their existing UI.
+  */
+  chatMessageLayout: "bubbles",
+  /*
   FNXC:TaskDetailActivityFirst 2026-06-30-23:59:
   Project task-detail defaults are Activity-first unless this opt-in is true. Keeping the default false preserves explicit deep-link ids while making omitted non-done task opens land on Activity → Live.
   */
   taskDetailChatFirst: false,
   executorAllowSiblingBranchRename: false,
-  worktreeNaming: "random",
   worktrunk: {
     enabled: false,
     binaryPath: undefined,
@@ -608,14 +732,21 @@ export const DEFAULT_PROJECT_SETTINGS = {
   executorEscalationProvider: undefined,
   executorEscalationModelId: undefined,
   executorEscalationNodeId: undefined,
+  /*
+  FNXC:ReviewConvergence 2026-08-23-21:05:
+  FN-149's six review-convergence/arbitration keys are declared in BUILTIN_WORKFLOW_SETTINGS, which
+  the U4 hard-move made the SINGLE source of truth for a moved key's default. Re-declaring them here
+  put them back in the legacy object the hard-move emptied, so an undeclared key on a custom workflow
+  could resolve to this literal instead of the declaration default — the exact drift
+  `workflow-settings-fallback-alignment` guards. The declaration defaults are identical (both
+  `*Enabled` default true, the provider/model lanes carry no default), and the reader uses
+  `!== false`, so removing them here preserves behaviour and restores the invariant.
+  */
   /**
    * FNXC:Merge 2026-06-26-00:00:
    * New and unconfigured projects default AI merge to sync a dirty checked-out integration branch, restoring the legacy stash → fast-forward → restore landing behavior. Explicit persisted merger.allowDirtyLocalCheckoutSync values still win, and no existing-project migration stamps this default into storage.
    */
   merger: { mode: "ai", maxReviewPasses: 3, allowDirtyLocalCheckoutSync: true },
-  mergeDiffVolumeMinLines: undefined,
-  mergeDiffVolumeThreshold: undefined,
-  mergeDiffVolumeAllowlist: undefined,
   requiredChecks: undefined,
   mergeStrategyOverlapBehavior: "flip-to-prefer-branch",
   postMergeAuditMode: "warn",
@@ -725,6 +856,13 @@ export const DEFAULT_PROJECT_SETTINGS = {
   gitlabApiBaseUrl: undefined,
   gitlabAuthToken: undefined,
   gitlabAuthTokenType: undefined,
+  jiraEnabled: undefined,
+  jiraBaseUrl: undefined,
+  jiraApiBaseUrl: undefined,
+  jiraAuthEmail: undefined,
+  jiraAuthTokenSecretKey: undefined,
+  jiraAuthTokenSecretScope: undefined,
+  jiraBranchNameTemplate: undefined,
   gitlabCommentOnDone: false,
   gitlabCommentTemplate: undefined,
   gitlabCloseSourceIssueOnDone: false,
@@ -746,6 +884,8 @@ export const DEFAULT_PROJECT_SETTINGS = {
   not variant-detected and unsupported input, including Japanese, remains English.
   */
   taskDefinitionInInputLanguage: false,
+  /* FNXC:TaskOutputLanguage 2026-08-19-14:56: Undefined preserves legacy true compatibility; the resolver supplies English for fresh projects. */
+  taskOutputLanguage: undefined,
   useAiMergeCommitSummary: true,
   // Title-summarizer model lanes stay project-scoped (not moved in U4).
   titleSummarizerProvider: undefined,
@@ -766,6 +906,11 @@ export const DEFAULT_PROJECT_SETTINGS = {
   importTranslateCredentialInstanceId: undefined,
   importTranslateModelId: undefined,
   importTranslateThinkingLevel: undefined,
+  // FNXC:FastCheapModelLane 2026-08-29-02:43: Project Fast & Cheap overrides stay separate from ordinary execution models so fast routing remains opt-in.
+  fastCheapProvider: undefined,
+  fastCheapCredentialInstanceId: undefined,
+  fastCheapModelId: undefined,
+  fastCheapThinkingLevel: undefined,
   /*
   FNXC:Settings-MergerModel 2026-07-13-07:52:
   Merger model lane stays project-scoped (not workflow-moved) like title summarizer: Settings → Project Models can override the global merger baseline without binding the choice to a workflow graph.
@@ -794,6 +939,40 @@ export const DEFAULT_PROJECT_SETTINGS = {
   taskEvaluationRetention: undefined,
   memoryEnabled: true,
   memoryBackendType: "qmd",
+  // FNXC:StashConfig 2026-08-13-16:35: (RUFU-068) Optional per-project Stash LCM
+  // memory backend config. stashUrl points at the operator's Stash server
+  // (default http://127.0.0.1:3457). stashApiKey is an override for hard
+  // isolation (separate Stash instance/account); the PRIMARY API key lives in
+  // the global secrets store ("stash-api-key") and is NEVER committed. Project
+  // value wins over global. TencentDB's URL setting is intentionally NOT ported.
+  stashUrl: "",
+  stashApiKey: "",
+  /*
+  FNXC:Rufu126VectorSearch 2026-08-19-10:50:
+  RUFU-126 (D3): opt-in vector (semantic) recall for the Stash memory backend.
+  Default OFF — zero behavior change until the operator enables it (this is a
+  prototype; rejected alternative was automatic capability detection, which
+  would change default behavior and pay a per-process 404 round-trip against
+  unpatched servers). When true, multi-word (≥2 tokens) recall queries try the
+  Stash GET /api/v1/me/sessions/events/semantic-search endpoint first and fall
+  back byte-identically to the RUFU-121 keyword path on any vector failure
+  (see memory-backend-stash.ts search() + docs/research/stash-vector-search-evaluation.md
+  for D1–D5). Schema-only, consistent with stashUrl/stashApiKey (no UI row).
+  */
+  stashVectorSearch: false,
+  /*
+  FNXC:StashSessionCapture 2026-08-19-04:37:
+  (RUFU-122) Task-terminal transcript upload defaults. All are inert unless
+  memoryBackendType === "stash". executorSessionCaptureEnabled gates ONLY the
+  transcript upload (the RUFU-068 terminal anchor event still fires when it is
+  off) and defaults ON. executorSessionCaptureMaxEvents caps transcript events
+  per task; the engine keeps the most recent N (default 20000).
+  executorSessionCaptureIncludeStatus is the schema-only "keep a setting" for
+  uploading `status` log entries (default off; no UI row).
+  */
+  executorSessionCaptureEnabled: true,
+  executorSessionCaptureMaxEvents: 20_000,
+  executorSessionCaptureIncludeStatus: false,
   memoryAutoSummarizeEnabled: false,
   memoryAutoSummarizeThresholdChars: 50_000,
   memoryAutoSummarizeSchedule: "0 3 * * *",

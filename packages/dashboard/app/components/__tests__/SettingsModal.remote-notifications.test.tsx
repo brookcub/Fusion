@@ -70,6 +70,7 @@ import {
   waitForSettingsModalReady,
   settingsModalUser,
   installSettingsModalEnv,
+  flushSettingsAutoSave,
 } from "./SettingsModal.test-harness";
 
 vi.mock("../../api", async (importOriginal) => {
@@ -354,12 +355,15 @@ describe("SettingsModal", () => {
       });
 
       it("main Settings Save persists Tailscale and lifecycle remote fields without starting a tunnel", async () => {
-        await settingsModalUser.click(screen.getByLabelText("Tailscale"));
-        await settingsModalUser.click(screen.getByLabelText("Accept routes"));
-        await openAdvancedSettings();
-        await settingsModalUser.click(screen.getByLabelText("Remember last running state"));
+        // FNXC:SettingsModalTests 2026-08-16-03:46: flush the 500ms auto-save debounce on the fake clock instead of a real-timer waitFor (FN-2707); assertions unchanged. Fake timers go on BEFORE the mutating edit so the debounce lands on the fake clock.
+        vi.useFakeTimers();
+        fireEvent.click(screen.getByLabelText("Tailscale"));
+        fireEvent.click(screen.getByLabelText("Accept routes"));
+        fireEvent.click(screen.getByText("Advanced Settings"));
+        fireEvent.click(screen.getByLabelText("Remember last running state"));
 
-
+        await flushSettingsAutoSave();
+        vi.useRealTimers();
         await waitFor(() => {
           expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(
             expect.objectContaining({
@@ -385,12 +389,14 @@ describe("SettingsModal", () => {
 
     it("reopens with Remote Access checkboxes checked after main Settings Save", async () => {
       const firstRender = await renderModalSection("remote", "Remote Access");
-      await settingsModalUser.click(screen.getByLabelText("Tailscale"));
-      await settingsModalUser.click(screen.getByLabelText("Accept routes"));
-      await openAdvancedSettings();
-      await settingsModalUser.click(screen.getByLabelText("Remember last running state"));
+      vi.useFakeTimers();
+      fireEvent.click(screen.getByLabelText("Tailscale"));
+      fireEvent.click(screen.getByLabelText("Accept routes"));
+      fireEvent.click(screen.getByText("Advanced Settings"));
+      fireEvent.click(screen.getByLabelText("Remember last running state"));
 
-
+      await flushSettingsAutoSave();
+      vi.useRealTimers();
       await waitFor(() => {
         expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(
           expect.objectContaining({
@@ -459,12 +465,14 @@ describe("SettingsModal", () => {
       });
 
       await renderModalSection("remote", "Remote Access");
-      await settingsModalUser.click(screen.getByLabelText("Tailscale"));
-      await settingsModalUser.click(screen.getByLabelText("Accept routes"));
-      await openAdvancedSettings();
-      await settingsModalUser.click(screen.getByLabelText("Remember last running state"));
+      vi.useFakeTimers();
+      fireEvent.click(screen.getByLabelText("Tailscale"));
+      fireEvent.click(screen.getByLabelText("Accept routes"));
+      fireEvent.click(screen.getByText("Advanced Settings"));
+      fireEvent.click(screen.getByLabelText("Remember last running state"));
 
-
+      await flushSettingsAutoSave();
+      vi.useRealTimers();
       await waitFor(() => {
         expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(
           expect.objectContaining({
@@ -509,14 +517,38 @@ describe("SettingsModal", () => {
       expect(document.querySelector(".remote-share-block")).not.toBeInTheDocument();
     });
 
-    it("renders remote-share-block when tunnel is running with a URL", async () => {
+    it("labels a running Cloudflare tunnel URL with Cloudflare terminology", async () => {
+      mockFetchRemoteStatus.mockResolvedValue({ provider: "cloudflare", state: "running", url: "https://demo-tunnel.trycloudflare.com/", lastError: null });
+      await renderModalSection("remote", "Remote Access");
+
+      const shareBlock = document.querySelector(".remote-share-block");
+      expect(shareBlock).toBeInTheDocument();
+      expect(shareBlock?.textContent).toContain("Cloudflare tunnel URL:");
+      expect(shareBlock?.textContent).toContain("https://demo-tunnel.trycloudflare.com/");
+      expect(shareBlock?.textContent).not.toContain("Tailnet");
+    });
+
+    it("retains the Tailnet URL label for a running Tailscale tunnel", async () => {
       mockFetchRemoteStatus.mockResolvedValue({ provider: "tailscale", state: "running", url: "https://machine.ts.net/", lastError: null });
       await renderModalSection("remote", "Remote Access");
 
       const statusBar = document.querySelector(".remote-status-bar");
+      const shareBlock = document.querySelector(".remote-share-block");
       expect(statusBar).toBeInTheDocument();
       expect(statusBar?.className).toContain("remote-status-bar--running");
-      expect(document.querySelector(".remote-share-block")).toBeInTheDocument();
+      expect(shareBlock?.textContent).toContain("Tailnet URL:");
+      expect(shareBlock?.textContent).toContain("https://machine.ts.net/");
+    });
+
+    it("uses a neutral URL label when the running tunnel provider is unknown", async () => {
+      mockFetchRemoteStatus.mockResolvedValue({ provider: null, state: "running", url: "https://unknown.example/", lastError: null });
+      await renderModalSection("remote", "Remote Access");
+
+      const shareBlock = document.querySelector(".remote-share-block");
+      expect(shareBlock).toBeInTheDocument();
+      expect(shareBlock?.textContent).toContain("Tunnel URL:");
+      expect(shareBlock?.textContent).toContain("https://unknown.example/");
+      expect(shareBlock?.textContent).not.toContain("Tailnet");
     });
 
     it("updates provider selection via radio and shows provider status", async () => {
@@ -772,12 +804,14 @@ describe("SettingsModal", () => {
         expect(modeSelect.value).toBe("sticky-only");
         expect(delayInput.value).toBe("30000");
 
-        await settingsModalUser.selectOptions(modeSelect, "all");
+        vi.useFakeTimers();
+        fireEvent.change(modeSelect, { target: { value: "all" } });
         expect(delayInput).toBeDisabled();
-        await settingsModalUser.selectOptions(modeSelect, "sticky-only");
+        fireEvent.change(modeSelect, { target: { value: "sticky-only" } });
         fireEvent.change(delayInput, { target: { value: "45000" } });
 
-
+        await flushSettingsAutoSave();
+        vi.useRealTimers();
         await waitFor(() => {
           expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(
             expect.objectContaining({
@@ -790,9 +824,11 @@ describe("SettingsModal", () => {
 
       it("persists terminal-only selection on save", async () => {
         const modeSelect = screen.getByLabelText("Failure notification mode") as HTMLSelectElement;
-        await settingsModalUser.selectOptions(modeSelect, "terminal-only");
+        vi.useFakeTimers();
+        fireEvent.change(modeSelect, { target: { value: "terminal-only" } });
 
-
+        await flushSettingsAutoSave();
+        vi.useRealTimers();
         await waitFor(() => {
           expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(
             expect.objectContaining({
@@ -937,13 +973,16 @@ describe("SettingsModal", () => {
       mockFetchSettings.mockResolvedValueOnce({ ...defaultSettings, ntfyEnabled: false, ntfyTopic: undefined });
       await renderModalSection("notifications", "Notifications");
 
-      await settingsModalUser.click(screen.getByLabelText("Enable"));
+      vi.useFakeTimers();
+      fireEvent.click(screen.getByLabelText("Enable"));
       fireEvent.change(screen.getByLabelText("ntfy Topic"), { target: { value: "fresh-topic" } });
-      await settingsModalUser.click(screen.getByText("Advanced", { selector: "summary" }));
+      fireEvent.click(screen.getByText("Advanced", { selector: "summary" }));
       fireEvent.change(screen.getByLabelText("Custom ntfy server URL (optional)"), { target: { value: "https://ntfy.override.example//" } });
       fireEvent.change(screen.getByLabelText("Access token (optional)"), { target: { value: "override-token" } });
-      await settingsModalUser.click(screen.getByRole("button", { name: /Test notification/ }));
+      fireEvent.click(screen.getByRole("button", { name: /Test notification/ }));
 
+      await flushSettingsAutoSave();
+      vi.useRealTimers();
       await waitFor(() => {
         expect(mockTestNotification).toHaveBeenCalledWith(
           "ntfy",
@@ -991,9 +1030,11 @@ describe("SettingsModal", () => {
       await renderModalSection("notifications", "Notifications");
       await settingsModalUser.click(screen.getByText("Advanced", { selector: "summary" }));
       const tokenInput = screen.getByLabelText("Access token (optional)");
-      await settingsModalUser.clear(tokenInput);
+      vi.useFakeTimers();
+      fireEvent.change(tokenInput, { target: { value: "" } });
 
-
+      await flushSettingsAutoSave();
+      vi.useRealTimers();
       await waitFor(() => {
         expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(
           expect.objectContaining({ ntfyAccessToken: null }),
@@ -1135,13 +1176,15 @@ describe("SettingsModal", () => {
       await waitForSettingsModalReady();
       await openScheduledEvalsSection();
 
+      vi.useFakeTimers();
       fireEvent.change(screen.getByLabelText("Interval (ms)"), { target: { value: "120000" } });
       fireEvent.change(screen.getByLabelText("Evaluator Provider"), { target: { value: "openai" } });
       fireEvent.change(screen.getByLabelText("Evaluator Model"), { target: { value: "gpt-5" } });
-      await settingsModalUser.selectOptions(screen.getByLabelText("Follow-up Policy"), "auto-create");
+      fireEvent.change(screen.getByLabelText("Follow-up Policy"), { target: { value: "auto-create" } });
       fireEvent.change(screen.getByLabelText("Retention (days)"), { target: { value: "14" } });
 
-
+      await flushSettingsAutoSave();
+      vi.useRealTimers();
       await waitFor(() => {
         expect(mockUpdateSettings).toHaveBeenCalledWith(
           expect.objectContaining({
@@ -1177,10 +1220,12 @@ describe("SettingsModal", () => {
       await waitForSettingsModalReady();
       await openScheduledEvalsSection();
 
-      await settingsModalUser.clear(screen.getByLabelText("Evaluator Provider"));
-      await settingsModalUser.clear(screen.getByLabelText("Evaluator Model"));
+      vi.useFakeTimers();
+      fireEvent.change(screen.getByLabelText("Evaluator Provider"), { target: { value: "" } });
+      fireEvent.change(screen.getByLabelText("Evaluator Model"), { target: { value: "" } });
 
-
+      await flushSettingsAutoSave();
+      vi.useRealTimers();
       await waitFor(() => {
         expect(mockUpdateSettings).toHaveBeenCalledWith(
           expect.objectContaining({
@@ -1205,13 +1250,15 @@ describe("SettingsModal", () => {
       expect(screen.getByLabelText("Memory Backup Directory")).toHaveValue(".fusion/backups/memory");
       expect(screen.getByLabelText("Memory Backup Scope")).toHaveValue("all");
 
-      await settingsModalUser.click(screen.getByLabelText("Enable automatic memory backups"));
+      vi.useFakeTimers();
+      fireEvent.click(screen.getByLabelText("Enable automatic memory backups"));
       fireEvent.change(screen.getByLabelText("Memory Backup Schedule (Cron)"), { target: { value: "0 5 * * *" } });
       fireEvent.change(screen.getByLabelText("Memory Retention Count"), { target: { value: "21" } });
       fireEvent.change(screen.getByLabelText("Memory Backup Directory"), { target: { value: ".fusion/backups/custom-memory" } });
-      await settingsModalUser.selectOptions(screen.getByLabelText("Memory Backup Scope"), "agents");
+      fireEvent.change(screen.getByLabelText("Memory Backup Scope"), { target: { value: "agents" } });
 
-
+      await flushSettingsAutoSave();
+      vi.useRealTimers();
       await waitFor(() => {
         expect(mockUpdateSettings).toHaveBeenCalledWith(
           expect.objectContaining({
@@ -1268,16 +1315,18 @@ describe("SettingsModal", () => {
 
       await settingsModalUser.click(screen.getByText(/Advanced — external search providers/i));
       const providerSelect = await screen.findByLabelText("Search Provider");
+      vi.useFakeTimers();
       fireEvent.change(providerSelect, { target: { value: "tavily" } });
       fireEvent.change(screen.getByLabelText("Default Max Concurrent Runs"), { target: { value: "4" } });
       fireEvent.change(screen.getByLabelText("Default Max Sources Per Run"), { target: { value: "25" } });
       fireEvent.change(screen.getByLabelText("Default Max Duration (ms)"), { target: { value: "240000" } });
       fireEvent.change(screen.getByLabelText("Request Timeout (ms)"), { target: { value: "45000" } });
       fireEvent.change(screen.getByLabelText("Max Synthesis Rounds"), { target: { value: "3" } });
-      await settingsModalUser.click(screen.getByRole("checkbox", { name: /^GitHub$/i }));
-      await settingsModalUser.click(screen.getByRole("checkbox", { name: /^Local Docs$/i }));
+      fireEvent.click(screen.getByRole("checkbox", { name: /^GitHub$/i }));
+      fireEvent.click(screen.getByRole("checkbox", { name: /^Local Docs$/i }));
 
-
+      await flushSettingsAutoSave();
+      vi.useRealTimers();
       await waitFor(() => {
         expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(
           expect.objectContaining({
@@ -1358,11 +1407,14 @@ describe("SettingsModal", () => {
       await waitForSettingsModalReady();
       await openResearchProjectSection();
 
-      await settingsModalUser.click(screen.getByLabelText("Enable research in this project"));
-      const maxConcurrent = await screen.findByLabelText("Max Concurrent Runs");
+      vi.useFakeTimers();
+      fireEvent.click(screen.getByLabelText("Enable research in this project"));
+      // FNXC:SettingsModalTests 2026-08-16-03:46: the limits field renders synchronously after the toggle; findBy* polling deadlocks under vitest fake timers, so query synchronously.
+      const maxConcurrent = screen.getByLabelText("Max Concurrent Runs");
       fireEvent.change(maxConcurrent, { target: { value: "4" } });
 
-
+      await flushSettingsAutoSave();
+      vi.useRealTimers();
       await waitFor(() => {
         expect(mockUpdateSettings).toHaveBeenCalledWith(
           expect.objectContaining({

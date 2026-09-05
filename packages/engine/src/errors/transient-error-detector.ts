@@ -280,6 +280,9 @@ export function isNonContinuableSessionError(errorMessage: string): boolean {
 }
 
 const OPERATOR_ACTIONABLE_AGENT_ERROR_PATTERNS: RegExp[] = [
+  // FNXC:ProviderCompatibility 2026-09-05-08:30: unchanged invalid request
+  // parameters cannot recover through minute-long planning retries.
+  /\b(?:unsupported|unknown|unrecognized|invalid) parameter\b/i,
   /invalid api key/i,
   /authentication failed/i,
   /unauthorized/i,

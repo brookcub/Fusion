@@ -291,6 +291,35 @@ export function resolveReboundTarget(ir: WorkflowIr): string | undefined {
   return columns[0].id;
 }
 
+/**
+ * Resolve the destination for an automatic dependency-driven re-specification.
+ * A manual intake is a capture lane, so its intake target is not safe for an
+ * automated replan; use the workflow's hold lane instead. Returns undefined
+ * when the workflow has no usable trait-derived destination.
+ *
+ * FNXC:WorkflowLifecycleTraits 2026-08-19-02:45:
+ * Dependency-driven replans must not auto-route into a manual intake. Coding
+ * (Ideas) therefore returns its Planning hold column while automatic workflows
+ * retain their declared intake destination. This policy affects only automatic
+ * dependency-driven replan relocation; new-task creation and manual promotion
+ * keep their existing intake behavior.
+ */
+export function resolveDependencyReplanTarget(ir: WorkflowIr | undefined): string | undefined {
+  if (!ir) return undefined;
+  const columns = columnsOf(ir);
+  if (columns.length === 0) return undefined;
+
+  const registry = getTraitRegistry();
+  const intake = columns.find((column) => registry.resolveColumnFlags(column).intake === true);
+  if (!intake) return undefined;
+
+  const intakeTrait = intake.traits.find((trait) => trait.trait === "intake");
+  if (intakeTrait?.config?.autoTriage === false) {
+    return columns.find((column) => registry.resolveColumnFlags(column).hold === true)?.id;
+  }
+  return intake.id;
+}
+
 /*
 FNXC:WorkflowLifecycleColumns 2026-07-27-09:10 (U1 / KTD-2 — workflow-owned lifecycle):
 THE lifecycle-column resolution seam. ~207 production sites decide the lifecycle by
@@ -500,6 +529,38 @@ export async function resolveReboundTargetForTask(store: WorkflowIrResolverStore
  * execution?", which is a single destination, not a membership test. Callers asking "is this card in
  * WIP?" want `columnsWithFlag(ir, "countsTowardWip")` instead — a board may declare several.
  */
+/*
+FNXC:LifecycleContainment 2026-08-28-01:09:
+FN-207 keeps automatic repair adjacent to the task's current lifecycle role.
+`resolveReboundTarget` remains hold-first for WIP replanning, but it is unsafe for
+review cards because it would skip implementation. This resolver has no literal
+or first-column fallback: an absent destination means the caller must retain the
+card in place rather than inventing a planning route.
+*/
+export function resolveContainedBackwardTarget(ir: WorkflowIr, fromColumnId: string): string | undefined {
+  const source = columnsOf(ir).find((column) => column.id === fromColumnId);
+  if (!source) return undefined;
+  const roleFlags = getTraitRegistry().resolveColumnFlags(source);
+  if (roleFlags.mergeOrchestration || roleFlags.mergeBlocker || roleFlags.humanReview) {
+    return columnsWithFlag(ir, "countsTowardWip")[0];
+  }
+  if (roleFlags.countsTowardWip) return columnsWithFlag(ir, "hold")[0];
+  return undefined;
+}
+
+export async function resolveContainedBackwardTargetForTask(
+  store: WorkflowIrResolverStore,
+  taskId: string,
+  fromColumnId: string,
+): Promise<string | undefined> {
+  try {
+    const ir = await resolveWorkflowIrForTask(store, taskId);
+    return ir ? resolveContainedBackwardTarget(ir, fromColumnId) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function resolveWipTargetForTask(store: WorkflowIrResolverStore, taskId: string): Promise<string> {
   try {
     const ir = await resolveWorkflowIrForTask(store, taskId);

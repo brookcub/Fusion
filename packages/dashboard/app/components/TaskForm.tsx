@@ -1,8 +1,8 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useComposerDictation } from "../hooks/useComposerDictation";
 import { MicButton } from "./MicButton";
-import { DEFAULT_TASK_PRIORITY, TASK_PRIORITIES, type GlobalSettings, type Task, type TaskPriority, type Settings, type WorkflowDefinition, type ResolvedWorkflowOptionalStep } from "@fusion/core";
+import { DEFAULT_TASK_PRIORITY, TASK_PRIORITIES, isValidTaskBranchName, type GlobalSettings, type Task, type TaskPriority, type Settings, type WorkflowDefinition, type ResolvedWorkflowOptionalStep } from "@fusion/core";
 import type { ToastType } from "../hooks/useToast";
 import { fetchModels, fetchSettings, fetchWorkflows, fetchWorkflowOptionalSteps, refineText, getRefineErrorMessage, updateGlobalSettings, fetchGlobalSettings, fetchGitBranches, type RefinementType, type ModelInfo, type NodeInfo } from "../api";
 import { WorkflowOptionalStepsDropdown } from "./WorkflowOptionalStepsDropdown";
@@ -16,6 +16,7 @@ import { getPriorityColorVar, getPriorityIcon, getPriorityLabel } from "../utils
 import { ProviderIcon } from "./ProviderIcon";
 import { WorkflowIcon } from "./WorkflowIcon";
 import { PendingAttachmentPreviews } from "./PendingAttachmentPreviews";
+import { restoreOptionalStepsOnFastExit } from "../utils/fastModeOptionalSteps";
 
 function getNodeStatusLabel(status: NodeInfo["status"], t: (key: string, defaultValue: string) => string): string {
   if (status === "online") return t("taskForm.nodeStatusOnline", "Online");
@@ -172,14 +173,27 @@ export interface TaskFormProps {
 
   // AI-assisted creation callbacks (create mode only)
   onPlanningMode?: (initialPlan: string, workflowId?: string | null) => void;
-  onSubtaskBreakdown?: (description: string, workflowId?: string | null) => void;
   onClose?: () => void;
 
   // Create-mode primary submission. NewTaskModal owns duplicate checks and payload shaping;
-  // TaskForm only places the visible Create affordance in the quick-action row.
+  // TaskForm only places the visible Create/Start affordances in the quick-action row.
   onCreateSubmit?: () => void;
   createSubmitLabel?: string;
   createSubmitDisabled?: boolean;
+  /*
+   * FNXC:NewTaskWorkflowStart 2026-08-19-00:17:
+   * Start is supplied only by a host that has validated server-derived manual-intake metadata and
+   * a safe destination. Keeping this optional prevents an ineligible workflow from leaving an
+   * empty button shell in either the desktop modal or mobile sheet.
+   *
+   * FNXC:NewTaskWorkflowStart 2026-08-27-10:50:
+   * FN-196 requires an eligible host to pass this callback even before description entry. The
+   * visible disabled button matches Quick Add's discoverable Start contract; only ineligible
+   * metadata omits the callback and leaves no action-row shell.
+   */
+  onStartSubmit?: () => void;
+  startSubmitLabel?: string;
+  startSubmitDisabled?: boolean;
 
   /** Optional content to render between the primary section and the "More options" toggle. */
   renderBelowPrimary?: React.ReactNode;
@@ -254,11 +268,13 @@ export function TaskForm({
   isActive = true,
   onAutoSaveDescription,
   onPlanningMode,
-  onSubtaskBreakdown,
   onClose,
   onCreateSubmit,
   createSubmitLabel,
   createSubmitDisabled,
+  onStartSubmit,
+  startSubmitLabel,
+  startSubmitDisabled,
   renderBelowPrimary,
   renderBelowModelConfiguration,
   hideDependencies,
@@ -276,6 +292,24 @@ export function TaskForm({
   onGithubRepoOverrideChange,
 }: TaskFormProps) {
   const { t } = useTranslation("app");
+  const branchNameRequired = branchMode === "existing" || branchMode === "custom-new" || branchMode === "shared-group";
+  const [jiraEnabled, setJiraEnabled] = useState(false);
+  const [jiraKey, setJiraKey] = useState("");
+  const [jiraError, setJiraError] = useState("");
+  const [jiraDeriving, setJiraDeriving] = useState(false);
+  const deriveJiraBranch = useCallback(async () => {
+    if (!jiraKey.trim() || !onBranchChange) return;
+    setJiraDeriving(true); setJiraError("");
+    try { const response = await fetch("/api/jira/derive-branch-name", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ issueKey: jiraKey }) }); const result = await response.json() as { ok: boolean; branchName?: string; message?: string }; if (result.ok && result.branchName) onBranchChange(result.branchName); else setJiraError(result.message ?? "Could not derive a branch name from JIRA."); } catch { setJiraError("Could not derive a branch name from JIRA."); } finally { setJiraDeriving(false); }
+  }, [jiraKey, onBranchChange]);
+  /*
+  FNXC:WorkspaceBranchInput 2026-08-20-03:38:
+  FN-9161 exposes a reusable workspace branch in this shared form. Show the
+  core-validity result beside the field so operators can correct a ref before
+  New Task blocks submission at its matching client-side validation boundary.
+  */
+  const trimmedBranchName = (branch ?? "").trim();
+  const branchNameInvalid = branchNameRequired && trimmedBranchName !== "" && !isValidTaskBranchName(trimmedBranchName);
   const hasInitialMoreOptions =
     (hideDependencies ? false : dependencies.length > 0) ||
     pendingImages.length > 0 ||
@@ -299,6 +333,7 @@ export function TaskForm({
   const [showDepDropdown, setShowDepDropdown] = useState(false);
   const [showWorkflowDropdown, setShowWorkflowDropdown] = useState(false);
   const executionModeRef = useRef(executionMode);
+  const preFastOptionalStepIdsRef = useRef<string[] | null>(null);
   useEffect(() => {
     executionModeRef.current = executionMode;
   }, [executionMode]);
@@ -319,6 +354,10 @@ export function TaskForm({
   const [workflowsLoading, setWorkflowsLoading] = useState(false);
   const [optionalSteps, setOptionalSteps] = useState<ResolvedWorkflowOptionalStep[]>([]);
   const [optionalStepsLoading, setOptionalStepsLoading] = useState(false);
+  const defaultOnOptionalStepIds = useMemo(
+    () => optionalSteps.filter((step) => step.defaultOn).map((step) => step.templateId),
+    [optionalSteps],
+  );
   const [autoSaveStatus, setAutoSaveStatus] = useState<"idle" | "saving" | "saved">("idle");
   const [baseBranchOptions, setBaseBranchOptions] = useState<string[]>([]);
   const [baseBranchCustomMode, setBaseBranchCustomMode] = useState(false);
@@ -363,8 +402,8 @@ export function TaskForm({
       .catch(() => {/* silently fail */})
       .finally(() => setModelsLoading(false));
     fetchSettings(projectId)
-      .then((nextSettings) => setSettings(nextSettings))
-      .catch(() => setSettings(null));
+      .then((nextSettings) => { setSettings(nextSettings); setJiraEnabled(nextSettings.jiraEnabled === true); })
+      .catch(() => { setSettings(null); setJiraEnabled(false); });
     // U6/R3: load selectable workflows for the picker. Fragments are excluded
     // (KTD-1) so they never appear as selectable task workflows.
     if (onWorkflowIdChange) {
@@ -398,12 +437,14 @@ export function TaskForm({
     const isCreateOptionalStepPicker = Boolean(onWorkflowIdChange);
     const isEditOptionalStepPicker = mode === "edit" && Boolean(optionalStepsWorkflowId);
     if (!isCreateOptionalStepPicker && !isEditOptionalStepPicker) return;
+    preFastOptionalStepIdsRef.current = null;
     let cancelled = false;
     setOptionalSteps([]);
     if (!resolvedOptionalWorkflowId) {
       // Clear any in-flight loading state (a prior fetch may have been cancelled
       // mid-flight when switching to "No workflow"), so the loading row never sticks.
       setOptionalStepsLoading(false);
+      preFastOptionalStepIdsRef.current = null;
       if (isCreateOptionalStepPicker) {
         onEnabledWorkflowStepsChange?.([], { optionalStepsAvailable: false, source: "initialization" });
       }
@@ -422,12 +463,14 @@ export function TaskForm({
           const seededSteps = executionModeRef.current === "fast"
             ? []
             : steps.filter((s) => s.defaultOn).map((s) => s.templateId);
+          preFastOptionalStepIdsRef.current = null;
           onEnabledWorkflowStepsChange?.(seededSteps, { optionalStepsAvailable: steps.length > 0, source: "initialization" });
         }
       })
       .catch(() => {
         if (cancelled) return;
         setOptionalSteps([]);
+        preFastOptionalStepIdsRef.current = null;
         if (isCreateOptionalStepPicker) {
           onEnabledWorkflowStepsChange?.([], { optionalStepsAvailable: false, source: "initialization" });
         }
@@ -447,13 +490,32 @@ export function TaskForm({
   /*
   FNXC:FastOptionalSteps 2026-06-30-09:08:
   Full-dialog Fast controls share one transition contract: entering fast mode clears currently enabled optional workflow steps exactly once, while the inline dropdown remains active so manual reselection is persisted as explicit create intent.
+
+  FNXC:FastOptionalSteps 2026-08-29-12:08:
+  FN-260 makes the create-form Fast transition reversible. Restore the captured pre-Fast selection with `source: "user"` when returning to Standard, while edit mode remains execution-mode-only because it never clears optional steps.
   */
   const handleExecutionModeChange = useCallback((nextMode: TaskExecutionModeSelection) => {
     onExecutionModeChange?.(nextMode);
-    if (nextMode === "fast" && onWorkflowIdChange) {
-      onEnabledWorkflowStepsChange?.([], { optionalStepsAvailable: optionalSteps.length > 0, source: "user" });
+    if (!onWorkflowIdChange) return;
+
+    const changeMeta = { optionalStepsAvailable: optionalSteps.length > 0, source: "user" } as const;
+    if (nextMode === "fast") {
+      preFastOptionalStepIdsRef.current = enabledWorkflowSteps ?? [];
+      onEnabledWorkflowStepsChange?.([], changeMeta);
+      return;
     }
-  }, [onEnabledWorkflowStepsChange, onExecutionModeChange, onWorkflowIdChange, optionalSteps.length]);
+
+    if (executionMode !== "fast") return;
+    onEnabledWorkflowStepsChange?.(
+      restoreOptionalStepsOnFastExit(
+        preFastOptionalStepIdsRef.current,
+        enabledWorkflowSteps ?? [],
+        defaultOnOptionalStepIds,
+      ),
+      changeMeta,
+    );
+    preFastOptionalStepIdsRef.current = null;
+  }, [defaultOnOptionalStepIds, enabledWorkflowSteps, executionMode, onEnabledWorkflowStepsChange, onExecutionModeChange, onWorkflowIdChange, optionalSteps.length]);
 
   const toggleOptionalStep = useCallback(
     (templateId: string) => {
@@ -1011,7 +1073,7 @@ export function TaskForm({
 
       FNXC:NewTaskDialogAffordances 2026-07-10-21:45:
       Priority and Fast are icon-only in the inline New Task row to match QuickEntryBox: priority uses the shared up/high, down/low, flag/normal, alert/urgent helper, and Fast uses Zap while title/aria-label/test-id semantics preserve accessibility and tests.
-      Plan/Subtask remain gated on their handoff callbacks. Model selectors, branch/base, node, review level, and GitHub tracking stay in the Advanced disclosure.
+      Plan remains gated on its handoff callback. Model selectors, branch/base, node, review level, and GitHub tracking stay in the Advanced disclosure.
 
       FNXC:NewTaskDialogAffordances 2026-06-23-21:20:
       The regular New Task dialog must visibly expose the screenshot quick-add button contract in the immediate action cluster while Advanced remains the deep configuration editor. TaskForm hosts the cluster so create payload state has one source of truth; NewTaskModal only supplies the submit handler and its existing dependency/agent quick controls.
@@ -1030,6 +1092,20 @@ export function TaskForm({
               data-testid="task-form-inline-create"
             >
               {createSubmitLabel ?? t("taskForm.createTask", "Create")}
+            </button>
+          )}
+          {onStartSubmit && (
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={onStartSubmit}
+              disabled={disabled || startSubmitDisabled}
+              data-testid="task-form-inline-start"
+              aria-label={startSubmitLabel ?? t("taskForm.startTask", "Start")}
+              title={startSubmitLabel ?? t("taskForm.startTask", "Start")}
+            >
+              <Zap size={12} className="task-form-action-icon" aria-hidden="true" />
+              {startSubmitLabel ?? t("taskForm.startTask", "Start")}
             </button>
           )}
           {onPlanningMode && (
@@ -1051,25 +1127,6 @@ export function TaskForm({
               {t("taskForm.planButton", "Plan")}
             </button>
           )}
-          {onSubtaskBreakdown && (
-            <button
-              type="button"
-              className="btn btn-sm"
-              onClick={() => {
-                const trimmed = description.trim();
-                if (!trimmed) {
-                  addToast(t("taskForm.enterDescriptionFirst", "Enter a description first"), "error");
-                  return;
-                }
-                onClose?.();
-                onSubtaskBreakdown(trimmed);
-              }}
-              disabled={disabled || !description.trim()}
-              data-testid="task-form-subtask-button"
-            >
-              {t("taskForm.subtaskButton", "Subtask")}
-            </button>
-          )}
 
           {/* FNXC:NewTask 2026-06-23-00:10: Attach — reuses the Advanced section's hidden file input; programmatic .click() works even while that section is collapsed. */}
           <button
@@ -1086,11 +1143,15 @@ export function TaskForm({
               : t("taskForm.attach", "Attach")}
           </button>
 
+          {/*
+          FNXC:NewTaskDialogAffordances 2026-09-01-05:04:
+          Icon-only inline quick-action controls must keep a compact square footprint and never stretch to fill a wrapped flex line on phones.
+          */}
           {/* FNXC:NewTask 2026-06-23-00:10: Fast — toggles executionMode standard⇄fast; btn-primary when active, matching QuickEntryBox's fast toggle. */}
           {onExecutionModeChange && executionMode !== undefined && (
             <button
               type="button"
-              className={`btn btn-sm ${executionMode === "fast" ? "btn-primary" : ""}`}
+              className={`btn btn-sm task-form-inline-icon-btn ${executionMode === "fast" ? "btn-primary" : ""}`}
               onClick={() => handleExecutionModeChange(executionMode === "fast" ? "standard" : "fast")}
               aria-pressed={executionMode === "fast"}
               aria-label={inlineFastButtonLabel}
@@ -1188,7 +1249,7 @@ export function TaskForm({
           {onPriorityChange && (
             <button
               type="button"
-              className="btn btn-sm"
+              className="btn btn-sm task-form-inline-icon-btn"
               onClick={() => {
                 const idx = TASK_PRIORITIES.indexOf(inlinePriority);
                 const next = TASK_PRIORITIES[(idx + 1) % TASK_PRIORITIES.length];
@@ -1399,8 +1460,25 @@ export function TaskForm({
                 value={branch || ""}
                 onChange={(e) => onBranchChange(e.target.value)}
                 placeholder={branchMode === "shared-group" ? t("taskForm.sharedBranchPlaceholder", "e.g. clionboarding") : t("taskForm.branchPlaceholder", "e.g. feature/my-task")}
+                aria-invalid={branchNameInvalid || undefined}
+                aria-describedby={branchNameInvalid ? "task-working-branch-help" : undefined}
                 disabled={disabled}
               />
+              {branchNameInvalid && (
+                <div id="task-working-branch-help" className="form-error">
+                  {t("taskForm.branchNameInvalid", "Enter a valid Git branch name (no spaces or ref punctuation).")}
+                </div>
+              )}
+              {jiraEnabled && (
+                <div className="form-group" data-testid="jira-derive-branch">
+                  <label htmlFor="jira-issue-key" className="model-select-label">{t("taskForm.jiraIssueKey", "JIRA issue key")}</label>
+                  <div className="flex-row gap-sm">
+                    <input id="jira-issue-key" className="input" value={jiraKey} onChange={(event) => setJiraKey(event.target.value)} placeholder="PRD-1234" disabled={disabled || jiraDeriving} />
+                    <button type="button" className="btn btn-sm" onClick={() => { void deriveJiraBranch(); }} disabled={disabled || jiraDeriving || !jiraKey.trim()}>{jiraDeriving ? t("taskForm.jiraDeriving", "Deriving…") : t("taskForm.jiraDerive", "Derive")}</button>
+                  </div>
+                  {jiraError && <div className="form-error">{jiraError}</div>}
+                </div>
+              )}
             </>
           )}
           {onBaseBranchChange && (

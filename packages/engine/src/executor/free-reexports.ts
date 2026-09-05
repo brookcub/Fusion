@@ -107,6 +107,20 @@ export {
   signalTaskComplete as signalTaskCompleteFree,
   triggerPostTaskReflectionCapture as triggerPostTaskReflectionCaptureFree,
 } from "./signal-task-complete.js";
+export {
+  triggerTaskMemoryCapture as triggerTaskMemoryCaptureFree,
+  resolveStashMemorySettings as resolveStashMemorySettingsFree,
+  chatMessageToMemoryCaptureEvent as chatMessageToMemoryCaptureEventFree,
+  ChatSessionMemoryCapture as ChatSessionMemoryCaptureFree,
+  createStashChatMemoryCaptureSink as createStashChatMemoryCaptureSinkFree,
+  STASH_SECRET_KEY as STASH_SECRET_KEY_FREE,
+  STASH_SECRET_SCOPE as STASH_SECRET_SCOPE_FREE,
+  CHAT_MESSAGE_ADDED as CHAT_MESSAGE_ADDED_FREE,
+  CHAT_SESSION_UPDATED as CHAT_SESSION_UPDATED_FREE,
+  FINAL_CHAT_SESSION_STATUSES as FINAL_CHAT_SESSION_STATUSES_FREE,
+  type ChatMemoryCaptureSink as ChatMemoryCaptureSinkFree,
+  type ChatEventEmitter as ChatEventEmitterFree,
+} from "./memory-capture.js";
 export { listWipLaneTasks as listWipLaneTasksFree } from "./list-wip-lane-tasks.js";
 export { resolveSeamColumnAgent as resolveSeamColumnAgentFree } from "./resolve-seam-column-agent.js";
 export { resumeOrphaned as resumeOrphanedFree } from "./resume-orphaned.js";
@@ -139,10 +153,13 @@ export { resetStepsIfWorkLost as resetStepsIfWorkLostFree } from "./reset-steps-
 export { routeRetryableRemediationGraphFailureToPreMergeFix as routeRetryableRemediationGraphFailureToPreMergeFixFree } from "./route-retryable-remediation.js";
 export { buildForeachWorktreeDeps as buildForeachWorktreeDepsFree } from "./build-foreach-worktree-deps.js";
 export { requestPreMergeOptionalStepFix as requestPreMergeOptionalStepFixFree } from "./request-pre-merge-optional-step-fix.js";
+export { appendReviewRemediationSteps as appendReviewRemediationStepsFree } from "./append-review-remediation-steps.js";
+export { resolveRemediationCheckout as resolveRemediationCheckoutFree } from "./resolve-remediation-checkout.js";
 export { createSpawnAgentTool as createSpawnAgentToolFree, spawnAgentParams as spawnAgentParamsFree } from "./create-spawn-agent-tool.js";
 export { createTaskUpdateTool as createTaskUpdateToolFree } from "./create-task-update-tool.js";
 export { attemptExecutorVerificationFix as attemptExecutorVerificationFixFree } from "./attempt-executor-verification-fix.js";
 export { createTaskDoneTool as createTaskDoneToolFree } from "./create-task-done-tool.js";
+export { createReviewDisputeTool as createReviewDisputeToolFree } from "./create-review-dispute-tool.js";
 export { resetLostWorkStepProgress as resetLostWorkStepProgressFree } from "./reset-lost-work-step-progress.js";
 export { resolveResumeLanes as resolveResumeLanesFree } from "./resolve-resume-lanes.js";
 export { isReentrantPausedAbortedInFlightNode as isReentrantPausedAbortedInFlightNodeFree } from "./is-reentrant-paused-aborted-in-flight-node.js";
@@ -198,7 +215,6 @@ export { acquireSessionRegistryPath as acquireSessionRegistryPathFree } from "./
 export { shouldDeferCompletionForGlobalPause as shouldDeferCompletionForGlobalPauseFree } from "./should-defer-completion-for-global-pause.js";
 export { parkApprovalSuspension as parkApprovalSuspensionFree } from "./park-approval-suspension.js";
 export { resumeApprovalAfterUnwindIfNeeded as resumeApprovalAfterUnwindIfNeededFree } from "./resume-approval-after-unwind.js";
-export { ensureTaskWorktreeForPlanning as ensureTaskWorktreeForPlanningFree } from "./ensure-task-worktree-for-planning.js";
 export { foreachActiveForTask as foreachActiveForTaskFree } from "./foreach-active-for-task.js";
 export { buildBranchPersistence as buildBranchPersistenceFree } from "./build-branch-persistence.js";
 export {

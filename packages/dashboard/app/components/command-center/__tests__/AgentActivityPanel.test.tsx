@@ -11,6 +11,7 @@ vi.mock("../../../api", () => ({ getAgentActivity }));
 vi.mock("../../../sse-bus", () => ({ subscribeSse }));
 
 import { AgentActivityPanel } from "../AgentActivityPanel";
+import { resolveAgentActivityPresentation } from "../agentActivityPresentation";
 
 const range = { from: null, to: null, preset: "all" };
 const event = (seq: string, overrides: Partial<AgentActivityEvent> = {}): AgentActivityEvent => ({
@@ -35,6 +36,27 @@ describe("AgentActivityPanel", () => {
     subscribeSse.mockReset().mockReturnValue(vi.fn());
   });
 
+  it("resolves and renders a not-run gate distinctly from a passed gate", async () => {
+    expect(resolveAgentActivityPresentation("workflow:gate-passed", { notRun: true })).toMatchObject({
+      labelKey: "commandCenter.agentActivity.workflowGateNotRun",
+      fallbackLabel: "Workflow gate not executed",
+      color: "var(--text-muted)",
+    });
+    getAgentActivity.mockResolvedValueOnce({
+      events: [event("2", {
+        type: "workflow:gate-passed",
+        summary: "Verification did not run",
+        metadata: { stepId: "custom", status: "skipped", attempt: 0, notRun: true },
+      })],
+      nextCursor: null,
+    });
+
+    render(<AgentActivityPanel projectId="project" range={range} />);
+
+    await screen.findByText("Workflow gate not executed");
+    expect(screen.queryByText("Workflow gate passed")).not.toBeInTheDocument();
+  });
+
   it("renders a seeded live row and prepends an SSE row without refetching", async () => {
     let subscription: { events: Record<string, (message: MessageEvent) => void> } | undefined;
     subscribeSse.mockImplementation((_url, options) => {
@@ -51,6 +73,54 @@ describe("AgentActivityPanel", () => {
     await screen.findByText("Completed work 3");
     expect(getAgentActivity).toHaveBeenCalledTimes(1);
     expect(screen.getAllByText(/Completed work/).map((row) => row.textContent)).toEqual(["Completed work 3", "Completed work 2"]);
+  });
+
+  it("hides state changes from live and timeline rows and from the type filter", async () => {
+    getAgentActivity.mockResolvedValueOnce({
+      events: [
+        event("2", { type: "agent:state-changed", summary: "Changed state" }),
+        event("1", { type: "task:started", summary: "Started work" }),
+      ],
+      nextCursor: null,
+    });
+    render(<AgentActivityPanel projectId="project" range={range} />);
+
+    await screen.findByText("Started work");
+    expect(screen.queryByText("Changed state")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Timeline" }));
+    expect(screen.getByText("Started work")).toBeInTheDocument();
+    expect(screen.queryByText("Changed state")).not.toBeInTheDocument();
+    const typeFilter = screen.getByLabelText("Filter by event type") as HTMLSelectElement;
+    expect([...typeFilter.options].some((option) => option.text === "Agent state changed")).toBe(false);
+    expect(typeFilter.options).toHaveLength(7);
+  });
+
+  it("does not render a live state-change SSE frame", async () => {
+    let subscription: { events: Record<string, (message: MessageEvent) => void> } | undefined;
+    subscribeSse.mockImplementation((_url, options) => {
+      subscription = options;
+      return vi.fn();
+    });
+    getAgentActivity.mockResolvedValueOnce({ events: [], nextCursor: null });
+    render(<AgentActivityPanel projectId="project" range={range} />);
+    await screen.findByTestId("cc-area-agent-activity-empty");
+
+    act(() => subscription?.events["agent:activity"](new MessageEvent("agent:activity", {
+      data: JSON.stringify(event("2", { type: "agent:state-changed", summary: "Changed state" })),
+    })));
+    expect(screen.queryByText("Changed state")).not.toBeInTheDocument();
+  });
+
+  it("shows an empty state and keeps timeline paging available when every row is hidden", async () => {
+    getAgentActivity.mockResolvedValueOnce({
+      events: [event("1", { type: "agent:state-changed", summary: "Changed state" })],
+      nextCursor: "1",
+    });
+    render(<AgentActivityPanel projectId="project" range={range} />);
+    await screen.findByTestId("cc-area-agent-activity-empty");
+    fireEvent.click(screen.getByRole("button", { name: "Timeline" }));
+    expect(screen.getByTestId("cc-area-agent-activity-empty")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Load older" })).toBeInTheDocument();
   });
 
   it("opens a task from its timeline row and retains a separate agent target", async () => {

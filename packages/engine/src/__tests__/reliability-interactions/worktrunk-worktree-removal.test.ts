@@ -5,20 +5,26 @@ import { cleanupOrphanedWorktrees } from "../../worktree/worktree-pool.js";
 import { SelfHealingManager } from "../../self-healing.js";
 import { NativeWorktreeBackend, WorktrunkWorktreeBackend } from "../../worktree/worktree-backend.js";
 
-const { execSpy, existsSpy, readdirSpy } = vi.hoisted(() => ({
-  execSpy: vi.fn(),
-  existsSpy: vi.fn(() => true),
-  readdirSpy: vi.fn(() => []),
-}));
+const { execSpy, execFileSpy, existsSpy, readdirSpy, readFileSpy } = vi.hoisted(() => {
+  const execFileSpy = vi.fn().mockResolvedValue({ stdout: "", stderr: "" });
+  (execFileSpy as any)[Symbol.for("nodejs.util.promisify.custom")] = execFileSpy;
+  return {
+    execSpy: vi.fn(),
+    execFileSpy,
+    existsSpy: vi.fn(() => true),
+    readdirSpy: vi.fn(() => []),
+    readFileSpy: vi.fn(() => ""),
+  };
+});
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
-  return { ...actual, exec: execSpy };
+  return { ...actual, exec: execSpy, execFile: execFileSpy };
 });
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
-  return { ...actual, existsSync: existsSpy, readdirSync: readdirSpy };
+  return { ...actual, existsSync: existsSpy, readdirSync: readdirSpy, readFileSync: readFileSpy };
 });
 
 
@@ -38,7 +44,24 @@ describe("reliability interactions: worktrunk worktree removal routing", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     execSpy.mockImplementation((_cmd: string, _opts: unknown, cb: (err: unknown, stdout: string, stderr: string) => void) => cb(null, "", ""));
-    existsSpy.mockReturnValue(true);
+    execFileSpy.mockReset();
+    execFileSpy.mockResolvedValue({ stdout: "", stderr: "" });
+    // A workspace-group marker is an explicit delete veto in the ownership proof; these fixtures
+    // are ordinary single-project worktrees, so the marker must be absent.
+    existsSpy.mockImplementation(((path: string) => !String(path).endsWith("/.fusion-workspace-root")) as never);
+    /*
+    FNXC:WorkspaceWorktree 2026-08-23-18:39:
+    `isReclaimableWorktreeCandidate` now requires Git to prove a candidate directory belongs to
+    THIS project before a destructive sweep may touch it, since a shared configured worktree root
+    can hold other projects' checkouts. This fully-mocked fs fixture must therefore state what it
+    always meant: the scanned directories are real linked worktrees of /repo, i.e. their `.git`
+    file is a gitdir pointer below /repo/.git.
+    */
+    readFileSpy.mockImplementation(((path: string) => {
+      const target = String(path);
+      if (target.endsWith("/.git")) return `gitdir: /repo/.git/worktrees/${target.split("/").slice(-2)[0]}\n`;
+      return "";
+    }) as never);
   });
 
   afterEach(() => {

@@ -8,7 +8,88 @@ export interface EntryPointBranchAssignmentInput {
 
 export interface EntryPointBranchAssignment {
   workingBranch?: string;
+  /** Set only when this helper derives a Fusion-owned branch. */
+  branchWriteOrigin?: "engine";
   mergeTargetBranch?: string;
+}
+
+export type TaskBranchOrigin = "engine-canonical" | "group-derived" | "operator-supplied";
+
+/**
+ * FNXC:BranchNaming 2026-08-21-09:09:
+ * Task mutation boundaries reject ambiguous branch writes. Callers must declare whether the
+ * branch is operator-owned or engine-selected; this keeps ownership durable instead of inferred.
+ */
+export class BranchWriteProvenanceError extends Error {
+  constructor() {
+    super("branchWriteOrigin is required when branch is provided");
+    this.name = "BranchWriteProvenanceError";
+  }
+}
+
+/**
+ * FNXC:BranchNaming 2026-08-20-03:40:
+ * Branch ownership follows its durable write provenance, not its spelling. A matching
+ * operator marker wins even for `fusion/<task>`; otherwise only this task's canonical
+ * namespace is engine-owned, then group assignment marks Fusion-derived branches.
+ */
+export function classifyTaskBranchOrigin(
+  task: Pick<import("../types.js").Task, "id" | "branch" | "branchContext">,
+  branch?: string,
+): TaskBranchOrigin {
+  const candidate = (branch ?? task.branch ?? `fusion/${task.id.toLowerCase()}`).trim();
+  const override = task.branchContext?.branchOverride;
+  if (override) {
+    const marker = override.branch.trim();
+    if (candidate === marker) return "operator-supplied";
+    /*
+    FNXC:BranchNaming 2026-08-28-10:33:
+    PR #3523 review: a bare branch-name collision renames the requested branch by appending
+    a numeric sibling suffix (`-2`..`-50` in worktree-backend, `-2`..`-6` in worktree-pool).
+    When the requested branch was an operator-override branch that reuses Fusion's namespace
+    (e.g. `fusion/fn-1`), the renamed form (`fusion/fn-1-2`) is still a rename of the
+    operator's branch; an exact-marker match alone would classify it engine-canonical and
+    expose it to ownership-sensitive cleanup. Only the numeric sibling suffix keeps the
+    marker — suffixed engine derivatives (`-step-<i>`, `-stranded`) stay engine-owned.
+    When an override deliberately takes the canonical name, a sibling rename is ambiguous
+    between the operator's and the engine's branch; treating it as operator-supplied is the
+    safe direction because provenance then withholds engine deletion.
+    */
+    const escapedMarker = marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`^${escapedMarker}-\\d+$`, "i").test(candidate)) return "operator-supplied";
+  }
+  const escapedId = task.id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (new RegExp(`^fusion/${escapedId}(?:-.+)?$`, "i").test(candidate)) return "engine-canonical";
+  if (task.branchContext?.assignmentMode === "shared" || task.branchContext?.assignmentMode === "per-task-derived") {
+    return "group-derived";
+  }
+  return "operator-supplied";
+}
+
+export function isFusionDeletableBranch(
+  task: Pick<import("../types.js").Task, "id" | "branch" | "branchContext">,
+  branch?: string,
+): boolean {
+  return classifyTaskBranchOrigin(task, branch) !== "operator-supplied";
+}
+
+export function isOperatorAttachEligibleBranch(
+  task: Pick<import("../types.js").Task, "id" | "branch" | "branchContext">,
+  branch?: string,
+): boolean {
+  return classifyTaskBranchOrigin(task, branch) === "operator-supplied";
+}
+
+/**
+ * FNXC:BranchNaming 2026-08-20-03:40:
+ * PR heads must match the task's real working branch. Shared members keep their
+ * canonical worktree branch, while all other tasks retain their trimmed branch.
+ */
+export function resolveTaskPrHeadBranch(
+  task: Pick<import("../types.js").Task, "id" | "branch" | "branchContext">,
+): string {
+  if (task.branchContext?.assignmentMode === "shared") return `fusion/${task.id.toLowerCase()}`;
+  return task.branch?.trim() || `fusion/${task.id.toLowerCase()}`;
 }
 
 /**
@@ -55,6 +136,16 @@ export function validateBranchGroupBranchName(name: string): string {
     throw new Error(`Invalid branch group branch name: ${JSON.stringify(name)}`);
   }
   return name;
+}
+
+/** General task-branch aliases deliberately share the branch-group ruleset. */
+export const isValidTaskBranchName = isValidBranchGroupBranchName;
+export function validateTaskBranchName(name: string): string {
+  try {
+    return validateBranchGroupBranchName(name);
+  } catch {
+    throw new Error(`Invalid task branch name: ${JSON.stringify(name)}`);
+  }
 }
 
 /**
@@ -126,16 +217,19 @@ export function resolveEntryPointBranchAssignment(
     case "shared":
       return {
         workingBranch: derivePerTaskBranchName(resolvedBranch, taskSegment),
+        branchWriteOrigin: "engine",
         mergeTargetBranch: normalizeOptionalBranch(resolvedBranch),
       };
     case "per-task-derived":
       return {
         workingBranch: derivePerTaskBranchName(resolvedBranch, taskSegment),
+        branchWriteOrigin: "engine",
         mergeTargetBranch: undefined,
       };
     case "project-default":
       return {
         workingBranch: undefined,
+        branchWriteOrigin: "engine",
         mergeTargetBranch: undefined,
       };
     case "existing":

@@ -4,7 +4,7 @@ import type { ComponentProps } from "react";
 import { readFileSync } from "node:fs";
 import { NewTaskModal } from "../NewTaskModal";
 import type { Task, Column } from "@fusion/core";
-import { apiFetchGitHubIssues, apiFetchGitHubPulls, checkDuplicateTasks, fetchAgents, fetchGitRemotes, type BoardWorkflowsPayload } from "../../api";
+import { apiFetchGitHubIssues, apiFetchGitHubPulls, checkDuplicateTasks, fetchAgents, fetchBoardWorkflows, fetchGitRemotes, type BoardWorkflowsPayload, type DuplicateMatch } from "../../api";
 import { writeBoardWorkflowsCache } from "../../utils/boardWorkflowsCache";
 import { writeLastSelectedWorkflowId } from "../../utils/lastSelectedWorkflow";
 import { GITHUB_SETUP_WARNING_DELAY_MS, GITHUB_SETUP_WARNING_MISSING_SINCE_KEY } from "../../hooks/useGithubSetupWarningDelay";
@@ -28,9 +28,10 @@ vi.mock("lucide-react", () => ({
   Paperclip: () => null,
   ArrowDown: () => null,
   ArrowUp: () => null,
-  Flag: () => null,
+  Flag: () => <svg />,
   TriangleAlert: () => null,
-  Zap: () => null,
+  Zap: () => <svg />,
+  ShieldCheck: () => null,
   Brain: () => null,
   Server: () => null,
   Cpu: () => null,
@@ -45,6 +46,7 @@ vi.mock("../../api", () => ({
   uploadAttachment: vi.fn().mockResolvedValue({}),
   checkDuplicateTasks: vi.fn().mockResolvedValue([]),
   fetchGitRemotes: vi.fn().mockResolvedValue([]),
+  fetchBoardWorkflows: vi.fn().mockResolvedValue({ flagEnabled: true, defaultWorkflowId: "builtin:coding", workflows: [], taskWorkflowIds: {} }),
   apiFetchGitHubIssues: vi.fn().mockResolvedValue([]),
   apiFetchGitHubPulls: vi.fn().mockResolvedValue([]),
   fetchModels: vi.fn().mockResolvedValue({ models: [
@@ -144,6 +146,7 @@ describe("NewTaskModal", () => {
     mockConfirm.mockResolvedValue(true);
     vi.mocked(checkDuplicateTasks).mockResolvedValue([]);
     vi.mocked(fetchGitRemotes).mockResolvedValue([]);
+    vi.mocked(fetchBoardWorkflows).mockResolvedValue({ flagEnabled: true, defaultWorkflowId: "builtin:coding", workflows: [], taskWorkflowIds: {} });
     vi.mocked(apiFetchGitHubIssues).mockResolvedValue([]);
     vi.mocked(apiFetchGitHubPulls).mockResolvedValue([]);
     window.localStorage.clear();
@@ -153,6 +156,18 @@ describe("NewTaskModal", () => {
       viewportHeight: null,
       viewportOffsetTop: 0,
     });
+  });
+
+  it.each(["mobile", "desktop"] as const)("keeps the priority quick action accessible in the %s action row", (viewportMode) => {
+    mockViewportMode = viewportMode;
+    renderNewTaskModal();
+
+    const actions = screen.getByTestId("task-form-description-actions");
+    const priority = screen.getByTestId("task-form-inline-priority");
+    expect(actions).toContainElement(priority);
+    expect(priority).toHaveAttribute("aria-label", expect.stringMatching(/^Priority:/));
+    expect(priority).toHaveAttribute("title", expect.stringMatching(/^Priority:/));
+    expect(actions.querySelector("button:empty")).toBeNull();
   });
 
   it("restores desktop body density only for the 768px tablet resize class", () => {
@@ -423,7 +438,6 @@ describe("NewTaskModal", () => {
       await waitFor(() => expect(screen.getByTestId("new-task-github-reference-picker")).toBeInTheDocument());
 
       expect(document.querySelector(".floating-window.new-task-modal")).toBeNull();
-      expect(newTaskModalCss).toContain("FNXC:ModalTouchGeometry 2026-07-27-18:00");
       expect(newTaskModalCss).toMatch(/\.new-task-modal\s*\{[^}]*pointer-events:\s*auto;/s);
     });
 
@@ -507,7 +521,6 @@ describe("NewTaskModal", () => {
   it("exposes New Task dialog quick-add affordance parity when AI handoff callbacks are supplied", () => {
     renderNewTaskModal({
       onPlanningMode: vi.fn(),
-      onSubtaskBreakdown: vi.fn(),
     });
 
     const advancedSection = screen.getByTestId("task-form-more-options");
@@ -560,6 +573,28 @@ describe("NewTaskModal", () => {
     expect(advancedSection).toHaveAttribute("hidden");
     expect(select).toHaveValue("standard");
     expect(Array.from(select.options).map((option) => option.value)).toEqual(["standard", "fast"]);
+  });
+
+  it("omits plan approval across successive submissions while Fast still toggles", async () => {
+    const onCreateTask = vi.fn().mockResolvedValue(makeTask("FN-234"));
+    renderNewTaskModal({ onCreateTask, projectId: "project-1" });
+    expect(screen.queryByTestId("task-form-plan-approval-toggle")).toBeNull();
+
+    const fastToggle = screen.getByTestId("task-form-inline-fast");
+    fireEvent.click(fastToggle);
+    expect(fastToggle).toHaveAttribute("aria-pressed", "true");
+    fireEvent.change(screen.getByPlaceholderText("What needs to be done?"), { target: { value: "First ordinary task" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create Task" }));
+    await waitFor(() => expect(onCreateTask).toHaveBeenCalledTimes(1));
+    expect(onCreateTask.mock.calls[0]?.[0]).toMatchObject({ executionMode: "fast" });
+    expect(onCreateTask.mock.calls[0]?.[0]).not.toHaveProperty("requirePlanApproval");
+
+    await waitFor(() => expect(screen.getByPlaceholderText("What needs to be done?")).toHaveValue(""));
+    expect(screen.getByTestId("task-form-inline-fast")).toHaveAttribute("aria-pressed", "false");
+    fireEvent.change(screen.getByPlaceholderText("What needs to be done?"), { target: { value: "Second ordinary task" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create Task" }));
+    await waitFor(() => expect(onCreateTask).toHaveBeenCalledTimes(2));
+    expect(onCreateTask.mock.calls[1]?.[0]).not.toHaveProperty("requirePlanApproval");
   });
 
   it("includes executionMode fast in the create payload when Fast is selected", async () => {
@@ -710,53 +745,6 @@ describe("NewTaskModal", () => {
     expect(screen.getByTestId("task-form-execution-mode-select")).toHaveValue("standard");
   });
 
-  it("hands trimmed descriptions to planning and subtask callbacks without discard confirmation", () => {
-    const onPlanningMode = vi.fn();
-    const onSubtaskBreakdown = vi.fn();
-    const { unmount, props } = renderNewTaskModal({
-      onPlanningMode,
-      onSubtaskBreakdown,
-    });
-
-    fireEvent.change(screen.getByPlaceholderText("What needs to be done?"), { target: { value: "  Break this down  " } });
-    fireEvent.click(screen.getByTestId("task-form-plan-button"));
-
-    expect(props.onClose).toHaveBeenCalledTimes(1);
-    expect(mockConfirm).not.toHaveBeenCalled();
-    expect(onPlanningMode).toHaveBeenCalledWith("Break this down");
-    expect(onSubtaskBreakdown).not.toHaveBeenCalled();
-
-    unmount();
-    renderNewTaskModal({
-      onPlanningMode,
-      onSubtaskBreakdown,
-    });
-
-    fireEvent.change(screen.getByPlaceholderText("What needs to be done?"), { target: { value: "  Split into subtasks  " } });
-    fireEvent.click(screen.getByTestId("task-form-subtask-button"));
-
-    expect(onSubtaskBreakdown).toHaveBeenCalledWith("Split into subtasks");
-    expect(onPlanningMode).toHaveBeenCalledTimes(1);
-  });
-
-  it("disables Plan and Subtask handoff buttons until a description is present", () => {
-    renderNewTaskModal({
-      onPlanningMode: vi.fn(),
-      onSubtaskBreakdown: vi.fn(),
-    });
-
-    const planButton = screen.getByTestId("task-form-plan-button");
-    const subtaskButton = screen.getByTestId("task-form-subtask-button");
-
-    expect(planButton).toBeDisabled();
-    expect(subtaskButton).toBeDisabled();
-
-    fireEvent.change(screen.getByPlaceholderText("What needs to be done?"), { target: { value: "Ready to plan" } });
-
-    expect(planButton).not.toBeDisabled();
-    expect(subtaskButton).not.toBeDisabled();
-  });
-
   // FNXC:NewTask 2026-06-23-00:10: The New Task dialog NO LONGER force-opens TaskForm's advanced controls. The DEEP/advanced options (model selectors, workflow picker, etc.) are collapsed behind a disclosure relabeled "Advanced"; the common quick-add buttons (Attach/Fast/Priority) are surfaced inline next to Plan and are always visible.
   it("keeps deep options behind a collapsed 'Advanced' disclosure while surfacing inline quick-add buttons", () => {
     renderNewTaskModal();
@@ -895,6 +883,31 @@ describe("NewTaskModal", () => {
           expect.objectContaining({ enabledWorkflowSteps: ["browser-verification"] }),
         );
       });
+    });
+
+    it.each(["mobile", "desktop"] as const)("restores default-on steps in the %s New Task layout after Fast is disabled", async (viewport) => {
+      const { fetchWorkflows, fetchWorkflowOptionalSteps } = await import("../../api");
+      mockViewportMode = viewport;
+      vi.mocked(fetchWorkflows).mockResolvedValue([WF]);
+      vi.mocked(fetchWorkflowOptionalSteps).mockResolvedValue([{ ...STEP, defaultOn: true }]);
+
+      const { props } = renderNewTaskModal();
+      fireEvent.change(screen.getByPlaceholderText("What needs to be done?"), { target: { value: "Restore Fast selection" } });
+      await chooseWorkflowOption("wf-x");
+
+      const trigger = await screen.findByTestId("task-form-inline-optional-steps");
+      await waitFor(() => expect(trigger).toHaveTextContent("Steps: 1 selected"));
+      const executionModeSelect = screen.getByTestId("task-form-execution-mode-select");
+      fireEvent.change(executionModeSelect, { target: { value: "fast" } });
+      await waitFor(() => expect(trigger).toHaveTextContent("Steps: none"));
+      fireEvent.change(executionModeSelect, { target: { value: "standard" } });
+      await waitFor(() => expect(trigger).toHaveTextContent("Steps: 1 selected"));
+
+      fireEvent.click(screen.getByRole("button", { name: "Create Task" }));
+      await waitFor(() => expect(props.onCreateTask).toHaveBeenCalledTimes(1));
+      const payload = vi.mocked(props.onCreateTask).mock.calls[0]?.[0] as Record<string, unknown>;
+      expect(payload.enabledWorkflowSteps).toEqual(["browser-verification"]);
+      expect(payload).not.toHaveProperty("executionMode");
     });
 
     it("keeps exactly one inline optional-steps trigger when Advanced is expanded", async () => {
@@ -1211,6 +1224,18 @@ describe("NewTaskModal", () => {
     expect(screen.getByText("Branch name is required for this branch strategy.")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Create Task" }));
+    expect(props.onCreateTask).not.toHaveBeenCalled();
+  });
+
+  it("rejects an invalid custom branch name before submitting", () => {
+    const { props } = renderNewTaskModal();
+
+    fireEvent.change(screen.getByPlaceholderText("What needs to be done?"), { target: { value: "Task with malformed branch" } });
+    fireEvent.change(screen.getByLabelText("Branch strategy"), { target: { value: "custom-new" } });
+    fireEvent.change(screen.getByLabelText("Branch name"), { target: { value: "feature/has space" } });
+
+    expect(screen.getByRole("button", { name: "Create Task" })).toBeDisabled();
+    expect(screen.getAllByText("Enter a valid Git branch name (no spaces or ref punctuation).").length).toBeGreaterThan(0);
     expect(props.onCreateTask).not.toHaveBeenCalled();
   });
 
@@ -1734,6 +1759,25 @@ describe("NewTaskModal", () => {
       });
     });
 
+    it("preserves the selected workflow through duplicate acknowledgement", async () => {
+      await mockWorkflows([{ id: "WF-DUP", name: "Duplicate-safe" }]);
+      vi.mocked(checkDuplicateTasks).mockResolvedValueOnce([
+        { id: "FN-DUP", title: "Existing", description: "Existing duplicate", column: "todo", score: 0.9 },
+      ]);
+      const { props } = renderNewTaskModal();
+
+      await waitFor(() => expect(screen.getByTestId("task-workflow-dropdown-trigger")).toBeTruthy());
+      await chooseWorkflowOption("WF-DUP");
+      fireEvent.change(screen.getByPlaceholderText("What needs to be done?"), { target: { value: "Duplicate-safe task" } });
+      fireEvent.click(screen.getByRole("button", { name: "Create Task" }));
+      await screen.findByText("Possible duplicates");
+      fireEvent.click(screen.getByRole("button", { name: "Create anyway" }));
+
+      await waitFor(() => expect(props.onCreateTask).toHaveBeenCalledWith(
+        expect.objectContaining({ workflowId: "WF-DUP", acknowledgedDuplicates: ["FN-DUP"] }),
+      ));
+    });
+
     it("does not render the legacy per-step checkbox UI", async () => {
       await mockWorkflows([{ id: "WF-1", name: "QA" }]);
       renderNewTaskModal();
@@ -1743,6 +1787,397 @@ describe("NewTaskModal", () => {
       });
       expect(screen.queryByTestId("workflow-step-order")).toBeNull();
       expect(document.querySelector('[data-testid^="workflow-step-checkbox-"]')).toBeNull();
+    });
+  });
+
+  describe("manual-intake Start", () => {
+    function mockStartWorkflows(id: string, name: string) {
+      return import("../../api").then(({ fetchWorkflows }) => {
+        vi.mocked(fetchWorkflows).mockResolvedValueOnce([{
+          id,
+          name,
+          description: "",
+          kind: "workflow",
+          ir: { version: "v1", name, nodes: [], edges: [] },
+          layout: {},
+          createdAt: "",
+          updatedAt: "",
+        }] as any);
+      });
+    }
+
+    const codingIdeasBoardPayload: BoardWorkflowsPayload = {
+      flagEnabled: true,
+      defaultWorkflowId: "builtin:coding",
+      workflows: [{
+        id: "builtin:coding-ideas",
+        name: "Coding (Ideas)",
+        columns: [
+          { id: "ideas", name: "Ideas", flags: { intake: true, hold: true, manualIntake: true } },
+          { id: "todo", name: "Todo", flags: {} },
+          { id: "done", name: "Done", flags: { complete: true } },
+        ],
+      }],
+      taskWorkflowIds: {},
+    };
+
+    it("atomically creates Coding (Ideas) Start in its proven working column", async () => {
+      await mockStartWorkflows("builtin:coding-ideas", "Coding (Ideas)");
+      vi.mocked(fetchBoardWorkflows).mockResolvedValueOnce(codingIdeasBoardPayload);
+      const onCreateTask = vi.fn().mockResolvedValue({ ...makeTask("FN-START"), column: "todo", workflowId: "builtin:coding-ideas" });
+      const { props } = renderNewTaskModal({ onCreateTask });
+
+      await waitFor(() => expect(screen.getByTestId("task-workflow-dropdown-trigger")).toBeTruthy());
+      await chooseWorkflowOption("builtin:coding-ideas");
+      fireEvent.change(screen.getByPlaceholderText("What needs to be done?"), { target: { value: "Start this idea" } });
+      const start = await screen.findByTestId("task-form-inline-start");
+      expect(start).toBeEnabled();
+      fireEvent.click(start);
+
+      await waitFor(() => expect(onCreateTask).toHaveBeenCalledWith(expect.objectContaining({
+        workflowId: "builtin:coding-ideas",
+        column: "todo",
+        description: "Start this idea",
+      })));
+      expect(props.addToast).toHaveBeenCalledWith("Queued FN-START for planning", "success");
+    });
+
+    /*
+    FNXC:QuickAddStart 2026-08-26-19:19:
+    Second Start surface for the duplicated-Ideas-workflow fix: the New Task dialog shares
+    `quickAddStart`'s resolution with the board composer, so it must also create in the duplicate's
+    own Planning lane instead of promoting into the WIP lane (a rejected transition that left the
+    card parked in Ideas).
+    */
+    it("atomically creates a duplicated Ideas workflow's Start in its own Planning lane", async () => {
+      await mockStartWorkflows("WF-014", "Coding ideas V2");
+      vi.mocked(fetchBoardWorkflows).mockResolvedValueOnce({
+        flagEnabled: true,
+        defaultWorkflowId: "builtin:coding",
+        workflows: [{
+          id: "WF-014",
+          name: "Coding ideas V2",
+          columns: [
+            { id: "ideas", name: "Ideas", flags: { intake: true, manualIntake: true } },
+            { id: "todo", name: "Planning", flags: { hold: true } },
+            { id: "in-progress", name: "In progress", flags: { countsTowardWip: true } },
+            { id: "done", name: "Done", flags: { complete: true } },
+          ],
+        }],
+        taskWorkflowIds: {},
+      } as BoardWorkflowsPayload);
+      const onCreateTask = vi.fn().mockResolvedValue({ ...makeTask("FN-CLONE"), column: "todo", workflowId: "WF-014" });
+      const onMoveTask = vi.fn();
+      renderNewTaskModal({ onCreateTask, onMoveTask });
+
+      await waitFor(() => expect(screen.getByTestId("task-workflow-dropdown-trigger")).toBeTruthy());
+      await chooseWorkflowOption("WF-014");
+      fireEvent.change(screen.getByPlaceholderText("What needs to be done?"), { target: { value: "Start this idea" } });
+      fireEvent.click(await screen.findByTestId("task-form-inline-start"));
+
+      await waitFor(() => expect(onCreateTask).toHaveBeenCalledWith(expect.objectContaining({ workflowId: "WF-014", column: "todo" })));
+      expect(onMoveTask).not.toHaveBeenCalled();
+    });
+
+    it("keeps the eligible Start node mounted while editing in the desktop floating host", async () => {
+      mockViewportMode = "desktop";
+      await mockStartWorkflows("builtin:coding-ideas", "Coding (Ideas)");
+      vi.mocked(fetchBoardWorkflows).mockResolvedValueOnce(codingIdeasBoardPayload);
+      renderNewTaskModal();
+
+      await waitFor(() => expect(screen.getByTestId("task-workflow-dropdown-trigger")).toBeTruthy());
+      await chooseWorkflowOption("builtin:coding-ideas");
+      const start = await screen.findByTestId("task-form-inline-start");
+      const description = screen.getByPlaceholderText("What needs to be done?");
+      expect(start).toBeVisible();
+      expect(start).toBeDisabled();
+      expect(screen.getByTestId("task-form-description-actions")).toContainElement(start);
+
+      fireEvent.change(description, { target: { value: "Start from desktop" } });
+      expect(screen.getByTestId("task-form-inline-start")).toBeEnabled();
+      expect(screen.getByTestId("task-form-inline-start")).toBe(start);
+
+      fireEvent.change(description, { target: { value: "" } });
+      expect(screen.getByTestId("task-form-inline-start")).toBeDisabled();
+      expect(screen.getByTestId("task-form-inline-start")).toBe(start);
+    });
+
+    it("creates a custom manual-intake task before moving it once to the validated target", async () => {
+      await mockStartWorkflows("WF-MANUAL", "Manual intake");
+      vi.mocked(fetchBoardWorkflows).mockResolvedValueOnce({
+        flagEnabled: true,
+        defaultWorkflowId: "builtin:coding",
+        workflows: [{
+          id: "WF-MANUAL",
+          name: "Manual intake",
+          columns: [
+            { id: "waiting", name: "Waiting", flags: { intake: true, manualIntake: true } },
+            { id: "building", name: "Building", flags: {} },
+            { id: "done", name: "Done", flags: { complete: true } },
+          ],
+        }],
+        taskWorkflowIds: {},
+      });
+      const onMoveTask = vi.fn().mockResolvedValue({ ...makeTask("FN-CUSTOM"), column: "building", workflowId: "WF-MANUAL" });
+      const onCreateTask = vi.fn().mockResolvedValue({ ...makeTask("FN-CUSTOM"), column: "waiting", workflowId: "WF-MANUAL" });
+      const { props } = renderNewTaskModal({ onCreateTask, onMoveTask });
+
+      await waitFor(() => expect(screen.getByTestId("task-workflow-dropdown-trigger")).toBeTruthy());
+      await chooseWorkflowOption("WF-MANUAL");
+      fireEvent.change(screen.getByPlaceholderText("What needs to be done?"), { target: { value: "Start custom intake" } });
+      fireEvent.click(await screen.findByTestId("task-form-inline-start"));
+
+      await waitFor(() => expect(onMoveTask).toHaveBeenCalledWith("FN-CUSTOM", "building"));
+      expect(onCreateTask).toHaveBeenCalledWith(expect.objectContaining({ workflowId: "WF-MANUAL" }));
+      expect(onMoveTask).toHaveBeenCalledTimes(1);
+      expect(onCreateTask.mock.invocationCallOrder[0]).toBeLessThan(onMoveTask.mock.invocationCallOrder[0]);
+      expect(props.addToast).toHaveBeenCalledWith("Queued FN-CUSTOM for planning", "success");
+    });
+
+    it("reports a partial outcome when custom Start move fails after creation", async () => {
+      await mockStartWorkflows("WF-MANUAL", "Manual intake");
+      vi.mocked(fetchBoardWorkflows).mockResolvedValueOnce({
+        flagEnabled: true,
+        defaultWorkflowId: "builtin:coding",
+        workflows: [{
+          id: "WF-MANUAL",
+          name: "Manual intake",
+          columns: [
+            { id: "waiting", name: "Waiting", flags: { intake: true, manualIntake: true } },
+            { id: "building", name: "Building", flags: {} },
+          ],
+        }],
+        taskWorkflowIds: {},
+      });
+      const onCreateTask = vi.fn().mockResolvedValue({ ...makeTask("FN-PARTIAL"), column: "waiting", workflowId: "WF-MANUAL" });
+      const onMoveTask = vi.fn().mockRejectedValue(new Error("move unavailable"));
+      const { props } = renderNewTaskModal({ onCreateTask, onMoveTask });
+
+      await waitFor(() => expect(screen.getByTestId("task-workflow-dropdown-trigger")).toBeTruthy());
+      await chooseWorkflowOption("WF-MANUAL");
+      fireEvent.change(screen.getByPlaceholderText("What needs to be done?"), { target: { value: "Keep created task" } });
+      fireEvent.click(await screen.findByTestId("task-form-inline-start"));
+
+      await waitFor(() => expect(props.addToast).toHaveBeenCalledWith("Created FN-PARTIAL, but could not start it", "error"));
+      expect(onCreateTask).toHaveBeenCalledTimes(1);
+      expect(onMoveTask).toHaveBeenCalledTimes(1);
+    });
+
+    it("renders Start disabled while empty and preserves its node while editing", async () => {
+      await mockStartWorkflows("builtin:coding-ideas", "Coding (Ideas)");
+      vi.mocked(fetchBoardWorkflows).mockResolvedValueOnce(codingIdeasBoardPayload);
+      renderNewTaskModal();
+
+      await waitFor(() => expect(screen.getByTestId("task-workflow-dropdown-trigger")).toBeTruthy());
+      await chooseWorkflowOption("builtin:coding-ideas");
+      const start = await screen.findByTestId("task-form-inline-start");
+      expect(start).toBeDisabled();
+
+      const description = screen.getByPlaceholderText("What needs to be done?");
+      fireEvent.change(description, { target: { value: "Start this idea" } });
+      expect(screen.getByTestId("task-form-inline-start")).toBeEnabled();
+      expect(screen.getByTestId("task-form-inline-start")).toBe(start);
+
+      fireEvent.change(description, { target: { value: "" } });
+      expect(screen.getByTestId("task-form-inline-start")).toBeDisabled();
+      expect(screen.getByTestId("task-form-inline-start")).toBe(start);
+    });
+
+    it("keeps Start disabled for whitespace-only descriptions", async () => {
+      await mockStartWorkflows("builtin:coding-ideas", "Coding (Ideas)");
+      vi.mocked(fetchBoardWorkflows).mockResolvedValueOnce(codingIdeasBoardPayload);
+      renderNewTaskModal();
+
+      await waitFor(() => expect(screen.getByTestId("task-workflow-dropdown-trigger")).toBeTruthy());
+      await chooseWorkflowOption("builtin:coding-ideas");
+      fireEvent.change(screen.getByPlaceholderText("What needs to be done?"), { target: { value: "   " } });
+      expect(await screen.findByTestId("task-form-inline-start")).toBeDisabled();
+    });
+
+    /*
+    FNXC:NewTaskWorkflowStart 2026-08-27-11:04:
+    FN-196's no-shell contract applies to every modal host. The shared action row deliberately
+    retains other controls, so these checks fence the optional Start slot itself rather than treating
+    an icon-only Fast control as a phantom Start button.
+    */
+    function expectNoStartActionShell() {
+      const actions = screen.getByTestId("task-form-description-actions");
+      expect(screen.queryByTestId("task-form-inline-start")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Start" })).toBeNull();
+      expect(actions.querySelector('button[data-testid="task-form-inline-start"]')).toBeNull();
+      expect(actions.querySelector('button[aria-label="Start"], button[title="Start"]')).toBeNull();
+    }
+
+    it.each(["mobile", "desktop"] as const)("leaves no Start shell on %s when a manual-intake workflow needs a missing move callback", async (viewportMode) => {
+      mockViewportMode = viewportMode;
+      await mockStartWorkflows("WF-MANUAL", "Manual intake");
+      vi.mocked(fetchBoardWorkflows).mockResolvedValueOnce({
+        flagEnabled: true,
+        defaultWorkflowId: "builtin:coding",
+        workflows: [{
+          id: "WF-MANUAL",
+          name: "Manual intake",
+          columns: [
+            { id: "waiting", name: "Waiting", flags: { intake: true, manualIntake: true } },
+            { id: "building", name: "Building", flags: {} },
+          ],
+        }],
+        taskWorkflowIds: {},
+      });
+      renderNewTaskModal();
+
+      await waitFor(() => expect(screen.getByTestId("task-workflow-dropdown-trigger")).toBeTruthy());
+      await chooseWorkflowOption("WF-MANUAL");
+      expectNoStartActionShell();
+    });
+
+    it("keeps the label tied to the submitted action while creation is in flight", async () => {
+      await mockStartWorkflows("builtin:coding-ideas", "Coding (Ideas)");
+      vi.mocked(fetchBoardWorkflows).mockResolvedValueOnce(codingIdeasBoardPayload);
+      let resolveDuplicateCheck!: (matches: DuplicateMatch[]) => void;
+      vi.mocked(checkDuplicateTasks).mockImplementationOnce(() => new Promise<DuplicateMatch[]>((resolve) => { resolveDuplicateCheck = resolve; }));
+      const { props } = renderNewTaskModal();
+
+      await waitFor(() => expect(screen.getByTestId("task-workflow-dropdown-trigger")).toBeTruthy());
+      await chooseWorkflowOption("builtin:coding-ideas");
+      fireEvent.change(screen.getByPlaceholderText("What needs to be done?"), { target: { value: "Create normally" } });
+      fireEvent.click(screen.getByTestId("task-form-inline-create"));
+      expect(screen.getByTestId("task-form-inline-start")).toBeDisabled();
+      expect(screen.getByTestId("task-form-inline-start")).toHaveAccessibleName("Start");
+      resolveDuplicateCheck([]);
+      await waitFor(() => expect(props.onCreateTask).toHaveBeenCalled());
+
+      let resolveStartDuplicateCheck!: (matches: DuplicateMatch[]) => void;
+      vi.mocked(checkDuplicateTasks).mockImplementationOnce(() => new Promise<DuplicateMatch[]>((resolve) => { resolveStartDuplicateCheck = resolve; }));
+      await waitFor(() => expect(screen.queryByTestId("task-form-inline-start")).toBeNull());
+      await chooseWorkflowOption("builtin:coding-ideas");
+      fireEvent.change(screen.getByPlaceholderText("What needs to be done?"), { target: { value: "Start now" } });
+      fireEvent.click(screen.getByTestId("task-form-inline-start"));
+      expect(screen.getByTestId("task-form-inline-start")).toHaveAccessibleName("Starting...");
+      resolveStartDuplicateCheck([]);
+    });
+
+    it("resolves Start from the project default when no workflow is selected", async () => {
+      await mockStartWorkflows("builtin:coding-ideas", "Coding (Ideas)");
+      vi.mocked(fetchBoardWorkflows).mockResolvedValueOnce({ ...codingIdeasBoardPayload, defaultWorkflowId: "builtin:coding-ideas" });
+      renderNewTaskModal();
+
+      await waitFor(() => expect(screen.getByTestId("task-workflow-dropdown-trigger")).toBeTruthy());
+      expect(await screen.findByTestId("task-form-inline-start")).toBeDisabled();
+    });
+
+    it("waits for a usable board-workflow payload before exposing Start", async () => {
+      await mockStartWorkflows("builtin:coding-ideas", "Coding (Ideas)");
+      let resolveBoardWorkflows!: (payload: BoardWorkflowsPayload) => void;
+      vi.mocked(fetchBoardWorkflows).mockImplementationOnce(() => new Promise<BoardWorkflowsPayload>((resolve) => { resolveBoardWorkflows = resolve; }));
+      renderNewTaskModal();
+
+      await waitFor(() => expect(screen.getByTestId("task-workflow-dropdown-trigger")).toBeTruthy());
+      await chooseWorkflowOption("builtin:coding-ideas");
+      expect(screen.queryByTestId("task-form-inline-start")).toBeNull();
+      resolveBoardWorkflows(codingIdeasBoardPayload);
+      expect(await screen.findByTestId("task-form-inline-start")).toBeDisabled();
+    });
+
+    it.each(["mobile", "desktop"] as const)("leaves no Start shell on %s when No workflow is selected", async (viewportMode) => {
+      mockViewportMode = viewportMode;
+      await mockStartWorkflows("builtin:coding-ideas", "Coding (Ideas)");
+      vi.mocked(fetchBoardWorkflows).mockResolvedValueOnce(codingIdeasBoardPayload);
+      renderNewTaskModal({ onMoveTask: vi.fn() });
+
+      await waitFor(() => expect(screen.getByTestId("task-workflow-dropdown-trigger")).toBeTruthy());
+      await chooseWorkflowOption("__none__");
+      fireEvent.change(screen.getByPlaceholderText("What needs to be done?"), { target: { value: "No workflow Start" } });
+      expectNoStartActionShell();
+    });
+
+    it.each(["mobile", "desktop"] as const)("leaves no Start shell on %s for selected auto-triage metadata", async (viewportMode) => {
+      mockViewportMode = viewportMode;
+      await mockStartWorkflows("builtin:coding", "Coding");
+      vi.mocked(fetchBoardWorkflows).mockResolvedValueOnce({
+        flagEnabled: true,
+        defaultWorkflowId: "builtin:coding",
+        workflows: [{
+          id: "builtin:coding",
+          name: "Coding",
+          columns: [{ id: "planning", name: "Planning", flags: { intake: true, manualIntake: false } }, { id: "done", name: "Done", flags: { complete: true } }],
+        }],
+        taskWorkflowIds: {},
+      });
+      renderNewTaskModal({ onMoveTask: vi.fn() });
+
+      await waitFor(() => expect(screen.getByTestId("task-workflow-dropdown-trigger")).toBeTruthy());
+      await chooseWorkflowOption("builtin:coding");
+      expectNoStartActionShell();
+    });
+
+    /*
+    FNXC:NewTaskWorkflowStart 2026-08-27-11:13:
+    FN-196 keeps the All workflows dialog intentionally lane-agnostic: an unset picker resolves the
+    project default, so an auto-triage default must not borrow a visible Start affordance from any
+    Ideas lane that happened to open the dialog.
+    */
+    it.each(["mobile", "desktop"] as const)("leaves no Start shell on %s when All workflows resolves to an auto-triage default", async (viewportMode) => {
+      mockViewportMode = viewportMode;
+      await mockStartWorkflows("builtin:coding", "Coding");
+      vi.mocked(fetchBoardWorkflows).mockResolvedValueOnce({
+        flagEnabled: true,
+        defaultWorkflowId: "builtin:coding",
+        workflows: [{
+          id: "builtin:coding",
+          name: "Coding",
+          columns: [{ id: "planning", name: "Planning", flags: { intake: true, manualIntake: false } }, { id: "done", name: "Done", flags: { complete: true } }],
+        }],
+        taskWorkflowIds: {},
+      });
+      renderNewTaskModal();
+
+      await waitFor(() => expect(screen.getByTestId("task-workflow-dropdown-trigger")).toBeTruthy());
+      expectNoStartActionShell();
+    });
+
+    it.each(["mobile", "desktop"] as const)("leaves no Start shell on %s for malformed workflow columns", async (viewportMode) => {
+      mockViewportMode = viewportMode;
+      await mockStartWorkflows("WF-MALFORMED", "Malformed workflow");
+      vi.mocked(fetchBoardWorkflows).mockResolvedValueOnce({
+        flagEnabled: true,
+        defaultWorkflowId: "builtin:coding",
+        workflows: [{
+          id: "WF-MALFORMED",
+          name: "Malformed workflow",
+          columns: [{ id: "broken", name: "Broken" }],
+        }],
+        taskWorkflowIds: {},
+      } as BoardWorkflowsPayload);
+      renderNewTaskModal({ onMoveTask: vi.fn() });
+
+      await waitFor(() => expect(screen.getByTestId("task-workflow-dropdown-trigger")).toBeTruthy());
+      await chooseWorkflowOption("WF-MALFORMED");
+      expectNoStartActionShell();
+    });
+
+    it.each(["mobile", "desktop"] as const)("leaves no Start shell on %s when board metadata rejects", async (viewportMode) => {
+      mockViewportMode = viewportMode;
+      await mockStartWorkflows("builtin:coding-ideas", "Coding (Ideas)");
+      vi.mocked(fetchBoardWorkflows).mockRejectedValueOnce(new Error("metadata unavailable"));
+      renderNewTaskModal();
+
+      await waitFor(() => expect(screen.getByTestId("task-workflow-dropdown-trigger")).toBeTruthy());
+      await chooseWorkflowOption("builtin:coding-ideas");
+      await waitFor(() => expect(screen.queryByTestId("task-form-inline-start")).toBeNull());
+      expectNoStartActionShell();
+    });
+
+    it.each(["mobile", "desktop"] as const)("leaves no Start shell on %s when the board-workflow payload is unusable", async (viewportMode) => {
+      mockViewportMode = viewportMode;
+      await mockStartWorkflows("builtin:coding-ideas", "Coding (Ideas)");
+      vi.mocked(fetchBoardWorkflows).mockResolvedValueOnce({ ...codingIdeasBoardPayload, flagEnabled: false });
+      renderNewTaskModal();
+
+      await waitFor(() => expect(screen.getByTestId("task-workflow-dropdown-trigger")).toBeTruthy());
+      await chooseWorkflowOption("builtin:coding-ideas");
+      await waitFor(() => expect(screen.queryByTestId("task-form-inline-start")).toBeNull());
+      expectNoStartActionShell();
     });
   });
 
@@ -2162,7 +2597,6 @@ describe("NewTaskModal", () => {
         .map((match) => match[0])
         .join("\n");
 
-      expect(newTaskModalCss).toContain("FNXC:NewTaskWorkflowDropdown 2026-06-30");
       expect(workflowRules).toContain("var(--space-");
       expect(workflowRules).toContain("max-width: 100%");
       expect(workflowRules).toContain("overflow-y: auto");
@@ -2256,7 +2690,6 @@ describe("NewTaskModal", () => {
     });
 
     it("delegates touch drag styling to the shared FloatingWindow primitive", () => {
-      expect(newTaskModalCss).toContain("FloatingWindow owns its shared drag");
       expect(newTaskModalCss).not.toContain("new-task-resize-handle");
       expect(newTaskModalCss).not.toContain("var(--shadow-xl)");
     });

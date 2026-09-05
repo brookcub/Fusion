@@ -5,6 +5,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { SettingsModal, SettingsView } from "../SettingsModal";
+import { __test_resetPendingUpdateInstall } from "../../hooks/usePendingUpdateInstall";
 import type { Settings } from "@fusion/core";
 
 
@@ -18,7 +19,6 @@ const defaultSettings = {
   directMergeCommitStrategy: "auto",
   pushAfterMerge: false,
   pushRemote: "origin",
-  recycleWorktrees: false,
   worktreeInitCommand: "",
   testCommand: "",
   buildCommand: "",
@@ -69,7 +69,7 @@ vi.mock("../../api", () => ({
   deleteCustomProvider: vi.fn(() => Promise.resolve(undefined)),
   testNtfyNotification: vi.fn(() => Promise.resolve({ success: true })),
   testNotification: vi.fn(() => Promise.resolve({ success: true })),
-  fetchBackups: vi.fn(() => Promise.resolve({ count: 0, totalSize: 0, backups: [] })),
+  fetchBackups: vi.fn(() => Promise.resolve({ count: 0, totalSize: 0, backups: [], schedule: { enabled: false, cronExpression: "0 2 * * *", routineRegistered: false } })),
   createBackup: vi.fn(() => Promise.resolve({ success: true })),
   exportSettings: vi.fn(() => Promise.resolve({ version: 1, exportedAt: new Date().toISOString(), global: undefined, project: {} })),
   importSettings: vi.fn(() => Promise.resolve({ success: true, globalCount: 0, projectCount: 0 })),
@@ -118,6 +118,7 @@ vi.mock("../../api", () => ({
   })),
   fetchDashboardHealth: vi.fn(() => Promise.resolve({ status: "ok", version: "1.2.3", uptime: 120 })),
   checkForUpdates: vi.fn(() => Promise.resolve({ currentVersion: "1.0.0", latestVersion: "2.0.0", updateAvailable: true })),
+  checkForUpdate: vi.fn(() => Promise.resolve({ currentVersion: "1.0.0", latestVersion: "2.0.0", updateAvailable: true })),
   installUpdate: vi.fn(() => Promise.resolve({ currentVersion: "1.0.0", latestVersion: "2.0.0", updated: true })),
   fetchSystemInfo: vi.fn(() => Promise.resolve({ supervised: true, restartSupported: true })),
   requestSystemRestart: vi.fn(() => Promise.resolve({ scheduled: true })),
@@ -159,7 +160,7 @@ vi.mock("../../hooks/useMemoryBackendStatus", () => ({
   })),
 }));
 
-import { fetchDashboardHealth, fetchSettings, loginProvider, saveApiKey, updateSettings } from "../../api";
+import { checkForUpdates, fetchAuthStatus, fetchDashboardHealth, fetchSettings, loginProvider, saveApiKey, updateSettings } from "../../api";
 
 function setDocumentHidden(hidden: boolean): void {
   Object.defineProperty(document, "hidden", { configurable: true, value: hidden });
@@ -273,6 +274,7 @@ function expectBaseRule(css: string, selector: string, declaration: string): voi
 
 describe("SettingsModal mobile adaptations", () => {
   beforeEach(() => {
+    __test_resetPendingUpdateInstall();
     vi.clearAllMocks();
     setDocumentHidden(false);
     localStorage.removeItem("fusion_github_star_count");
@@ -421,6 +423,28 @@ describe("SettingsModal mobile adaptations", () => {
     expect(document.querySelector(".settings-update-check")).toBeTruthy();
   });
 
+  it("renders managed update guidance without an update-now shell in the mobile footer", async () => {
+    mockSettingsViewport(true);
+    vi.mocked(checkForUpdates).mockResolvedValueOnce({
+      currentVersion: "1.2.3",
+      latestVersion: null,
+      updateAvailable: false,
+      disabled: true,
+      externallyManaged: true,
+      message: "Managed deployment updates must be installed through its release pipeline.",
+    });
+    const user = userEvent.setup();
+    const { findByText, queryByRole } = render(<SettingsModal onClose={vi.fn()} addToast={vi.fn()} />);
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+
+    const modalActions = document.querySelector(".modal-actions");
+    await user.click(within(modalActions as HTMLElement).getByRole("button", { name: "Check for updates" }));
+
+    expect(await findByText(/Managed deployment updates/)).toBeTruthy();
+    expect(queryByRole("button", { name: "Update now" })).toBeNull();
+    expect(document.querySelector(".settings-update-now-btn")).toBeNull();
+  });
+
   it("keeps update-now button reachable from the mobile footer", async () => {
     mockSettingsViewport(true);
     const user = userEvent.setup();
@@ -505,6 +529,24 @@ describe("SettingsModal mobile adaptations", () => {
     await user.selectOptions(picker, "cli-binary");
     expect(await findByText(/Installing the global CLI lets you run fn and fusion/)).toBeTruthy();
     expect(document.querySelector(".cli-binary-panel")).toBeTruthy();
+  });
+
+  it("keeps Remote Access in the Basic-mode Infrastructure picker without an empty group", async () => {
+    localStorage.removeItem("fusion:settings:show-advanced");
+    mockSettingsViewport(true);
+    const user = userEvent.setup();
+    const { getByLabelText, getByRole } = render(<SettingsModal onClose={vi.fn()} addToast={vi.fn()} />);
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+
+    expect(getByRole("checkbox", { name: "Advanced settings" })).not.toBeChecked();
+    const picker = getByLabelText("Settings Section") as HTMLSelectElement;
+    const remoteOptions = Array.from(picker.options).filter((option) => option.value === "remote");
+    expect(remoteOptions).toHaveLength(1);
+    expect(remoteOptions[0]?.parentElement).toHaveAttribute("label", "Infrastructure");
+    expect(picker.querySelector('optgroup[label="Infrastructure"] option')).not.toBeNull();
+
+    await user.selectOptions(picker, "remote");
+    expect(getByRole("heading", { name: "Remote Access" })).toBeInTheDocument();
   });
 
   it("excludes research sections from mobile picker when researchView is disabled", async () => {
@@ -736,6 +778,41 @@ describe("SettingsModal mobile adaptations", () => {
     expect(saveApiKey).toHaveBeenCalledWith("anthropic-api-key", "sk-mobile");
   });
 
+  it.each([
+    ["modal", (props: { onClose: () => void; addToast: () => void }) => <SettingsModal {...props} />],
+    ["embedded", (props: { onClose: () => void; addToast: () => void }) => <SettingsView {...props} />],
+  ])("keeps the Anthropic OAuth loginError banner inside the card on mobile %s Settings", async (_surface, Surface) => {
+    mockSettingsViewport(true);
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 375 });
+    vi.mocked(fetchAuthStatus).mockResolvedValue({
+      providers: [
+        {
+          id: "anthropic-subscription",
+          name: "Anthropic Subscription",
+          authenticated: false,
+          type: "oauth",
+          expired: true,
+          loginError: "This OAuth session expired and could not be refreshed. Re-login to restore model access.",
+        },
+        { id: "anthropic-api-key", name: "Anthropic API Key", authenticated: false, type: "api_key" },
+      ],
+    } as Awaited<ReturnType<typeof fetchAuthStatus>>);
+
+    const user = userEvent.setup();
+    const { findByTestId, getByLabelText } = render(<Surface onClose={vi.fn()} addToast={vi.fn()} />);
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+    await user.selectOptions(getByLabelText("Settings Section"), "authentication");
+
+    const subscriptionCard = (await findByTestId("auth-provider-icon-anthropic-subscription")).closest(".auth-provider-card") as HTMLElement;
+    const alert = within(subscriptionCard).getByRole("alert");
+    const header = subscriptionCard.querySelector(".auth-provider-header");
+    expect(alert).toHaveClass("auth-provider-login-error");
+    expect(alert).toHaveTextContent("Re-login to restore model access");
+    expect(header).not.toContainElement(alert);
+    expect(header?.nextElementSibling).toBe(alert);
+    expect(subscriptionCard.querySelector(".auth-provider-actions")).toBeTruthy();
+  });
+
   it("renders notification provider cards responsively on mobile", async () => {
     mockSettingsViewport(true);
     Object.defineProperty(window, "innerWidth", { configurable: true, value: 375 });
@@ -895,7 +972,12 @@ describe("SettingsModal mobile adaptations", () => {
     // Custom Provider cards render outside .auth-panel-body and retain their mobile gutter.
     expectMobileRule(css, ".auth-provider-card", "margin: 0 var(--space-sm) var(--space-sm);");
     expectMobileRule(css, ".auth-provider-header", "padding: var(--space-sm);");
-    expectMobileRule(css, ".auth-provider-header > div:not(.auth-provider-info):not(.auth-apikey-section)", "margin-left: auto;");
+    expectMobileRule(css, ".auth-provider-header > div:not(.auth-provider-info):not(.auth-apikey-section):not(.auth-provider-actions)", "margin-left: auto;");
+    expectMobileRule(css, ".auth-provider-header > .auth-provider-actions", "width: 100%;");
+    expectMobileRule(css, ".auth-provider-header > .auth-provider-actions", "flex-basis: 100%;");
+    expectMobileRule(css, ".auth-provider-header > .auth-provider-actions", "min-width: 0;");
+    expectMobileRule(css, ".auth-provider-header > .auth-provider-actions", "max-width: 100%;");
+    expectMobileRule(css, ".auth-provider-header > .auth-provider-actions", "margin-left: 0;");
     expectMobileRule(css, ".auth-apikey-section", "align-items: flex-end;");
     expectMobileRule(css, ".auth-apikey-input-row", "justify-content: flex-end;");
     expectMobileRule(css, ".auth-apikey-input-row .btn", "margin-left: auto;");

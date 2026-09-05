@@ -3,7 +3,13 @@ import { readFileSync, realpathSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { resolveGlobalDir, isVersionNewer, resolveUpdateTargetVersion } from "@fusion/core";
+import {
+  EXTERNALLY_MANAGED_UPDATE_MESSAGE,
+  resolveGlobalDir,
+  resolveUpdatesExternallyManaged,
+  isVersionNewer,
+  resolveUpdateTargetVersion,
+} from "@fusion/core";
 import type { UpdateChannel } from "@fusion/core";
 
 const CACHE_FILENAME = "update-check.json";
@@ -30,10 +36,17 @@ export type UpdateCheckResult = {
   error?: string;
 };
 
+export type UpdateInstallOutcome = "installed" | "no-update-available" | "check-failed" | "unsupported-install-method" | "failed";
+
+/** `check-failed` is reserved for a route pre-install re-check; this helper never returns it. */
 export type UpdateInstallResult = {
   currentVersion: string;
   latestVersion: string | null;
+  /** True exactly when outcome is `installed`, retained for older consumers. */
   updated: boolean;
+  outcome: UpdateInstallOutcome;
+  /** Human-readable for every non-installed terminal outcome. */
+  message?: string;
   error?: string;
 };
 
@@ -150,7 +163,7 @@ function isPermissionInstallError(error: unknown): boolean {
 }
 
 /** Best-effort path of the running Fusion binary, used to tailor remediation. */
-function detectRunningBinaryPath(): string | null {
+export function detectRunningBinaryPath(): string | null {
   const argvPath = process.argv[1];
   if (typeof argvPath === "string" && argvPath.length > 0) return argvPath;
   return typeof process.execPath === "string" ? process.execPath : null;
@@ -166,7 +179,7 @@ brew's own git repo, not where formulae install). So resolve the symlink and mat
 real Cellar/opt install roots — checking only `/usr/local/Homebrew/` missed Intel Macs.
 `/usr/local/bin` is deliberately NOT matched: it is shared with npm-global bins.
 */
-function isHomebrewInstall(binaryPath: string | null): boolean {
+export function isHomebrewInstall(binaryPath: string | null): boolean {
   if (!binaryPath) return false;
   let resolved = binaryPath;
   try {
@@ -180,6 +193,53 @@ function isHomebrewInstall(binaryPath: string | null): boolean {
     p.startsWith("/usr/local/opt/") ||    // Intel formula opt symlinks
     p.includes("/Homebrew/") ||           // brew's own repo checkout
     p.startsWith("/home/linuxbrew/"),     // Linuxbrew
+  );
+}
+
+export function detectUnsupportedInstallMethod(input: {
+  externallyManaged?: boolean;
+  sourceWorkspaceRoot?: string;
+  binaryPath?: string | null;
+  hasNpm?: boolean;
+}): { reason: "externally-managed" | "source-checkout" | "homebrew" | "npm-missing"; message: string } | null {
+  if (input.externallyManaged) {
+    return { reason: "externally-managed", message: EXTERNALLY_MANAGED_UPDATE_MESSAGE };
+  }
+  if (input.sourceWorkspaceRoot) {
+    return { reason: "source-checkout", message: `This Fusion is running from a source checkout at ${input.sourceWorkspaceRoot}; a global npm install will not change it — pull and rebuild the checkout instead.` };
+  }
+  const binaryPath = input.binaryPath ?? detectRunningBinaryPath();
+  if (isHomebrewInstall(binaryPath)) {
+    return { reason: "homebrew", message: "This Fusion install is managed by Homebrew and cannot be updated with npm. Update it from a terminal with: brew upgrade fusion" };
+  }
+  if (input.hasNpm === false) {
+    return {
+      reason: "npm-missing",
+      message:
+        "Update failed: npm is not available on this host, so the in-app updater cannot run. " +
+        "This Fusion install is managed outside npm — update it the way it was installed. " +
+        "If npm can be installed for this host, use `npm install -g @runfusion/fusion@<version>` from a terminal.",
+    };
+  }
+  return null;
+}
+
+/*
+FNXC:UpdateInstall 2026-08-21-16:37:
+`/bin/sh` reports a missing command as exit 127 with `npm: not found`, not ENOENT or
+`command not found`. Recognize each shell form so the updater returns actionable guidance
+rather than leaking raw stderr to the operator.
+*/
+function isNpmMissingError(error: unknown): boolean {
+  const installError = error as InstallError;
+  const message = [installError?.message, installError?.stderr, installError?.stdout]
+    .filter((part): part is string => typeof part === "string")
+    .join("\n");
+  const mentionsNpm = /\bnpm\b/i.test(message);
+  return (
+    installError?.code === 127 ||
+    (installError?.code === "ENOENT" && mentionsNpm) ||
+    /\bnpm\b[^\n]*\bnot found\b|\bnpm\b[^\n]*command not found|['"]npm['"]\s+is not recognized as an internal or external command|spawn\s+npm\s+ENOENT/i.test(message)
   );
 }
 
@@ -250,82 +310,52 @@ export async function clearUpdateCheckCache(fusionDir: string): Promise<void> {
 export async function performUpdateInstall(
   currentVersion: string,
   latestVersion: string | null,
-  options: { exec?: ExecInstall; fusionDir?: string } = {},
+  options: {
+    exec?: ExecInstall;
+    fusionDir?: string;
+    installMethod?: { sourceWorkspaceRoot?: string; externallyManaged?: boolean };
+  } = {},
 ): Promise<UpdateInstallResult> {
   const runExec = options.exec ?? execAsync;
   const fusionDir = options.fusionDir ?? resolveGlobalDir();
-
-  // No resolved target → nothing safe to install. Callers guard this today;
-  // the guard here keeps the exec path unreachable if one ever stops.
+  /*
+  FNXC:UpdateInstall 2026-08-14-19:31:
+  A silent updated:false response was indistinguishable from a dead button. Failed
+  checks and an up-to-date re-check must never share an outcome; host-only source
+  checkout context is injected here so unsupported installs are refused pre-flight.
+  */
+  const unsupported = detectUnsupportedInstallMethod({
+    externallyManaged: options.installMethod?.externallyManaged ?? resolveUpdatesExternallyManaged(),
+    sourceWorkspaceRoot: options.installMethod?.sourceWorkspaceRoot,
+  });
+  if (unsupported) return { currentVersion, latestVersion, updated: false, outcome: "unsupported-install-method", message: unsupported.message, error: unsupported.message };
   if (!latestVersion || !SAFE_VERSION_RE.test(latestVersion)) {
-    return {
-      currentVersion,
-      latestVersion,
-      updated: false,
-      error: `No valid update target version to install${latestVersion ? ` ('${latestVersion}')` : ""}.`,
-    };
+    const error = `No valid update target version to install${latestVersion ? ` ('${latestVersion}')` : ""}.`;
+    return { currentVersion, latestVersion, updated: false, outcome: "failed", message: error, error };
   }
-
+  const failed = (error: string): UpdateInstallResult => ({ currentVersion, latestVersion, updated: false, outcome: "failed", message: error, error });
   try {
     await runExec(buildInstallCommand(latestVersion), getInstallOptions());
     await clearUpdateCheckCache(fusionDir);
-    return {
-      currentVersion,
-      latestVersion,
-      updated: true,
-    };
+    return { currentVersion, latestVersion, updated: true, outcome: "installed" };
   } catch (error) {
-    /*
-    FNXC:UpdateInstall 2026-07-19-09:50:
-    Native npm dependencies can take longer than two minutes to install on Windows. Allow five minutes, and when exec kills a slow install, report the timeout metadata before npm's preceding deprecation warnings.
-    */
-    if (isInstallTimeoutError(error)) {
-      return {
-        currentVersion,
-        latestVersion,
-        updated: false,
-        error: getInstallTimeoutMessage(latestVersion),
-      };
+    if (isNpmMissingError(error)) {
+      const message = detectUnsupportedInstallMethod({ hasNpm: false })!.message;
+      return { currentVersion, latestVersion, updated: false, outcome: "unsupported-install-method", message, error: message };
     }
-
-    // FNXC:UpdateInstallPermissions 2026-07-10-14:00: a root-owned global dir
-    // (from `sudo npm i -g`) yields EACCES/EPERM the non-root updater cannot
-    // recover from — return actionable guidance rather than raw npm stderr.
-    if (isPermissionInstallError(error)) {
-      return {
-        currentVersion,
-        latestVersion,
-        updated: false,
-        error: getPermissionRemediationMessage(detectRunningBinaryPath()),
-      };
-    }
-
-    if (!isBinCollisionInstallError(error)) {
-      return {
-        currentVersion,
-        latestVersion,
-        updated: false,
-        error: getInstallErrorMessage(error),
-      };
-    }
-
+    if (isInstallTimeoutError(error)) return failed(getInstallTimeoutMessage(latestVersion));
+    if (isPermissionInstallError(error)) return failed(getPermissionRemediationMessage(detectRunningBinaryPath()));
+    if (!isBinCollisionInstallError(error)) return failed(getInstallErrorMessage(error));
     try {
       await runExec(buildInstallCommand(latestVersion, true), getInstallOptions());
       await clearUpdateCheckCache(fusionDir);
-      return {
-        currentVersion,
-        latestVersion,
-        updated: true,
-      };
+      return { currentVersion, latestVersion, updated: true, outcome: "installed" };
     } catch (forceError) {
-      return {
-        currentVersion,
-        latestVersion,
-        updated: false,
-        error: isInstallTimeoutError(forceError)
-          ? getInstallTimeoutMessage(latestVersion, true)
-          : getInstallErrorMessage(forceError),
-      };
+      if (isNpmMissingError(forceError)) {
+        const message = detectUnsupportedInstallMethod({ hasNpm: false })!.message;
+        return { currentVersion, latestVersion, updated: false, outcome: "unsupported-install-method", message, error: message };
+      }
+      return failed(isInstallTimeoutError(forceError) ? getInstallTimeoutMessage(latestVersion, true) : getInstallErrorMessage(forceError));
     }
   }
 }

@@ -27,6 +27,7 @@ Dashboard `POST /tasks` now performs a pre-create duplicate gate using token-ove
   - `task.source.sourceMetadata.acknowledgedDuplicateIds = [...]`
 - Override creates emit activity type `task:duplicate-warning-overridden` with acknowledged IDs and scored candidate metadata.
 - Duplicate lineage is persisted on the task row via canonical source fields (`sourceType: "task_duplicate"`, `sourceParentTaskId`) plus `sourceMetadata.duplicateOfTaskIds` when available, so `fn task show <id>` and Task Detail views can render duplicate-of linkage directly from task provenance.
+- A duplicated task inherits the source task's workflow by default, including that workflow's intake column and default-on optional groups. `POST /api/tasks/:id/duplicate` accepts an optional `{ "workflowId": "..." }` body to choose another enabled workflow; disabled, retired, or unknown workflow ids are rejected.
 
 #### Deterministic duplicate guard (FN-4918, extended by FN-5060)
 
@@ -34,7 +35,7 @@ Fusion applies a deterministic guard for exact normalized content matches (title
 
 - Dashboard `POST /tasks`
 - CLI `fn task create` (`runTaskCreate`)
-- Engine `createAgentTask` (powers `fn_task_create`, including triage subtask splits)
+- Engine `createAgentTask` (powers `fn_task_create`)
 - Mission feature triage (`MissionStore.triageFeature`)
 
 Behavior is consistent across these surfaces:
@@ -94,7 +95,7 @@ Near-duplicate flagging now keeps the task in its normal flow column (`todo` / a
 - `source.sourceMetadata.nearDuplicateOf = <canonicalTaskId>`
 - `source.sourceMetadata.nearDuplicateScore = <number>`
 - `source.sourceMetadata.nearDuplicateSharedTokens = <string[]>`
-- optional `source.sourceMetadata.nearDuplicateDismissed = true` after user chooses Keep
+- optional `source.sourceMetadata.nearDuplicateDismissed = true` after the operator clears the duplicate flag
 - activity event `task:near-duplicate-flagged`
 
 A near-duplicate flag is only actionable while the canonical task is active. The triage backstop does not persist `nearDuplicateOf` for archived, soft-deleted, done, or missing canonicals; when a canonical later becomes inactive through archive, soft-delete, or move-to-done, the store clears `nearDuplicateOf`, `nearDuplicateScore`, `nearDuplicateSharedTokens`, and `nearDuplicateDismissed` from active referrers and records an informational log entry without pausing or failing those tasks.
@@ -102,19 +103,13 @@ A near-duplicate flag is only actionable while the canonical task is active. The
 Dashboard surfaces this as a yellow Duplicate chip plus modal actions only while the canonical exists and is active:
 
 - **Archive** (user-initiated archive path)
-- **Keep** (dismisses the warning by setting `nearDuplicateDismissed: true`)
+- **Clear the duplicate flag** (dismisses the warning by setting `nearDuplicateDismissed: true`)
 
 This layer complements, rather than replaces, FN-4829 similarity detection, FN-4918 deterministic deduplication, and FN-4892 same-agent intake heuristics.
 
 ### Workspace worktree cleanup on archive
 
-Archiving a workspace (multi-repository) task now synchronously removes every recorded per-sub-repository worktree, including archives initiated by `fn_task_archive` and CLI paths that do not construct an executor. Each path is protected by a per-repository cross-process reservation until backend removal and branch cleanup finish. If one removal fails, its reservation is quarantined and the next acquisition reconciles that orphan; successful sibling repositories are still released. `archiveTask(..., { cleanup: false })` intentionally retains worktrees, and the self-healing workspace sweep remains an idempotent backstop.
-
-### Task-pinned orphan recovery
-
-When `worktreeNaming: "task-id"` finds an inactive pinned directory whose Git metadata is incomplete or unregistered, Fusion preserves the whole directory before recreating the task worktree at the same path. The normal preservation root is `<project>/.fusion/recovery/worktrees`. If the configured worktree directory is on another filesystem, Fusion retries the atomic rename under `<worktreesDir>/.fusion-recovery/worktrees` instead of using copy-and-delete.
-
-Each preservation root retains the newest 10 Fusion-generated orphan directories. Pruning is best-effort and skips unknown names, symlinks, unreadable entries, and paths with active sessions. Copy artifacts elsewhere if they need indefinite retention. Worktree discovery, cleanup, and capacity scans treat `.fusion-recovery` as an internal container rather than a task worktree.
+Archiving a workspace (multi-repository) task now synchronously removes every recorded per-sub-repository worktree, including archives initiated by `fn_task_archive` and CLI paths that do not construct an executor. Each path is protected by a per-repository cross-process reservation until backend removal and its `fusion/<task-id>` branch cleanup finish. If one removal fails, its reservation is quarantined and the next acquisition reconciles that orphan; successful sibling repositories are still released. On unarchive, Fusion reconciles the retained live-row metadata: it drops each per-repository entry whose exact worktree path is gone (including its `landedSha`) and clears a stale singular worktree path. A fully disposed workspace task consequently returns as a non-workspace card that must be re-executed rather than re-landed. `archiveTask(..., { cleanup: false })` intentionally retains worktrees, and the self-healing workspace sweep remains an idempotent backstop. See [Workspaces](./workspaces.md#archiving-and-cleanup) for the workspace operator lifecycle.
 
 ### Explicit duplicate-marker guard (FN-5220)
 
@@ -144,7 +139,7 @@ Layer behavior:
 - **Triage planning loop** — after triage reads the generated `PROMPT.md`, an exact redirect marker short-circuits directly into `finalizeApprovedTask()`. Normal plans run deterministic spec hygiene checks in triage, then the selected workflow's optional Plan Review gate owns AI plan review before execution.
 - **Self-healing sweep** — maintenance Batch 2 runs `resolveExplicitDuplicateMarkerTasks()` across `triage`/`todo` tasks to clean up older stuck marker tasks. The sweep is best-effort, capped at 50 marker tasks per cycle, and can be disabled with the internal setting `resolveExplicitDuplicateMarkerEnabled: false` (default `true`).
 
-An operator's decision is durable for a task and its active canonical pair. **Keep** records the acknowledgement, clears the marker-only prompt and triage decision hold, and lets planning continue; triage and self-healing will not ask again if that same marker is reprocessed. A marker for a different active canonical remains a new decision. **Delete** for an explicit-marker decision soft-deletes the duplicate, while **Archive** for an ordinary near-duplicate leaves it terminal in Archived; neither outcome is reopened as a duplicate decision.
+An operator's decision is durable for a task and its active canonical pair. **Clearing the duplicate flag** records the acknowledgement, retires the marker source, clears the triage decision hold, and lets planning continue; triage and self-healing will not ask again if that same marker is reprocessed. A marker for a different active canonical remains a new decision. **Delete** for an explicit-marker decision soft-deletes the duplicate, while **Archive** for an ordinary near-duplicate leaves it terminal in Archived; neither outcome is reopened as a duplicate decision.
 
 All three layers fail open: parse errors, task lookup failures, file-read failures, activity-recording errors, or other unexpected exceptions log a warning and continue normal intake/triage/self-healing flow instead of blocking task creation or recovery.
 
@@ -162,7 +157,7 @@ Fusion applies two conservative intake heuristics that may auto-archive newly fi
 
 - **Ghost-bug preflight** (triage finalize path): for bug-fix-shaped specs that cite concrete constructs/commands, Fusion probes current `main`. If all definitive probes show the cited bug does not reproduce, the task is archived as `auto-resolved-ghost-bug`.
 - **Same-agent duplicate intake** (all task-create backends): if the same `source.sourceAgentId` (or `source.sourceParentTaskId`) filed a highly similar task within 24h (threshold `0.75`), Fusion still detects the near-duplicate — but what happens next depends on the `autoArchiveDuplicateTasksEnabled` project/global setting (default **`false`**, FN-7658/FN-8401):
-  - **Default (`false`)**: the later task is left in place and flagged via the same near-duplicate marker used elsewhere (`sourceMetadata.nearDuplicateOf` / `nearDuplicateScore`), so the dashboard's yellow "Duplicate" chip with Keep/Archive actions surfaces it for a human decision. Neither the new task nor its live siblings are moved to `archived` or deleted automatically.
+  - **Default (`false`)**: the later task is left in place and flagged via the same near-duplicate marker used elsewhere (`sourceMetadata.nearDuplicateOf` / `nearDuplicateScore`), so the dashboard's yellow "Duplicate" chip with a clear-the-flag control and Archive action surfaces it for a human decision. Neither the new task nor its live siblings are moved to `archived` or deleted automatically.
   - **`true`** (legacy behavior, opt-in): only the later/new task is archived as `auto-resolved-duplicate`; its live siblings remain intact.
 
 Ghost-bug preflight is unaffected by `autoArchiveDuplicateTasksEnabled` — it is a distinct heuristic and always auto-archives on a definitive non-repro.
@@ -197,11 +192,8 @@ On desktop/tablet, open **Planning** from the left sidebar to start or resume a 
 - AI asks clarifying questions
 - AI reasoning (thinking output) is preserved and visible throughout the session — expand the reasoning toggle to review the model's analysis before answering each question or accepting the summary
 - Produces summary + key deliverables
-- Create one task or **Break into Tasks** (multi-task generation with dependencies)
-- Summary view includes a **Priority** selector (`low`, `normal`, `high`, `urgent`) so single-task creation can set priority before task creation
-- Break-into-tasks mode includes per-subtask **Priority** selectors (`low`, `normal`, `high`, `urgent`) so each generated task can be prioritized before creation
-- Break-into-tasks descriptions are structured with subtask-specific guidance first, then a separate larger-plan context section (plus `## Planning Interview Context` when interview history exists)
-- Final multi-task creation now uses a compact request payload: unchanged generated subtask descriptions stay server-side, while any edits to title, description, size, priority, and dependencies are preserved when tasks are created
+- Creates one detailed task from the validated plan; complex requests retain their original task identity, plan, documents, and dependencies
+- Summary view includes a **Priority** selector (`low`, `normal`, `high`, `urgent`) so task creation can set priority before task creation
 - Sessions persist when the planning surface is closed or you navigate away — resume from the Planning sidebar list at any time; reasoning context is restored automatically
 - Back navigation rewinds the server-side planning session to the previous answered question so you can revise earlier answers and continue from the corrected turn
 - On the summary screen, **Refine Further** continues through the backend planning session (including resumed completed sessions) and waits for a real follow-up question or updated summary; it does not switch to an empty question view
@@ -213,25 +205,13 @@ In **Todos** view, each todo item includes a planning action:
 - Click the planning (💡) action on a todo item
 - Opens Planning Mode with that todo text pre-filled as the initial plan
 - Starts an AI planning interview (clarification questions + summary)
-- You can then create one task or break the plan into multiple tasks
+- You can then create one detailed task from the plan
 
 This action starts a planning session; it does **not** immediately create a task.
 
 For full Todo View behavior (enablement, list/item actions, API routes, and storage), see [Todo View](./todo-view.md).
 
-### 4) Subtask Breakdown Dialog
-
-Use the 🌳 button:
-
-- Generate 2–5 candidate subtasks
-- Shows live thinking/progress immediately while generation runs, before the candidate list is ready
-- Send the run to the background or close the dialog without canceling it; use the background-session indicator to resume running, waiting, or completed breakdowns
-- Drag to reorder
-- Add dependencies only on earlier items
-- Set each subtask's **Priority** (`low`, `normal`, `high`, `urgent`) before create
-- Create tasks in one action
-
-### 5) Expanded Controls
+### 4) Expanded Controls
 
 Expand the creation panel (▼) to access additional controls:
 
@@ -298,7 +278,7 @@ This is a forward-safety guard for stranded completed tasks. See FN-4055/FN-4079
 Fusion now derives `task.inReviewStall` for non-paused `in-review` tasks when a known stuck-state shape is detected. This signal is state-based (not log-heuristic) and is computed server-side on task hydration.
 
 `InReviewStallCode` values:
-- `transient-merge-status-no-owner` — task is still in `merging`/`merging-pr`/`merging-fix` after the stale-merging age threshold, but no active merger owns it. `recoverStaleMergingStatus()` clears this stamp and re-enqueues auto-merge-eligible, non-workspace, non-`mergeConfirmed` **unpaused** tasks. Paused tasks never re-enqueue; the sole clear-only exception is the engine-owned `merge-deadlock-detected` hold, whose status-preserving park can otherwise retain an orphan stamp indefinitely. Explicit human, approval, and unknown pauses remain intentionally suppressed. The signal itself remains diagnostic-only.
+- `transient-merge-status-no-owner` — task is still in `merging`/`merging-pr`/`merging-fix` after the stale-merging age threshold, but no active merger owns it. `recoverStaleMergingStatus()` clears this stamp and re-enqueues auto-merge-eligible, non-workspace, non-`mergeConfirmed` **unpaused** tasks. Manual merge doors now clear a stamp owned by their interrupted `fn task merge` process on Ctrl-C, SIGTERM, or terminal-close SIGHUP, and reconcile only age-proven residue before claiming. This follows three distinct authorizations: the merge body's abort fence (A), its proven in-process writer (B), or age evidence without owner proof (C). The five-minute engine sweep remains the backstop for hard kills and power loss. Paused tasks never re-enqueue; the sole clear-only exception is the engine-owned `merge-deadlock-detected` hold, whose status-preserving park can otherwise retain an orphan stamp indefinitely. Explicit human, approval, and unknown pauses remain intentionally suppressed. The signal itself remains diagnostic-only.
 - `merge-retries-exhausted` — `mergeRetries` reached the auto-merge retry cap without `mergeDetails.mergeConfirmed === true`.
 - `no-worktree-no-merge-confirmed` — task has no worktree path and merge is not confirmed (excluding explicit no-op merges).
 - `merge-blocker` — `getTaskMergeBlocker()` reports a merge/finalization blocker.
@@ -369,13 +349,26 @@ Auto-completion/finalization remains owned by existing recovery passes:
 
 ### Archive worktree cleanup
 
-Archiving a single-repository task synchronously removes its git worktree before branch and task-metadata cleanup. This applies to random and pinned (`task-id`/`task-title`) names, including `fn_task_archive` and direct CLI archive commands that run without an executor. A host-scoped filesystem reservation serializes a successor's deterministic-path acquisition with archival disposal; if removal fails, the reservation is quarantined so the next acquisition can reconcile the orphan instead of colliding with it. `archive({ cleanup: false })` intentionally retains the worktree. Workspace tasks' per-repository `workspaceWorktrees` are not removed by this lifecycle yet.
+Archiving a single-repository task synchronously removes its task-ID-pinned git worktree before branch and task-metadata cleanup. CLI and extension archive requests fence live execution under the per-task advisory transaction lock: a WIP-lane or active-merge refusal performs no archive write and suppresses all cleanup (worktrees, branches, and task directory). Native worktrees always derive from the lowercased task ID; Worktrunk retains its backend-owned layout. A host-scoped filesystem reservation serializes a successor's deterministic-path acquisition with archival disposal; if removal fails, the reservation is quarantined so the next acquisition can reconcile the orphan instead of colliding with it. `archive({ cleanup: false })` intentionally retains the worktree. Workspace tasks' per-repository `workspaceWorktrees` are not removed by this lifecycle yet.
 
 Board ordering behavior:
 - `todo` mirrors scheduler dispatch order: priority first (`urgent` → `low`), then oldest `createdAt` within a priority tier, then task ID as deterministic tie-break.
 - `triage`, `in-progress`, and `in-review` remain priority-first with task-ID tie-breaks (`in-review` still pins merge-active statuses above non-merging tasks).
 - The `done` column is recency-ordered by completion time (newest first), using `columnMovedAt` as primary and falling back to `updatedAt` then `createdAt` for legacy tasks.
 - The dashboard **list view default ordering matches these same per-column semantics** until a user clicks a sortable header (manual list sorting still overrides defaults).
+
+<!-- FNXC:TaskCardMovement 2026-08-27-12:01: FN-198 makes workflow automation the sole owner of dashboard task placement; Board gestures and menus must not offer relocation. -->
+
+### Task placement on Board and List
+
+Tasks cannot be relocated manually from Board, List, or Task Detail. The workflow and its automated recovery paths decide placement. Use **Retry** to repeat the current stage in place, **Reset** to edit the original description and restart cleanly from the confirmed request, or **Delete** to remove a task. A manual-intake card can still show **Start**, which admits a new idea into its workflow rather than relocating active work. Start is accepted only while the card remains in the column the operator saw: if another Start or the scheduler has already advanced it, Fusion refuses the stale press without cancelling work and publishes the current card state. Task cards have no **Promote** control; workflow scheduling owns capacity-gated releases.
+
+### Plan approval hold
+
+After planning, the card remains at `status: "awaiting-approval"` in the workflow's planning lane, which may be an intake or hold column, and shows **Need Your Review**. **Approve** releases the reviewed plan. **Reject Plan** remains available in Task Detail; it discards the plan and regenerates in place when the card is already in its workflow's planning column. Cards outside planning retain the workflow intake rehome.
+
+<!-- FNXC:BoardNavigationDocs 2026-08-28-13:29: FN-229 makes the pointing hand identify clickable task tiles without changing card activation or Board pan eligibility; disabled controls and editing keep native cursors. -->
+On desktop and tablet Boards, a task tile shows the pointing hand on hover. Dragging a task card's noninteractive body or text pans the Board viewport without moving the task, and the closed grabbing hand remains visible across the whole Board until the drag ends. Disabled controls and editing retain their native state and form cursors at rest.
 
 ### Lifecycle commands
 
@@ -428,7 +421,7 @@ These filters apply only to board rendering (not list view). Each filter support
 Task branch fields are intentionally distinct:
 
 - `task.branch` — the actual working branch used for the task worktree (for example `fusion/fn-1234` or a conflict-suffixed variant).
-- `task.baseBranch` — the task's configured merge target/base branch intent.
+- `task.baseBranch` — the task's configured merge target/base branch intent. For workspace tasks it is verified in each sub-repository at acquisition; each resolved (or fallback) selection is pinned in that repository's worktree entry. Editing it after worktrees exist affects only future acquisition and never retargets existing member worktrees.
 - `task.executionStartBranch` — internal execution provenance used when scheduler/executor temporarily start from a dependency branch; this is transient and cleared during execution resets/recovery.
 
 `PrInfo.baseBranch` is unchanged and continues to represent pull-request target branch metadata.
@@ -437,13 +430,16 @@ Task branch fields are intentionally distinct:
 
 When a task was created to resolve a temporary failure state in another task (for example, a preserved `in-review/failed` merge condition), its dependency contract may become stale after recovery.
 
+Dependencies must always target a live task in the same project. Fusion rejects a missing or soft-deleted dependency instead of persisting a durable blocker; a blocked execution that discovers one returns to planning so the prerequisite can be corrected.
+
 Use supported TaskStore/API paths to reconcile safely:
 
 - Remove/replace stale dependencies through task update APIs (do not hand-edit `task.json` or PostgreSQL rows)
+- Normal task deletion refuses when live dependents still reference the task. Where a supported caller explicitly removes dependency references, Fusion atomically removes those edges and returns affected dependents to planning.
 - Add a single comment/log entry explaining why the dependency changed
 - Keep downstream blockers coherent (only tasks that still truly depend on unfinished work should remain blocked)
 
-Completion gating treats dependencies as resolved only when the dependency task is in `done`, `in-review`, or `archived`.
+The PostgreSQL TaskStore/API boundary performs this validation and recovery. Do not use direct SQL or task JSON edits to remove dangling dependency references. Completion gating treats dependencies as resolved only when the dependency task is in `done`, `in-review`, or `archived`.
 
 Auto-merge recovery follow-up creation is deduplicated: Fusion creates at most one active (`not done/archived`) recovery task per unresolved parent failure, and merge-conflict recovery also deduplicates by active branch ownership to prevent parallel duplicate follow-ups on the same conflict branch.
 
@@ -467,47 +463,57 @@ Fusion no longer provides a dedicated task-branch conflict CLI command. Resolve 
 
 ## Task Execution Modes
 
-Each task has an execution mode that controls how the executor agent approaches the task:
+Each task has an execution mode that controls how the selected workflow executes it:
 
 | Mode | Description |
 |------|-------------|
-| `standard` | Full execution with complete review workflow (default) |
-| `fast` | Expedited execution with minimal overhead for simple tasks |
+| `standard` | Plans the work, executes the planned steps, and runs the workflow's normal review path (default). |
+| `fast` | Uses the original request for one implementation occurrence, without a planning session or pre-merge review. |
 
-### Fast Mode Bypassed Gates
+### Fast Mode Route
 
-When `executionMode: "fast"`, the following automated review/validation gates are **bypassed**:
+<!-- FNXC:FastLane 2026-08-29-03:20: Fast is a first-class overlay on the task's selected workflow, not a separate workflow or a lean planning variant. Keep the route description aligned with the graph taxonomy so a simple edit cannot silently skip its only implementation occurrence. -->
 
-| Gate | Standard Mode | Fast Mode |
+A Fast card is captured in intake, can pass through a hold/planning column while its worktree is prepared, then executes once and enters the normal review/merge region. `undefined` and `null` execution modes remain standard.
+
+| Category | Fast behavior |
+|----------|---------------|
+| **Bypassed** | The planning seam, every pre-merge optional group (including an explicitly selected group), their remediation/no-op nodes, and per-step `step-review` nodes. A bypassed pre-merge group records terminal `skipped` evidence with `bypassedBy: "fast-mode"`; it is never silently deleted. |
+| **Retargeted** | `parse-steps` still dispatches, but writes exactly one synthetic implementation step instead of reading `PROMPT.md`. The implementation session receives the original request and uses the Fast & Cheap model lane. |
+| **Untouched** | Completion summary, the merge region, and post-merge optional groups retain their standard workflow behavior. |
+
+`parse-steps` is deliberately retargeted rather than bypassed: it is the validated dominator for a `foreach(source: "task-steps")` region, and an empty expansion otherwise follows its success edge with zero implementation instances. The Fast template route also suppresses deferred done-marking and follows the existing `outcome:approve` edge past `step-review`; it records no fabricated reviewer verdict.
+
+### Fast Mode Bypassed Work
+
+| Work | Standard Mode | Fast Mode |
 |------|---------------|-----------|
-| `review_step` tool enforcement | Available to executor agent | **Not injected** |
-| Pre-merge workflow-step execution | Runs configured steps | **Skipped** |
-| Custom graph pre-merge prompt/script/gate nodes | Run in selected custom workflows | **Skipped** |
-| Workflow revision loop | Enabled (feedback → fix → re-review) | **Disabled** |
+| Planning session and Plan Review | Runs before execution | **Bypassed** |
+| Plan-derived step parsing | Reads planned `PROMPT.md` headings | **Retargeted** to one synthetic step from the original request |
+| Pre-merge optional groups | Run when default-on or explicitly enabled | **Bypassed**, with recorded skipped evidence |
+| Per-step code review | Reviews every stepwise occurrence | **Bypassed**; step execution marks its own step done |
+| Executor deterministic test/build gate | Runs when configured | **Skipped** (the Fast-mode behavior of the executor lane) |
 
-### Fast Mode Mandatory Gates
+### Fast Mode Unchanged Work
 
-The bypass applies to both the legacy workflow-step path and the workflow graph executor path (including custom non-`builtin:coding` workflows). `undefined` or `null` execution mode is treated as standard mode.
-
-The following quality gates **remain enforced** in fast mode:
-
-| Gate | Behavior |
+| Work | Behavior |
 |------|----------|
-| `task_done` requirement | Agent must call `task_done()` to complete |
-| Completion blocker checks | Tests, build, and typecheck from PROMPT.md still enforced |
-| Post-merge workflow steps | Run as normal (merger-owned) |
+| Completion summary | Runs normally before merge. |
+| Merge region | Uses the selected workflow's existing merge gates and landing behavior. |
+| Post-merge optional groups | Run normally after a successful merge. |
+| `task_done()` | Remains the implementation session's completion tool. |
 
 ### Execution Mode Matrix
 
 | Feature | Standard | Fast |
 |---------|----------|------|
-| Executor agent session | Full prompt + tools | Full prompt (minus review_step) |
-| Pre-merge workflow steps (legacy, builtin, and custom graph workflows) | ✅ Run | ❌ Bypassed |
-| Custom graph prompt/script/gate validation nodes | ✅ Run | ❌ Bypassed |
-| `review_step` tool | ✅ Available | ❌ Not available |
-| Post-merge workflow steps | ✅ Run | ✅ Run |
-| Completion blockers (test/build/typecheck) | ✅ Enforced | ✅ Enforced |
-| `task_done()` requirement | ✅ Required | ✅ Required |
+| Planning prompt | Full specification prompt | No planning prompt |
+| Implementation prompt | Planned step context | Compact original-request context |
+| Implementation occurrences | Parsed plan steps | Exactly one synthetic step when the workflow has `parse-steps` + `foreach` |
+| Pre-merge optional groups | ✅ Run when enabled | ❌ Bypassed even when explicitly enabled |
+| Per-step review | ✅ Runs where authored | ❌ Bypassed without a verdict |
+| Completion summary / merge | ✅ Run | ✅ Run unchanged |
+| Post-merge groups | ✅ Run | ✅ Run unchanged |
 
 ### Setting Execution Mode
 
@@ -630,7 +636,7 @@ Execution ownership is preserved for active work:
 This is distinct from steering comments: steering feedback targets the currently running executor session, while comment-driven re-triage requests a fresh specification pass for planned work.
 ## Refinement Tasks
 
-`fn task refine <id>` creates a new planning task that depends on the original done/in-review task.
+`fn task refine <id>` creates a new planning follow-up that depends on the original done/in-review task.
 
 Example:
 
@@ -640,16 +646,17 @@ fn task refine FN-042 --feedback "Add explicit rollback tests for partial failur
 
 Behavior:
 
-- New title format: `Refinement: <source label>`
-- New task depends on source task
-- Created in `planning`
-- Refinement tasks inherit the source task's GitHub tracking state (unlinked sources opt out; linked sources inherit `enabled` and optional `repoOverride`, but never copy the source issue link)
+- The new title is derived from the first meaningful line of the operator's feedback; the full feedback remains in the description.
+- The new task depends on the source task and keeps `sourceType: "task_refine"` lineage.
+- Placement is workflow-aware: automatic workflows retain their trait-derived `intake`; manual intakes (`autoTriage: false`) bypass the capture lane and use the workflow's trait-derived `hold`/Planning lane. If no workflow destination is available, the existing `triage` fallback is retained.
+- The selected workflow and refinement seed prompt are persisted with the child so normal planning and approval processing can continue from the returned column.
+- Refinement tasks inherit the source task's GitHub tracking state (unlinked sources opt out; linked sources inherit `enabled` and optional `repoOverride`, but never copy the source issue link).
 
 ## Archive and Restore
 
 ### Archive behavior
 
-- `fn task archive <id>` moves any live-board task (`triage`, `todo`, `in-progress`, `in-review`, or `done`) to `archived`; tasks already in `archived` are rejected.
+- `fn task archive <id>` moves eligible live-board tasks to `archived`; tasks already in `archived` are rejected. It refuses WIP-lane or active-merge tasks unless a human operator explicitly supplies `--force`.
 - Archive records the task's `preArchiveColumn` so restore can return to the original live column instead of always assuming `done`.
 - Dashboard delete confirmations for live tasks include an **Archive Instead** action so users can preserve history without soft-deleting the task.
 - Archived tasks can also be deleted from the dashboard/API/CLI. Deleting an archived task removes the archived snapshot from lists and search, but first materializes the normal soft-delete tombstone so the task ID remains reserved unless the operator explicitly chooses allow-resurrection behavior.
@@ -721,7 +728,7 @@ Recovery/backfill guidance:
 - Also accepts an optional `{ granularity?: "squash" | "per-sha" }` field (FN-7548) that selects the git-path commit granularity: `"squash"` (default, unchanged) accumulates all attributable commits into one revert commit; `"per-sha"` creates one attributed revert commit per original sha (each with its own `Fusion-Task-Id` trailer and audit line), skipping no-op shas without empty commits. A mid-batch conflict in either mode rolls back the whole batch — no partially-landed per-sha commits. This field only affects the single-repo git path and is ignored when `mode` resolves to `"ai"` or the task is a workspace task.
 - Git-path response contract (additive only): `{ mode: "git", clean, revertCommitSha?, revertCommitShas?, conflicts?, alreadyReverted?, unsupported?, needsHuman?, reason? }`. A clean revert lands a `revert(FN-xxxx): ...` commit carrying a `Fusion-Task-Id` trailer on the resolved base branch; `revertCommitShas` reports every commit created (all of them for `per-sha`, the single one for `squash`) alongside the existing `revertCommitSha`.
 - AI-undo response contract: `{ mode: "ai", createdTaskId: "FN-YYYY", alreadyOpen?: true }`. The created task is an ordinary `triage`-column board task (via the normal `store.createTask` path) that references the source task's id, mission, and landed files, and instructs undoing the source task's behavior while preserving unrelated later changes to the same files, using a `revert(FN-xxxx): ...` commit convention. It carries NO dependency on the (already done/archived) source task. A `sourceMetadata.revertOf` marker makes repeated fallback calls idempotent — while an AI-undo task for that source is still open, a further call returns the same `createdTaskId` with `alreadyOpen: true` instead of creating a duplicate; a prior undo task that itself reached `done`/`archived` does not suppress a fresh one.
-- **Workspace (multi-repo) tasks (FN-7547):** tasks with `workspaceWorktrees` populated (`isWorkspaceTask`) are revertable too — the route dispatches to a dedicated workspace path that reasons about every sub-repo's integration branch as ONE all-or-nothing unit. It resolves each sub-repo's attributable commit(s), dry-run classifies every sub-repo first, and only commits a `revert(FN-xxxx): ...` commit on EACH sub-repo when every sub-repo classifies clean/already-reverted; if any sub-repo conflicts, no sub-repo is committed and every touched sub-repo worktree is rolled back to its pre-call state. Response contract for workspace tasks: `{ mode: "git", clean, workspace: { repos: [{ repo, classification, revertCommitSha?, conflicts?, alreadyReverted? }] }, conflicts?: {repo, file, ...}[] }`. A conflicting workspace result still falls back to the AI-undo task under `"auto"` mode, same as a single-repo conflicting result.
+- **Workspace (multi-repo) tasks (FN-7547):** tasks with `workspaceWorktrees` populated (`isWorkspaceTask`) are revertable too — the route dispatches to a dedicated workspace path that reasons about every sub-repo's integration branch as ONE all-or-nothing unit. It resolves each sub-repo's attributable commit(s), dry-run classifies every sub-repo first, and only commits a `revert(FN-xxxx): ...` commit on EACH sub-repo when every sub-repo classifies clean/already-reverted; if any sub-repo conflicts, no sub-repo is committed and every touched sub-repo worktree is rolled back to its pre-call state. Response contract for workspace tasks: `{ mode: "git", clean, workspace: { repos: [{ repo, classification, revertCommitSha?, conflicts?, alreadyReverted? }] }, conflicts?: {repo, file, ...}[] }`. A conflicting workspace result still falls back to the AI-undo task under `"auto"` mode, same as a single-repo conflicting result. See [Workspaces](./workspaces.md#reverting-a-workspace-task) for the operator lifecycle.
 - **`autoMerge:false` PR-based revert (FN-7554):** for a single-repo task whose git revert classifies **clean**, `autoMerge:false` no longer dead-ends at `needsHuman`. The route prepares a dedicated `fusion/revert-<id>` branch off the resolved base branch (via the engine's `prepareRevertPrBranch`, which NEVER writes to the base branch itself), pushes it, and opens a GitHub PR through the same owner/repo resolution, `githubRateLimiter` gate, `findPrForBranch` idempotency, and `manual: true` handoff as `POST /tasks/:id/pr/create`. Response: `{ mode: "pr", clean: true, prUrl, prNumber, revertBranch, existingPr? }` — a second call while the PR is still open links the existing PR (`existingPr: true`) instead of re-pushing. GitHub unconfigured or rate-limited still degrades gracefully to `{ mode: "git", needsHuman: true, reason }`, and a conflicting/unsupported/already-reverted classification is unaffected (no PR is opened; `"auto"` mode still falls back to the AI-undo task on conflict/unsupported).
 - **`autoMerge:false` PR-based revert extended to workspace tasks (FN-7577):** a workspace task whose git revert classifies **clean across every sub-repo** also opens PRs instead of dead-ending at `needsHuman` under `autoMerge:false`. The engine's `prepareWorkspaceRevertPrBranches` mirrors the workspace all-or-nothing classify-all contract: it dry-run classifies EVERY sub-repo first, and only prepares one `fusion/revert-<id>` branch per sub-repo (never writing any sub-repo's integration branch) when every sub-repo classifies clean/already-reverted — a single conflicting sub-repo aborts the WHOLE preparation with no branch created anywhere. The route then resolves owner/repo and checks the rate limiter for EVERY sub-repo before pushing/creating any PR (so a GitHub-unconfigured or rate-limited sub-repo degrades the whole task to `needsHuman` rather than opening a partial subset), then opens one PR per sub-repo reusing FN-7554's per-sub-repo `findPrForBranch` idempotency and `manual: true` handoff. Response: `{ mode: "pr", clean: true, workspace: { repos: [{ repo, revertBranch, prUrl, prNumber, existingPr? }] } }`. Existing `{ mode: "git" | "ai" | "pr" }` shapes, the `autoMerge:true` workspace path, and FN-7554's single-repo path are unchanged.
 - **Dashboard auto-linking (FN-7555):** the AI-undo task's card shows an "Undo of FN-xxxx" chip and its detail view shows a clickable "Created to undo FN-xxxx" link back to the source task. The source task's detail view shows an "Undo task: FN-YYYY" link whenever an OPEN undo task referencing it exists in the loaded tasks (matching `TaskStore.findOpenRevertTaskForSource`'s open-only semantics — a `done`/`archived`/soft-deleted undo task is never surfaced as active). Both directions are derived client-side from `sourceMetadata.revertOf`; no new API. A dedicated Done/Archived card revert-trigger action is still a separate follow-up (see FN-7525).
@@ -742,8 +749,6 @@ Import issues:
 
 - GitHub-imported tasks retain typed source issue metadata (`sourceIssue.provider/repository/externalIssueId/issueNumber/url`), which executor and merger flows use to include `Ref: owner/repo#N` in commit bodies.
 - When `githubCloseSourceIssueOnDone` is enabled (default: `false`), Fusion also closes linked source-imported GitHub issues with `state_reason: completed` when the task moves into `done`. On startup, a bounded reconciliation sweep checks done tasks and closes any still-open source issue links that were missed due to transient failures.
-- When triage splits an imported GitHub task into subtasks and closes the parent, Fusion comments on each affected source/tracking issue with the parent and child task IDs immediately before closing it. A source and tracking link to the same issue have one deterministic owner, so that issue receives exactly one comment and one close; different issues each receive one of both. The `task:deleted` run-audit row records only `closureKind` and `closureChildTaskIds` (no comment prose). This notification is delivered by the deleting store's in-process event; PostgreSQL does not support cross-process observation of `task:deleted` through the legacy SQLite polling path.
-- GitLab mirrors this split-close handoff for resolved project issues: it posts one note naming the parent and unique child task IDs, then closes that same issue only after the note succeeds. Empty child lists do nothing, duplicate IDs retain their first occurrence, and merge requests are never auto-closed.
 - Deleting a task linked to a GitLab issue outside a split closes that issue by default. Callers can pass `githubIssueAction: "leave"` to opt out; `"delete"` safely degrades to closing because Fusion never hard-deletes GitLab issues. GitLab merge requests are never auto-closed by task deletion. This delete behavior is independent of `gitlabCloseSourceIssueOnDone`, which controls only task-moved done-close behavior.
 
 ```bash
@@ -774,7 +779,7 @@ GitHub tracking issues are optional issues Fusion can create from Fusion tasks. 
 
 ### Agent- and tool-created task coverage
 
-When task creation runs with tracking enabled, Fusion attempts issue creation via a **universal post-create hook** (`setTaskCreatedHook`) that fires for every task-creation path: dashboard HTTP routes, pi extension tools (`fn_task_create`, `fn_task_import_github*`, `fn_delegate_task`), CLI commands (`fn task add`, `fn task duplicate`, `fn task refine`), mission/feature triage, automation `create-task` workflow steps, agent-driven delegation, routine/cron-created tasks, and subtask creation paths. Dashboard REST API coverage explicitly includes `POST /api/tasks`, `POST /api/tasks/:id/duplicate`, `POST /api/tasks/:id/refine`, and `POST /api/subtasks/create-tasks`. The hook is registered once per process entrypoint by calling `registerGithubTrackingHook()` at startup before any reachable `store.createTask` path. See the FN-5057 audit matrix (task document `audit`) for the current surface-by-surface registration map and resolved `sourceType` values. The hook is best-effort and non-blocking: task creation still succeeds even if repo resolution fails or GitHub calls fail. For existing tasks, PATCH first persists any `githubTracking` mutation (enable/disable, repo override, or unlink), then evaluates whether the updated task is **enabled and still unlinked** and should trigger best-effort issue creation (including non-`githubTracking` edits). This keeps retry/create behavior consistent from Task Detail instead of relying on stale pre-patch state.
+When task creation runs with tracking enabled, Fusion attempts issue creation via a **universal post-create hook** (`setTaskCreatedHook`) that fires for every task-creation path: dashboard HTTP routes, pi extension tools (`fn_task_create`, `fn_task_import_github*`, `fn_delegate_task`), CLI commands (`fn task add`, `fn task duplicate`, `fn task refine`), mission/feature triage, automation `create-task` workflow steps, agent-driven delegation, and routine/cron-created tasks. Dashboard REST API coverage explicitly includes `POST /api/tasks`, `POST /api/tasks/:id/duplicate`, and `POST /api/tasks/:id/refine`. The hook is registered once per process entrypoint by calling `registerGithubTrackingHook()` at startup before any reachable `store.createTask` path. See the FN-5057 audit matrix (task document `audit`) for the current surface-by-surface registration map and resolved `sourceType` values. The hook is best-effort and non-blocking: task creation still succeeds even if repo resolution fails or GitHub calls fail. For existing tasks, PATCH first persists any `githubTracking` mutation (enable/disable, repo override, or unlink), then evaluates whether the updated task is **enabled and still unlinked** and should trigger best-effort issue creation (including non-`githubTracking` edits). This keeps retry/create behavior consistent from Task Detail instead of relying on stale pre-patch state.
 
 Tracking behavior is controlled per task:
 
@@ -928,7 +933,9 @@ Users can apply presets at task creation; manual model selection can override th
 
 ## AI Title Summarization
 
-When `autoSummarizeTitles` is enabled and a task has a long untitled description, Fusion can auto-generate a concise title. This applies to tasks created from the dashboard/API as well as tasks created by agents and tooling flows (`fn_task_create`, delegated tasks, and triage-created child tasks). GitHub tracking now waits for the `createTask`-level summarizer (explicit or auto-attached from settings) to settle before filing, then uses that resulting title and falls back to deterministic description-derived title generation only when summarization is unavailable.
+`autoSummarizeTitles` is a project-scoped boolean (default `false`) that controls automatic title attempts for every non-empty task description created without a title. When enabled, dashboard/API, direct store, agent, scheduled, signal, and CLI-backed creates use the configured title model regardless of description length. When disabled or unavailable, triage supplies a deterministic title derived from the first meaningful description line (with shared Markdown normalization and a 60-character safety cap), and the planner's normal `# Task: ID - title` heading is written back to project-scoped metadata.
+
+Explicit titles always win. `summarize:true`, Task Detail **Summarize**, and the explicit summarization endpoint remain available even when automatic mode is disabled. The setting is read as a snapshot for each create: changing it does not rename existing tasks or cancel an already-started attempt. GitHub tracking uses its configured summarizer for any non-empty titleless task and falls back to deterministic description-derived title generation when summarization is unavailable.
 
 If a configured title summarizer model is stale after a pi upgrade, Fusion logs a warning naming that provider/model and retries once with automatic model resolution before falling back to deterministic title generation. Genuine AI-service failures are not masked by this retry.
 
@@ -962,3 +969,13 @@ Use `noCommitsExpected: true` for tasks where the deliverable is a decision/repo
 ### Active-time statistics
 
 Task Detail labels this measure **Total active time**. It sums durable planning AI time (`cumulativePlanningMs`, including a live `planningStartedAt` segment) and in-progress execution time (`cumulativeActiveMs`, including a live `executionStartedAt` segment). Column dwell is wall-clock queue time and is intentionally excluded.
+
+## Generated task language
+
+In **Settings → Models → Project**, choose whether AI-authored task plans, titles, steps, summaries, and recommendations use English, the task input language, or the Fusion interface language. The choice is captured when a planning, title, execution, or workflow generation begins; changing it does not translate or alter existing tasks or active sessions.
+
+## Blocked tasks
+
+**Blocked** means infrastructure outside the task worktree requires operator action, such as exhausted disk, unavailable credentials, a provider outage, or a terminal network failure. The card preserves completed steps and committed work while displaying the raw code and message.
+
+Use the robot action to open Chat with that exact error prefilled. After repairing the external obstacle, use **Retry**. Retry resumes the recorded interrupted workflow node; it does not reset steps, delete `PROMPT.md`, replan, or replace the task worktree and branch. Repeated Retry requests are refused while the resume continuation is already pending.

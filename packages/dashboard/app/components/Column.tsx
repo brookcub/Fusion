@@ -2,7 +2,8 @@ import { memo, useMemo, useState, useCallback, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useFlashOnIncrease } from "../hooks/useFlashOnIncrease";
 import { useConfirm } from "../hooks/useConfirm";
-import { COLUMN_LABELS, COLUMN_DESCRIPTIONS, getErrorMessage, type DoneColumnSortMode, type Task, type TaskDetail, type Column as ColumnType, type ColumnId, type TaskCreateInput, type GithubIssueAction, type MergeResult } from "@fusion/core";
+import { rebuildTaskSpec } from "../api";
+import { COLUMN_LABELS, COLUMN_DESCRIPTIONS, getErrorMessage, type TaskColumnSortMode, type DoneColumnSortMode, type Task, type TaskDetail, type Column as ColumnType, type ColumnId, type TaskCreateInput, type GithubIssueAction, type MergeResult } from "@fusion/core";
 import { enrichRunningAgentTaskShapeFromFlags, isRunningAgentTask } from "../../../core/src/agents/live-agent-count";
 import { isNearDuplicateCanonicalInactive } from "../../../core/src/duplicates/near-duplicate-canonical";
 import { TaskCard } from "./TaskCard";
@@ -13,7 +14,6 @@ import { groupByWorktree } from "../utils/worktreeGrouping";
 import {
   isArchivedColumnRole,
   isCompleteColumnRole,
-  isHoldColumnRole,
   isPreImplementationColumnRole,
   isReviewColumnRole,
   isWipColumnRole,
@@ -84,6 +84,11 @@ export function translateRejection(t: TFn, rejection: TransitionRejectionDetail)
         "board.rejection.unplannedForExecution",
         "This task isn't ready for execution yet — planning or plan review is still outstanding.",
       );
+    case "stale-move-precondition":
+      return t(
+        "board.rejection.staleMovePrecondition",
+        "This card already moved on. Refresh to see where it is now.",
+      );
     default:
       return t(rejection.messageKey, rejection.messageKey);
   }
@@ -108,6 +113,11 @@ export function translateRejectionKey(t: TFn, messageKey: string): string {
         "board.rejection.unplannedForExecution",
         "This task isn't ready for execution yet — planning or plan review is still outstanding.",
       );
+    case "board.rejection.staleMovePrecondition":
+      return t(
+        "board.rejection.staleMovePrecondition",
+        "This card already moved on. Refresh to see where it is now.",
+      );
     default:
       return t(messageKey, messageKey);
   }
@@ -118,19 +128,21 @@ interface ColumnProps {
   tasks: Task[];
   projectId?: string;
   maxConcurrent: number;
+  /** Execution-worktree ceiling used for the Up Next preview. */
+  maxWorktrees: number;
   showWorktreeGrouping: boolean;
-  onMoveTask: (id: string, column: ColumnId, optionsOrPosition?: { preserveProgress?: boolean } | number) => Promise<Task>;
+  onMoveTask: (id: string, column: ColumnId, optionsOrPosition?: { preserveProgress?: boolean; expectedColumn?: string } | number) => Promise<Task>;
   onPauseTask?: (id: string) => Promise<Task>;
   onUnpauseTask?: (id: string) => Promise<Task>;
-  onResetTask?: (id: string) => Promise<Task>;
-  onDuplicateTask?: (id: string) => Promise<Task>;
+  onResetTask?: (id: string, options?: { description?: string }) => Promise<Task>;
+  onDuplicateTask?: (id: string, options?: { workflowId?: string }) => Promise<Task>;
   onMergeTask?: (id: string) => Promise<MergeResult>;
   onOpenDetail: (task: Task | TaskDetail) => void;
   onOpenRefine?: (task: Task | TaskDetail) => void;
   onOpenGroupModal?: (groupId: string) => void;
   addToast: (message: string, type?: ToastType) => void;
   onQuickCreate?: (input: TaskCreateInput) => Promise<Task | void>;
-  onNewTask?: () => void;
+  onNewTask?: (workflowId?: string | null) => void;
   autoMerge?: boolean;
   /** Project merge strategy for Task Detail-equivalent card context actions. */
   mergeStrategy?: string;
@@ -143,19 +155,29 @@ interface ColumnProps {
     updates: { title?: string; description?: string; dependencies?: string[]; githubTracking?: { enabled?: boolean } }
   ) => Promise<Task>;
   onRetryTask?: (id: string) => Promise<Task>;
+  onOpenChatWithPrefill?: (prefillText: string) => void;
   onArchiveTask?: (id: string, options?: { removeLineageReferences?: boolean }) => Promise<Task>;
   onUnarchiveTask?: (id: string) => Promise<Task>;
   /* FNXC:TaskRevert 2026-07-05-00:00 (FN-7525): threaded alongside onArchiveTask/onUnarchiveTask. */
   onRevertTask?: (id: string, body?: RevertTaskOptions) => Promise<RevertTaskResult>;
+  /*
+  FNXC:TaskRevert 2026-08-27-02:18:
+  Reverted work is identified by a card label in its own column rather than a separate column,
+  so its Delete and Revise resolution actions must reach the in-column card.
+  */
+  onReviseTask?: (task: Task) => void;
   onDeleteTask?: (id: string, options?: {
     removeDependencyReferences?: boolean;
     removeLineageReferences?: boolean;
     githubIssueAction?: GithubIssueAction;
   }) => Promise<Task>;
   onArchiveAllDone?: () => Promise<Task[]>;
-  /** Current Done-column display order, supplied only for the board's Done surface. */
+  /** Current display order for this Board lane. */
+  sortMode?: TaskColumnSortMode;
+  /** Updates this lane's Board-local display order. */
+  onSortModeChange?: (mode: TaskColumnSortMode) => void;
+  /** Compatibility aliases retained for existing Done-column integrations. */
   doneSortMode?: DoneColumnSortMode;
-  /** Updates the board-local Done-column display order. */
   onDoneSortModeChange?: (mode: DoneColumnSortMode) => void;
   collapsed?: boolean;
   onToggleCollapse?: () => void;
@@ -171,10 +193,6 @@ interface ColumnProps {
    * Called when the user clicks the "Plan" button in the inline create card.
    */
   onPlanningMode?: (initialPlan: string, workflowId?: string | null) => void;
-  /**
-   * Called when the user clicks the "Subtask" button in the inline create card.
-   */
-  onSubtaskBreakdown?: (description: string, workflowId?: string | null) => void;
   onOpenDetailWithTab?: (task: Task | TaskDetail, initialTab: "changes" | "retries" | "workflow") => void;
   favoriteProviders?: string[];
   favoriteModels?: string[];
@@ -182,8 +200,6 @@ interface ColumnProps {
   onToggleModelFavorite?: (modelId: string) => void;
   /** When true, search is active — bypass pagination so all matching tasks are visible. */
   isSearchActive?: boolean;
-  /** Project-level stuck task timeout in milliseconds (undefined = disabled) */
-  taskStuckTimeoutMs?: number;
   /** Called when user clicks a mission badge on a task card */
   onOpenMission?: (missionId: string) => void;
   /** Timestamp (ms) when task data was last confirmed fresh from the server. Used for freshness-aware stuck detection. */
@@ -225,23 +241,9 @@ interface ColumnProps {
   workflowContextMenuColumns?: readonly TaskContextMenuColumnMetadata[];
   /** Per-task workflow columns for aggregate Board cards whose tasks come from different workflows. */
   taskContextMenuColumnsByTaskId?: ReadonlyMap<string, readonly TaskContextMenuColumnMetadata[]>;
-  /** Manually promote a held card out of this hold column (workflow mode). */
-  /** `force` waives the unplanned-for-execution gate after operator confirmation. */
-  onPromote?: (taskId: string, options?: { force?: boolean }) => Promise<void>;
-  /**
-   * Pre-check whether a drop into THIS column is allowed for the dragged task.
-   * Returns null for "allowed", or an i18n messageKey for a deterministic
-   * rejection (guard/capacity/unknown-column/workflow-mismatch). When a
-   * rejection is returned, dragover is NOT prevented, so the card never renders
-   * in this column (no-move semantics, R17). The dragged task id is read from a
-   * board-level ref set on dragstart.
-   */
-  canDropTask?: (taskId: string) => string | null;
-  /** Read the id of the task currently being dragged (board-level ref). */
-  getDraggingTaskId?: () => string | null;
 }
 
-function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktreeGrouping, onMoveTask, onPauseTask, onUnpauseTask, onResetTask, onDuplicateTask, onMergeTask, onOpenDetail, onOpenRefine, onOpenGroupModal, addToast, onQuickCreate, onNewTask, autoMerge, mergeStrategy = "direct", onToggleAutoMerge, planAutoApproveEnabled, onTogglePlanAutoApprove, globalPaused, onUpdateTask, onRetryTask, onArchiveTask, onUnarchiveTask, onRevertTask, onDeleteTask, onArchiveAllDone, doneSortMode, onDoneSortModeChange, collapsed, onToggleCollapse, archivedHasMore, archivedLoadingMore, onLoadMoreArchived, allTasks, availableModels, onPlanningMode, onSubtaskBreakdown, onOpenDetailWithTab, favoriteProviders, favoriteModels, onToggleFavorite, onToggleModelFavorite, isSearchActive, taskStuckTimeoutMs, onOpenMission, lastFetchTimeMs, taskCardFieldDefs, taskWorkflowBadges, blockerFanoutMap, prAuthAvailable, holdTaskIds, workflowMode, workflowId, workflowOptions, defaultWorkflowId, columnDisplayName, columnDescription, columnFlags, workflowContextMenuColumns, taskContextMenuColumnsByTaskId, onPromote, canDropTask, getDraggingTaskId }: ColumnProps) {
+function ColumnComponent({ column, tasks, projectId, maxWorktrees, showWorktreeGrouping, onMoveTask, onPauseTask, onUnpauseTask, onResetTask, onDuplicateTask, onMergeTask, onOpenDetail, onOpenRefine, onOpenGroupModal, addToast, onQuickCreate, onNewTask, autoMerge, mergeStrategy = "direct", onToggleAutoMerge, planAutoApproveEnabled, onTogglePlanAutoApprove, globalPaused, onUpdateTask, onRetryTask, onOpenChatWithPrefill, onArchiveTask, onUnarchiveTask, onRevertTask, onReviseTask, onDeleteTask, onArchiveAllDone, sortMode, onSortModeChange, doneSortMode, onDoneSortModeChange, collapsed, onToggleCollapse, archivedHasMore, archivedLoadingMore, onLoadMoreArchived, allTasks, availableModels, onPlanningMode, onOpenDetailWithTab, favoriteProviders, favoriteModels, onToggleFavorite, onToggleModelFavorite, isSearchActive, onOpenMission, lastFetchTimeMs, taskCardFieldDefs, taskWorkflowBadges, blockerFanoutMap, prAuthAvailable, holdTaskIds, workflowMode, workflowId, workflowOptions, defaultWorkflowId, columnDisplayName, columnDescription, columnFlags, workflowContextMenuColumns, taskContextMenuColumnsByTaskId }: ColumnProps) {
   const { t } = useTranslation("app");
   // Anchor the board.rejection.* catalog keys for the i18next extractor (it
   // scopes `t` to the useTranslation binding, so the shared translateRejection
@@ -252,18 +254,13 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
     unknownColumn: t("board.rejection.unknownColumn", "That column doesn't exist in this task's workflow."),
     workflowMismatch: t("board.rejection.workflowMismatch", "Drag can't move a card between workflows. Use the workflow switcher instead."),
     mergeBlocked: t("board.rejection.mergeBlocked", "This task is blocked from completing until its merge step finishes."),
-    promoteRejected: t("board.rejection.promoteRejected", "This card could not be promoted."),
+    staleMovePrecondition: t("board.rejection.staleMovePrecondition", "This card already moved on. Refresh to see where it is now."),
   }), [t]);
   void rejectionCopy;
-  const [dragOver, setDragOver] = useState(false);
   const [visibleTaskCount, setVisibleTaskCount] = useState(VISIBLE_TASKS_INITIAL);
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [isReplanning, setIsReplanning] = useState(false);
   const [isPausingAll, setIsPausingAll] = useState(false);
-  const [isMovingAllToTodo, setIsMovingAllToTodo] = useState(false);
-  // Workflow mode: per-card promote in-flight ids + inline capacity feedback.
-  const [promotingIds, setPromotingIds] = useState<ReadonlySet<string>>(() => new Set());
-  const [inlineFeedback, setInlineFeedback] = useState<string | null>(null);
   /*
   FNXC:WorkflowColumnDescriptions 2026-07-22-12:30:
   Whitespace-only values can exist in pre-editor/custom IR. Treat them as
@@ -303,16 +300,6 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
     return isNearDuplicateCanonicalInactive(canonical, canonical ? getTaskColumnFlags(canonical) : undefined);
   }, [allTasks, getTaskColumnFlags]);
 
-  // Clear the inline capacity-exhausted banner once the column's task list
-  // changes via SSE (e.g. an occupant moves out and capacity frees up). The
-  // banner reflects a point-in-time promote rejection; a changed roster means
-  // the stale constraint may no longer hold. Keyed on the task-id signature so
-  // it only fires on real membership changes, not every parent re-render.
-  const taskIdSignature = useMemo(() => tasks.map((task) => task.id).join(","), [tasks]);
-  useEffect(() => {
-    setInlineFeedback(null);
-  }, [taskIdSignature]);
-
   // Close the column dropdown menu when the user clicks anywhere else.
   useEffect(() => {
     if (!isMenuOpen) return;
@@ -348,7 +335,6 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
   behaviour change, documented rather than silent; covered by column-role-degraded-flags.test.ts.
   */
   const isArchived = isArchivedColumnRole(columnFlags, column);
-  const isHoldColumn = isHoldColumnRole(columnFlags, column);
   const isCollapsed = isArchived && collapsed;
   const isWipProcessingColumn = isWipColumnRole(columnFlags, column);
   /*
@@ -429,185 +415,6 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
     setVisibleTaskCount(VISIBLE_TASKS_INITIAL);
   }, [isSearchActive, searchResultSignature]);
 
-  const handleDragOver = useCallback((e: React.DragEvent) => {
-    // Don't allow dropping into archived column via drag-drop
-    if (isArchived) return;
-    // Workflow mode (R17): deterministic rejections are NO-MOVE — we do NOT
-    // call preventDefault, so the browser refuses the drop and the card never
-    // renders in this column. A null result means the drop is allowed.
-    if (workflowMode && canDropTask && getDraggingTaskId) {
-      const draggingId = getDraggingTaskId();
-      if (draggingId) {
-        const rejectionKey = canDropTask(draggingId);
-        if (rejectionKey) {
-          setInlineFeedback(translateRejectionKey(t, rejectionKey));
-          return; // no preventDefault → no-move
-        }
-      }
-    }
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "move";
-    setDragOver(true);
-  }, [isArchived, workflowMode, canDropTask, getDraggingTaskId, t]);
-
-  const handleDragLeave = useCallback((e: React.DragEvent) => {
-    const el = e.currentTarget as HTMLElement;
-    if (!el.contains(e.relatedTarget as Node)) {
-      setDragOver(false);
-      setInlineFeedback(null);
-    }
-  }, []);
-
-  const handleDrop = useCallback(async (e: React.DragEvent) => {
-    e.preventDefault();
-    setDragOver(false);
-    const taskId = e.dataTransfer.getData("text/plain");
-    if (!taskId) return;
-
-    // Check if task is already in this column - if so, skip the API call
-    const task = tasks.find((t) => t.id === taskId);
-    if (task && task.column === column) {
-      return; // No-op: task is already in this column
-    }
-
-    try {
-      const sourceTask = allTasks?.find((t) => t.id === taskId) ?? task;
-      const hasStepProgress = sourceTask?.steps.some((step) => step.status !== "pending") ?? false;
-      /*
-      FNXC:WorkflowResolvedColumns 2026-07-29-00:00 (U12 — R8 drift conversion):
-      This component's `column` IS the drop target, so its own `columnFlags` are the
-      target's traits — no lookup needed, unlike the same prompt in TaskCard/ListView
-      where the card and the destination differ. Ids remain the fallback for the
-      no-metadata window.
-      */
-      /*
-      FNXC:WorkflowResolvedColumns 2026-07-30-19:20 (Phase B — consolidated, semantics verified):
-      Routed through `isPreImplementationColumnRole`. This is the SAME preserve-progress prompt that
-      helper was written for — ListView asks it about a move target, this component asks it about
-      itself — and the degraded id sets are identical (`{todo, triage}`), so the consolidation is
-      exact rather than approximately right.
-
-      Verified before consolidating, because the sibling case in TaskContextMenu is NOT
-      interchangeable: `isPreExecutionHoldColumn` drives the Plan affordance and its degraded set is
-      `{triage}` alone, so routing THAT through this helper added `plan` to flagless `todo` cards.
-      Same shape, different degraded answer — matched here, kept separate there.
-      */
-      const shouldPrompt = hasStepProgress && isPreImplementationColumnRole(columnFlags, column);
-      let moveOptions: { preserveProgress?: boolean } | undefined;
-
-      if (shouldPrompt) {
-        const keepProgress = await confirm({
-          title: t("column.preserveProgressTitle", "Preserve Progress?"),
-          message: t("column.preserveProgressMessage", "This task has completed steps. Keep progress before moving?"),
-          confirmLabel: t("column.keepProgress", "Keep Progress"),
-          cancelLabel: t("column.resetProgress", "Reset Progress"),
-        });
-
-        if (keepProgress) {
-          moveOptions = { preserveProgress: true };
-        } else {
-          const resetProgress = await confirm({
-            title: t("column.resetProgressTitle", "Reset Progress?"),
-            message: t("column.resetProgressMessage", "Reset all step progress before moving this task?"),
-            confirmLabel: t("column.resetProgressConfirm", "Reset Progress"),
-            cancelLabel: t("column.cancelMove", "Cancel Move"),
-            danger: true,
-          });
-          if (!resetProgress) {
-            return;
-          }
-        }
-      }
-
-      await onMoveTask(taskId, column, moveOptions);
-    } catch (err) {
-      // Workflow mode (R17): a structured 409 carries a typed rejection. The
-      // optimistic move snaps back automatically (the next SSE/refresh restores
-      // the card's real column); surface the translated rejection messageKey.
-      const rejection = extractTransitionRejection(err);
-      if (rejection) {
-        addToast(translateRejection(t, rejection), "error");
-      } else {
-        addToast(getErrorMessage(err), "error");
-      }
-    }
-  /*
-  FNXC:WorkflowResolvedColumns 2026-07-31-00:40:
-  `columnFlags` BELONGS IN THIS LIST — the drop handler asks it whether this lane is pre-implementation.
-
-  `shouldPrompt` gates the "Preserve Progress?" confirmation on
-  `isPreImplementationColumnRole(columnFlags, column)`. The flags arrive after first paint, and
-  `useCallback` without them in its deps hands the DOM the closure built during the pre-load render.
-  In that closure the helper falls back to `LEGACY_PRE_IMPLEMENTATION_COLUMN_IDS`, which does not
-  contain a renamed intake/hold lane — so `shouldPrompt` is false and a card with completed steps is
-  moved WITHOUT asking, silently resetting progress the user was meant to be offered a choice about.
-
-  SEVERITY, STATED HONESTLY: `allTasks` and `tasks` are in this list and change identity on any
-  task-list refresh, so the stale closure is rebuilt within seconds on an active board — a window,
-  not a permanent wrong answer, like the near-duplicate chip and unlike the TaskCard ticker whose
-  refreshing dependency fired only at local midnight. The window is exactly the quiet gap after the
-  traits land, and a drop inside it loses work without a prompt.
-  */
-  }, [addToast, allTasks, column, columnFlags, confirm, onMoveTask, tasks, t]);
-
-  /*
-  FNXC:BoardPromote 2026-07-25-04:55:
-  Promote is a two-attempt flow for the `unplanned-for-execution` rejection only.
-  The first attempt never forces; if the server refuses because a replan / plan
-  review is still outstanding, the operator is asked whether to start execution
-  anyway and the retry carries `{ force: true }`. Every other rejection (capacity,
-  guard) stays a plain inline message with no override — those are not the
-  operator's call to waive. Inline feedback rather than a toast, so several holds
-  can promote concurrently without toast spam.
-  */
-  const handlePromote = useCallback(async (taskId: string) => {
-    if (!onPromote) return;
-    setInlineFeedback(null);
-    setPromotingIds((prev) => {
-      const next = new Set(prev);
-      next.add(taskId);
-      return next;
-    });
-    try {
-      try {
-        await onPromote(taskId);
-      } catch (err) {
-        const rejection = extractTransitionRejection(err);
-        if (rejection?.code !== "unplanned-for-execution") throw err;
-
-        const forceConfirmed = await confirm({
-          title: t("column.promoteUnplannedTitle", "Start execution anyway?"),
-          message: t(
-            "column.promoteUnplannedMessage",
-            "{{taskId}} is still waiting on planning or plan review. Promoting now starts execution with the current plan and cancels the pending replan.",
-            { taskId },
-          ),
-          confirmLabel: t("column.promoteUnplannedConfirm", "Start Anyway"),
-          cancelLabel: t("column.promoteUnplannedCancel", "Keep Waiting"),
-          danger: true,
-        });
-        if (!forceConfirmed) {
-          setInlineFeedback(translateRejection(t, rejection));
-          return;
-        }
-        await onPromote(taskId, { force: true });
-      }
-    } catch (err) {
-      const rejection = extractTransitionRejection(err);
-      if (rejection) {
-        setInlineFeedback(translateRejection(t, rejection));
-      } else {
-        setInlineFeedback(getErrorMessage(err));
-      }
-    } finally {
-      setPromotingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(taskId);
-        return next;
-      });
-    }
-  }, [confirm, onPromote, t]);
-
   /*
   FNXC:WorkflowResolvedColumns 2026-07-30-20:10 (PR #2772 review — my own inert conversion):
   The dependency flags `groupByWorktree` needs, derived from the per-task column metadata this
@@ -633,14 +440,19 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
     return index;
   }, [allTasks, tasks, taskContextMenuColumnsByTaskId]);
 
+  /*
+  FNXC:CapacityModel 2026-08-21-15:45:
+  FN-282 requires the board's Up Next preview to use execution-worktree capacity rather than the independent AI-task ceiling.
+  The configured max can be shadowed by an enabled worktree cap, so showing it here would promise slots the scheduler cannot grant.
+  */
   const worktreeGroups = useMemo(() => {
     if (!showWorktreeGroups) return [];
-    return groupByWorktree(tasks, allTasks ?? tasks, maxConcurrent, holdTaskIds, dependencyColumnFlags);
+    return groupByWorktree(tasks, allTasks ?? tasks, maxWorktrees, holdTaskIds, dependencyColumnFlags);
     // `holdTaskIds` IS a dependency: the board resolves it after the workflows fetch, so
     // omitting it would pin the first-paint value and the upcoming-work list would keep
     // using the legacy-id fallback for the rest of the session. This repo has no
     // react-hooks/exhaustive-deps rule, so nothing catches that but reading it.
-  }, [showWorktreeGroups, tasks, allTasks, maxConcurrent, holdTaskIds, dependencyColumnFlags]);
+  }, [showWorktreeGroups, tasks, allTasks, maxWorktrees, holdTaskIds, dependencyColumnFlags]);
 
   const visibleTasks = useMemo(() => {
     if (!shouldPaginate) return tasks;
@@ -711,33 +523,35 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
     }
   }, [onLoadMoreArchived, isLoadingMoreArchived]);
 
+  /*
+  FNXC:BoardColumnMenu 2026-08-27-12:01:
+  FN-198 keeps bulk replanning server-owned: it rebuilds each task specification and never
+  chooses a destination column. `onMoveTask` is forwarded below only for manual-intake Start.
+  */
   const handleReplanAll = useCallback(async () => {
     setIsMenuOpen(false);
     if (tasks.length === 0) return;
 
     const confirmed = await confirm({
       title: t("column.replanAllTitle", "Replan All Tasks"),
-      message: t("column.replanAllMessage", "Move all {{count}} todo task{{plural}} back to planning to be replanned?", { count: tasks.length, plural: tasks.length === 1 ? "" : "s" }),
+      message: t("column.replanAllMessage", "Replan {{count}} task{{plural}} from its original description? Its current plan will be discarded.", { count: tasks.length, plural: tasks.length === 1 ? "" : "s" }),
     });
     if (!confirmed) return;
 
     setIsReplanning(true);
     try {
-      // Issue moves in parallel — onMoveTask is per-task, no bulk endpoint.
-      const results = await Promise.allSettled(
-        tasks.map((task) => onMoveTask(task.id, "triage" as ColumnType)),
-      );
-      const failed = results.filter((r) => r.status === "rejected").length;
-      const moved = results.length - failed;
+      const results = await Promise.allSettled(tasks.map((task) => rebuildTaskSpec(task.id, projectId)));
+      const failed = results.filter((result) => result.status === "rejected").length;
+      const replanned = results.length - failed;
       if (failed === 0) {
-        addToast(t("column.movedToPlanning", "Moved {{count}} task{{plural}} to planning for replanning", { count: moved, plural: moved === 1 ? "" : "s" }), "success");
+        addToast(t("column.replannedTasks", "Replanned {{count}} task{{plural}}", { count: replanned, plural: replanned === 1 ? "" : "s" }), "success");
       } else {
-        addToast(t("column.movePartialFailure", "Moved {{moved}} of {{total}} tasks; {{failed}} failed", { moved, total: results.length, failed }), "error");
+        addToast(t("column.replanPartialFailure", "Replanned {{replanned}} of {{total}} tasks; {{failed}} failed", { replanned, total: results.length, failed }), "error");
       }
     } finally {
       setIsReplanning(false);
     }
-  }, [tasks, onMoveTask, addToast, confirm]);
+  }, [addToast, confirm, projectId, t, tasks]);
 
   const pauseEligibleTasks = useMemo(
     () => tasks.filter((task) => !task.paused && !task.assignedAgentId),
@@ -751,7 +565,7 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
   const isProcessingColumn = isWipColumnRole(columnFlags, column);
   const isReviewColumn = isReviewColumnRole(columnFlags, column);
   const hasColumnBulkActions = isTodoLikeColumn || isProcessingColumn || isReviewColumn;
-  const isMenuBusy = isReplanning || isPausingAll || isMovingAllToTodo;
+  const isMenuBusy = isReplanning || isPausingAll;
   const columnLabelText = workflowMode ? (columnDisplayName ?? COLUMN_LABELS[column] ?? column) : COLUMN_LABELS[column];
 
   const handlePauseAll = useCallback(async () => {
@@ -784,58 +598,6 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
     }
   }, [onPauseTask, pauseEligibleCount, columnLabelText, pauseEligibleTasks, addToast, confirm, t]);
 
-  const handleMoveAllToTodo = useCallback(async () => {
-    setIsMenuOpen(false);
-    if (tasks.length === 0) return;
-
-    const confirmed = await confirm({
-      title: t("column.moveAllToTodoTitle", "Move All to Todo"),
-      message: t("column.moveAllToTodoMessage", "Move all {{count}} {{columnLabel}} task{{plural}} to Todo?", { count: tasks.length, columnLabel: columnLabelText.toLowerCase(), plural: tasks.length === 1 ? "" : "s" }),
-    });
-    if (!confirmed) return;
-
-    const hasAnyProgress = tasks.some((task) => task.steps.some((step) => step.status !== "pending"));
-    let preserveProgress = false;
-    if (hasAnyProgress) {
-      const keepProgress = await confirm({
-        title: t("column.preserveProgressTitle", "Preserve Progress?"),
-        message: t("column.preserveProgressMoveTodoMessage", "Some tasks have completed steps. Keep progress before moving to Todo?"),
-        confirmLabel: t("column.keepProgress", "Keep Progress"),
-        cancelLabel: t("column.resetProgress", "Reset Progress"),
-      });
-
-      if (keepProgress) {
-        preserveProgress = true;
-      } else {
-        const resetProgress = await confirm({
-          title: t("column.resetProgressTitle", "Reset Progress?"),
-          message: t("column.resetProgressMoveTodoMessage", "Reset step progress for tasks before moving to Todo?"),
-          confirmLabel: t("column.resetProgressConfirm", "Reset Progress"),
-          cancelLabel: t("column.cancelMove", "Cancel Move"),
-          danger: true,
-        });
-        if (!resetProgress) {
-          return;
-        }
-      }
-    }
-
-    setIsMovingAllToTodo(true);
-    try {
-      const results = await Promise.allSettled(
-        tasks.map((task) => onMoveTask(task.id, "todo", preserveProgress ? { preserveProgress: true } : undefined)),
-      );
-      const failed = results.filter((r) => r.status === "rejected").length;
-      const moved = results.length - failed;
-      if (failed === 0) {
-        addToast(t("column.movedToTodo", "Moved {{count}} task{{plural}} to Todo", { count: moved, plural: moved === 1 ? "" : "s" }), "success");
-      } else {
-        addToast(t("column.moveToTodoPartialFailure", "Moved {{moved}} of {{total}} tasks to Todo; {{failed}} failed", { moved, total: results.length, failed }), "error");
-      }
-    } finally {
-      setIsMovingAllToTodo(false);
-    }
-  }, [tasks, columnLabelText, onMoveTask, addToast, confirm, t]);
 
   /*
   FNXC:DoneColumnSorting 2026-06-29-20:23:
@@ -843,8 +605,16 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
   */
   /* Complete AND not archived: the archived lane is also "complete-ish" but must not carry the
      Done-sort control, and that exclusion survives the move to the shared helper. */
+  /*
+  FNXC:TaskColumnSorting 2026-08-18-21:24:
+  Every visible Board lane uses the same existing actions menu and keeps its own local mode.
+  The physical Archived lane is the sole server-backed exception: Board passes its committed
+  hook mode and callback here, while the hook fences replacement pages before committing.
+  */
+  const effectiveSortMode = sortMode ?? doneSortMode;
+  const effectiveSortModeChange = onSortModeChange ?? onDoneSortModeChange;
+  const showSortControl = effectiveSortMode !== undefined && !!effectiveSortModeChange;
   const isDoneSortColumn = isCompleteColumnRole(columnFlags, column) && !isArchivedColumnRole(columnFlags, column);
-  const showDoneSortControl = isDoneSortColumn && doneSortMode !== undefined && !!onDoneSortModeChange;
   const showDoneArchiveAction = isDoneSortColumn && !!onArchiveAllDone;
   /*
   FNXC:PlanApproval 2026-07-01-08:44:
@@ -854,18 +624,17 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
   This shortcut belongs ONLY to the intake/planning column, never to hold (Todo-like) columns — the built-in Coding workflow's Todo column carries the hold trait and was wrongly surfacing this toggle. Board.tsx is the single source of truth gating which columns receive `onTogglePlanAutoApprove`; Column.tsx just renders whatever prop it is given, so the fix lives in Board.tsx's intake-only gate, not here.
   */
   const hasPlanAutoApproveAction = !!onTogglePlanAutoApprove;
-  const hasDoneMenuActions = showDoneSortControl || showDoneArchiveAction;
-  const hasColumnMenu = hasColumnBulkActions || hasDoneMenuActions || hasPlanAutoApproveAction;
-  const doneSortControlLabel = t("column.doneSortControlLabel", "Sort Done tasks");
-  const doneSortOptions: Array<{ mode: DoneColumnSortMode; label: string }> = [
-    { mode: "completion-date-desc", label: t("column.doneSortCompletionDateDesc", "Completion date (newest first)") },
-    { mode: "task-id-desc", label: t("column.doneSortTaskIdDesc", "Task ID (newest first)") },
+  const hasColumnMenu = hasColumnBulkActions || showSortControl || showDoneArchiveAction || hasPlanAutoApproveAction;
+  const sortControlLabel = t("column.sortControlLabel", "Sort tasks in this column");
+  const sortOptions: Array<{ mode: TaskColumnSortMode; label: string }> = [
+    { mode: "completion-date-desc", label: t("column.sortArrivalDesc", "Arrival in this column — Completion date (newest first)") },
+    { mode: "task-id-desc", label: t("column.sortTaskIdDesc", "Task ID (newest first) — highest task number first") },
   ];
 
-  const handleDoneSortModeSelect = useCallback((mode: DoneColumnSortMode) => {
-    onDoneSortModeChange?.(mode);
+  const handleSortModeSelect = useCallback((mode: TaskColumnSortMode) => {
+    effectiveSortModeChange?.(mode);
     setIsMenuOpen(false);
-  }, [onDoneSortModeChange]);
+  }, [effectiveSortModeChange]);
 
   const handlePlanAutoApproveToggle = useCallback(() => {
     onTogglePlanAutoApprove?.();
@@ -894,11 +663,8 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
 
   return (
     <div
-      className={`column${dragOver ? " drag-over" : ""}${isArchived ? " column-archived" : ""}${isCollapsed ? " column-collapsed" : ""}`}
+      className={`column${isArchived ? " column-archived" : ""}${isCollapsed ? " column-collapsed" : ""}`}
       data-column={column}
-      onDragOver={handleDragOver}
-      onDragLeave={handleDragLeave}
-      onDrop={handleDrop}
     >
       <div className="column-header">
         <div className={`column-dot dot-${column}`} />
@@ -926,7 +692,7 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
           </label>
         )}
         {onNewTask && (
-          <button className="btn btn-task-create btn-sm" onClick={onNewTask}>
+          <button className="btn btn-task-create btn-sm" onClick={() => onNewTask()}>
             + {t("column.newTask", "New Task")}
           </button>
         )}
@@ -981,25 +747,25 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
                     </span>
                   </label>
                 )}
-                {showDoneSortControl && (
-                  <div className="column-menu-group" role="group" aria-label={doneSortControlLabel}>
-                    {doneSortOptions.map((option) => (
+                {showSortControl && (
+                  <div className="column-menu-group" role="group" aria-label={sortControlLabel}>
+                    {sortOptions.map((option) => (
                       <button
                         key={option.mode}
                         type="button"
                         role="menuitemradio"
-                        aria-checked={doneSortMode === option.mode}
+                        aria-checked={effectiveSortMode === option.mode}
                         className="column-menu-item column-menu-item-radio"
-                        onClick={() => handleDoneSortModeSelect(option.mode)}
+                        onClick={() => handleSortModeSelect(option.mode)}
                       >
                         <span className="column-menu-item-row">
-                          <span className="column-menu-item-check" aria-hidden="true">{doneSortMode === option.mode ? "✓" : ""}</span>
+                          <span className="column-menu-item-check" aria-hidden="true">{effectiveSortMode === option.mode ? "✓" : ""}</span>
                           <span>{option.label}</span>
                         </span>
                         <span className="column-menu-item-hint">
                           {option.mode === "completion-date-desc"
-                            ? t("column.doneSortCompletionDateDescHint", "Show recently completed tasks first")
-                            : t("column.doneSortTaskIdDescHint", "Show highest task IDs first")}
+                            ? t("column.sortArrivalDescHint", "Show the newest arrivals in this column first")
+                            : t("column.sortTaskIdDescHint", "Show the highest task IDs first")}
                         </span>
                       </button>
                     ))}
@@ -1031,12 +797,11 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
                   >
                     {t("column.replanAll", "Replan All")}
                     <span className="column-menu-item-hint">
-                      {t("column.replanAllHint", "Move {{count}} task{{plural}} to Planning", { count: tasks.length, plural: tasks.length === 1 ? "" : "s" })}
+                      {t("column.replanAllHint", "Replan {{count}} task{{plural}} from its original description", { count: tasks.length, plural: tasks.length === 1 ? "" : "s" })}
                     </span>
                   </button>
                 )}
                 {(isProcessingColumn || isReviewColumn) && (
-                  <>
                     <button
                       type="button"
                       role="menuitem"
@@ -1053,19 +818,6 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
                             : t("column.pauseHint", "Pause {{count}} active unassigned task{{plural}}", { count: pauseEligibleCount, plural: pauseEligibleCount === 1 ? "" : "s" })}
                       </span>
                     </button>
-                    <button
-                      type="button"
-                      role="menuitem"
-                      className="column-menu-item"
-                      onClick={() => void handleMoveAllToTodo()}
-                      disabled={tasks.length === 0 || isMovingAllToTodo}
-                    >
-                      {t("column.moveAllToTodo", "Move All to Todo")}
-                      <span className="column-menu-item-hint">
-                        {t("column.moveToTodoHint", "Move {{count}} task{{plural}} to Todo", { count: tasks.length, plural: tasks.length === 1 ? "" : "s" })}
-                      </span>
-                    </button>
-                  </>
                 )}
               </div>
             )}
@@ -1074,11 +826,6 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
       </div>
       {!isCollapsed && resolvedColumnDescription && (
         <p className="column-desc">{resolvedColumnDescription}</p>
-      )}
-      {!isCollapsed && inlineFeedback && (
-        <p className="column-inline-feedback" role="status" data-testid="column-inline-feedback">
-          {inlineFeedback}
-        </p>
       )}
       {!isCollapsed && (
         <div className="column-body">
@@ -1090,8 +837,7 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
               tasks={allTasks ?? []}
               availableModels={availableModels}
               onPlanningMode={onPlanningMode}
-              onSubtaskBreakdown={onSubtaskBreakdown}
-              workflowId={workflowMode ? workflowId : undefined}
+                            workflowId={workflowMode ? workflowId : undefined}
               workflowOptions={workflowMode ? workflowOptions : undefined}
               defaultWorkflowId={workflowMode ? defaultWorkflowId : undefined}
               projectId={projectId}
@@ -1118,7 +864,9 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
             ) : (
               worktreeGroups.map((group) => (
                 <WorktreeGroup
-                  key={group.label}
+                  key={group.id}
+                  kind={group.kind}
+                  repoCount={group.repoCount}
                   label={group.label}
                   activeTasks={group.activeTasks}
                   queuedTasks={group.queuedTasks}
@@ -1133,6 +881,7 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
                   onUpdateTask={onUpdateTask}
                   onPauseTask={onPauseTask}
                   onRetryTask={onRetryTask}
+                  onOpenChatWithPrefill={onOpenChatWithPrefill}
                   onUnpauseTask={onUnpauseTask}
                   onResetTask={onResetTask}
                   onDuplicateTask={onDuplicateTask}
@@ -1142,7 +891,6 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
                   onRevertTask={onRevertTask}
                   onDeleteTask={onDeleteTask}
                   onOpenDetailWithTab={onOpenDetailWithTab}
-                  taskStuckTimeoutMs={taskStuckTimeoutMs}
                   onOpenMission={onOpenMission}
                   lastFetchTimeMs={lastFetchTimeMs}
                   taskCardFieldDefs={taskCardFieldDefs}
@@ -1176,6 +924,7 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
                   onUpdateTask={onUpdateTask}
                   onPauseTask={onPauseTask}
                   onRetryTask={onRetryTask}
+                  onOpenChatWithPrefill={onOpenChatWithPrefill}
                   onUnpauseTask={onUnpauseTask}
                   onResetTask={onResetTask}
                   onDuplicateTask={onDuplicateTask}
@@ -1183,15 +932,13 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
                   onArchiveTask={onArchiveTask}
                   onUnarchiveTask={onUnarchiveTask}
                   onRevertTask={onRevertTask}
+                  onReviseTask={onReviseTask}
                   onDeleteTask={onDeleteTask}
                   onOpenDetailWithTab={onOpenDetailWithTab}
-                  taskStuckTimeoutMs={taskStuckTimeoutMs}
                   onOpenMission={onOpenMission}
                   onMoveTask={onMoveTask}
                   taskColumnFlags={getTaskColumnFlags(task)}
                   taskMoveColumns={getTaskContextMenuColumns(task)}
-                  onPromote={isHoldColumn && onPromote ? handlePromote : undefined}
-                  isPromoting={isHoldColumn && onPromote ? promotingIds.has(task.id) : undefined}
                   lastFetchTimeMs={lastFetchTimeMs}
                   cardFieldDefs={taskCardFieldDefs?.get(task.id)}
                   workflowBadge={taskWorkflowBadges?.get(task.id)}

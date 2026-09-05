@@ -35,11 +35,14 @@ import {
   ApprovalRequestStore,
   isEphemeralAgent,
   resolveEffectiveAgentPermissionPolicy,
+  resolveTaskOutputLanguage,
   summarizeTitle,
   FUSION_RUNTIME_SELF_AWARENESS,
   createLogger,
   resolvePermanentAgentEffectiveModel,
   resolvePermanentAgentEffectiveThinkingLevel,
+  isExperimentalFeatureEnabled,
+  CHAT_FOCUS_FLAG,
 } from "@fusion/core";
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
@@ -74,6 +77,7 @@ import {
   createTaskListTool,
   createTaskShowTool,
   createTaskSearchTool,
+  createPatchnodeReadTool,
   createListAgentsTool,
   createDelegateTaskTool,
   createTaskAssignTool,
@@ -172,6 +176,44 @@ const diagnostics: DiagnosticsLogger = {
 };
 
 const SKILL_COMMAND_PATTERN = /(^|\s)\/skill:([^\s]+)/gi;
+const CHAT_RUNTIME_INTERRUPT_TIMEOUT_MS = 5_000;
+
+/**
+ * FNXC:ChatCancellation 2026-08-23-02:53:
+ * Force send and Stop must ask a running runtime to interrupt through its own API,
+ * not only a local AbortController that the runtime never receives. Plugin sessions
+ * such as ACP and Grok expose no interrupt, so this guard is duck-typed; a stalled or
+ * rejecting runtime is bounded so existing disposal and durable reconciliation proceed.
+ */
+async function requestRuntimeSessionInterrupt(session: unknown): Promise<void> {
+  const sessionWithAbort = session as { abort?: () => Promise<void> | void } | undefined;
+  if (typeof sessionWithAbort?.abort !== "function") {
+    return;
+  }
+
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const outcome = await Promise.race([
+      Promise.resolve()
+        .then(() => sessionWithAbort.abort!())
+        .then(() => "completed" as const, (err) => ({ error: err })),
+      new Promise<"timed-out">((resolve) => {
+        timeout = setTimeout(() => resolve("timed-out"), CHAT_RUNTIME_INTERRUPT_TIMEOUT_MS);
+      }),
+    ]);
+    if (outcome === "timed-out") {
+      diagnostics.error("Timed out requesting runtime session interrupt during chat cancellation");
+    } else if (typeof outcome === "object" && "error" in outcome) {
+      diagnostics.error("Failed to request runtime session interrupt during chat cancellation:", outcome.error);
+    }
+  } catch (err) {
+    diagnostics.error("Failed to request runtime session interrupt during chat cancellation:", err);
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
+  }
+}
 
 function bareChatSkillCommandName(name: string): string {
   return name
@@ -237,9 +279,19 @@ function mergeTypedSkillCommands(
   FNXC:ChatSkills 2026-06-17-18:16:
   The advertised chat `/skill:{name}` command must request that skill for the model-loop session while keeping execution settings authoritative; this merge only adds requested names to the existing skill-selection context so the resolver still filters disabled or excluded skills.
   */
+  /*
+  FNXC:ChatSkills 2026-08-16-04:04:
+  GitHub #1422 makes agent metadata skills forced read-first intent, while
+  `/skill:` only ensures availability. Preserve the base forced channel when a
+  typed command rebuilds selection so chat and room responders keep the shared
+  resolved-only prompt instruction.
+  */
   return {
     projectRootDir: baseSkillSelection?.projectRootDir ?? projectRootDir,
     requestedSkillNames,
+    ...(baseSkillSelection?.forcedSkillNames?.length
+      ? { forcedSkillNames: baseSkillSelection.forcedSkillNames }
+      : {}),
     sessionPurpose: baseSkillSelection?.sessionPurpose ?? sessionPurpose,
   };
 }
@@ -327,8 +379,29 @@ Dashboard Chat sessions intentionally use the project-root coding workspace buil
 const CHAT_CODING_TOOLS = "coding" as const;
 const ROOM_AMBIENT_MAX_RESPONDERS = 5;
 
-type ChatSessionStatsLike = { tokens?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number } };
+type ChatSessionStatsLike = {
+  tokens?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number };
+  contextUsage?: unknown;
+};
 type ChatTokenDelta = Pick<ChatTokenUsageCreateInput, "inputTokens" | "outputTokens" | "cachedTokens" | "cacheWriteTokens" | "totalTokens">;
+
+export type ChatMessageContextUsage = {
+  tokens: number | null;
+  contextWindow: number;
+  percent: number | null;
+};
+
+export function normalizeChatContextUsage(value: unknown): ChatMessageContextUsage | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const { tokens, contextWindow, percent } = value as Record<string, unknown>;
+  if (typeof contextWindow !== "number" || !Number.isFinite(contextWindow) || contextWindow <= 0) return undefined;
+  if (tokens !== null && (typeof tokens !== "number" || !Number.isFinite(tokens))) return undefined;
+  return {
+    tokens: tokens === null ? null : Math.max(0, Math.trunc(tokens)),
+    contextWindow: Math.max(1, Math.trunc(contextWindow)),
+    percent: typeof percent === "number" && Number.isFinite(percent) ? percent : null,
+  };
+}
 
 function normalizeChatTokenDelta(stats: ChatSessionStatsLike | undefined): ChatTokenDelta | undefined {
   const tokens = stats?.tokens;
@@ -342,14 +415,35 @@ function normalizeChatTokenDelta(stats: ChatSessionStatsLike | undefined): ChatT
   return { inputTokens, outputTokens, cachedTokens, cacheWriteTokens, totalTokens };
 }
 
-async function readChatSessionTokenDelta(session: unknown): Promise<ChatTokenDelta | undefined> {
-  const accessor = (session as { getSessionStats?: () => ChatSessionStatsLike | Promise<ChatSessionStatsLike> }).getSessionStats;
-  if (typeof accessor !== "function") return undefined;
+/*
+FNXC:ChatContextWindow 2026-08-22-23:57:
+pi is the source of truth for conversation context: contextUsage.tokens is calculateContextTokens(usage), using total tokens or input, output, cache-read, and cache-write tokens. pi reports tokens and percent as null immediately after compaction until a fresh assistant reply. Read this counts-only metadata best-effort so absent or failing session accessors never block a successful chat turn.
+*/
+async function readChatSessionUsageSnapshot(session: unknown): Promise<{ tokens?: ChatTokenDelta; contextUsage?: ChatMessageContextUsage }> {
+  let stats: ChatSessionStatsLike | undefined;
   try {
-    return normalizeChatTokenDelta(await accessor.call(session));
+    const statsAccessor = (session as { getSessionStats?: () => ChatSessionStatsLike | Promise<ChatSessionStatsLike | undefined> }).getSessionStats;
+    stats = typeof statsAccessor === "function" ? await statsAccessor.call(session) : undefined;
   } catch {
-    return undefined;
+    stats = undefined;
   }
+
+  const tokens = normalizeChatTokenDelta(stats);
+  let contextUsage = normalizeChatContextUsage(stats?.contextUsage);
+  if (!contextUsage) {
+    try {
+      const contextAccessor = (session as { getContextUsage?: () => unknown | Promise<unknown> }).getContextUsage;
+      contextUsage = typeof contextAccessor === "function"
+        ? normalizeChatContextUsage(await contextAccessor.call(session))
+        : undefined;
+    } catch {
+      contextUsage = undefined;
+    }
+  }
+  return {
+    ...(tokens ? { tokens } : {}),
+    ...(contextUsage ? { contextUsage } : {}),
+  };
 }
 
 function modelSnapshotForTokenUsage(session: unknown, fallback?: { fallbackModel?: string }): { provider: string | null; modelId: string | null } {
@@ -419,6 +513,13 @@ export interface ChatFusionToolsetOptions {
   missionMutationGated?: boolean;
   /** Required for command-execution requests; status remains safely readable without it. */
   actionGateContext?: AgentActionGateContext;
+  /*
+  FNXC:ChatMemoryFocus 2026-08-24-04:21:
+  Per-conversation memory focus storage remains available, but every reader is gated by
+  experimentalFeatures.chatFocus. A persisted topic is inert and recall stays whole-project
+  until operators opt in; enabled sessions still scope fn_memory_search at the backend.
+  */
+  focus?: string;
 }
 
 const CHAT_MISSION_READ_TOOL_NAMES = new Set(["fn_mission_list", "fn_mission_show"]);
@@ -575,7 +676,7 @@ function createTaskVerificationTools(taskStore: TaskStore, actionGateContext?: A
 }
 
 export async function createChatFusionToolset(options: ChatFusionToolsetOptions): Promise<ChatCustomTool[]> {
-  const { taskStore, agentStore, rootDir, agentId, missionMutationGated = false, actionGateContext } = options;
+  const { taskStore, agentStore, rootDir, agentId, missionMutationGated = false, actionGateContext, focus } = options;
   const tools: ChatCustomTool[] = [];
 
   if (taskStore) {
@@ -584,6 +685,7 @@ export async function createChatFusionToolset(options: ChatFusionToolsetOptions)
       createTaskListTool(taskStore),
       createTaskShowTool(taskStore),
       createTaskSearchTool(taskStore),
+      createPatchnodeReadTool(taskStore),
       ...createTaskVerificationTools(taskStore, options.actionGateContext),
       createTaskCreateTool(taskStore, { sourceType: "api" }, { rootDir }),
     );
@@ -620,7 +722,11 @@ export async function createChatFusionToolset(options: ChatFusionToolsetOptions)
       ...createIdeationTools(taskStore).filter((tool) => missionMutationGated || CHAT_IDEATION_READ_TOOL_NAMES.has(tool.name)),
       ...createGoalRetrievalTools(taskStore),
       /* FNXC:ChatAgentTools 2026-07-15-00:00: Chat exposes memory retrieval only and respects the workspace memory-enabled setting; prompt-triggered persistent writes stay excluded without an action-gate context. */
-      ...createMemoryTools(rootDir, settings).filter((tool) => tool.name !== "fn_memory_append"),
+      ...createMemoryTools(
+        rootDir,
+        settings,
+        focus && isExperimentalFeatureEnabled(settings, CHAT_FOCUS_FLAG) ? { focus } : undefined,
+      ).filter((tool) => tool.name !== "fn_memory_append"),
       ...createResearchTools({ store: taskStore, rootDir, getSettings: () => taskStore.getSettings() }),
     );
   }
@@ -1075,6 +1181,26 @@ export type ChatStreamEvent =
           createdAt: string;
         };
         attachments?: ChatAttachment[];
+        interrupted?: boolean;
+        dispatch?: "agents";
+        failedAgentNames?: string[];
+      };
+    }
+  | {
+      type: "agent_message";
+      data: {
+        message: {
+          id: string;
+          sessionId: string;
+          role: "assistant";
+          content: string;
+          thinkingOutput: string | null;
+          metadata: Record<string, unknown> | null;
+          attachments?: ChatAttachment[];
+          createdAt: string;
+        };
+        senderAgentId: string;
+        senderAgentName: string;
       };
     }
   | { type: "error"; data: string | ChatFailureInfo };
@@ -1404,15 +1530,45 @@ export class RoomReplyGenerationError extends Error {
   }
 }
 
+interface ChatCancellationResult {
+  success: boolean;
+  interrupted: boolean;
+  message?: ChatMessage;
+}
+
+interface ActiveChatGeneration {
+  abortController: AbortController;
+  agentResult?: AgentResult;
+  generationId: number;
+  cancellationRequested: boolean;
+  cancellationResult?: ChatCancellationResult;
+  settled: Promise<void>;
+  resolveSettled: () => void;
+}
+
+interface ChatReplacementPreparation {
+  promise: Promise<{ generationId: number; retained: ChatMessage[] }>;
+  generationId?: number;
+}
+
+/** A replacement request was rejected before the SSE response was accepted. */
+export class ChatReplacementError extends Error {
+  constructor(
+    message: string,
+    readonly statusCode: 400 | 404 | 409 = 400,
+  ) {
+    super(message);
+    this.name = "ChatReplacementError";
+  }
+}
+
 export class ChatManager {
   private agentStoreReady?: Promise<void>;
   private generationCounter = 0;
   private inFlightPersistTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  private activeGenerations = new Map<string, {
-    abortController: AbortController;
-    agentResult?: AgentResult;
-    generationId: number;
-  }>();
+  private inFlightPersistChains = new Map<string, Promise<void>>();
+  private activeGenerations = new Map<string, ActiveChatGeneration>();
+  private replacementPreparations = new Map<string, ChatReplacementPreparation>();
 
   constructor(
     private chatStore: ChatStore,
@@ -1501,17 +1657,40 @@ export class ChatManager {
   its rejection observed so one failed jsonb write cannot become a process-wide
   unhandled rejection or interrupt the streaming turn.
   */
-  private persistInFlightGeneration(sessionId: string, snapshot: ChatInFlightGenerationState | null): void {
-    try {
-      void this.chatStore.setInFlightGeneration(sessionId, snapshot).catch(() => {
+  private persistInFlightGeneration(
+    sessionId: string,
+    snapshot: ChatInFlightGenerationState | null,
+    generationId?: number,
+  ): Promise<void> {
+    const previous = this.inFlightPersistChains.get(sessionId) ?? Promise.resolve();
+    const write = previous.then(async () => {
+      // FNXC:ChatCancellation 2026-08-18-21:52:
+      // Generation-scoped checkpoint writes are serialized so delayed work from an
+      // interrupted turn cannot clear or overwrite a newer turn's recovery slot.
+      if (generationId !== undefined && this.activeGenerations.get(sessionId)?.generationId !== generationId) {
+        return;
+      }
+      try {
+        await this.chatStore.setInFlightGeneration(sessionId, snapshot);
+      } catch {
         diagnostics.warn(`Failed to persist in-flight chat checkpoint for session ${sessionId}`);
-      });
-    } catch {
-      diagnostics.warn(`Failed to persist in-flight chat checkpoint for session ${sessionId}`);
-    }
+      }
+    });
+    const tracked = write.finally(() => {
+      if (this.inFlightPersistChains.get(sessionId) === tracked) {
+        this.inFlightPersistChains.delete(sessionId);
+      }
+    });
+    this.inFlightPersistChains.set(sessionId, tracked);
+    void tracked.catch(() => undefined);
+    return tracked;
   }
 
-  private queueInFlightGenerationPersist(sessionId: string, snapshot: ChatInFlightGenerationState | null): void {
+  private queueInFlightGenerationPersist(
+    sessionId: string,
+    snapshot: ChatInFlightGenerationState | null,
+    generationId: number,
+  ): void {
     const existingTimer = this.inFlightPersistTimers.get(sessionId);
     if (existingTimer) {
       clearTimeout(existingTimer);
@@ -1519,18 +1698,70 @@ export class ChatManager {
 
     const timer = setTimeout(() => {
       this.inFlightPersistTimers.delete(sessionId);
-      this.persistInFlightGeneration(sessionId, snapshot);
+      void this.persistInFlightGeneration(sessionId, snapshot, generationId);
     }, IN_FLIGHT_PERSIST_DEBOUNCE_MS);
     this.inFlightPersistTimers.set(sessionId, timer);
   }
 
-  private flushInFlightGenerationPersist(sessionId: string, snapshot: ChatInFlightGenerationState | null): void {
+  private flushInFlightGenerationPersist(
+    sessionId: string,
+    snapshot: ChatInFlightGenerationState | null,
+    generationId?: number,
+  ): Promise<void> {
     const existingTimer = this.inFlightPersistTimers.get(sessionId);
     if (existingTimer) {
       clearTimeout(existingTimer);
       this.inFlightPersistTimers.delete(sessionId);
     }
-    this.persistInFlightGeneration(sessionId, snapshot);
+    return this.persistInFlightGeneration(sessionId, snapshot, generationId);
+  }
+
+  /*
+   * FNXC:ChatCancellation 2026-08-19-05:20:
+   * An explicit Stop must write the streamed textual prefix to the same file-backed pi session that the next turn reopens. PostgreSQL history alone cannot restore model context, while appending a second assistant entry would make the model see the prefix twice when pi already recorded it during cancellation.
+   */
+  private persistInterruptedSessionContext(
+    sessionManager: SessionManager | undefined,
+    session: ChatSession | null | undefined,
+    text: string,
+  ): void {
+    if (!text) {
+      return;
+    }
+    if (!sessionManager || !session) {
+      throw new Error("Interrupted chat context has no file-backed session");
+    }
+
+    const context = sessionManager.buildSessionContext();
+    const lastAssistant = [...context.messages].reverse().find((message) => message.role === "assistant");
+    const lastAssistantText = lastAssistant && Array.isArray(lastAssistant.content)
+      ? lastAssistant.content
+        .filter((part): part is { type: "text"; text: string } => part?.type === "text" && typeof part.text === "string")
+        .map((part) => part.text)
+        .join("")
+      : typeof lastAssistant?.content === "string" ? lastAssistant.content : "";
+
+    if (lastAssistantText === text) {
+      return;
+    }
+
+    sessionManager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text }],
+      api: "chat",
+      provider: session.modelProvider ?? "unknown",
+      model: session.modelId ?? "unknown",
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: Date.now(),
+    });
   }
 
   private async getChatModelSettings(): Promise<{
@@ -1644,16 +1875,23 @@ export class ChatManager {
    * Routes that subscribe to SSE before invoking `sendMessage` should call this
    * first so subscription and broadcast generationIds are tied together.
    */
-  beginGeneration(sessionId: string): { generationId: number; abortController: AbortController } {
+  beginGeneration(
+    sessionId: string,
+    options?: { allowReplacementPreparation?: boolean },
+  ): { generationId: number; abortController: AbortController } {
+    if (this.replacementPreparations.has(sessionId) && !options?.allowReplacementPreparation) {
+      throw new ChatReplacementError(`A message replacement is already being prepared for session ${sessionId}`, 409);
+    }
+
     // If a previous generation is still tracked (e.g. its browser disconnected
     // mid-stream and its agent loop hasn't reached `finally` yet), abort its
     // controller so it stops issuing further prompts/tool calls that would
     // race against the new generation for the same CLI session file.
     //
-    // We deliberately do NOT dispose its agent here — the previous generation
-    // owns its own dispose in its `finally`. Calling dispose pre-emptively can
-    // yank the underlying CLI process out from under the new generation's
-    // freshly-opened SessionManager pointing at the same session file.
+    // We deliberately do NOT request the runtime-native interrupt or dispose its agent here —
+    // the previous generation owns both in its own teardown. Calling dispose pre-emptively can
+    // yank the underlying CLI process out from under the new generation's freshly-opened
+    // SessionManager pointing at the same session file.
     const existing = this.activeGenerations.get(sessionId);
     if (existing) {
       existing.abortController.abort();
@@ -1661,7 +1899,17 @@ export class ChatManager {
     this.generationCounter += 1;
     const generationId = this.generationCounter;
     const abortController = new AbortController();
-    this.activeGenerations.set(sessionId, { abortController, generationId });
+    let resolveSettled!: () => void;
+    const settled = new Promise<void>((resolve) => {
+      resolveSettled = resolve;
+    });
+    this.activeGenerations.set(sessionId, {
+      abortController,
+      generationId,
+      cancellationRequested: false,
+      settled,
+      resolveSettled,
+    });
     return { generationId, abortController };
   }
 
@@ -2227,7 +2475,7 @@ export class ChatManager {
         throw new Error("Room responder returned an empty reply");
       }
 
-      const tokenDelta = await readChatSessionTokenDelta(resolvedSession.session);
+      const { tokens: tokenDelta } = await readChatSessionUsageSnapshot(resolvedSession.session);
       const model = modelSnapshotForTokenUsage(resolvedSession.session, roomFallbackInfo);
       return {
         content: finalContent,
@@ -2241,6 +2489,128 @@ export class ChatManager {
     } finally {
       resolvedSession.session.dispose?.();
     }
+  }
+
+  /*
+  FNXC:ChatMentionDispatch 2026-08-23-02:31:
+  Direct-chat mentions summon permanent agents for that message instead of depending on room membership.
+  Each responder resolves its own model and thinking configuration; unmentioned turns keep the direct model loop.
+  */
+  private async dispatchMentionedAgentReplies(input: {
+    session: ChatSession;
+    sessionId: string;
+    content: string;
+    attachments?: ChatAttachment[];
+    mentions: ChatMention[];
+    latestUserMessageId: string;
+    generationId: number;
+  }): Promise<void> {
+    const failedAgentNames: string[] = [];
+    let replies = 0;
+    for (const mention of input.mentions) {
+      const responder = await this.getAgentById(mention.agentId);
+      if (!responder) continue;
+      try {
+        const response = await this.generateMentionedAgentReply({ ...input, responder });
+        if (isRoomSkipSentinel(response.content)) continue;
+        const message = await this.chatStore.addMessage(input.sessionId, {
+          role: "assistant", content: response.content, thinkingOutput: response.thinkingOutput ?? undefined,
+          metadata: { senderAgentId: responder.id, senderAgentName: responder.name, ...(response.fallback ? { fallback: response.fallback } : {}) },
+        });
+        if (response.tokenUsage) {
+          await this.chatStore.recordTokenUsage({ sourceKind: "chat", chatSessionId: input.sessionId, messageId: message.id, projectId: input.session.projectId ?? null, agentId: responder.id, createdAt: message.createdAt, ...response.tokenUsage });
+        }
+        replies++;
+        chatStreamManager.broadcast(input.sessionId, {
+          type: "agent_message",
+          data: { message: { id: message.id, sessionId: message.sessionId, role: "assistant", content: message.content, thinkingOutput: message.thinkingOutput ?? null, metadata: message.metadata ?? null, attachments: message.attachments, createdAt: message.createdAt }, senderAgentId: responder.id, senderAgentName: responder.name },
+        }, { generationId: input.generationId });
+      } catch (error) {
+        diagnostics.error(`Mentioned chat responder ${responder.id} failed in ${input.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+        failedAgentNames.push(responder.name);
+      }
+    }
+    await this.flushInFlightGenerationPersist(input.sessionId, null, input.generationId);
+    if (replies === 0 && failedAgentNames.length > 0) {
+      chatStreamManager.broadcast(input.sessionId, { type: "error", data: { summary: `Failed to generate replies from ${failedAgentNames.join(", ")}` } }, { generationId: input.generationId });
+      return;
+    }
+    chatStreamManager.broadcast(input.sessionId, { type: "done", data: { messageId: "", dispatch: "agents", ...(failedAgentNames.length > 0 ? { failedAgentNames } : {}) } }, { generationId: input.generationId });
+  }
+
+  private async generateMentionedAgentReply(input: {
+    session: ChatSession;
+    sessionId: string;
+    content: string;
+    attachments?: ChatAttachment[];
+    mentions: ChatMention[];
+    latestUserMessageId: string;
+    generationId: number;
+    responder: Agent;
+  }): Promise<{ content: string; thinkingOutput: string | null; fallback?: { primaryModel: string; fallbackModel: string; triggerPoint: "session-creation" | "prompt-time" }; tokenUsage?: ChatTokenDelta & { modelProvider: string | null; modelId: string | null } }> {
+    await ensureEngineReady();
+    let systemPrompt = CHAT_SYSTEM_PROMPT;
+    if (buildAgentChatPromptFn) {
+      try { systemPrompt = await buildAgentChatPromptFn({ agent: input.responder, rootDir: this.rootDir, agentStore: this.agentStore, basePrompt: CHAT_SYSTEM_PROMPT, includeProjectMemory: true }); }
+      catch (error) { diagnostics.warn(`Failed to build mentioned chat prompt for ${input.responder.id}: ${error instanceof Error ? error.message : String(error)}`); }
+    }
+    const mentionContext = await this.buildMentionContext(input.mentions);
+    systemPrompt = `${systemPrompt}${mentionContext ? `\n\n${mentionContext}` : ""}\n\n${CHAT_AGENT_MESSAGE_ROUTING_GUIDANCE}\n\n${CHAT_CODEBASE_ACCURACY_GUIDANCE}`;
+    const limits = await this.getRoomCompactionSettings();
+    const history = await this.chatStore.getMessages(input.sessionId, { limit: limits.fetchLimit, order: "desc" });
+    const transcript = buildCompactedRoomTranscript([...history].reverse().map((message) => ({ id: message.id, role: message.role, content: message.content, createdAt: message.createdAt, senderAgentId: typeof message.metadata?.senderAgentId === "string" ? message.metadata.senderAgentId : null })), input.latestUserMessageId, limits);
+    const { attachmentContents, imageContents } = await readChatAttachmentContents(this.rootDir, { kind: "session", sessionId: input.sessionId }, input.attachments, diagnostics);
+    const skills = parseSkillCommands(input.content);
+    const prompt = [`You are replying as ${input.responder.name} in direct chat after being explicitly mentioned.`, "Direct-chat transcript (oldest to newest, bounded):", transcript, "Latest user message to answer:", skills.strippedContent, formatChatAttachmentContents(attachmentContents), formatChatImageAttachmentHints(imageContents)].filter(Boolean).join("\n\n");
+    const settings = await this.getChatModelSettings();
+    const runtimeModel = extractRuntimeModel(input.responder.runtimeConfig);
+    const inheritedModel = resolvePermanentAgentEffectiveModel(input.responder, settings);
+    const hasRuntimeModel = !!runtimeModel.provider && !!runtimeModel.modelId;
+    const skillContext = buildSessionSkillContextSync(input.responder, "heartbeat", this.rootDir, this.getPluginRunnerForSkillSelection());
+    const skillSelection = mergeTypedSkillCommands(skillContext.skillSelectionContext, skills.requestedSkillNames, this.rootDir, "heartbeat");
+    const workflowTools = createChatWorkflowAuthoringTools(this.taskStore, input.session.projectId ?? null);
+    const gates = await createChatMissionGateContexts(this.taskStore, this.agentStore, input.responder);
+    const fusionTools = await createChatFusionToolset({ taskStore: this.taskStore, agentStore: this.agentStore, rootDir: this.rootDir, agentId: input.responder.id, missionMutationGated: gates.missionMutationGated, actionGateContext: gates.actionGateContext });
+    let fallback: { primaryModel: string; fallbackModel: string; triggerPoint: "session-creation" | "prompt-time" } | undefined;
+    const resolved = await createResolvedAgentSession({
+      sessionPurpose: "heartbeat", pluginRunner: this.pluginRunner, runtimeHint: extractRuntimeHint(input.responder.runtimeConfig), cwd: this.rootDir, systemPrompt, tools: CHAT_CODING_TOOLS,
+      ...(skillSelection ? { skillSelection } : {}), ...(skillContext.additionalSkillPaths.length > 0 ? { additionalSkillPaths: skillContext.additionalSkillPaths } : {}),
+      ...(workflowTools.length + fusionTools.length > 0 ? { customTools: dedupeChatTools([...workflowTools, ...fusionTools]) } : {}),
+      ...((hasRuntimeModel ? runtimeModel.provider : inheritedModel.provider) && (hasRuntimeModel ? runtimeModel.modelId : inheritedModel.modelId) ? { defaultProvider: hasRuntimeModel ? runtimeModel.provider : inheritedModel.provider, defaultModelId: hasRuntimeModel ? runtimeModel.modelId : inheritedModel.modelId } : {}),
+      ...(resolvePermanentAgentEffectiveThinkingLevel(input.responder, settings) ? { defaultThinkingLevel: resolvePermanentAgentEffectiveThinkingLevel(input.responder, settings) } : {}),
+      ...(settings.fallbackProvider && settings.fallbackModelId ? { fallbackProvider: settings.fallbackProvider, fallbackModelId: settings.fallbackModelId } : {}),
+      ...(gates.actionGateContext ? { actionGateContext: gates.actionGateContext } : {}), ...(gates.permanentAgentGating ? { permanentAgentGating: gates.permanentAgentGating } : {}),
+      onFallbackModelUsed: (payload: typeof fallback) => { fallback = payload; },
+    });
+    const generationEntry = this.activeGenerations.get(input.sessionId);
+    if (!generationEntry || generationEntry.generationId !== input.generationId) {
+      resolved.session.dispose?.();
+      throw new Error("Generation cancelled");
+    }
+    /*
+    FNXC:ChatCancellation 2026-08-23-03:29:
+    Explicitly mentioned-agent replies share the chat generation cancellation barrier. Register
+    the resolved runtime session before prompting so Stop/Force can interrupt and dispose the
+    actual responder rather than an unused controller slot.
+    */
+    generationEntry.agentResult = resolved;
+    if (generationEntry.abortController.signal.aborted) {
+      resolved.session.dispose?.();
+      throw new Error("Generation cancelled");
+    }
+    try {
+      await enginePromptWithFallback(resolved.session, prompt, imageContents.length > 0 ? { images: imageContents } : undefined);
+      type AgentMessage = { role?: string; type?: string; content?: string | Array<{ type?: string; text?: string }> };
+      const state = resolved.session.state as { messages?: AgentMessage[]; errorMessage?: string } | undefined;
+      if (state?.errorMessage?.trim()) throw new Error(state.errorMessage.trim());
+      const messages = state?.messages ?? (resolved.session as { messages?: AgentMessage[] }).messages ?? [];
+      const answer = [...messages].reverse().find((message) => message.role === "assistant" || message.type === "assistant");
+      const content = typeof answer?.content === "string" ? answer.content : Array.isArray(answer?.content) ? answer.content.map((part) => part?.type === "text" ? part.text ?? "" : "").join("") : "";
+      if (!content.trim()) throw new Error("Mentioned responder returned an empty reply");
+      const { tokens } = await readChatSessionUsageSnapshot(resolved.session);
+      const model = modelSnapshotForTokenUsage(resolved.session, fallback);
+      return { content: content.trim(), thinkingOutput: null, ...(fallback ? { fallback } : {}), ...(tokens ? { tokenUsage: { ...tokens, modelProvider: model.provider, modelId: model.modelId } } : {}) };
+    } finally { resolved.session.dispose?.(); }
   }
 
   /**
@@ -2295,7 +2665,14 @@ export class ChatManager {
       generationId = allocated.generationId;
       abortController = allocated.abortController;
     }
+    const replacementPreparation = this.replacementPreparations.get(sessionId);
+    if (replacementPreparation?.generationId === generationId) {
+      // The matching send now owns this generation. Consuming the reservation here
+      // lets its normal generation-finally cleanup own the active slot.
+      this.replacementPreparations.delete(sessionId);
+    }
     const broadcastOptions = { generationId };
+    const generationState = this.activeGenerations.get(sessionId);
 
     const session = await this.chatStore.getSession(sessionId);
 
@@ -2338,6 +2715,7 @@ export class ChatManager {
         if (current?.generationId === generationId) {
           this.activeGenerations.delete(sessionId);
         }
+        generationState?.resolveSettled?.();
       }
       return;
     }
@@ -2354,6 +2732,7 @@ export class ChatManager {
     };
     const toolCallsAccum: ToolCallRecord[] = [];
     const pendingToolStarts = new Map<string, Array<{ toolName: string; args?: Record<string, unknown> }>>();
+    let sessionManager: SessionManager | undefined;
     let fallbackInfo:
       | { primaryModel: string; fallbackModel: string; triggerPoint: "session-creation" | "prompt-time" }
       | undefined;
@@ -2387,7 +2766,7 @@ export class ChatManager {
         ],
         replayFromEventId: lastStreamEventId,
         updatedAt: new Date().toISOString(),
-      });
+      }, generationId);
     };
 
     try {
@@ -2407,7 +2786,7 @@ export class ChatManager {
         toolCalls: [],
         replayFromEventId: 0,
         updatedAt: new Date().toISOString(),
-      });
+      }, generationId);
 
       const parsedSkillCommands = parseSkillCommands(content);
 
@@ -2443,11 +2822,24 @@ export class ChatManager {
           void Promise.resolve(emitted).catch(() => undefined);
         } catch { /* telemetry must not enter the message-save failure path */ }
       } catch (err) {
-        this.flushInFlightGenerationPersist(sessionId, null);
+        await this.flushInFlightGenerationPersist(sessionId, null, generationId);
         chatStreamManager.broadcast(sessionId, {
           type: "error",
           data: `Failed to save message: ${err instanceof Error ? err.message : "Unknown error"}`,
         }, broadcastOptions);
+        return;
+      }
+
+      if (mentions.length > 0 && this.activeGenerations.get(sessionId)?.generationId === generationId) {
+        await this.dispatchMentionedAgentReplies({
+          session,
+          sessionId,
+          content,
+          attachments,
+          mentions,
+          latestUserMessageId: persistedUserMessageId!,
+          generationId,
+        });
         return;
       }
 
@@ -2551,14 +2943,22 @@ export class ChatManager {
       // Auto-generate chat title on first message if session has no title.
       // Run after the agent fetch so the title-summarizer uses the agent's model.
       if (needsTitle) {
+        const titleSettingsPromise = this.getChatModelSettings();
+        /*
+        FNXC:ChatTitleLanguage 2026-09-01-21:25:
+        Chat titles follow the resolved taskOutputLanguage policy just like task titles. Resolve the
+        settings only inside this detached title operation so message sending never waits on title work.
+        */
         // Fire-and-forget title generation (non-blocking)
         (async () => {
           try {
+            const titleLanguageTarget = resolveTaskOutputLanguage(await titleSettingsPromise, content.trim());
             const generated = await summarizeTitle(
               content.trim(),
               this.rootDir,
               effectiveModelProvider,
               effectiveModelId,
+              titleLanguageTarget,
             );
             const title = generated ?? content.trim().slice(0, 60).trim();
             if (title) {
@@ -2615,7 +3015,7 @@ export class ChatManager {
       // the Claude CLI --resume session it owns) is keyed off the chat. On the
       // first user message we create a fresh, file-backed session and persist
       // its path; subsequent messages reopen the same file.
-      const sessionManager = await this.resolveCliSessionManager(session);
+      sessionManager = await this.resolveCliSessionManager(session);
 
       /*
        * FNXC:ChatMessageEdit 2026-07-07-09:00:
@@ -2743,6 +3143,13 @@ export class ChatManager {
         agentId: agent?.id,
         missionMutationGated: missionGateContexts.missionMutationGated,
         actionGateContext: missionGateContexts.actionGateContext,
+        /*
+        FNXC:ChatMemoryFocus 2026-08-24-04:21:
+        Direct-chat sessions retain their persisted topic for storage compatibility, but the
+        toolset applies it only while experimentalFeatures.chatFocus is enabled. Otherwise the
+        value is inert and both direct and room chat recall remain whole-project.
+        */
+        focus: session?.memoryFocus ?? undefined,
       });
       const customTools = dedupeChatTools([
         createAskQuestionTool(),
@@ -2871,11 +3278,15 @@ export class ChatManager {
         ...(this.taskStore ? { mcpServers: (await resolveMcpServersForStore(this.taskStore, { agentId: agent?.id })).servers } : {}),
         ...sessionOptions,
       });
-      this.activeGenerations.set(sessionId, { abortController, agentResult, generationId });
-
-      if (abortController.signal.aborted) {
+      const generationEntry = this.activeGenerations.get(sessionId);
+      if (!generationEntry || generationEntry.generationId !== generationId) {
         agentResult.session.dispose?.();
         return;
+      }
+      generationEntry.agentResult = agentResult;
+
+      if (abortController.signal.aborted) {
+        throw new Error("Generation cancelled");
       }
 
       // Send user message and get response
@@ -2886,7 +3297,7 @@ export class ChatManager {
       );
 
       if (abortController.signal.aborted) {
-        return;
+        throw new Error("Generation cancelled");
       }
 
       interface AgentMessage {
@@ -2907,7 +3318,7 @@ export class ChatManager {
           effectiveModelId,
         );
         await persistFailureMessage(this.chatStore, sessionId, failureInfo);
-        this.flushInFlightGenerationPersist(sessionId, null);
+        await this.flushInFlightGenerationPersist(sessionId, null, generationId);
         chatStreamManager.broadcast(sessionId, {
           type: "error",
           data: failureInfo,
@@ -2948,6 +3359,10 @@ export class ChatManager {
       if (fallbackInfo) {
         assistantMetadata.fallback = fallbackInfo;
       }
+      const usageSnapshot = await readChatSessionUsageSnapshot(agentResult.session);
+      if (usageSnapshot.contextUsage) {
+        assistantMetadata.contextUsage = usageSnapshot.contextUsage;
+      }
       const assistantMessage = await this.chatStore.addMessage(sessionId, {
         role: "assistant",
         content: finalResponseText,
@@ -2955,8 +3370,7 @@ export class ChatManager {
         metadata: Object.keys(assistantMetadata).length > 0 ? assistantMetadata : undefined,
       });
 
-      const tokenDelta = await readChatSessionTokenDelta(agentResult.session);
-      if (tokenDelta) {
+      if (usageSnapshot.tokens) {
         const model = modelSnapshotForTokenUsage(agentResult.session, fallbackInfo);
         /*
          * FNXC:ChatTokenAccounting 2026-07-02-00:00:
@@ -2971,11 +3385,11 @@ export class ChatManager {
           modelProvider: model.provider,
           modelId: model.modelId,
           createdAt: assistantMessage.createdAt,
-          ...tokenDelta,
+          ...usageSnapshot.tokens,
         });
       }
 
-      this.flushInFlightGenerationPersist(sessionId, null);
+      await this.flushInFlightGenerationPersist(sessionId, null, generationId);
 
       // Broadcast done event with persisted assistant snapshot so clients can
       // render completion even when incremental text deltas were absent.
@@ -2997,12 +3411,76 @@ export class ChatManager {
         },
       }, broadcastOptions);
     } catch (err) {
+      const generationEntry = this.activeGenerations.get(sessionId);
+      const isExplicitCancellation = abortController.signal.aborted
+        && generationEntry?.generationId === generationId
+        && generationEntry.cancellationRequested;
+      if (isExplicitCancellation) {
+        let interruptedMessage: ChatMessage | undefined;
+        let interruptionDurable = true;
+        // FNXC:ChatCancellation 2026-08-19-05:20:
+        // Stop is a durable conversation transition: save the visible prefix to both the PostgreSQL transcript and the reopened pi session before clearing its checkpoint. A failed durable write keeps the checkpoint available for recovery and reports failure so clients retain their local prefix.
+        if (accumulatedText || accumulatedThinking || toolCallsAccum.length > 0) {
+          if (accumulatedText) {
+            try {
+              this.persistInterruptedSessionContext(sessionManager, session, accumulatedText);
+            } catch (persistErr) {
+              interruptionDurable = false;
+              diagnostics.error(`Failed to persist interrupted pi context for session ${sessionId}:`, persistErr);
+            }
+          }
+          try {
+            interruptedMessage = await this.chatStore.addMessage(sessionId, {
+              role: "assistant",
+              content: accumulatedText,
+              thinkingOutput: accumulatedThinking || undefined,
+              metadata: {
+                interrupted: true,
+                ...(fallbackInfo ? { fallback: fallbackInfo } : {}),
+                ...(toolCallsAccum.length > 0 ? { toolCalls: toolCallsAccum } : {}),
+              },
+            });
+          } catch (persistErr) {
+            interruptionDurable = false;
+            diagnostics.error(`Failed to persist interrupted response for session ${sessionId}:`, persistErr);
+          }
+        }
+
+        if (interruptionDurable) {
+          await this.flushInFlightGenerationPersist(sessionId, null, generationId);
+        }
+        const current = this.activeGenerations.get(sessionId);
+        if (current?.generationId === generationId) {
+          current.cancellationResult = {
+            success: interruptionDurable,
+            interrupted: Boolean(interruptedMessage),
+            ...(interruptedMessage ? { message: interruptedMessage } : {}),
+          };
+          chatStreamManager.broadcast(sessionId, {
+            type: "done",
+            data: {
+              messageId: interruptedMessage?.id ?? "",
+              ...(interruptedMessage ? {
+                message: {
+                  id: interruptedMessage.id,
+                  sessionId: interruptedMessage.sessionId,
+                  role: "assistant" as const,
+                  content: interruptedMessage.content,
+                  thinkingOutput: interruptedMessage.thinkingOutput,
+                  metadata: interruptedMessage.metadata,
+                  attachments: interruptedMessage.attachments,
+                  createdAt: interruptedMessage.createdAt,
+                },
+              } : {}),
+              interrupted: true,
+            },
+          }, broadcastOptions);
+        }
+        return;
+      }
+
       if (abortController.signal.aborted) {
-        this.flushInFlightGenerationPersist(sessionId, null);
-        chatStreamManager.broadcast(sessionId, {
-          type: "error",
-          data: "Generation cancelled",
-        }, broadcastOptions);
+        await this.flushInFlightGenerationPersist(sessionId, null, generationId);
         return;
       }
 
@@ -3035,7 +3513,7 @@ export class ChatManager {
         diagnostics.error(`Failed to persist failure message for session ${sessionId}:`, persistErr);
       }
 
-      this.flushInFlightGenerationPersist(sessionId, null);
+      await this.flushInFlightGenerationPersist(sessionId, null, generationId);
 
       chatStreamManager.broadcast(sessionId, {
         type: "error",
@@ -3050,6 +3528,7 @@ export class ChatManager {
       if (stillOwnsSlot) {
         this.activeGenerations.delete(sessionId);
       }
+      generationState?.resolveSettled?.();
 
       // Dispose the agent session — but ONLY when we still own the slot.
       //
@@ -3074,30 +3553,120 @@ export class ChatManager {
     }
   }
 
-  cancelGeneration(sessionId: string): boolean {
-    const entry = this.activeGenerations.get(sessionId);
-    if (!entry) {
-      return false;
+  /*
+   * FNXC:ChatMessageEdit 2026-08-19-03:34:
+   * A saved edit is a single fenced operation: validate the persisted user target,
+   * rewind PostgreSQL and reachable pi history before SSE acceptance, then allocate
+   * the generation that the replacement POST will subscribe to. The reservation
+   * prevents an ordinary send from aborting the rewind window or a second edit from
+   * deleting a different transcript range.
+   */
+  async prepareReplacement(
+    sessionId: string,
+    fromMessageId: string,
+  ): Promise<{ generationId: number; retained: ChatMessage[] }> {
+    if (this.replacementPreparations.has(sessionId)) {
+      throw new ChatReplacementError(`A message replacement is already being prepared for session ${sessionId}`, 409);
     }
 
-    entry.abortController.abort();
+    const preparation: ChatReplacementPreparation = { promise: Promise.resolve({ generationId: 0, retained: [] }) };
+    preparation.promise = (async () => {
+      const session = await this.chatStore.getSession(sessionId);
+      if (!session) {
+        throw new ChatReplacementError(`Chat session ${sessionId} not found`, 404);
+      }
+      if (session.cliExecutorAdapterId) {
+        throw new ChatReplacementError("Message replacement is not supported for CLI-backed chat sessions");
+      }
 
-    if (entry.agentResult) {
-      try {
-        entry.agentResult.session.dispose?.();
-      } catch (err) {
-        diagnostics.error(`Error disposing agent session during cancellation:`, err);
+      const target = await this.chatStore.getMessage(fromMessageId);
+      if (!target || target.sessionId !== sessionId) {
+        throw new ChatReplacementError(`Message ${fromMessageId} not found in session ${sessionId}`, 404);
+      }
+      if (target.role !== "user") {
+        throw new ChatReplacementError(`Message ${fromMessageId} is not a user message and cannot be edited`);
+      }
+      if (this.activeGenerations.has(sessionId)) {
+        throw new ChatReplacementError(`Cannot edit message ${fromMessageId}: a generation is currently in progress for session ${sessionId}`);
+      }
+
+      const { retained } = await this.rewindSessionForEdit(sessionId, fromMessageId);
+      const allocated = this.beginGeneration(sessionId, { allowReplacementPreparation: true });
+      preparation.generationId = allocated.generationId;
+      return { generationId: allocated.generationId, retained };
+    })();
+    this.replacementPreparations.set(sessionId, preparation);
+
+    try {
+      return await preparation.promise;
+    } catch (error) {
+      const current = this.replacementPreparations.get(sessionId);
+      if (current === preparation) {
+        this.replacementPreparations.delete(sessionId);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Release a prepared replacement when the route cannot wire its SSE response.
+   * This is intentionally narrow: a send that reached the accepted response owns
+   * cleanup through its normal generation-finally path.
+   */
+  releasePreparedReplacement(sessionId: string, generationId: number): void {
+    const preparation = this.replacementPreparations.get(sessionId);
+    if (preparation?.generationId !== generationId) {
+      return;
+    }
+    this.replacementPreparations.delete(sessionId);
+    const active = this.activeGenerations.get(sessionId);
+    if (active?.generationId === generationId) {
+      active.abortController.abort();
+      this.activeGenerations.delete(sessionId);
+      active.resolveSettled();
+    }
+  }
+
+  /**
+   * FNXC:ChatCancellation 2026-08-21-01:36:
+   * `/new` and `/clear` always cross this server-authoritative barrier because local streaming
+   * state can be stale. An idle session has no interrupted state to persist, so absence is a
+   * successful no-op; only an active generation that cannot become durable reports failure.
+   */
+  async cancelGeneration(sessionId: string): Promise<ChatCancellationResult> {
+    const entry = this.activeGenerations.get(sessionId);
+    if (!entry) {
+      return { success: true, interrupted: false };
+    }
+
+    if (!entry.cancellationRequested) {
+      entry.cancellationRequested = true;
+      entry.abortController.abort();
+
+      if (entry.agentResult) {
+        /*
+         * FNXC:ChatCancellation 2026-08-23-02:53:
+         * Force send and Stop must request the runtime-native interrupt before disposal because
+         * the local controller is not passed to prompt(). ACP/Grok sessions lack abort(), and
+         * this bounded request must finish before the existing durable settled barrier can wait.
+         */
+        if (typeof (entry.agentResult.session as { abort?: unknown }).abort === "function") {
+          await requestRuntimeSessionInterrupt(entry.agentResult.session);
+        }
+        try {
+          entry.agentResult.session.dispose?.();
+        } catch (err) {
+          diagnostics.error(`Error disposing agent session during cancellation:`, err);
+        }
       }
     }
 
-    this.flushInFlightGenerationPersist(sessionId, null);
-
-    chatStreamManager.broadcast(sessionId, {
-      type: "error",
-      data: "Generation cancelled",
-    }, { generationId: entry.generationId });
-
-    return true;
+    // The send loop owns persistence and its terminal SSE event. Waiting here
+    // makes the HTTP cancel response a durable reconciliation barrier for clients.
+    if (entry.settled) {
+      await entry.settled;
+    }
+    return entry.cancellationResult ?? { success: true, interrupted: false };
   }
 
   /**

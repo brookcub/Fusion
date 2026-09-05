@@ -75,6 +75,7 @@ describe("executor shared-branch autoMerge:false liveness gates", () => {
       mergeAbortResult,
       "merge-seam",
       true,
+      false,
     );
 
     expect(retryable).toBe(false);
@@ -90,6 +91,7 @@ describe("executor shared-branch autoMerge:false liveness gates", () => {
       mergeAbortResult,
       "merge-seam",
       true,
+      false,
     )).resolves.toBe(false);
   });
 
@@ -102,6 +104,7 @@ describe("executor shared-branch autoMerge:false liveness gates", () => {
       mergeAbortResult,
       "merge-seam",
       true,
+      false,
     )).resolves.toBe(true);
   });
 
@@ -114,6 +117,7 @@ describe("executor shared-branch autoMerge:false liveness gates", () => {
       mergeAbortResult,
       "merge-seam",
       true,
+      false,
     )).resolves.toBe(true);
   });
 
@@ -176,7 +180,7 @@ describe("executor shared-branch autoMerge:false liveness gates", () => {
       nodeId: "plan-review",
     })).resolves.toBe(true);
 
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo", { preserveWorktree: true });
+    expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo", { preserveWorktree: true, workflowMoveSource: "workflow-remediation" });
     expect(store.updateTask).toHaveBeenCalledWith(task.id, expect.objectContaining({ status: "needs-replan" }), undefined);
   });
 
@@ -262,6 +266,7 @@ describe("executor shared-branch autoMerge:false liveness gates", () => {
       mergeAbortResult,
       "merge-seam",
       true,
+      false,
     )).resolves.toBe(false);
   });
 });

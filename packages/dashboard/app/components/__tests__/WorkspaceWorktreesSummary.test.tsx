@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { render, screen } from "@testing-library/react";
-import { WorkspaceWorktreesSummary, isWorkspaceTask } from "../WorkspaceWorktreesSummary";
+import { WorkspaceWorktreesSummary, deriveWorkspaceRepoStatus, isWorkspaceTask } from "../WorkspaceWorktreesSummary";
 
 /*
 FNXC:Workspace 2026-06-21-00:00:
@@ -39,10 +39,10 @@ describe("isWorkspaceTask", () => {
     expect(isWorkspaceTask({ worktree: undefined, workspaceWorktrees: {} })).toBe(false);
   });
 
-  it("prefers the singular worktree even if workspaceWorktrees is populated", () => {
+  it("prefers populated acquired workspace entries over stale singular routing", () => {
     expect(
-      isWorkspaceTask({ worktree: "/wt/x", workspaceWorktrees: workspaceTask.workspaceWorktrees }),
-    ).toBe(false);
+      isWorkspaceTask({ worktree: "/wt/stale", workspaceWorktrees: workspaceTask.workspaceWorktrees }),
+    ).toBe(true);
   });
 });
 
@@ -65,12 +65,89 @@ describe("WorkspaceWorktreesSummary", () => {
     expect(screen.getByText("fusion/fn-1-b")).toBeTruthy();
   });
 
+  it("renders recorded bases and fallback markers only in the full per-repo list", () => {
+    render(<WorkspaceWorktreesSummary task={{ worktree: undefined, workspaceWorktrees: {
+      "repo-a": { worktreePath: "/wt/repo-a", branch: "fusion/fn-1-a", baseBranch: "release/1.2" },
+      "repo-b": { worktreePath: "/wt/repo-b", branch: "fusion/fn-1-b", baseBranch: "main", baseBranchFallbackFrom: "release/1.2" },
+      "repo-legacy": { worktreePath: "/wt/legacy", branch: "fusion/fn-1-legacy" },
+    } }} />);
+    expect(screen.getAllByTestId("workspace-repo-base-branch")).toHaveLength(2);
+    expect(screen.getByTestId("workspace-repo-base-fallback")).toHaveAttribute("title", expect.stringContaining("release/1.2"));
+    expect(screen.getByTestId("workspace-repo-base-fallback")).toHaveAttribute("title", expect.stringContaining("repo-b"));
+  });
+
+  it("renders the acquired workspace entry in full and compact modes despite stale singular routing", () => {
+    const staleWorkspaceTask = {
+      worktree: "/wt/unrelated-stale-worktree",
+      workspaceWorktrees: {
+        "repo-acquired": { worktreePath: "/wt/repo-acquired/.worktrees/FN-080", branch: "fusion/FN-080" },
+      },
+    } as const;
+    const { unmount } = render(<WorkspaceWorktreesSummary task={staleWorkspaceTask} />);
+
+    expect(screen.getByText(/1 repo acquired/i)).toBeTruthy();
+    expect(screen.getByText("repo-acquired")).toBeTruthy();
+    expect(screen.getByText("/wt/repo-acquired/.worktrees/FN-080")).toBeTruthy();
+    expect(screen.getByText("fusion/FN-080")).toBeTruthy();
+    expect(screen.queryByText("/wt/unrelated-stale-worktree")).toBeNull();
+
+    unmount();
+    render(<WorkspaceWorktreesSummary task={staleWorkspaceTask} compact />);
+    expect(screen.getByTestId("workspace-worktrees-placeholder")).toHaveTextContent("1 repo acquired");
+  });
+
   it("renders only the compact placeholder in compact mode", () => {
     render(<WorkspaceWorktreesSummary task={workspaceTask} compact />);
     expect(screen.getByTestId("workspace-worktrees-placeholder").textContent).toContain("2 repos");
     // Compact variant omits the full per-repo list.
     expect(screen.queryByTestId("workspace-worktrees-summary")).toBeNull();
     expect(screen.queryByText("/wt/repo-a")).toBeNull();
+    expect(screen.queryByTestId("workspace-repo-base-branch")).toBeNull();
+    expect(screen.queryByTestId("workspace-repo-base-fallback")).toBeNull();
+  });
+
+  it("renders landed, failed, and pending statuses with the partial-land detail", () => {
+    render(<WorkspaceWorktreesSummary task={{ worktree: undefined, error: "Workspace partial-land failed", workspaceWorktrees: {
+      "repo-a": { worktreePath: "/wt/repo-a", branch: "fusion/fn-1-a", landedSha: "abcdef1234567890" },
+      "repo-b": { worktreePath: "/wt/repo-b", branch: "fusion/fn-1-b", landFailure: { message: "squash failed: conflict", at: "2026-08-15T12:00:00.000Z" } },
+      "repo-c": { worktreePath: "/wt/repo-c", branch: "fusion/fn-1-c" },
+    } }} />);
+    expect(screen.getByText("abcdef12")).toBeTruthy();
+    expect(screen.getAllByTestId("workspace-repo-status-landed")).toHaveLength(1);
+    expect(screen.getAllByTestId("workspace-repo-status-failed")).toHaveLength(1);
+    expect(screen.getAllByTestId("workspace-repo-status-pending")).toHaveLength(1);
+    expect(screen.getByText("squash failed: conflict")).toBeTruthy();
+    expect(screen.getByText(/1 of 3 repos landed/i)).toBeTruthy();
+    expect(screen.getByTestId("workspace-partial-land-detail")).toHaveTextContent("Workspace partial-land failed");
+    expect(screen.getByRole("list").firstElementChild).toHaveClass("workspace-worktrees-item--wrapping");
+  });
+
+  it("renders legacy partial land failures as pending without parsing task.error", () => {
+    render(<WorkspaceWorktreesSummary task={{ worktree: undefined, error: "repo-b conflict", workspaceWorktrees: {
+      "repo-a": { worktreePath: "/wt/repo-a", branch: "fusion/fn-1-a", landedSha: "abcdef1234567890" },
+      "repo-b": { worktreePath: "/wt/repo-b", branch: "fusion/fn-1-b" },
+    } }} />);
+    expect(screen.getByText("abcdef12")).toBeTruthy();
+    expect(screen.getAllByTestId("workspace-repo-status-pending")).toHaveLength(1);
+    expect(screen.queryByTestId("workspace-repo-status-failed")).toBeNull();
+    expect(screen.getByTestId("workspace-partial-land-detail")).toHaveTextContent("repo-b conflict");
+  });
+
+  it("keeps compact mode free of per-repository status details", () => {
+    render(<WorkspaceWorktreesSummary compact task={{ worktree: undefined, workspaceWorktrees: {
+      "repo-a": { worktreePath: "/wt/repo-a", branch: "fusion/fn-1-a", landedSha: "abcdef1234567890", landFailure: { message: "stale", at: "now" } },
+    } }} />);
+    expect(screen.queryByTestId(/workspace-repo-status/)).toBeNull();
+    expect(screen.queryByText("abcdef12")).toBeNull();
+    expect(screen.queryByText("stale")).toBeNull();
+  });
+
+  it("derives landed proof before failure, including finalize recovery proof", () => {
+    const failure = { message: "failed", at: "now" };
+    expect(deriveWorkspaceRepoStatus({ worktreePath: "/wt", branch: "x", landedSha: "landed", landFailure: failure }, "repo-a")).toMatchObject({ status: "landed", landedSha: "landed" });
+    expect(deriveWorkspaceRepoStatus({ worktreePath: "/wt", branch: "x", landFailure: failure }, "repo-a", { workspaceLandedShas: { "repo-a": "recovered" } })).toMatchObject({ status: "landed", landedSha: "recovered" });
+    expect(deriveWorkspaceRepoStatus({ worktreePath: "/wt", branch: "x", landFailure: failure }, "repo-a")).toMatchObject({ status: "failed" });
+    expect(deriveWorkspaceRepoStatus({ worktreePath: "/wt", branch: "x" }, "repo-a")).toMatchObject({ status: "pending" });
   });
 
   it("renders nothing for a single-repo task, leaving existing rendering unchanged", () => {

@@ -15,6 +15,7 @@ import {
   RefreshCw,
   ScrollText,
   Cpu,
+  GitPullRequestArrow,
 } from "lucide-react";
 import {
   createBackup,
@@ -30,6 +31,7 @@ import {
   startFnBinaryLinkLocal,
   startFnBinaryUseGlobal,
   startSystemRebuild,
+  startSystemSourceUpdate,
   type SystemInfoResponse,
   type SystemLogEntryDto,
   type SystemRebuildJobLine,
@@ -37,6 +39,7 @@ import {
   type UpdateCheckResponse,
 } from "../../../api/legacy";
 import { subscribeSse } from "../../../sse-bus";
+import { pendingUpdateInstallState, usePendingUpdateInstall } from "../../../hooks/usePendingUpdateInstall";
 import type { ReportActionType } from "@fusion/core";
 import type { ToastType } from "../../../hooks/useToast";
 import { ReportActionMenu } from "../../ReportActionMenu";
@@ -44,6 +47,7 @@ import { ReportModal } from "../../ReportModal";
 import { resolveReportContextRefs } from "../../../utils/reportContextRefs";
 import { copyTextToClipboard } from "../../../utils/copyToClipboard";
 import { capLogEntries } from "../../../hooks/useAgentLogs";
+import { useVisibilityAwarePoll } from "../../../hooks/visibilitySuspension";
 import "./SystemControlsArea.css";
 
 /*
@@ -79,6 +83,9 @@ until a backgrounded mobile tab is discarded by the OS and reloads with a white 
 The joined-string render below is O(kept lines) per frame, so the cap bounds render cost too.
 */
 export const LOG_VIEW_CAP = 500;
+
+/** How often to re-probe capabilities while the probe has not landed. Self-disables on success. */
+export const SYSTEM_INFO_RETRY_INTERVAL_MS = 10_000;
 const RESTART_POLL_MS = 1500;
 const BACK_ONLINE_RELOAD_DELAY_MS = 3000;
 // Bound the post-restart wait so a server that never comes back (crashed
@@ -160,6 +167,8 @@ export function SystemControlsArea({ projectId, addToast }: SystemControlsAreaPr
   const logFollowingRef = useRef(true);
 
   const [updateCheckResult, setUpdateCheckResult] = useState<UpdateCheckResponse | null>(null);
+  // The global update hook hydrates; this panel also records its explicit refresh result.
+  const pendingInstall = usePendingUpdateInstall({ hydrate: false });
 
   /*
   FNXC:SystemPanel 2026-07-18-16:12:
@@ -231,6 +240,28 @@ export function SystemControlsArea({ projectId, addToast }: SystemControlsAreaPr
       cancelled = true;
     };
   }, [loadInfo]);
+
+  /*
+  FNXC:SystemPanel 2026-09-01-14:32:
+  RETRY THE CAPABILITY PROBE UNTIL IT LANDS. `loadInfo` had exactly two callers — this panel's mount
+  and the Refresh button — so one failed fetch was permanent. Every dev-only control is gated on
+  `info` (`showRebuildControls = info?.rebuildSupported ?? false`), so a probe that missed left the
+  panel with no Rebuild, Full rebuild, or plugin cards and no way back except clicking Refresh by
+  hand. Operator report: "why do I have to hit refresh, it should just show". The trigger is routine
+  rather than exotic — a Command Center tab left open across a `pnpm dev` restart mounts, or polls,
+  straight into the window where the server is not answering.
+
+  Gated on `!info`, so this stops the moment the probe succeeds: it is a recovery path, not a poll.
+  `refreshOnVisible` also retries on the visible edge, which is exactly when an operator returns to a
+  tab that was open through a restart.
+  */
+  useVisibilityAwarePoll(
+    () => {
+      void loadInfo();
+    },
+    SYSTEM_INFO_RETRY_INTERVAL_MS,
+    { enabled: !info, refreshOnVisible: true },
+  );
 
   useEffect(() => {
     jobRef.current = job;
@@ -522,6 +553,22 @@ export function SystemControlsArea({ projectId, addToast }: SystemControlsAreaPr
     [adoptJob, info?.restartSupported, runAction],
   );
 
+  /*
+  FNXC:SystemPanelSourceUpdate 2026-09-01-01:22:
+  "Update from source" is the one button a remote contributor with dashboard-only access presses to
+  ship: it pulls, rebuilds, and restarts into the new code. The restart is requested by the SERVER
+  and only after the build succeeded, so a failed build leaves this dashboard running and reachable —
+  the control deliberately does not schedule a client-side restart of its own.
+  */
+  const beginSourceUpdate = useCallback(
+    () =>
+      runAction("source-update", async () => {
+        const snapshot = await startSystemSourceUpdate(info?.restartSupported ?? false);
+        adoptJob(snapshot);
+      }),
+    [adoptJob, info?.restartSupported, runAction],
+  );
+
   const beginFnLinkLocal = useCallback(
     () =>
       runAction("fn-link-local", async () => {
@@ -544,9 +591,14 @@ export function SystemControlsArea({ projectId, addToast }: SystemControlsAreaPr
     () =>
       runAction("check-updates", async () => {
         const result = await refreshUpdateCheck();
+        pendingUpdateInstallState.record(result.pendingInstall);
         setUpdateCheckResult(result);
         if (result.error) {
           toast(result.error, "error");
+          return;
+        }
+        if (result.externallyManaged) {
+          toast(t("systemControls.updatesExternallyManaged", "Updates are managed by this deployment"), "warning");
           return;
         }
         if (result.disabled) {
@@ -689,6 +741,28 @@ export function SystemControlsArea({ projectId, addToast }: SystemControlsAreaPr
   */
   const showRebuildControls = info?.rebuildSupported ?? false;
   /*
+  FNXC:SystemPanelSourceUpdate 2026-09-01-01:22:
+  The update control is always VISIBLE (unlike the dev-only rebuild cards) but honestly disabled with
+  the reason, because a container operator needs to be told WHY the one action they were promised is
+  unavailable — "not running from source" and "unsupervised, so nothing would respawn me" are
+  different problems with different fixes, and silently hiding the card looks like a missing feature.
+  Both conditions must hold: a git checkout to pull into, and a supervising parent to restart into it.
+  */
+  const sourceUpdateEnabled = Boolean(info?.sourceUpdateSupported) && Boolean(info?.restartSupported);
+  const sourceUpdateDisabledNote = !info
+    ? undefined
+    : !info.sourceUpdateSupported
+      ? t(
+          "systemControls.sourceUpdateNotFromSource",
+          "Not running from a source checkout — start the container with --from-source (FUSION_SOURCE_ROOT) to enable this.",
+        )
+      : !info.restartSupported
+        ? t(
+            "systemControls.sourceUpdateUnsupervised",
+            "Needs a supervising parent to restart into the new build — restart the dashboard without --no-supervise.",
+          )
+        : undefined;
+  /*
   FNXC:SystemPanelFnBinary 2026-07-15-09:54:
   Link-local is HIDDEN unless the server advertises a Fusion source checkout
   (dev mode). Use-global and check-for-updates stay visible on packaged installs.
@@ -764,6 +838,20 @@ export function SystemControlsArea({ projectId, addToast }: SystemControlsAreaPr
         disabled: false,
         run: () => void doCheckUpdates(),
         testId: "cc-syscontrol-check-updates",
+      },
+      {
+        key: "source-update",
+        icon: GitPullRequestArrow,
+        title: t("systemControls.sourceUpdate", "Update from source"),
+        description: t(
+          "systemControls.sourceUpdateDesc",
+          "Pull the latest source (fast-forward only), rebuild it, and restart into the new code. A failed build never restarts the server.",
+        ),
+        cta: t("systemControls.sourceUpdateCta", "Update & restart"),
+        disabled: !sourceUpdateEnabled || rebuildRunning,
+        note: sourceUpdateDisabledNote,
+        run: () => void beginSourceUpdate(),
+        testId: "cc-syscontrol-source-update",
       },
       {
         key: "restart",
@@ -855,6 +943,9 @@ export function SystemControlsArea({ projectId, addToast }: SystemControlsAreaPr
     ],
     [
       beginFnLinkLocal,
+      beginSourceUpdate,
+      sourceUpdateDisabledNote,
+      sourceUpdateEnabled,
       beginFnUseGlobal,
       beginRebuild,
       doAgentsRestart,
@@ -940,22 +1031,26 @@ export function SystemControlsArea({ projectId, addToast }: SystemControlsAreaPr
           </div>
         ) : null}
 
-        {updateCheckResult && !updateCheckResult.error ? (
+        {(pendingInstall || (updateCheckResult && !updateCheckResult.error)) ? (
           <div
-            className={`cc-syscontrols-banner ${updateCheckResult.updateAvailable ? "cc-syscontrols-banner--back" : ""}`}
+            className={`cc-syscontrols-banner ${pendingInstall || updateCheckResult?.updateAvailable ? "cc-syscontrols-banner--back" : ""}`}
             role="status"
             data-testid="cc-system-update-check-result"
           >
             <span>
-              {updateCheckResult.disabled
-                ? t("systemControls.updatesDisabled", "Update checks are disabled in global settings")
-                : updateCheckResult.updateAvailable && updateCheckResult.latestVersion
+              {pendingInstall
+                ? t("updateBanner.updateSuccess", "Updated to v{{version}} — restart Fusion to apply", { version: pendingInstall.latestVersion })
+                : updateCheckResult?.externallyManaged
+                  ? t("systemControls.updatesExternallyManaged", "Updates are managed by this deployment")
+                : updateCheckResult?.disabled
+                  ? t("systemControls.updatesDisabled", "Update checks are disabled in global settings")
+                : updateCheckResult?.updateAvailable && updateCheckResult.latestVersion
                   ? t("systemControls.updateAvailable", "Update available: v{{version}} (current: v{{current}})", {
                       version: updateCheckResult.latestVersion,
                       current: updateCheckResult.currentVersion,
                     })
                   : t("systemControls.upToDate", "You're up to date (v{{version}})", {
-                      version: updateCheckResult.currentVersion,
+                      version: updateCheckResult?.currentVersion,
                     })}
             </span>
           </div>

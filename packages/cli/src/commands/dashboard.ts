@@ -37,8 +37,20 @@ import {
   isPostgresUniqueError,
   ProjectPartitionRekeyError,
   resolveTaskLifecycleColumns,
+  DEFAULT_PROJECT_SETTINGS,
+  resolveEffectiveConcurrency,
+  resolveWorktreeCapacityLimit,
   type WorkflowIr,
 } from "@fusion/core";
+
+export function mapTuiConcurrencySettings(settings: Record<string, unknown> | null | undefined): { maxConcurrent: number; maxWorktrees: number } {
+  const capacity = resolveEffectiveConcurrency(settings);
+  return {
+    maxConcurrent: capacity.maxConcurrent,
+    // FNXC:CapacityModel 2026-08-21-16:18: TUI settings display the configured worktree value even when its admission gate is off.
+    maxWorktrees: resolveWorktreeCapacityLimit({ ...(settings ?? {}), worktreeLimitEnabled: true })!,
+  };
+}
 
 /*
 FNXC:WorkflowLifecycleColumns 2026-08-02-08:50 (fleet: CLI dashboard/serve stats):
@@ -87,6 +99,7 @@ import {
 import {
   runAiMerge,
   landWorkspaceTask,
+  withWorkspaceMergeDispatchLease,
   MissionAutopilot,
   MissionExecutionLoop,
   HeartbeatMonitor,
@@ -100,6 +113,10 @@ import {
   createFusionAuthStorage,
   createFusionModelRegistry,
   refreshFusionModelRegistry,
+  setLocalDashboardPort,
+  startCloudLinkPresence,
+  stopCloudLinkPresence,
+  reconcileUnownedStaleMergeStamp,
 } from "@fusion/engine";
 import { setHostTaskStore, clearHostTaskStores } from "../extension.js";
 import { DefaultPackageManager, SettingsManager, discoverAndLoadExtensions, createExtensionRuntime } from "@earendil-works/pi-coding-agent";
@@ -118,6 +135,7 @@ import { ensureCwdProjectRegistered } from "./ensure-project-registered.js";
 import { createReadOnlyProviderSettingsView } from "./provider-settings.js";
 import { wrapAuthStorageWithApiKeyProviders } from "./provider-auth.js";
 import { getPackageManagerAgentDir } from "./auth-paths.js";
+import { createProjectScopedPackageManagerFactory } from "./skills-package-manager.js";
 import { resolveProject } from "../project-context.js";
 import {
   ensureClaudeSkillsForAllProjectsOnStartup,
@@ -140,13 +158,15 @@ import {
 } from "./llama-cpp-extension.js";
 import { getCachedUpdateStatus, isUpdateCheckEnabled } from "../update-cache.js";
 import { resolveSelfExtension } from "./self-extension.js";
-import { ensureBundledDependencyGraphPluginInstalled, ensureBundledGrokRuntimePluginInstalled, ensureBundledPluginInstalled, isBundledPluginId } from "../plugins/bundled-plugin-install.js";
+import { ensureBundledCursorRuntimePluginInstalled, ensureBundledDependencyGraphPluginInstalled, ensureBundledGrokRuntimePluginInstalled, ensureBundledPluginInstalled, isBundledPluginId } from "../plugins/bundled-plugin-install.js";
 import { registerCustomProviders, reregisterCustomProviders } from "./custom-provider-registry.js";
 import { handleOpencodeGoApiKeySaved, syncStartupModels } from "./startup-model-sync.js";
 import { DashboardTUI, DashboardLogSink, isTTYAvailable, type SystemInfo, type GitStatus, type GitCommit, type GitCommitDetail, type GitBranch, type GitWorktree, type FileEntry, type FileReadResult, type TaskStep as TUITaskStep, type TaskLogEntry as TUITaskLogEntry, type TaskDetailData, type TaskEvent } from "./dashboard-tui/index.js";
 import { DASHBOARD_STARTUP_STATUS, runTuiStartupPrelude } from "./dashboard-startup-chain.js";
 import { phaseTime } from "../startup-phase.js";
 import {
+  DEV_SERVER_LISTENING_MESSAGE,
+  DEV_TUNNEL_READY_MESSAGE,
   DEV_SOURCE_RESTART_ARMED_MESSAGE,
   registerDevSourceRestart,
 } from "./dev-source-restart.js";
@@ -803,6 +823,16 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
   // stores it to localStorage for subsequent loads.
   const dashboardAuthToken = await resolveDashboardAuthToken(opts);
 
+  /*
+  FNXC:DevTunnel 2026-08-19-04:30:
+  Set by the dev wrapper's IPC hand-off (see DEV_TUNNEL_READY_MESSAGE) and rendered by the TUI.
+  Declared at run scope because the two halves — receiving the URL and having a TUI to draw it on —
+  complete in either order.
+  */
+  let devTunnelUrl: string | undefined;
+  let remoteTunnelUrl: string | undefined;
+  let applyTunnelUrl: (() => void) | undefined;
+
   // Single sink/logger pair for all dashboard command diagnostics.
   // In TTY mode this routes to DashboardTUI; in non-TTY mode it falls back to console.*.
   const logSink = new DashboardLogSink();
@@ -888,8 +918,7 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
           const fullSettings = await store.getSettings();
           // Return SettingsValues subset for TUI
           return {
-            maxConcurrent: fullSettings.maxConcurrent ?? 1,
-            maxWorktrees: fullSettings.maxWorktrees ?? 2,
+            ...mapTuiConcurrencySettings(fullSettings),
             autoMerge: fullSettings.autoMerge ?? false,
             mergeStrategy: fullSettings.mergeStrategy ?? "direct",
             pollIntervalMs: fullSettings.pollIntervalMs ?? 60_000,
@@ -901,8 +930,8 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
           };
         }
         return {
-          maxConcurrent: 1,
-          maxWorktrees: 2,
+          maxConcurrent: DEFAULT_PROJECT_SETTINGS.maxConcurrent,
+          maxWorktrees: DEFAULT_PROJECT_SETTINGS.maxWorktrees,
           autoMerge: false,
           mergeStrategy: "direct",
           pollIntervalMs: 60_000,
@@ -1245,8 +1274,7 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
     try {
       const settings = await store.getSettings();
       tui.setSettings({
-        maxConcurrent: settings.maxConcurrent ?? 1,
-        maxWorktrees: settings.maxWorktrees ?? 2,
+        ...mapTuiConcurrencySettings(settings),
         autoMerge: settings.autoMerge ?? false,
         mergeStrategy: settings.mergeStrategy ?? "direct",
         pollIntervalMs: settings.pollIntervalMs ?? 60_000,
@@ -1572,6 +1600,27 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
       );
     }
 
+    /*
+     * FNXC:CursorCli 2026-08-16-04:05:
+     * FN-9093: the Cursor provider card's Enable action only flips `useCursorCli` in settings and never
+     * registers fusion-plugin-cursor-runtime, so `getRuntimeById("cursor")` missed and every cursor-cli
+     * selection hit the fail-fast "install and enable the Cursor runtime plugin" error after enabling.
+     * Mirror the FN-7761 Grok eager bootstrap so the Cursor runtime is loadable before chat sends.
+     */
+    try {
+      const installStatus = await ensureBundledCursorRuntimePluginInstalled(pluginStore, pluginLoader);
+      if (installStatus === "installed") {
+        logSink.log("Installed bundled Cursor CLI runtime plugin", "plugins");
+      } else if (installStatus === "missing-bundle") {
+        logSink.log("Bundled Cursor CLI runtime plugin was not found in this build", "plugins");
+      }
+    } catch (err) {
+      logSink.log(
+        `Failed to auto-install bundled Cursor CLI runtime plugin: ${err instanceof Error ? err.message : err}`,
+        "plugins",
+      );
+    }
+
     try {
       const { loaded, errors } = await pluginLoader.loadAllPlugins();
       logSink.log(`Loaded ${loaded} plugins (${errors} errors)`, "plugins");
@@ -1618,6 +1667,8 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
   - UI-only (--no-engine): createServer receives uiOnlyOnMerge which calls runAiMerge/landWorkspaceTask with pluginRunner undefined — dual-remediation for grok-cli/no-key is correct because there is no ProjectEngine PluginRunner. Do not invent a bootstrap here and do not pass the bare PluginLoader (lacks getRuntimeById).
   */
   const uiOnlyOnMerge = async (taskId: string) => {
+    // Authorization C: this dashboard has no exclusive process-level merge ownership proof.
+    await reconcileUnownedStaleMergeStamp(store, taskId);
     // FNXC:Workspace 2026-06-21-23:40 (Phase C U1, KTD2):
     // Dashboard merge button (UI-only mode). A workspace-mode task routes through
     // the ENGINE per-repo merge loop `landWorkspaceTask` (each sub-repo lands on its
@@ -1629,28 +1680,34 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
     // (the engine/CLI canonical predicate) instead of re-inlining the workspaceWorktrees check.
     const isWorkspaceMerge = !!mergeTask && isWorkspaceTask(mergeTask);
     if (isWorkspaceMerge) {
-      const workspaceResult = await landWorkspaceTask(store, mergeTask!, cwd, {
-        agentStore,
-        // FNXC:GrokCliRouting 2026-07-15-10:17: UI-only has no engine PluginRunner.
-        pluginRunner: undefined,
-      });
+      const workspaceResult = await withWorkspaceMergeDispatchLease(store, taskId, (workspaceDispatchFence) =>
+        landWorkspaceTask(store, mergeTask!, cwd, {
+          agentStore,
+          workspaceDispatchFence,
+          manual: true,
+          // FNXC:GrokCliRouting 2026-07-15-10:17: UI-only has no engine PluginRunner.
+          pluginRunner: undefined,
+        }),
+      );
       const latest = await store.getTask(taskId).catch(() => mergeTask!);
-      // FNXC:Workspace 2026-06-22-05:10 (Phase C review B3):
-      // landWorkspaceTask now finalizes the workspace task to done on allLanded (Phase C U2),
-      // so the merge door must report merged=true when the workspace fully landed — mirroring
-      // the engine dispatch's MergeResult. The first landed sub-repo's landedSha is the recorded
-      // commitSha (same convention finalizeWorkspaceTask uses). On a partial land, merged stays
-      // false and the partial-land error surfaces on the task log.
+      /*
+      FNXC:Workspace 2026-08-15-04:22:
+      `finalized`, not `allLanded`, is the UI-only merge signal. A blocked finalize is already
+      parked, so never return merged/confirmed metadata for it; expose its reason instead.
+      */
       const landedSha = workspaceResult.repos.find((r) => r.status === "landed")?.landedSha;
+      const workspaceMerged = workspaceResult.allLanded && workspaceResult.finalized;
       return {
         task: latest ?? mergeTask!,
         branch: getTaskBranchName(taskId),
-        merged: workspaceResult.allLanded,
-        mergeConfirmed: workspaceResult.allLanded || undefined,
-        commitSha: workspaceResult.allLanded ? landedSha : undefined,
+        merged: workspaceMerged,
+        mergeConfirmed: workspaceMerged || undefined,
+        commitSha: workspaceMerged ? landedSha : undefined,
         worktreeRemoved: false,
         branchDeleted: false,
-        error: workspaceResult.allLanded ? undefined : "partial workspace land — see task log",
+        error: workspaceMerged
+          ? undefined
+          : workspaceResult.finalizeBlockedReason ?? "partial workspace land — see task log",
       };
     }
 
@@ -2021,6 +2078,7 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
     ? createSkillsAdapter({
         // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dashboard's resolve() uses a looser onMissing signature than pi's DefaultPackageManager
         packageManager: packageManager as any,
+        getPackageManager: createProjectScopedPackageManagerFactory(getPackageManagerAgentDir()),
         getSettingsPath: (rootDir: string) => getProjectSettingsPath(rootDir),
         /*
          * FNXC:PluginSkills 2026-07-10-00:00:
@@ -2033,6 +2091,12 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
   async function disposeAsync(): Promise<void> {
     if (disposed) return;
     disposed = true;
+    /*
+    FNXC:CloudLink 2026-08-24-00:05:
+    Programmatic dispose() must stop Cloud Link presence so a Quick Tunnel and
+    heartbeat timer cannot outlive the dashboard backend.
+    */
+    await stopCloudLinkPresence().catch(() => undefined);
 
     // Clear pending debounce timer
     if (tuiRefreshDebounceTimer) {
@@ -2135,8 +2199,8 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
     const engineManager: ProjectEngineManager = new ProjectEngineManager(centralCoreForEngine, {
       cliPackageVersion,
       getMergeStrategy,
-      processPullRequestMerge: (s, wd, taskId, pool, signal) =>
-        processPullRequestMergeTask(s, wd, taskId, githubClient, getTaskMergeBlocker, pool, signal),
+      processPullRequestMerge: (s, wd, taskId, signal) =>
+        processPullRequestMergeTask(s, wd, taskId, githubClient, getTaskMergeBlocker, signal),
       createGroupPr: createGroupPrCallback(githubClient),
       syncGroupPr: syncGroupPrCallback(githubClient),
       /*
@@ -2270,6 +2334,25 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
         )
       : undefined;
 
+    /*
+    FNXC:DevTunnel 2026-08-19-04:45:
+    Surface the operator's own remote tunnel in the system panel too. Its URL previously existed only
+    in the dashboard's Settings UI and the /remote/status route, so a terminal user running headless
+    — the exact case a tunnel is for — had no way to read the address their Fusion was reachable at.
+    Subscribing beats polling: the manager already pushes status, including the transition to null
+    when the tunnel stops, which must clear the row rather than strand a dead URL on screen.
+    */
+    for (const engine of engineManager.getAllEngines().values()) {
+      const tunnelManager = engine.getRemoteTunnelManager?.();
+      if (!tunnelManager) continue;
+      tunnelManager.subscribeStatus((status) => {
+        const url = typeof status?.url === "string" && status.url.length > 0 ? status.url : undefined;
+        if (url === remoteTunnelUrl) return;
+        remoteTunnelUrl = url;
+        applyTunnelUrl?.();
+      });
+    }
+
     // Get the trigger scheduler from any running engine
     for (const engine of engineManager.getAllEngines().values()) {
       const ts = engine.getHeartbeatTriggerScheduler();
@@ -2313,7 +2396,13 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
       if (hybridExecutor) {
         await hybridExecutor.shutdown();
       }
-      await engineManager.stopAll();
+      /*
+      FNXC:RemoteAccess 2026-09-01-02:54:
+      shutdown() runs disposeAsync() BEFORE its own engineManager.stopAll(), so this is the call that
+      actually reaches the tunnels first — the restart intent has to be threaded here too, or the
+      handover never happens and the operator's public URL dies on every Restart anyway.
+      */
+      await engineManager.stopAll({ supervisedRestart: shutdownExitCode === FUSION_RESTART_EXIT_CODE });
       await closeCentralCoreBestEffort(centralCoreForEngine, "dispose cleanup");
     });
 
@@ -2480,7 +2569,16 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
       }
 
       // Stop all project engines uniformly
-      await timeShutdownStep("engineManager.stopAll", () => engineManager.stopAll());
+      /*
+      FNXC:RemoteAccess 2026-09-01-02:54:
+      Tell the engine manager WHY we are exiting. `shutdownExitCode` is FUSION_RESTART_EXIT_CODE only
+      when requestSelfRestart set it, so it is the honest local signal for "a supervisor will relaunch
+      us" — unlike the inherited FUSION_RESTART_SUPERVISED env var. Remote tunnels are handed over
+      instead of killed on that path; a real container stop still tears them down.
+      */
+      await timeShutdownStep("engineManager.stopAll", () =>
+        engineManager.stopAll({ supervisedRestart: shutdownExitCode === FUSION_RESTART_EXIT_CODE }),
+      );
 
       // Stop peer exchange service
       if (peerExchangeService) {
@@ -2496,6 +2594,8 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
           await centralCoreForMesh!.updateNode(localNodeIdForMesh!, { status: "offline" });
         });
       }
+
+      await timeShutdownStep("stopCloudLinkPresence", () => stopCloudLinkPresence());
 
       await timeShutdownStep("closeCentralCore", () =>
         closeCentralCoreBestEffort(centralCoreForEngine, `shutdown (${signal})`),
@@ -2820,6 +2920,7 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
       }
 
       await logShutdownDiagnostics(signal);
+      await timeShutdownStep("stopCloudLinkPresence", () => stopCloudLinkPresence());
       await disposeAsync();
       stopDiagnosticInterval();
       if (triggerScheduler) triggerScheduler.stop();
@@ -2940,6 +3041,63 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
       logSink.warn(`Port ${selectedPort} in use, using ${actualPort} instead`, "dashboard");
     }
 
+    /*
+    FNXC:RemoteAccess 2026-08-19-04:00:
+    Publish the bound port to the engine so remote tunnels target THIS dashboard. Before this they
+    pointed at a hardcoded localhost:4040, so a dashboard on any other port (explicit --port, PORT,
+    or the EADDRINUSE rebind just above) tunnelled whatever else owned 4040.
+    */
+    setLocalDashboardPort(actualPort);
+    /*
+    FNXC:CloudLink 2026-08-22-00:40:
+    Linked instances start a Cloudflare Quick Tunnel to this bound port and
+    republish the URL to Cloud Link whenever cloudflared rotates it.
+    */
+    /*
+    FNXC:CloudLink 2026-08-24-00:05:
+    Do not publish an unauthenticated dashboard through a public Quick Tunnel.
+    */
+    if (dashboardAuthToken) {
+      void startCloudLinkPresence(actualPort, (message) => logSink.log(message, "cloud-link")).catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        logSink.warn(`Cloud Link presence failed: ${message}`, "cloud-link");
+      });
+    } else {
+      logSink.log("Skipping public tunnel because dashboard auth is off.", "cloud-link");
+    }
+
+    /*
+    FNXC:DevTunnel 2026-08-19-04:30:
+    Capture the dev tunnel URL as soon as it can arrive, not when the TUI happens to exist. The
+    wrapper sends it once, whenever cloudflared publishes — which can land before or after the TUI
+    is constructed, and a message with no listener attached is simply lost. Store it here and let
+    whichever comes second do the rendering.
+    */
+    process.on("message", (message: unknown) => {
+      const parsed = message as { type?: string; url?: string } | null;
+      if (parsed?.type !== DEV_TUNNEL_READY_MESSAGE) return;
+      if (typeof parsed.url !== "string" || parsed.url.length === 0) return;
+      devTunnelUrl = parsed.url;
+      applyTunnelUrl?.();
+    });
+
+    /*
+    FNXC:DevTunnel 2026-08-19-02:05: report the REAL port to the dev supervisor (no-op without an
+    IPC channel, i.e. every non-`pnpm dev` launch). See DEV_SERVER_LISTENING_MESSAGE.
+
+    FNXC:DevTunnel 2026-08-19-03:00: report the resolved auth token too. The supervisor previously
+    re-derived it by reading ~/.fusion/settings.json, which is simply the wrong source — the token
+    is not necessarily stored there, so `--tunnel` printed "no token yet" while the dashboard's own
+    banner printed a working one two lines above. This value IS the token the server installed, so
+    there is nothing left to guess. IPC only, parent process only: never logged, never sent onward.
+    */
+    process.send?.({
+      type: DEV_SERVER_LISTENING_MESSAGE,
+      port: actualPort,
+      host: selectedHost,
+      token: dashboardAuthToken,
+    });
+
     // ── mDNS discovery: broadcast presence and listen for other nodes ───────
     //
     // Advertises this node on the local network and discovers other Fusion nodes
@@ -3025,11 +3183,22 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
         startTimeMs: dashboardStartedAt,
         startupDurationMs,
       };
-      tui.setSystemInfo(systemInfo);
+      /*
+      FNXC:DevTunnel 2026-08-19-04:30:
+      `pnpm dev --tunnel` prints its banner to stdout, which a TTY run hands to this TUI — the TUI
+      paints over it, so the public URL (the entire point of the flag) was unreadable. Render it in
+      the system panel instead, whether the URL arrived before this point or arrives later.
+      */
+      /*
+      FNXC:DevTunnel 2026-08-19-04:45:
+      A dev tunnel is the one the operator started by hand, so it wins when both exist; otherwise the
+      remote tunnel's URL shows. Either way the panel is where a terminal user can actually read it.
+      */
+      applyTunnelUrl = () => tui.setSystemInfo({ ...systemInfo, tunnelUrl: devTunnelUrl ?? remoteTunnelUrl });
+      applyTunnelUrl();
       tui.setReady(true);
       tui.setSettings({
-        maxConcurrent: settings.maxConcurrent ?? 1,
-        maxWorktrees: settings.maxWorktrees ?? 2,
+        ...mapTuiConcurrencySettings(settings),
         autoMerge: settings.autoMerge ?? false,
         mergeStrategy: settings.mergeStrategy ?? "direct",
         pollIntervalMs: settings.pollIntervalMs ?? 60_000,
@@ -3178,8 +3347,7 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
           getSettings: async () => {
             const s = await store.getSettings();
             return {
-              maxConcurrent: s.maxConcurrent ?? 1,
-              maxWorktrees: s.maxWorktrees ?? 2,
+              ...mapTuiConcurrencySettings(s),
               autoMerge: s.autoMerge ?? false,
               mergeStrategy: s.mergeStrategy ?? "direct",
               pollIntervalMs: s.pollIntervalMs ?? 60_000,

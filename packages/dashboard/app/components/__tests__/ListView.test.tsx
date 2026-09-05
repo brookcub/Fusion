@@ -52,7 +52,6 @@ vi.mock("../QuickEntryBox", () => ({
     onCreate,
     addToast,
     onPlanningMode,
-    onSubtaskBreakdown,
     workflowId,
     workflowOptions,
     defaultWorkflowId,
@@ -61,7 +60,6 @@ vi.mock("../QuickEntryBox", () => ({
     onCreate?: (input: { description: string; workflowId?: string | null; column?: string }) => Promise<unknown>;
     addToast: (message: string, type?: "error" | "success" | "info" | "warning") => void;
     onPlanningMode?: (initialPlan: string, workflowId?: string | null) => void;
-    onSubtaskBreakdown?: (description: string, workflowId?: string | null) => void;
     workflowId?: string | null;
     workflowOptions?: { id: string; name: string; columns?: Array<{ flags?: { manualIntake?: boolean } }> }[];
     defaultWorkflowId?: string | null;
@@ -140,9 +138,6 @@ vi.mock("../QuickEntryBox", () => ({
           <button type="button" data-testid="quick-entry-deps">Deps</button>
           <button type="button" data-testid="quick-entry-plan" onClick={() => handoff(onPlanningMode)}>
             Plan
-          </button>
-          <button type="button" data-testid="quick-entry-subtask" onClick={() => handoff(onSubtaskBreakdown)}>
-            Subtask
           </button>
           {workflowOptions && workflowOptions.length > 1 ? (
             <button type="button" data-testid="quick-entry-workflow-option-wf-custom" onClick={() => setSelectedWorkflowId("wf-custom")}>
@@ -228,8 +223,9 @@ import { readAppFile } from "../../test/cssFixture";
 
 const mockConfirm = vi.fn();
 const mockConfirmWithChoice = vi.fn();
+const mockConfirmWithSelect = vi.fn();
 vi.mock("../../hooks/useConfirm", () => ({
-  useConfirm: () => ({ confirm: mockConfirm, confirmWithChoice: mockConfirmWithChoice }),
+  useConfirm: () => ({ confirm: mockConfirm, confirmWithChoice: mockConfirmWithChoice, confirmWithSelect: mockConfirmWithSelect }),
 }));
 
 const mockAddToast = vi.fn();
@@ -776,6 +772,8 @@ describe("ListView", () => {
     vi.mocked(refreshPrStatus).mockResolvedValue({} as any);
     mockConfirm.mockReset();
     mockConfirmWithChoice.mockReset();
+    mockConfirmWithSelect.mockReset();
+    mockConfirmWithSelect.mockResolvedValue({ choice: "primary", checkboxValue: false, selectValue: "builtin:coding" });
     subscribeSseMock.mockClear();
     for (const key of Object.keys(listViewSseHandlers)) delete listViewSseHandlers[key];
     localStorage.clear();
@@ -807,6 +805,84 @@ describe("ListView", () => {
     renderListView();
     // The search/filter is now in the header, not in the list view toolbar
     expect(screen.getByText("View")).toBeDefined();
+  });
+
+  it("renders plan approval actions for a hold-column task in desktop rows", () => {
+    const viewportSpy = mockDesktopViewport();
+    const payload = { ...DEFAULT_LANE_PAYLOAD, taskWorkflowIds: { "FN-228-desktop": "builtin:coding" } };
+    writeBoardWorkflowsCache(TEST_PROJECT_ID, payload);
+    vi.mocked(fetchBoardWorkflows).mockResolvedValue(payload);
+    try {
+      renderListView({
+        tasks: [createMockTask({
+          id: "FN-228-desktop",
+          column: "todo",
+          status: "awaiting-approval",
+          prompt: "# Reviewed plan",
+        })],
+      });
+
+      const notice = screen.getByTestId("plan-approval-list-FN-228-desktop");
+      expect(within(notice).getByRole("button", { name: "Approve" })).toBeEnabled();
+      expect(within(notice).getAllByRole("button")).toHaveLength(1);
+    } finally {
+      viewportSpy.mockRestore();
+    }
+  });
+
+  it("renders plan approval actions for a hold-column task in compact cards", () => {
+    const viewportSpy = mockMobileViewport();
+    const payload = { ...DEFAULT_LANE_PAYLOAD, taskWorkflowIds: { "FN-228-mobile": "builtin:coding" } };
+    writeBoardWorkflowsCache(TEST_PROJECT_ID, payload);
+    vi.mocked(fetchBoardWorkflows).mockResolvedValue(payload);
+    try {
+      renderListView({
+        tasks: [createMockTask({
+          id: "FN-228-mobile",
+          column: "todo",
+          status: "awaiting-approval",
+          prompt: "# Reviewed plan",
+        })],
+      });
+
+      const notice = screen.getByTestId("plan-approval-list-FN-228-mobile");
+      expect(within(notice).getByRole("button", { name: "Approve" })).toBeEnabled();
+      expect(within(notice).getAllByRole("button")).toHaveLength(1);
+    } finally {
+      viewportSpy.mockRestore();
+    }
+  });
+
+  it("hides the retired plan approval badge for legacy data in desktop rows", () => {
+    const viewportSpy = mockDesktopViewport();
+    const payload = { ...DEFAULT_LANE_PAYLOAD, taskWorkflowIds: { "FN-234-legacy": "builtin:coding" } };
+    writeBoardWorkflowsCache(TEST_PROJECT_ID, payload);
+    vi.mocked(fetchBoardWorkflows).mockResolvedValue(payload);
+    try {
+      const legacyFields = { requirePlanApproval: true } as unknown as Partial<Task>;
+      renderListView({ tasks: [createMockTask({ id: "FN-234-legacy", executionMode: "fast", ...legacyFields })] });
+
+      expect(screen.queryByTestId("plan-approval-badge-list-table-FN-234-legacy")).toBeNull();
+      expect(screen.getByLabelText("Fast mode")).toBeVisible();
+    } finally {
+      viewportSpy.mockRestore();
+    }
+  });
+
+  it("hides the retired plan approval badge for legacy data in compact cards", () => {
+    const viewportSpy = mockMobileViewport();
+    const payload = { ...DEFAULT_LANE_PAYLOAD, taskWorkflowIds: { "FN-234-legacy-mobile": "builtin:coding" } };
+    writeBoardWorkflowsCache(TEST_PROJECT_ID, payload);
+    vi.mocked(fetchBoardWorkflows).mockResolvedValue(payload);
+    try {
+      const legacyFields = { requirePlanApproval: true } as unknown as Partial<Task>;
+      renderListView({ tasks: [createMockTask({ id: "FN-234-legacy-mobile", executionMode: "fast", ...legacyFields })] });
+
+      expect(screen.queryByTestId("plan-approval-badge-list-card-FN-234-legacy-mobile")).toBeNull();
+      expect(screen.getByLabelText("Fast mode")).toBeVisible();
+    } finally {
+      viewportSpy.mockRestore();
+    }
   });
 
   it("renders the exhausted review budget indicator only for the matching approval reason in desktop rows", () => {
@@ -1207,7 +1283,6 @@ describe("ListView", () => {
     expect(screen.getByRole("menu")).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: "Retry" })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: "Pause" })).toBeInTheDocument();
-    expect(screen.getByRole("menuitem", { name: "Move to In progress" })).toBeInTheDocument();
     expect(failedRow).not.toHaveClass("list-row--selected");
     expect(onOpenDetail).not.toHaveBeenCalled();
     expect(fetchTaskDetail).not.toHaveBeenCalled();
@@ -1218,18 +1293,6 @@ describe("ListView", () => {
     fireEvent.contextMenu(document.querySelector('.list-row[data-id="FN-003"]') as HTMLElement, { clientX: 40, clientY: 50 });
     expect(screen.getByRole("menuitem", { name: "Merge & Close" })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: "Refine" })).toBeInTheDocument();
-    /*
-    FNXC:TaskContextMenu 2026-07-29-00:00 (U12 — R8):
-    "In progress", not "In Progress". The label is now interpolated from the WORKFLOW's
-    own column name (`BUILTIN_CODING_WORKFLOW_IR` declares "In progress") instead of the
-    hardcoded English string `taskDetail.move.backToInProgress`. This assertion is the
-    visible proof that the label follows the workflow: rename that column and the menu
-    renames with it. Task Detail cases that render before board-workflows resolves still
-    read "Back to In Progress" — they go through the no-metadata fallback, which uses
-    the legacy column label map.
-    */
-    expect(screen.getByRole("menuitem", { name: "Back to In progress" })).toBeInTheDocument();
-
     fireEvent.contextMenu(document.querySelector('.list-row[data-id="FN-006"]') as HTMLElement, { clientX: 40, clientY: 50 });
     expect(screen.getByRole("menuitem", { name: "Merge & Close" })).toBeInTheDocument();
 
@@ -1243,9 +1306,6 @@ describe("ListView", () => {
     fireEvent.contextMenu(document.querySelector('.list-row[data-id="FN-004"]') as HTMLElement, { clientX: 40, clientY: 50 });
     expect(screen.getByRole("menuitem", { name: "Archive" })).toBeInTheDocument();
 
-    fireEvent.contextMenu(document.querySelector('.list-row[data-id="FN-005"]') as HTMLElement, { clientX: 40, clientY: 50 });
-    expect(screen.getByRole("menuitem", { name: "Move to Done" })).toBeInTheDocument();
-
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
 
@@ -1255,30 +1315,75 @@ describe("ListView", () => {
     expect(screen.getByRole("menuitem", { name: "Merge & Close" })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: "Refine" })).toBeInTheDocument();
 
-    mockConfirm.mockResolvedValueOnce(true);
-    fireEvent.contextMenu(document.querySelector('.list-row[data-id="FN-007"]') as HTMLElement, { clientX: 40, clientY: 50 });
-    fireEvent.click(screen.getByRole("menuitem", { name: "Move to Todo" }));
-    await waitFor(() => expect(onMoveTask).toHaveBeenCalledWith("FN-007", "todo", { preserveProgress: true }));
-
-    fireEvent.contextMenu(document.querySelector('.list-row[data-id="FN-005"]') as HTMLElement, { clientX: 40, clientY: 50 });
-    fireEvent.click(screen.getByRole("menuitem", { name: "Move to Done" }));
     expect(onPauseTask).not.toHaveBeenCalled();
     expect(onRetryTask).not.toHaveBeenCalled();
     expect(onArchiveTask).not.toHaveBeenCalled();
     viewportSpy.mockRestore();
   });
 
-  it("routes reset through the centralized confirm seam and proceeds in skip mode", async () => {
+  it("opens editable Reset without consulting confirmation settings", async () => {
     const onResetTask = vi.fn(async () => createMockTask());
-    mockConfirm.mockResolvedValueOnce(true);
-    renderListView({ tasks: [createMockTask({ id: "FN-901", column: "in-progress" })], onResetTask });
+    renderListView({
+      tasks: [createMockTask({ id: "FN-901", column: "in-progress", description: "Original list request" })],
+      onResetTask,
+    });
 
     fireEvent.contextMenu(document.querySelector('.list-row[data-id="FN-901"]') as HTMLElement, { clientX: 40, clientY: 50 });
     fireEvent.click(await screen.findByRole("menuitem", { name: "Reset" }));
 
+    expect(await screen.findByTestId("task-reset-dialog")).toBeInTheDocument();
+    expect(mockConfirm).not.toHaveBeenCalled();
+    expect(screen.getByTestId("task-reset-description")).toHaveValue("Original list request");
+    fireEvent.change(screen.getByTestId("task-reset-description"), { target: { value: "Corrected list request" } });
+    fireEvent.click(screen.getByTestId("task-reset-submit"));
+    await waitFor(() => expect(onResetTask).toHaveBeenCalledWith(
+      "FN-901",
+      { description: "Corrected list request" },
+    ));
+  });
+
+  it("keeps the list Reset call arity unchanged when the description is untouched", async () => {
+    const onResetTask = vi.fn(async () => createMockTask());
+    renderListView({
+      tasks: [createMockTask({ id: "FN-901", column: "in-progress", description: "Original list request" })],
+      onResetTask,
+    });
+
+    fireEvent.contextMenu(document.querySelector('.list-row[data-id="FN-901"]') as HTMLElement, { clientX: 40, clientY: 50 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Reset" }));
+    fireEvent.click(await screen.findByTestId("task-reset-submit"));
+
     await waitFor(() => expect(onResetTask).toHaveBeenCalledWith("FN-901"));
-    expect(mockConfirm).toHaveBeenCalledWith(expect.objectContaining({ danger: true, title: "Reset" }));
-    expect(document.querySelector(".confirm-dialog-overlay")).toBeNull();
+    expect(onResetTask.mock.calls[0]).toEqual(["FN-901"]);
+    expect(mockConfirm).not.toHaveBeenCalled();
+  });
+
+  it("forwards the selected workflow from the desktop row duplicate action", async () => {
+    const workflowPayload = {
+      ...DEFAULT_LANE_PAYLOAD,
+      workflows: [
+        DEFAULT_LANE_PAYLOAD.workflows[0],
+        { ...DEFAULT_LANE_PAYLOAD.workflows[0], id: "wf-b", name: "Workflow B" },
+      ],
+      taskWorkflowIds: { "FN-DUP": "builtin:coding" },
+    };
+    writeBoardWorkflowsCache(TEST_PROJECT_ID, workflowPayload);
+    vi.mocked(fetchBoardWorkflows).mockResolvedValue(workflowPayload);
+    mockConfirmWithSelect.mockResolvedValueOnce({ choice: "primary", checkboxValue: false, selectValue: "wf-b" });
+    const onDuplicateTask = vi.fn(async () => createMockTask({ id: "FN-COPY" }));
+    renderListView({
+      tasks: [createMockTask({ id: "FN-DUP", column: "todo" })],
+      onDuplicateTask,
+    });
+
+    const row = document.querySelector('.list-row[data-id="FN-DUP"]') as HTMLElement;
+    fireEvent.contextMenu(row, { clientX: 40, clientY: 50 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Duplicate" }));
+
+    await waitFor(() => expect(onDuplicateTask).toHaveBeenCalledWith("FN-DUP", { workflowId: "wf-b" }));
+    expect(mockConfirmWithSelect).toHaveBeenCalledWith(expect.objectContaining({
+      select: expect.objectContaining({ defaultValue: "builtin:coding" }),
+    }));
   });
 
   it("opens Planning Mode from eligible list row menus and omits it for executing rows", async () => {
@@ -1533,6 +1638,73 @@ describe("ListView", () => {
     vi.useRealTimers();
   });
 
+  it("keeps reverted completed rows labelled and revisable from the desktop context menu", () => {
+    const viewportSpy = mockDesktopViewport();
+    showAllColumnsByDefault();
+    const reverted = createMockTask({
+      id: "FN-REVERTED",
+      title: "Reverted desktop task",
+      column: "done",
+      status: "done",
+      sourceMetadata: { revertedAt: "2026-08-01T00:00:00.000Z" },
+    });
+    const onReviseTask = vi.fn();
+
+    renderListView({ tasks: [reverted], onReviseTask });
+
+    expect(screen.queryByTestId("list-reverted-tasks")).toBeNull();
+    expect(document.querySelector('.list-row[data-id="FN-REVERTED"]')).toHaveTextContent("Reverted");
+    fireEvent.contextMenu(document.querySelector('.list-row[data-id="FN-REVERTED"]') as HTMLElement, { clientX: 40, clientY: 50 });
+    expect(screen.getByRole("menuitem", { name: "Delete" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Revise" }));
+    expect(onReviseTask).toHaveBeenCalledWith(reverted);
+    viewportSpy.mockRestore();
+  });
+
+  it("deduplicates reverted rows in their ordinary list group", () => {
+    const viewportSpy = mockDesktopViewport();
+    showAllColumnsByDefault();
+    const reverted = createMockTask({
+      id: "FN-REVERTED-DUPLICATE",
+      title: "Reverted duplicate task",
+      column: "done",
+      status: "done",
+      sourceMetadata: { revertedAt: "2026-08-01T00:00:00.000Z" },
+    });
+
+    renderListView({ tasks: [reverted, reverted] });
+
+    expect(screen.queryByTestId("list-reverted-tasks")).toBeNull();
+    expect(document.querySelectorAll('.list-row[data-id="FN-REVERTED-DUPLICATE"]')).toHaveLength(1);
+    viewportSpy.mockRestore();
+  });
+
+  it("keeps reverted completed rows labelled and revisable from mobile long-press", () => {
+    vi.useFakeTimers();
+    const viewportSpy = mockMobileViewport();
+    const reverted = createMockTask({
+      id: "FN-REVERTED-MOBILE",
+      title: "Reverted mobile task",
+      column: "done",
+      status: "done",
+      sourceMetadata: { revertedAt: "2026-08-01T00:00:00.000Z" },
+    });
+    const onReviseTask = vi.fn();
+
+    renderListView({ tasks: [reverted], onReviseTask });
+
+    const card = document.querySelector('.list-card[data-id="FN-REVERTED-MOBILE"]') as HTMLElement;
+    expect(card).toHaveTextContent("Reverted");
+    fireEvent.pointerDown(card, { pointerType: "touch", pointerId: 1, clientX: 24, clientY: 32 });
+    act(() => {
+      vi.advanceTimersByTime(550);
+    });
+    fireEvent.pointerUp(screen.getByRole("menuitem", { name: "Revise" }), { pointerType: "touch", pointerId: 2 });
+    expect(onReviseTask).toHaveBeenCalledWith(reverted);
+    viewportSpy.mockRestore();
+    vi.useRealTimers();
+  });
+
   it("opens refine from a mobile done-card long-press", () => {
     vi.useFakeTimers();
     const viewportSpy = mockMobileViewport();
@@ -1660,6 +1832,44 @@ describe("ListView", () => {
 
     expect(fetchBoardWorkflows).toHaveBeenCalledTimes(1);
     expect(screen.getByRole("listbox", { name: "Workflow" })).toBeInTheDocument();
+  });
+
+  it("keeps disabled Coding out of the List selector while retaining its task assignment", async () => {
+    vi.mocked(fetchBoardWorkflows).mockResolvedValue({
+      flagEnabled: true,
+      defaultWorkflowId: "builtin:quick-fix",
+      workflows: [
+        {
+          id: "builtin:coding",
+          name: "Coding",
+          selectable: false,
+          columns: [{ id: "todo", name: "Todo", flags: { hold: true } }],
+        },
+        {
+          id: "builtin:quick-fix",
+          name: "Quick Fix",
+          selectable: true,
+          columns: [{ id: "todo", name: "Todo", flags: { hold: true } }],
+        },
+        {
+          id: "builtin:review-heavy",
+          name: "Review Heavy",
+          selectable: true,
+          columns: [{ id: "todo", name: "Todo", flags: { hold: true } }],
+        },
+      ],
+      taskWorkflowIds: { "FN-001": "builtin:coding" },
+    });
+
+    renderListView({
+      tasks: [createMockTask({ id: "FN-001", column: "todo", title: "Disabled Coding task" })],
+    });
+
+    const selector = await screen.findByTestId("workflow-switcher");
+    fireEvent.click(selector);
+    expect(screen.queryByTestId("workflow-switcher-option-builtin:coding")).toBeNull();
+    expect(screen.getByTestId("workflow-switcher-option-builtin:quick-fix")).toBeInTheDocument();
+    expect(screen.getByTestId("workflow-switcher-option-builtin:review-heavy")).toBeInTheDocument();
   });
 
   it("keeps a custom list workflow selected after task refresh and workflow payload revalidation", async () => {
@@ -1914,6 +2124,7 @@ describe("ListView", () => {
 
   it("shows all workflows in ListView without submitting the aggregate sentinel", async () => {
     const mockOnQuickCreate = vi.fn().mockResolvedValue({ id: "FN-new" });
+    const mockOnNewTask = vi.fn();
     vi.mocked(fetchBoardWorkflows).mockResolvedValue({
       flagEnabled: true,
       defaultWorkflowId: "builtin:coding",
@@ -1931,6 +2142,7 @@ describe("ListView", () => {
         createMockTask({ id: "FN-003", column: "triage", title: "Stale workflow task" }),
       ],
       onQuickCreate: mockOnQuickCreate,
+      onNewTask: mockOnNewTask,
     });
 
     await selectWorkflow(ALL_WORKFLOWS_BOARD_VIEW_ID);
@@ -1940,6 +2152,9 @@ describe("ListView", () => {
     expect(screen.getByText("Stale workflow task")).toBeInTheDocument();
     expect(screen.getByTestId("workflow-switcher")).toHaveTextContent("All workflows");
     expect(screen.queryByTestId(`workflow-switcher-edit-${ALL_WORKFLOWS_BOARD_VIEW_ID}`)).toBeNull();
+
+    fireEvent.click(screen.getByText("+ New Task"));
+    expect(mockOnNewTask).toHaveBeenCalledWith(undefined);
 
     fireEvent.change(screen.getByTestId("quick-entry-input"), { target: { value: "Aggregate quick add" } });
     fireEvent.keyDown(screen.getByTestId("quick-entry-input"), { key: "Enter" });
@@ -2608,7 +2823,7 @@ describe("ListView", () => {
     expect(statusBadge.className).toContain("failed");
   });
 
-  it("suppresses failed table styling and Retry for a stale failed task with automatic recovery pending", () => {
+  it("suppresses failed table styling but keeps stage-aware Retry while automatic recovery is pending", () => {
     const viewportSpy = mockDesktopViewport();
     const task = createMockTask({
       id: "FN-RECOVERY",
@@ -2624,7 +2839,7 @@ describe("ListView", () => {
     expect(row).not.toHaveClass("failed");
     expect(screen.getByText("failed")).not.toHaveClass("failed");
     fireEvent.contextMenu(row, { clientX: 40, clientY: 50 });
-    expect(screen.queryByRole("menuitem", { name: "Retry" })).toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Retry" })).toBeInTheDocument();
     viewportSpy.mockRestore();
   });
 
@@ -2653,13 +2868,6 @@ describe("ListView", () => {
       expectedClass: "failed",
       expectedColor: "var(--color-error-dark)",
       disallowedColor: "var(--in-review)",
-    },
-    {
-      name: "stuck + todo uses triage token color",
-      classes: "list-status-badge list-status-badge--todo stuck",
-      expectedClass: "stuck",
-      expectedColor: "var(--triage)",
-      disallowedColor: "var(--todo)",
     },
   ])("FN-4208 keeps list badge state precedence: $name", ({ classes, expectedClass, expectedColor, disallowedColor }) => {
     const cleanupCss = mountCssForBadgeTests();
@@ -3048,62 +3256,7 @@ describe("ListView", () => {
     expect(row?.className).not.toContain("agent-active");
   });
 
-  it("renders stuck indicator when task is stuck and timeout is set", () => {
-    const staleTime = new Date(Date.now() - 600000).toISOString();
-    const tasks = [
-      createMockTask({
-        id: "FN-001",
-        status: "executing",
-        column: "in-progress",
-        updatedAt: staleTime,
-      }),
-    ];
-
-    renderListView({ tasks, taskStuckTimeoutMs: 600000 });
-
-    const row = screen.getByText("FN-001").closest("tr");
-    expect(row?.className).toContain("stuck");
-
-    const statusBadge = screen.getByText("Stuck");
-    expect(statusBadge.className).toContain("stuck");
-  });
-
-  it("does not render stuck indicator when taskStuckTimeoutMs is undefined", () => {
-    const staleTime = new Date(Date.now() - 600000).toISOString();
-    const tasks = [
-      createMockTask({
-        id: "FN-001",
-        status: "executing",
-        column: "in-progress",
-        updatedAt: staleTime,
-      }),
-    ];
-
-    renderListView({ tasks });
-
-    const row = screen.getByText("FN-001").closest("tr");
-    expect(row?.className).not.toContain("stuck");
-    expect(screen.getByText("executing")).toBeInTheDocument();
-  });
-
-  it("stuck indicator takes precedence over agent-active", () => {
-    const staleTime = new Date(Date.now() - 600000).toISOString();
-    const tasks = [
-      createMockTask({
-        id: "FN-001",
-        status: "executing",
-        column: "in-progress",
-        updatedAt: staleTime,
-      }),
-    ];
-
-    renderListView({ tasks, taskStuckTimeoutMs: 600000, globalPaused: false });
-
-    const row = screen.getByText("FN-001").closest("tr");
-    expect(row?.className).toContain("stuck");
-    expect(row?.className).not.toContain("agent-active");
-    expect(screen.getByText("Stuck")).toBeInTheDocument();
-  });
+  // FNXC:StuckTagRemoval 2026-08-17-22:30: stuck-task tagging removed from the dashboard; stuck coverage deleted with it.
 
   it("renders column badges with correct colors", () => {
     const columns = ["triage", "todo", "in-progress", "in-review", "done"] as const;
@@ -3266,16 +3419,16 @@ describe("ListView", () => {
     expect(screen.getAllByRole("row").filter((r) => r.getAttribute("data-id"))).toHaveLength(1);
   });
 
-  it("calls onNewTask when + New Task button is clicked", () => {
+  it("forwards the selected workflow rather than a click event when + New Task is clicked", () => {
     const mockOnNewTask = vi.fn();
 
     renderListView({ onNewTask: mockOnNewTask });
 
-    const newTaskButton = screen.getByText("+ New Task");
-    fireEvent.click(newTaskButton);
+    fireEvent.click(screen.getByText("+ New Task"));
 
-    expect(mockOnNewTask).toHaveBeenCalled();
+    expect(mockOnNewTask).toHaveBeenCalledWith("builtin:coding");
   });
+
 
   it("keeps Bulk Edit, View, and + New Task together in the desktop sidebar controls", () => {
     renderListView({}, { openViewOptions: false });
@@ -3310,13 +3463,14 @@ describe("ListView", () => {
     expect(desktopSplitRule).toContain("grid-template-columns: auto 0 minmax(0, 1fr)");
   });
 
-  it("keeps Bulk Edit, View, and + New Task together in the mobile toolbar controls", () => {
+  it("omits the full New Task button from mobile toolbar controls", () => {
     const viewportSpy = mockMobileViewport();
     renderListView({}, { openViewOptions: false });
 
     const actions = document.querySelector(".list-toolbar .list-action-cluster");
     const actionButtons = Array.from(actions?.querySelectorAll("button") ?? []).map((button) => button.textContent);
-    expect(actionButtons).toEqual(["Bulk Edit", "View", "+ New Task"]);
+    expect(actionButtons).toEqual(["Bulk Edit", "View"]);
+    expect(screen.queryByText("+ New Task")).toBeNull();
 
     viewportSpy.mockRestore();
   });
@@ -3362,174 +3516,7 @@ describe("ListView", () => {
     expect(todoZone?.textContent).toContain("1");
   });
 
-  it("handles drag and drop to move tasks between columns", async () => {
-    const tasks = [createMockTask({ id: "FN-001", column: "triage" })];
-    const mockOnMoveTask = vi.fn(() => Promise.resolve(tasks[0]));
 
-    renderListView({ tasks, onMoveTask: mockOnMoveTask });
-
-    const row = screen.getByText("FN-001").closest("tr")!;
-
-    // Simulate drag start
-    fireEvent.dragStart(row, {
-      dataTransfer: {
-        setData: vi.fn(),
-        effectAllowed: "move",
-      },
-    });
-
-    // Simulate drop on todo column drop zone (use querySelector for specificity)
-    const todoZone = document.querySelector('[data-column="todo"].list-drop-zone')!;
-    fireEvent.dragOver(todoZone, {
-      preventDefault: vi.fn(),
-      dataTransfer: { dropEffect: "move" },
-    });
-
-    fireEvent.drop(todoZone, {
-      preventDefault: vi.fn(),
-      dataTransfer: {
-        getData: vi.fn(() => "FN-001"),
-      },
-    });
-
-    await waitFor(() => {
-      expect(mockOnMoveTask).toHaveBeenCalledWith("FN-001", "todo", undefined);
-    });
-  });
-
-  it("prompts to preserve progress when dropping task with completed steps to todo", async () => {
-    const tasks = [createMockTask({
-      id: "FN-001",
-      column: "in-progress",
-      steps: [
-        { title: "Step 1", status: "done" },
-        { title: "Step 2", status: "pending" },
-      ],
-    })];
-    const mockOnMoveTask = vi.fn(() => Promise.resolve(tasks[0]));
-    mockConfirm.mockResolvedValueOnce(true);
-
-    renderListView({ tasks, onMoveTask: mockOnMoveTask });
-
-    const row = screen.getByText("FN-001").closest("tr")!;
-    fireEvent.dragStart(row, {
-      dataTransfer: {
-        setData: vi.fn(),
-        effectAllowed: "move",
-      },
-    });
-
-    const todoZone = document.querySelector('[data-column="todo"].list-drop-zone')!;
-    fireEvent.drop(todoZone, {
-      preventDefault: vi.fn(),
-      dataTransfer: {
-        getData: vi.fn(() => "FN-001"),
-      },
-    });
-
-    await waitFor(() => {
-      expect(mockConfirm).toHaveBeenCalledWith(expect.objectContaining({
-        title: "Preserve Progress?",
-        cancelLabel: "Reset Progress",
-      }));
-      expect(mockOnMoveTask).toHaveBeenCalledWith("FN-001", "todo", { preserveProgress: true });
-    });
-  });
-
-  it("prompts to preserve progress when dropping task with completed steps to a workflow hold column", async () => {
-    const tasks = [createMockTask({
-      id: "FN-001",
-      column: "doing",
-      steps: [
-        { title: "Step 1", status: "done" },
-        { title: "Step 2", status: "pending" },
-      ],
-    })];
-    const mockOnMoveTask = vi.fn(() => Promise.resolve(tasks[0]));
-    mockConfirm.mockResolvedValueOnce(true);
-    vi.mocked(fetchBoardWorkflows).mockResolvedValue({
-      flagEnabled: true,
-      defaultWorkflowId: "wf-custom",
-      workflows: [
-        {
-          id: "wf-custom",
-          name: "Custom",
-          columns: [
-            { id: "queue", name: "Queue", flags: { hold: true } },
-            { id: "doing", name: "Doing", flags: { countsTowardWip: true } },
-            { id: "shipped", name: "Shipped", flags: { complete: true } },
-          ],
-        },
-      ],
-      taskWorkflowIds: { "FN-001": "wf-custom" },
-    });
-
-    renderListView({ tasks, onMoveTask: mockOnMoveTask });
-    await waitFor(() => expect(document.querySelector('[data-column="queue"].list-drop-zone')).toBeTruthy());
-
-    fireEvent.drop(document.querySelector('[data-column="queue"].list-drop-zone')!, {
-      preventDefault: vi.fn(),
-      dataTransfer: {
-        getData: vi.fn(() => "FN-001"),
-      },
-    });
-
-    await waitFor(() => {
-      expect(mockConfirm).toHaveBeenCalledWith(expect.objectContaining({
-        title: "Preserve Progress?",
-      }));
-      expect(mockOnMoveTask).toHaveBeenCalledWith("FN-001", "queue", { preserveProgress: true });
-    });
-  });
-
-  it("does not set draggable for paused tasks", () => {
-    const tasks = [createMockTask({ id: "FN-001", paused: true })];
-
-    renderListView({ tasks });
-
-    const row = screen.getByText("FN-001").closest("tr")!;
-    // Paused tasks should have draggable="false"
-    expect(row.getAttribute("draggable")).toBe("false");
-  });
-
-  it("sets draggable for non-paused tasks", () => {
-    const tasks = [createMockTask({ id: "FN-001", paused: false })];
-
-    renderListView({ tasks });
-
-    const row = screen.getByText("FN-001").closest("tr")!;
-    // Non-paused tasks should have draggable="true"
-    expect(row.getAttribute("draggable")).toBe("true");
-  });
-
-  it("shows error toast when onMoveTask fails during drag and drop", async () => {
-    const tasks = [createMockTask({ id: "FN-001", column: "triage" })];
-    const mockOnMoveTask = vi.fn(() => Promise.reject(new Error("Move failed")));
-
-    renderListView({ tasks, onMoveTask: mockOnMoveTask });
-
-    const row = screen.getByText("FN-001").closest("tr")!;
-
-    fireEvent.dragStart(row, {
-      dataTransfer: {
-        setData: vi.fn(),
-        effectAllowed: "move",
-      },
-    });
-
-    // Use querySelector to find the specific drop zone
-    const todoZone = document.querySelector('[data-column="todo"].list-drop-zone')!;
-    fireEvent.drop(todoZone, {
-      preventDefault: vi.fn(),
-      dataTransfer: {
-        getData: vi.fn(() => "FN-001"),
-      },
-    });
-
-    await waitFor(() => {
-      expect(mockAddToast).toHaveBeenCalledWith("Move failed", "error");
-    });
-  });
 
   it("displays full description in title cell when no title exists", () => {
     const longDescription = "A".repeat(100);
@@ -4614,39 +4601,6 @@ describe("ListView Quick Entry", () => {
       workflowId: "wf-custom",
       column: "backlog",
     })));
-  });
-
-  it("passes the selected workflow id to list quick-entry Plan and Subtask handoffs", async () => {
-    const onPlanningMode = vi.fn();
-    const onSubtaskBreakdown = vi.fn();
-    vi.mocked(fetchBoardWorkflows).mockResolvedValue({
-      flagEnabled: true,
-      defaultWorkflowId: "builtin:default",
-      workflows: [
-        {
-          id: "builtin:default",
-          name: "Default",
-          columns: [{ id: "triage", name: "Triage", flags: { intake: true } }],
-        },
-        {
-          id: "wf-list-active",
-          name: "List Active",
-          columns: [{ id: "triage", name: "Triage", flags: { intake: true } }],
-        },
-      ],
-      taskWorkflowIds: {},
-    });
-    renderListView({ onPlanningMode, onSubtaskBreakdown });
-
-    await selectWorkflow("wf-list-active");
-    const input = screen.getByTestId("quick-entry-input");
-    fireEvent.change(input, { target: { value: "Plan on selected list workflow" } });
-    fireEvent.click(screen.getByTestId("quick-entry-toggle"));
-    fireEvent.click(screen.getByTestId("quick-entry-plan"));
-    fireEvent.click(screen.getByTestId("quick-entry-subtask"));
-
-    expect(onPlanningMode).toHaveBeenCalledWith("Plan on selected list workflow", "wf-list-active");
-    expect(onSubtaskBreakdown).toHaveBeenCalledWith("Plan on selected list workflow", "wf-list-active");
   });
 
   it("shows error toast when onQuickCreate fails and keeps input content", async () => {
@@ -6254,5 +6208,69 @@ describe("ListView - Bulk Selection", () => {
       const card = container.querySelector('.list-card[data-id="FN-001"]');
       expect(card?.className).not.toContain("agent-active");
     });
+  });
+});
+
+describe("ListView titleless display fallback (FN-044)", () => {
+  const description200 = "d".repeat(200);
+  const description201 = "e".repeat(201);
+  const expectedBoundedDescription = description201.slice(0, 197) + "...";
+
+  it("uses the shared literal-dot fallback in the desktop table and preserves explicit titles", () => {
+    const viewportSpy = mockDesktopViewport();
+    try {
+      const { container, rerender } = renderListView({
+        tasks: [createMockTask({ id: "FN-044-desktop", title: undefined, description: description201 })],
+      });
+      expect(container.querySelector(".list-title-text")).toHaveTextContent(expectedBoundedDescription);
+      expect(container.querySelector(".list-title-text")?.textContent).toHaveLength(200);
+
+      const explicitTitle = "t".repeat(201);
+      rerender(<ListView
+        tasks={[createMockTask({ id: "FN-044-explicit", title: explicitTitle, description: description201 })]}
+        onMoveTask={vi.fn(async () => createMockTask())}
+        onRetryTask={vi.fn(async () => createMockTask())}
+        onDeleteTask={vi.fn(async () => createMockTask())}
+        onMergeTask={vi.fn(async () => ({ merged: false }))}
+        onResetTask={vi.fn(async () => createMockTask())}
+        onDuplicateTask={vi.fn(async () => createMockTask())}
+        onOpenDetail={vi.fn()}
+        addToast={mockAddToast}
+        globalPaused={false}
+        onNewTask={vi.fn()}
+        projectId={TEST_PROJECT_ID}
+      />);
+      expect(container.querySelector(".list-title-text")).toHaveTextContent(explicitTitle);
+    } finally {
+      viewportSpy.mockRestore();
+    }
+  });
+
+  it("uses the same fallback in mobile cards, including 200-character and whitespace-title controls", () => {
+    const viewportSpy = mockMobileViewport();
+    try {
+      const { container, rerender } = renderListView({
+        tasks: [createMockTask({ id: "FN-044-mobile", title: "   ", description: description201 })],
+      });
+      expect(container.querySelector(".list-card-title")).toHaveTextContent(expectedBoundedDescription);
+
+      rerender(<ListView
+        tasks={[createMockTask({ id: "FN-044-200", title: undefined, description: description200 })]}
+        onMoveTask={vi.fn(async () => createMockTask())}
+        onRetryTask={vi.fn(async () => createMockTask())}
+        onDeleteTask={vi.fn(async () => createMockTask())}
+        onMergeTask={vi.fn(async () => ({ merged: false }))}
+        onResetTask={vi.fn(async () => createMockTask())}
+        onDuplicateTask={vi.fn(async () => createMockTask())}
+        onOpenDetail={vi.fn()}
+        addToast={mockAddToast}
+        globalPaused={false}
+        onNewTask={vi.fn()}
+        projectId={TEST_PROJECT_ID}
+      />);
+      expect(container.querySelector(".list-card-title")).toHaveTextContent(description200);
+    } finally {
+      viewportSpy.mockRestore();
+    }
   });
 });

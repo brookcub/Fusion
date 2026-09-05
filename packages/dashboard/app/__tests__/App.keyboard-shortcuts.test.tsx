@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { closeTopmostDashboardPopupForShortcut } from "../App";
 import { useDashboardKeyboardShortcuts } from "../hooks/useDashboardKeyboardShortcuts";
 import { useNavigationHistory } from "../hooks/useNavigationHistory";
+import { usePoppedOutChats } from "../hooks/usePoppedOutChats";
 import { closeViewShortcut, retainViewNavRevert } from "../utils/dashboardShortcutToggles";
 
 function baseHandlers() {
@@ -138,54 +139,146 @@ describe("App dashboard keyboard shortcuts", () => {
     expect(closeTopmostPopup).not.toHaveBeenCalled();
   });
 
+  /*
+  FNXC:DashboardShortcuts 2026-08-23-22:55:
+  FN-116 added popped-out Quick Chats as their own shell tier, so the Escape order is
+  popped-out task → popped-out chat → Quick Chat → terminal → topmost open modal. Every state
+  fixture must carry `poppedOutChatEntries`, and the chat tier gets its own step below.
+  */
   it("closes exactly one topmost App popup per Escape in shell order", () => {
     const closePoppedOutTask = vi.fn();
+    const closePoppedOutChat = vi.fn();
     const closeQuickChat = vi.fn();
     const closeTerminal = vi.fn();
     const closeSettings = vi.fn();
     const closeTaskDetail = vi.fn();
+    const handlers = { closePoppedOutTask, closePoppedOutChat, closeQuickChat, closeTerminal };
 
     expect(closeTopmostDashboardPopupForShortcut(
       {
         // FN-8016: explicit globally-visible opt-out can expose both same-id entries;
         // Escape must preserve origin identity and close only the topmost one.
         poppedOutTaskEntries: [{ task: { id: "FN-1" }, originTaskView: "board" }, { task: { id: "FN-1" }, originTaskView: "planning" }],
+        poppedOutChatEntries: [{ projectId: "proj-1", session: { id: "chat-1" }, minimized: false }],
+
         quickChatOpen: true,
         terminalOpen: true,
         modalClosers: [[true, closeSettings], [true, closeTaskDetail]],
-      },
-      { closePoppedOutTask, closeQuickChat, closeTerminal },
+      } as never,
+      handlers,
     )).toBe(true);
     expect(closePoppedOutTask).toHaveBeenCalledWith("FN-1", "planning");
+    expect(closePoppedOutChat).not.toHaveBeenCalled();
     expect(closeQuickChat).not.toHaveBeenCalled();
     expect(closeTerminal).not.toHaveBeenCalled();
     expect(closeSettings).not.toHaveBeenCalled();
 
     expect(closeTopmostDashboardPopupForShortcut(
-      { poppedOutTaskEntries: [], quickChatOpen: true, terminalOpen: true, modalClosers: [[true, closeSettings]] },
-      { closePoppedOutTask, closeQuickChat, closeTerminal },
+      {
+        poppedOutTaskEntries: [],
+        poppedOutChatEntries: [{ projectId: "proj-1", session: { id: "chat-1" }, minimized: false }, { projectId: "proj-2", session: { id: "chat-2" }, minimized: false }],
+        quickChatOpen: true,
+        terminalOpen: true,
+        modalClosers: [[true, closeSettings]],
+      } as never,
+      handlers,
+    )).toBe(true);
+    expect(closePoppedOutChat).toHaveBeenCalledWith("proj-2", "chat-2");
+    expect(closePoppedOutChat).toHaveBeenCalledTimes(1);
+    expect(closeQuickChat).not.toHaveBeenCalled();
+
+    expect(closeTopmostDashboardPopupForShortcut(
+      { poppedOutTaskEntries: [], poppedOutChatEntries: [], quickChatOpen: true, terminalOpen: true, modalClosers: [[true, closeSettings]] } as never,
+      handlers,
+
     )).toBe(true);
     expect(closeQuickChat).toHaveBeenCalledTimes(1);
     expect(closeTerminal).not.toHaveBeenCalled();
 
     expect(closeTopmostDashboardPopupForShortcut(
-      { poppedOutTaskEntries: [], quickChatOpen: false, terminalOpen: true, modalClosers: [[true, closeSettings]] },
-      { closePoppedOutTask, closeQuickChat, closeTerminal },
+      { poppedOutTaskEntries: [], poppedOutChatEntries: [], quickChatOpen: false, terminalOpen: true, modalClosers: [[true, closeSettings]] } as never,
+      handlers,
+
     )).toBe(true);
     expect(closeTerminal).toHaveBeenCalledTimes(1);
     expect(closeSettings).not.toHaveBeenCalled();
 
     expect(closeTopmostDashboardPopupForShortcut(
-      { poppedOutTaskEntries: [], quickChatOpen: false, terminalOpen: false, modalClosers: [[false, closeSettings], [true, closeTaskDetail]] },
-      { closePoppedOutTask, closeQuickChat, closeTerminal },
+      { poppedOutTaskEntries: [], poppedOutChatEntries: [], quickChatOpen: false, terminalOpen: false, modalClosers: [[false, closeSettings], [true, closeTaskDetail]] } as never,
+      handlers,
+
     )).toBe(true);
     expect(closeTaskDetail).toHaveBeenCalledTimes(1);
     expect(closeSettings).not.toHaveBeenCalled();
 
     expect(closeTopmostDashboardPopupForShortcut(
-      { poppedOutTaskEntries: [], quickChatOpen: false, terminalOpen: false, modalClosers: [[false, closeSettings]] },
-      { closePoppedOutTask, closeQuickChat, closeTerminal },
+      { poppedOutTaskEntries: [], poppedOutChatEntries: [], quickChatOpen: false, terminalOpen: false, modalClosers: [[false, closeSettings]] } as never,
+      handlers,
+
     )).toBe(false);
+  });
+
+  it("skips minimized chats and closes the last visible chat before Quick Chat", () => {
+    const closePoppedOutChat = vi.fn();
+    const closeQuickChat = vi.fn();
+    const handlers = {
+      closePoppedOutTask: vi.fn(),
+      closePoppedOutChat,
+      closeQuickChat,
+      closeTerminal: vi.fn(),
+    };
+
+    expect(closeTopmostDashboardPopupForShortcut(
+      {
+        poppedOutTaskEntries: [],
+        poppedOutChatEntries: [
+          { projectId: "project", session: { id: "a" }, minimized: true },
+          { projectId: "project", session: { id: "b" }, minimized: true },
+        ],
+        quickChatOpen: true,
+        terminalOpen: false,
+        modalClosers: [],
+      } as never,
+      handlers,
+    )).toBe(true);
+    expect(closeQuickChat).toHaveBeenCalledTimes(1);
+    expect(closePoppedOutChat).not.toHaveBeenCalled();
+
+    expect(closeTopmostDashboardPopupForShortcut(
+      {
+        poppedOutTaskEntries: [],
+        poppedOutChatEntries: [
+          { projectId: "project", session: { id: "visible" }, minimized: false },
+          { projectId: "project", session: { id: "hidden" }, minimized: true },
+        ],
+        quickChatOpen: true,
+        terminalOpen: false,
+        modalClosers: [],
+      } as never,
+      handlers,
+    )).toBe(true);
+    expect(closePoppedOutChat).toHaveBeenCalledTimes(1);
+    expect(closePoppedOutChat).toHaveBeenCalledWith("project", "visible");
+    expect(closeQuickChat).toHaveBeenCalledTimes(1);
+  });
+
+  /*
+  FNXC:DashboardShortcuts 2026-08-23-03:33:
+  FN-169 re-raises an existing chat rather than reordering it, so Escape must retain insertion
+  order and close the last independently opened chat.
+  */
+  it("keeps Escape ordering when a popped-out chat is re-raised", () => {
+    const { result } = renderHook(() => usePoppedOutChats());
+    const session = (id: string) => ({ id, agentId: "agent", title: id, status: "active" as const, createdAt: "2026-08-23T00:00:00.000Z", updatedAt: "2026-08-23T00:00:00.000Z" });
+    act(() => result.current.popOut("project", session("a")));
+    act(() => result.current.popOut("project", session("b")));
+    act(() => result.current.popOut("project", session("a")));
+    const closePoppedOutChat = vi.fn();
+    expect(closeTopmostDashboardPopupForShortcut(
+      { poppedOutTaskEntries: [], poppedOutChatEntries: result.current.entries, quickChatOpen: false, terminalOpen: false, modalClosers: [] },
+      { closePoppedOutTask: vi.fn(), closePoppedOutChat, closeQuickChat: vi.fn(), closeTerminal: vi.fn() },
+    )).toBe(true);
+    expect(closePoppedOutChat).toHaveBeenCalledWith("project", "b");
   });
 
   it("prevents Escape only when the App shell closes a popup", () => {

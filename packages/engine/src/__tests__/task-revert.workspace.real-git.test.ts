@@ -4,10 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  applyWorkspaceRevertBoundaries,
   resolveWorkspaceTaskRevertCommits,
   revertWorkspaceTask,
 } from "../execution/task-revert.js";
 import type { Task } from "@fusion/core";
+import { findProvenLandedCommit, isRepoLanded } from "../merge/workspace-land-predicate.js";
 
 const hasGit = spawnSync("git", ["--version"], { stdio: "pipe" }).status === 0;
 const describeIfGit = hasGit ? describe : describe.skip;
@@ -172,6 +174,31 @@ describeIfGit("task-revert workspace real-git scenarios", { timeout: 30_000 }, (
     expect(git(repoB, "git show HEAD:b.ts")).toBe("line1");
   });
 
+  it("records a revert-stage breadcrumb when a recorded base has vanished", async () => {
+    const { workspaceRoot, repoA, repoB } = workspaceFixture();
+    const shaA = landTaskCommit(repoA, "a.ts", "line1\nfeature-a\n", "feat(FN-A): add feature in repo-a");
+    const shaB = landTaskCommit(repoB, "b.ts", "line1\nfeature-a\n", "feat(FN-A): add feature in repo-b");
+    const task = makeWorkspaceTask(shaA, shaB, {
+      workspaceWorktrees: {
+        "repo-a": { worktreePath: "repo-a", branch: "fusion/FN-A", landedSha: shaA, baseBranch: "release/deleted" },
+        "repo-b": { worktreePath: "repo-b", branch: "fusion/FN-A", landedSha: shaB },
+      },
+    });
+    const logs: string[] = [];
+    const events: Array<{ metadata: Record<string, unknown> }> = [];
+
+    await expect(revertWorkspaceTask({
+      task, workspaceRootDir: workspaceRoot, settings: {},
+      store: { logEntry: async (_id: string, message: string) => { logs.push(message); } } as unknown as import("@fusion/core").TaskStore,
+      audit: { git: async (event: never) => { events.push(event as unknown as { metadata: Record<string, unknown> }); } },
+    })).resolves.toMatchObject({ mode: "git", clean: true });
+
+    expect(logs.some((message) => message.includes("release/deleted"))).toBe(true);
+    expect(events).toHaveLength(1);
+    expect(events[0].metadata).toMatchObject({ stage: "revert", outcome: "fallback", fallbackReason: "recorded-base-vanished" });
+    expect(JSON.stringify(events[0].metadata)).not.toContain("release/deleted");
+  });
+
   it("the workspace guard still REFUSES a live lane under a resolved set", async () => {
     const { workspaceRoot, repoA, repoB } = workspaceFixture();
     const shaA = landTaskCommit(repoA, "a.ts", "line1\nfeature-a\n", "feat(FN-A): add feature in repo-a");
@@ -205,6 +232,9 @@ describeIfGit("task-revert workspace real-git scenarios", { timeout: 30_000 }, (
       expect(byRepo["repo-a"].revertCommitSha).toBeTruthy();
       expect(byRepo["repo-b"].classification).toBe("clean");
       expect(byRepo["repo-b"].revertCommitSha).toBeTruthy();
+      const nextWorktrees = applyWorkspaceRevertBoundaries(task.workspaceWorktrees, result.workspace.repos);
+      expect(nextWorktrees?.["repo-a"]?.revertBoundarySha).toBe(byRepo["repo-a"].revertCommitSha);
+      expect(nextWorktrees?.["repo-b"]?.revertBoundarySha).toBe(byRepo["repo-b"].revertCommitSha);
     }
 
     for (const repoRootDir of [repoA, repoB]) {
@@ -216,6 +246,28 @@ describeIfGit("task-revert workspace real-git scenarios", { timeout: 30_000 }, (
     }
     expect(git(repoA, "git show HEAD:a.ts")).toBe("line1");
     expect(git(repoB, "git show HEAD:b.ts")).toBe("line1");
+  });
+
+  it("revert then rerun invalidates both recorded and trailer landing proof across sub-repos", async () => {
+    const { workspaceRoot, repoA, repoB } = workspaceFixture();
+    const shaA = landTaskCommit(repoA, "a.ts", "line1\nfeature-a\n", "land\n\nFusion-Task-Id: FN-A");
+    const shaB = landTaskCommit(repoB, "b.ts", "line1\nfeature-b\n", "land\n\nFusion-Task-Id: FN-A");
+    const task = makeWorkspaceTask(shaA, shaB);
+    const reverted = await revertWorkspaceTask({ task, workspaceRootDir: workspaceRoot, settings: {} });
+    expect(reverted).toMatchObject({ mode: "git", clean: true });
+    if (reverted.mode !== "git" || !reverted.clean) throw new Error("expected clean revert");
+    const worktrees = applyWorkspaceRevertBoundaries(task.workspaceWorktrees, reverted.workspace.repos)!;
+
+    for (const [repoRel, repoRootDir] of [["repo-a", repoA], ["repo-b", repoB]] as const) {
+      const entry = worktrees[repoRel]!;
+      expect(await isRepoLanded(repoRootDir, "main", entry.landedSha, "FN-A", undefined, entry.revertBoundarySha)).toBe(false);
+      expect(await findProvenLandedCommit(repoRootDir, "main", undefined, "FN-A", undefined, entry.revertBoundarySha)).toBeUndefined();
+    }
+
+    const reLandedA = landTaskCommit(repoA, "a.ts", "line1\nfeature-a-redone\n", "reland\n\nFusion-Task-Id: FN-A");
+    const reLandedB = landTaskCommit(repoB, "b.ts", "line1\nfeature-b-redone\n", "reland\n\nFusion-Task-Id: FN-A");
+    expect(await findProvenLandedCommit(repoA, "main", reLandedA, "FN-A", undefined, worktrees["repo-a"]!.revertBoundarySha)).toBe(reLandedA);
+    expect(await findProvenLandedCommit(repoB, "main", reLandedB, "FN-A", undefined, worktrees["repo-b"]!.revertBoundarySha)).toBe(reLandedB);
   });
 
   it("partial-conflict rollback: a later task touching repo-b only leaves BOTH repos byte-identical to pre-call (Symptom Verification)", async () => {

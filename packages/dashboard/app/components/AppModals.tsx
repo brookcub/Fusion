@@ -5,12 +5,12 @@ import type { UseProjectActionsResult } from "../hooks/useProjectActions";
 import { mergeTaskSnapshot } from "../hooks/useTasks";
 import type { ModalManager } from "../hooks/useModalManager";
 import type { UseTaskHandlersResult } from "../hooks/useTaskHandlers";
+import type { ChatMessageLayout } from "../hooks/useAppSettings";
 import type { Toast, ToastType } from "../hooks/useToast";
 import { ModalErrorBoundary } from "./ErrorBoundary";
 import { TaskDetailModal } from "./TaskDetailModal";
 import type { BlockerFanoutColumnFlags } from "../hooks/useBlockerFanout";
 import { GitHubImportModal } from "./GitHubImportModal";
-import { SubtaskBreakdownModal } from "./SubtaskBreakdownModal";
 import { ScriptsModal } from "./ScriptsModal";
 import { FileBrowserModal } from "./FileBrowserModal";
 import { UsageIndicator } from "./UsageIndicator";
@@ -54,12 +54,13 @@ interface AppModalsProps {
   removeToast: (id: number) => void;
   modalManager: ModalManager;
   projectActions: Pick<UseProjectActionsResult, "handleAddProject" | "handleSetupComplete" | "handleModelOnboardingComplete">;
-  taskHandlers: Pick<UseTaskHandlersResult, "handleModalCreate" | "handlePlanningTaskCreated" | "handlePlanningTasksCreated" | "handleSubtaskTasksCreated" | "handleGitHubImport">;
+  taskHandlers: Pick<UseTaskHandlersResult, "handleModalCreate" | "handlePlanningTaskCreated" | "handlePlanningTasksCreated" | "handleGitHubImport">;
+  /** App-owned ingestion seam for a successful detail refinement. */
+  onRefinementCreated?: (task: Task) => void;
   onPlanningMode?: (initialPlan: string, workflowId?: string | null, sourceIssue?: { provider: "github"; repository: string; issueNumber: number; url: string; title?: string }) => void;
   onOpenChatWithPrefill?: (prefillText: string) => void;
-  onSubtaskBreakdown?: (description: string, workflowId?: string | null) => void;
   taskOperations: {
-    moveTask: (taskId: string, column: Column, optionsOrPosition?: { preserveProgress?: boolean } | number) => Promise<Task>;
+    moveTask: (taskId: string, column: Column, optionsOrPosition?: { preserveProgress?: boolean; expectedColumn?: string } | number) => Promise<Task>;
     deleteTask: (taskId: string, options?: {
       removeDependencyReferences?: boolean;
       removeLineageReferences?: boolean;
@@ -75,8 +76,9 @@ interface AppModalsProps {
     unpauseTask: (taskId: string) => Promise<Task>;
     /* FNXC:ReviewLaneBypass 2026-07-09-00:00 (FN-7720): operator-only review-lane bypass, threaded to TaskDetailModal only. */
     bypassReview?: (taskId: string, reason: string) => Promise<Task>;
-    resetTask: (taskId: string) => Promise<Task>;
-    duplicateTask: (taskId: string) => Promise<Task>;
+
+    resetTask: (taskId: string, options?: { description?: string }) => Promise<Task>;
+    duplicateTask: (taskId: string, options?: { workflowId?: string }) => Promise<Task>;
   };
   deepLink: {
     handleDetailClose: () => void;
@@ -84,7 +86,12 @@ interface AppModalsProps {
   settings: {
     prAuthAvailable: boolean;
     autoMerge: boolean;
+    openTasksInRightSidebar: boolean;
+    openMobileTasksInPopup: boolean;
+    taskPopupsBoardListOnly: boolean;
+    showCostBadgeOnCards: boolean;
     taskDetailChatFirst: boolean;
+    chatMessageLayout: ChatMessageLayout;
     themeMode: ThemeMode;
     colorTheme: ColorTheme;
     dashboardFontScalePct: number;
@@ -95,6 +102,12 @@ interface AppModalsProps {
     setDashboardFontScalePct: (scalePct: number) => void;
     setShadcnCustomColors: (colors: Record<string, string>) => void;
     setQuickChatButtonModeImmediate: (mode: "floating" | "footer" | "off") => void;
+    setChatMessageLayoutImmediate: (layout: ChatMessageLayout) => void;
+    setOpenTasksInRightSidebarImmediate: (enabled: boolean) => void;
+    setOpenMobileTasksInPopupImmediate: (enabled: boolean) => void;
+    setTaskPopupsBoardListOnlyImmediate: (enabled: boolean) => void;
+    setShowCostBadgeOnCardsImmediate: (enabled: boolean) => void;
+    setTaskDetailChatFirstImmediate: (enabled: boolean) => void;
     setMobileNavPrimaryItemsImmediate: (items: string[]) => void;
   };
   /** Optional override for the settings modal close handler. When provided, this is called instead of modalManager.closeSettings. */
@@ -120,9 +133,9 @@ export function AppModals({
   modalManager,
   projectActions,
   taskHandlers,
+  onRefinementCreated,
   onPlanningMode,
   onOpenChatWithPrefill,
-  onSubtaskBreakdown,
   taskOperations,
   deepLink,
   settings,
@@ -177,11 +190,6 @@ export function AppModals({
     modalManager.closeGitHubImport();
   }, [modalManager.closeGitHubImport, removeNav]);
 
-  const closeSubtaskWithNav = useCallback(() => {
-    removeNav(modalManager.closeSubtask);
-    modalManager.closeSubtask();
-  }, [modalManager.closeSubtask, removeNav]);
-
   const closeScriptsWithNav = useCallback(() => {
     removeNav(modalManager.closeScripts);
     modalManager.closeScripts();
@@ -232,8 +240,8 @@ export function AppModals({
     modalManager.closeSetupWizard();
   }, [modalManager.closeSetupWizard, removeNav]);
 
-  const handleOpenNewTask = useCallback(() => {
-    modalManager.openNewTask();
+  const handleOpenNewTask = useCallback((workflowId?: string | null) => {
+    modalManager.openNewTask(workflowId);
   }, [modalManager]);
 
   const handleOpenGitHubImport = useCallback(() => {
@@ -276,11 +284,6 @@ export function AppModals({
     [deepLink, modalManager, pushNav],
   );
 
-  const openGroupModalWithNav = useCallback((groupId: string) => {
-    modalManager.openGroupModal(groupId);
-    pushNav({ type: "modal", close: modalManager.closeGroupModal });
-  }, [modalManager, pushNav]);
-
   const handleOnboardingViewTask = useCallback((task: Task) => {
     setFirstCreatedTask(null);
     modalManager.closeModelOnboarding();
@@ -321,7 +324,6 @@ export function AppModals({
             onClose={closeDetailWithNav}
             onOpenDetail={openDetailTaskWithNav}
             mobileHeaderMode={modalManager.detailTaskOrigin === "list-mobile" ? "back" : "close"}
-            onMoveTask={taskOperations.moveTask}
             /* FNXC:TaskRevert 2026-08-01-20:27: Modal detail must offer the same revision draft recovery as every reverted-task host. */
             onReviseTask={(task) => modalManager.openNewTaskWithDescription(task.description)}
             onDeleteTask={taskOperations.deleteTask}
@@ -329,12 +331,14 @@ export function AppModals({
             onArchiveTask={taskOperations.archiveTask}
             onRevertTask={taskOperations.revertTask}
             onRetryTask={taskOperations.retryTask}
+            onOpenChatWithPrefill={onOpenChatWithPrefill}
             onPauseTask={taskOperations.pauseTask}
             onUnpauseTask={taskOperations.unpauseTask}
             onBypassReview={taskOperations.bypassReview}
             onResetTask={taskOperations.resetTask}
             onDuplicateTask={taskOperations.duplicateTask}
             onTaskUpdated={modalManager.updateDetailTask}
+            onRefinementCreated={onRefinementCreated}
             addToast={addToast}
             prAuthAvailable={settings.prAuthAvailable}
             autoMergeEnabled={settings.autoMerge}
@@ -381,6 +385,18 @@ export function AppModals({
               onDashboardFontScaleChange={settings.setDashboardFontScalePct}
               onShadcnCustomColorsChange={settings.setShadcnCustomColors}
               onQuickChatButtonModeChange={settings.setQuickChatButtonModeImmediate}
+              chatMessageLayout={settings.chatMessageLayout}
+              onChatMessageLayoutChange={settings.setChatMessageLayoutImmediate}
+              openTasksInRightSidebar={settings.openTasksInRightSidebar}
+              onOpenTasksInRightSidebarChange={settings.setOpenTasksInRightSidebarImmediate}
+              openMobileTasksInPopup={settings.openMobileTasksInPopup}
+              onOpenMobileTasksInPopupChange={settings.setOpenMobileTasksInPopupImmediate}
+              taskPopupsBoardListOnly={settings.taskPopupsBoardListOnly}
+              onTaskPopupsBoardListOnlyChange={settings.setTaskPopupsBoardListOnlyImmediate}
+              showCostBadgeOnCards={settings.showCostBadgeOnCards}
+              onShowCostBadgeOnCardsChange={settings.setShowCostBadgeOnCardsImmediate}
+              taskDetailChatFirst={settings.taskDetailChatFirst}
+              onTaskDetailChatFirstChange={settings.setTaskDetailChatFirstImmediate}
               onMobileNavPrimaryItemsChange={settings.setMobileNavPrimaryItemsImmediate}
               onReopenOnboarding={onReopenOnboarding}
               onOpenApprovals={onOpenApprovals}
@@ -413,29 +429,6 @@ export function AppModals({
         projectId={projectId}
       />
 
-      <ModalErrorBoundary>
-        {/*
-        FNXC:ProjectSwitchModalReset 2026-07-23-00:00:
-        Key the subtask breakdown by project so a project swap remounts it, mirroring the
-        embedded Planning view. Without the remount, the swap flipped isOpen=false and the
-        NEW projectId in the same render, so resetState persisted the old project's draft
-        description under the new project's storage key and kept it in memory — reopening
-        the breakdown in the new project showed the previous project's draft. The old
-        instance's unmount cleanup closes its stream and saves the draft under its own
-        project key.
-        */}
-        <SubtaskBreakdownModal
-          key={projectId ?? "no-project"}
-          isOpen={modalManager.isSubtaskOpen}
-          onClose={closeSubtaskWithNav}
-          initialDescription={modalManager.subtaskInitialDescription ?? ""}
-          onTasksCreated={taskHandlers.handleSubtaskTasksCreated}
-          projectId={projectId}
-          workflowId={modalManager.subtaskWorkflowId}
-          resumeSessionId={modalManager.subtaskResumeSessionId}
-          onOpenGroupModal={openGroupModalWithNav}
-        />
-      </ModalErrorBoundary>
 
       <ScriptsModal
         isOpen={modalManager.scriptsOpen}
@@ -478,12 +471,12 @@ export function AppModals({
           onClose={closeNewTaskWithNav}
           tasks={tasks}
           onCreateTask={handleModalCreateWithOnboardingTracking}
+          onMoveTask={(taskId, column) => taskOperations.moveTask(taskId, column as Column)}
           addToast={addToast}
           projectId={projectId}
           initialDescription={modalManager.newTaskInitialDescription ?? ""}
           initialWorkflowId={modalManager.newTaskInitialWorkflowId}
           onPlanningMode={onPlanningMode}
-          onSubtaskBreakdown={onSubtaskBreakdown}
         />
       </ModalErrorBoundary>
 

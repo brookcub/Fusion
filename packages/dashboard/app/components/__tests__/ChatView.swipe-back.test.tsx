@@ -21,6 +21,7 @@ vi.mock("../../api", async (importOriginal) => {
     fetchTasks: vi.fn().mockResolvedValue([]),
     updateGlobalSettings: vi.fn().mockResolvedValue(undefined),
     searchFiles: vi.fn().mockResolvedValue({ files: [] }),
+    fetchChatSession: vi.fn().mockResolvedValue({ session: { memoryFocus: null } }),
   };
 });
 
@@ -184,9 +185,27 @@ describe("ChatView mobile swipe-back", () => {
     });
 
     await waitFor(() => {
-      expect(selectSessionSpy).toHaveBeenCalledWith("");
-      expect(screen.getByText("Start a new conversation")).toBeInTheDocument();
+      expect(screen.getByTestId("chat-session-session-001")).toBeInTheDocument();
     });
+    expect(screen.queryByTestId("chat-back-btn")).not.toBeInTheDocument();
+  });
+
+  it("consumes the drill-in history entry when visible Back returns to the list", async () => {
+    mockViewport("mobile");
+    const historyBackSpy = vi.spyOn(window.history, "back").mockImplementation(() => {});
+
+    render(
+      <HistoryHarness>
+        <StatefulChatView />
+      </HistoryHarness>,
+    );
+
+    fireEvent.click(screen.getByTestId("chat-session-session-001"));
+    await waitFor(() => expect(screen.getByTestId("chat-back-btn")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId("chat-back-btn"));
+
+    expect(historyBackSpy).toHaveBeenCalledOnce();
     expect(screen.queryByTestId("chat-back-btn")).not.toBeInTheDocument();
   });
 
@@ -204,7 +223,14 @@ describe("ChatView mobile swipe-back", () => {
     expect(window.history.pushState).not.toHaveBeenCalled();
   });
 
-  it("does not push a nav entry on desktop selection", async () => {
+  /*
+  FNXC:ChatNavigation 2026-08-23-16:35:
+  FN-9193 docks the conversation list on tablet-or-wider hosts. While that list stays visible,
+  drilling into a thread is not a navigation step: no history entry is pushed and no in-thread Back
+  control renders, because the list the Back would return to never left the screen. Collapsing the
+  docked list restores the one-pane list/detail contract, and with it the drill-in history entry.
+  */
+  it("pushes no drill-in history entry while the docked desktop list stays visible", async () => {
     mockViewport("desktop");
 
     render(
@@ -218,7 +244,28 @@ describe("ChatView mobile swipe-back", () => {
     await waitFor(() => {
       expect(screen.getByTestId("chat-thread-header-identity")).toBeInTheDocument();
     });
+    expect(screen.getByTestId("chat-session-session-001")).toBeInTheDocument();
     expect(window.history.pushState).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("chat-back-btn")).not.toBeInTheDocument();
+  });
+
+  it("uses the same Back history entry for desktop selection with the docked list collapsed", async () => {
+    mockViewport("desktop");
+
+    render(
+      <HistoryHarness>
+        <StatefulChatView />
+      </HistoryHarness>,
+    );
+
+    fireEvent.click(screen.getByTestId("chat-docked-sidebar-toggle"));
+    fireEvent.click(screen.getByTestId("chat-session-session-001"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-thread-header-identity")).toBeInTheDocument();
+    });
+    expect(window.history.pushState).toHaveBeenCalled();
+    expect(screen.getByTestId("chat-back-btn")).toBeInTheDocument();
   });
 
   afterEach(() => {

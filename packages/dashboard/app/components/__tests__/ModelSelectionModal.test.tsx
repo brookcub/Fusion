@@ -102,6 +102,7 @@ vi.mock("../CustomModelDropdown", () => ({
             <option value="medium">Medium</option>
             <option value="high">High</option>
             <option value="xhigh">Very High</option>
+             <option value="max">Max</option>
           </select>
         </>
       ) : null}
@@ -215,7 +216,8 @@ describe("ModelSelectionModal", () => {
     renderModelSelectionModal({ onClose });
 
     const overlay = screen.getByTestId("model-selection-modal");
-    fireEvent.click(overlay);
+    fireEvent.mouseDown(overlay);
+    fireEvent.mouseUp(overlay);
 
     expect(onClose).toHaveBeenCalled();
   });
@@ -337,7 +339,7 @@ describe("ModelSelectionModal", () => {
       expect(select).toBeTruthy();
 
       const options = Array.from(select.options).map((o) => o.value);
-      expect(options).toEqual(["", "off", "minimal", "low", "medium", "high", "xhigh"]);
+      expect(options).toEqual(["", "off", "minimal", "low", "medium", "high", "xhigh", "max"]);
     });
 
     it("still omits the thinking-level selector while models are empty, even when onThinkingLevelChange is provided", () => {

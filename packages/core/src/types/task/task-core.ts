@@ -30,6 +30,7 @@ import type { InReviewStallSignal } from "../../tasks/in-review-stall.js";
 import type { InReviewStalledSignal } from "../../tasks/in-review-stalled.js";
 import type { StalePausedReviewSignal } from "../../tasks/stale-paused-review.js";
 import type { StalePausedTodoSignal } from "../../tasks/stale-paused-todo.js";
+import type { TaskExternalBlock } from "../../tasks/task-external-block.js";
 import type { StalledReviewSignal } from "../../tasks/stalled-review-detector.js";
 import type { TaskAgeStalenessSignal } from "../../tasks/task-age-staleness.js";
 import type { PlannerOverseerRuntimeSnapshot } from "../../planner/planner-overseer-state.js";
@@ -39,11 +40,20 @@ import type {
   TaskComment,
   TaskLogEntry,
   TaskStep,
+  TaskStepReport,
   WorkflowTransitionNotificationMarker,
 } from "./task-log.js";
 
 export interface MergeDetails {
   commitSha?: string;
+  /**
+   * FNXC:AIMerge 2026-08-28-09:29:
+   * The task-branch tip observed when a real landing was recorded. A later merge attempt may skip
+   * rebuilding its clean room only when this pin still equals the live branch tip, proving that no
+   * post-landing task work would be dropped. `mergeDetails` is stored in the task JSON column, so
+   * this additive optional field requires no SQL migration or schema-applier registration.
+   */
+  landedBranchTipSha?: string;
   /**
    * When merger used rebase strategy (>=2 substantive commits), this is the
    * parent SHA on the target branch before the cherry-pick chain. The canonical
@@ -364,6 +374,18 @@ export type TaskBranchAssignmentMode = "shared" | "per-task-derived";
 
 export interface TaskBranchContext {
   /**
+   * FNXC:BranchNaming 2026-08-20-03:40:
+   * A branch override records operator ownership at the same write boundary as
+   * `Task.branch`. It intentionally survives without branch-group fields: an
+   * operator-owned `fusion/...` name must never be mistaken for Fusion-owned.
+   */
+  branchOverride?: {
+    by: "operator";
+    at: string;
+    branch: string;
+    previousBranch?: string;
+  };
+  /**
    * The owning BranchGroup id (`BG-…`). Only set for shared-mode members that
    * were actually assigned to an ensured branch group. Non-shared members
    * (per-task-derived) carry branch context (source/assignmentMode) without a
@@ -371,8 +393,12 @@ export interface TaskBranchContext {
    * synthetic-groupId membership fallback (see filterTasksByBranchGroup).
    */
   groupId?: string;
-  source: TaskBranchGroupSource;
-  assignmentMode: TaskBranchAssignmentMode;
+  /** Omitted for a provenance-only operator override payload. */
+  source?: TaskBranchGroupSource;
+  /** Omitted for a provenance-only operator override payload. */
+  assignmentMode?: TaskBranchAssignmentMode;
+  /** Shared-group integration target retained across per-task worktree cleanup and Reset. */
+  mergeTargetBranch?: string;
   inheritedBaseBranch?: string;
 }
 
@@ -675,6 +701,110 @@ export interface TaskReleaseGateVerdict {
   evaluatedForUpdatedAt?: string;
 }
 
+/*
+FNXC:Workspace 2026-08-15-07:51:
+The atomic per-repository store mutation and its engine callers share this entry contract so
+per-key merges preserve every durable workspace worktree field rather than drifting into
+independent inline shapes.
+*/
+/*
+FNXC:Workspace 2026-08-20-00:56:
+Each sub-repository records the base ref selected at acquisition because later land, self-heal,
+and revert operations must target the ref the worktree was actually derived from. A requested
+base missing in one repo falls back to that repo's integration branch and records the requested
+name in baseBranchFallbackFrom. Legacy entries without these fields remain pinned to their own
+integration branch and ignore task.baseBranch. Ref names live here and in task logs, never audit metadata.
+*/
+/*
+FNXC:RepositoryScope 2026-08-29-08:50:
+FN-258 makes configured workspace membership the complete, confirmed scope for every workspace task.
+Review and landing still use this durable snapshot, but neither task creation nor later task mutations
+may select a subset of configured repositories.
+*/
+export interface TaskRepositoryScope {
+  repositories: string[];
+  /** Workspace membership is confirmed from the configured workspace, never selected per task. */
+  state?: "confirmed";
+  /** Monotonic configuration generation used to fence stale review callbacks. */
+  revision?: number;
+  confirmedAt?: string;
+  confirmedBy?: "workspace";
+  /** FNXC:RepositoryScope 2026-08-21-01:18: Fresh landing accepts only the exact repository diff approved by Code Review. */
+  reviewEvidence?: Record<string, { fingerprint: string; approvedAt: string }>;
+  /*
+  FNXC:WorkspaceFinalization 2026-08-21-09:09:
+  A repeated workspace Code Review REVISE must survive result cleanup and engine restart. Store the
+  reviewed repository and normalized input signature with its scope generation, never a root path
+  or checkout path, so a changed scope or diff opens a new remediation episode safely.
+  */
+  reviewRemediation?: { scopeRevision: number; repository: string; inputSignature: string };
+  /** Historical manual-scope events remain readable in Task Detail but no new task may write them. */
+  extensions?: Array<{
+    repository: string;
+    requestedAt: string;
+    requestedBy: string;
+    reason: string;
+    status: "accepted" | "refused";
+    refusedAt?: string;
+    refusedBy?: string;
+    refusalReason?: string;
+  }>;
+}
+
+export interface WorkspaceLandFailure {
+  /** Safe operator-facing failure family; technical detail is deliberately separate. */
+  category: "environment" | "review" | "content-conflict" | "internal-technical";
+  message: string;
+  at: string;
+  branch?: string;
+  repository?: string;
+  resource?: string;
+  action?: string;
+  /** Bounded diagnostics for agent logs only; never primary dashboard or CLI copy. */
+  technicalDetail?: string;
+}
+
+export interface WorkspaceWorktreeEntry {
+  worktreePath: string;
+  branch: string;
+  /** The ref this sub-repository worktree was derived from and must later target. */
+  baseBranch?: string;
+  /** The operator-requested ref when this repository instead used its integration branch. */
+  baseBranchFallbackFrom?: string;
+  baseCommitSha?: string;
+  landedSha?: string;
+  revertBoundarySha?: string;
+  /** Legacy rows containing only message/at/branch remain readable. */
+  landFailure?: WorkspaceLandFailure;
+}
+
+export type AiMergeFindingDisposition = "pending" | "corrected" | "absent-from-squash" | "still-present" | "dismissed";
+
+export interface AiMergeReviewFinding {
+  id: string;
+  text: string;
+  disposition: AiMergeFindingDisposition;
+  audit?: Array<{ at: string; actor: string; disposition: AiMergeFindingDisposition; reason?: string }>;
+}
+
+/** Durable authority for AI merge review reconciliation; it is never reconstructed from task logs. */
+export interface AiMergeReviewReconciliation {
+  sourceSha: string;
+  integrationTipSha: string;
+  candidateSha?: string;
+  candidateTreeSha?: string;
+  findings: AiMergeReviewFinding[];
+  consecutiveCleanApprovals: number;
+  correctivePasses: number;
+  /*
+  FNXC:AIMergeReviewReconciliation 2026-08-22-22:04:
+  FN-159 permits one same-candidate re-ask for malformed acknowledgements so reviewer protocol
+  defects cannot reset clean approvals forever; omit the field until that first re-ask.
+  */
+  invalidAcknowledgementCandidateSha?: string;
+  terminal?: boolean;
+}
+
 export interface Task {
   id: string;
   /** Immutable lineage identity used for durable commit/task attribution. */
@@ -694,8 +824,6 @@ export interface Task {
   /** Source column captured when this task is archived; used to restore sensibly. */
   preArchiveColumn?: Column;
   dependencies: string[];
-  /** User-requested hint for triage: prefer splitting into child tasks when appropriate. */
-  breakIntoSubtasks?: boolean;
   /** When true, this decision-only task is expected to complete without creating git commits. */
   noCommitsExpected?: boolean;
   worktree?: string;
@@ -717,8 +845,24 @@ export interface Task {
    * present AND whose recorded value is an ancestor of (or equals) the repo's
    * integration tip, so an interrupted multi-repo land retries only the un-landed
    * repos and never re-advances an already-landed ref (idempotent retry).
+   *
+   * FNXC:Workspace 2026-08-15-06:45:
+   * `revertBoundarySha` is the integration-branch commit after a completed git-mode revert
+   * (the revert commit, or pre-revert HEAD when already reverted). A proven landing at or behind
+   * it is stale and must re-land; `landedSha` remains for attribution and diff consumers.
+   *
+   * FNXC:Workspace 2026-08-15-07:05:
+   * `landFailure` is a display-only durable breadcrumb for dashboard per-repo status. It never
+   * participates in landed predicates, land control flow, retries, or park decisions, and a
+   * later `landedSha` supersedes it. Exactly the two `landWorkspaceTask` failed-result seams and
+   * self-healing's unrecoverable FORK-A park write it; busy, abort, persist-after-advance, and
+   * empty-merge paths deliberately do not. Legacy rows without it render pending because task
+   * error prose is never parsed for attribution. FN-9047/FN-9048 stale-state clearing must drop
+   * it alongside `landedSha`.
    */
-  workspaceWorktrees?: Record<string, { worktreePath: string; branch: string; baseCommitSha?: string; landedSha?: string }>;
+  workspaceWorktrees?: Record<string, WorkspaceWorktreeEntry>;
+  /** Explicit repository intent. Missing legacy scope is intentionally not inferred from checkouts. */
+  repositoryScope?: TaskRepositoryScope;
   steps: TaskStep[];
   currentStep: number;
   /**
@@ -730,6 +874,13 @@ export interface Task {
    */
   customFields?: Record<string, unknown>;
   status?: string;
+  /**
+   * FNXC:ExternalBlock 2026-08-28-03:48:
+   * Only obstacles originating outside the task worktree create this durable freeze. Internal
+   * code, test, planning, and review failures remain AI-repairable, while dependency and file
+   * overlap waits retain their separate queue state.
+   */
+  externalBlock?: TaskExternalBlock;
   /**
    * FNXC:TaskActivity 2026-07-28-12:00:
    * Dashboard-only signal from a fresh planner agent-log SSE entry. It is never
@@ -951,8 +1102,16 @@ export interface Task {
   enabledWorkflowSteps?: string[];
   /** Results from workflow step executions (populated after task implementation) */
   workflowStepResults?: WorkflowStepResult[];
+  /** Append-only implementation summaries retained independently of replannable steps. */
+  stepReports?: TaskStepReport[];
   /** Number of merge retry attempts made for this task (auto-merge conflict recovery) */
   mergeRetries?: number;
+  /*
+  FNXC:AIMergeReviewReconciliation 2026-08-20-21:56:
+  FN-090 keeps finding authority, candidate identity, confirmation count, and corrective budget
+  together so interruption cannot grant a fresh budget to an old reviewer finding.
+  */
+  aiMergeReviewReconciliation?: AiMergeReviewReconciliation;
   /** Number of workflow step failure retry attempts made for this task.
    *  When pre-merge workflow steps fail, the executor retries up to MAX_WORKFLOW_STEP_RETRIES
    *  times before marking the task as failed. Cleared on successful workflow step completion. */
@@ -1030,6 +1189,10 @@ export interface Task {
    *  recovery-policy module on each recoverable failure; cleared when work restarts
    *  cleanly or reaches a terminal column (in-review, done, archived). */
   recoveryRetryCount?: number;
+  /** FNXC:WorkspaceContention 2026-08-23-06:40: Durable owner-local retry budget for holdForSessionContention; manual retry, clean completion, and exhausted waits reset it. */
+  sessionContentionHoldCount?: number;
+  /** Operator-visible bounded reason owned only while holdForSessionContention schedules a retry. */
+  sessionContentionWaitReason?: string;
   /** Number of times this task has been requeued after the agent exited without
    *  calling `task_done`. Incremented by the executor for immediate `todo`
    *  requeues and by self-healing for deferred recovery of partial-progress
@@ -1122,6 +1285,9 @@ export interface Task {
   /** Number of reviewer fallback retries consumed by FN-4092 fallback-model
    *  and same-model strict-prompt retry paths. */
   reviewerFallbackRetryCount?: number;
+  /* FNXC:ReviewConvergence 2026-08-22-05:42: FN-149 tracks the spent recovery rung separately from its monotonic episode ceiling. */
+  reviewConvergenceStage?: number;
+  reviewConvergenceEscalationCount?: number;
   /** Derived retry aggregation computed at read time from retry counters.
    *  This field is not persisted to SQLite. */
   retrySummary?: RetrySummary;
@@ -1156,7 +1322,8 @@ export interface Task {
    * mislabel a completed implementation as a plan awaiting approval.
    * Undefined means either no hold or a routine manual plan-approval hold.
    */
-  awaitingApprovalReason?: "release-authorization" | "plan-review-replan-cap" | "merge-blocked-by-policy";
+  /** FNXC:RepositoryScope 2026-08-21-01:53: repeated unchanged Code Review revisions park for an operator before a third remediation loop. */
+  awaitingApprovalReason?: "release-authorization" | "plan-review-replan-cap" | "merge-blocked-by-policy" | "code-review-non-convergence";
   /*
    * FNXC:PlanApproval 2026-07-04-22:41:
    * FN-7569 — records the computePlanApprovalFingerprint (packages/core/src/plan-approval.ts)
@@ -1322,20 +1489,16 @@ export interface Task {
 }
 
 /*
-FNXC:Workspace 2026-06-21-19:05:
-R7 workspace merge-boundary guard (master-plan U0). Workspace-mode tasks populate
-`task.workspaceWorktrees` (one git worktree per sub-repo); their merge must run a
-per-repo loop that does NOT exist yet — it lands in master-plan U6. Until then, a
-workspace task reaching ANY merge entry point (engine dispatch, store.mergeTask,
-the CLI `onMergeImpl` / `runTaskMerge` callers) would run git operations against
-the NON-GIT workspace root and crash. This single shared predicate is called at the
-top of every merge door, BEFORE any git work, so the task is held with a clear,
-actionable error instead. It lives in @fusion/core so all four call sites — including
-store.mergeTask, which cannot import from @fusion/engine — share ONE implementation.
-The guard throws a NAMED `WorkspaceTaskMergeError` so callers (e.g. the engine merge
-dispatch catch) can distinguish this permanent config error from a transient merge
-failure and avoid burning mergeRetries. Master-plan U6 REMOVES this guard when the
-per-repo merge loop becomes the gate.
+FNXC:Workspace 2026-08-15-04:54:
+`landWorkspaceTask` ships the per-repository land loop for workspace-mode tasks,
+whose `task.workspaceWorktrees` entries each identify a sub-repository worktree.
+This shared guard remains defense-in-depth at single-repository merge doors: a
+workspace task that reaches one would otherwise run git against the non-git workspace
+root. It fails loudly and directs callers to the workspace land path instead. It lives
+in @fusion/core so all merge doors — including store.mergeTask, which cannot import
+from @fusion/engine — share one implementation. The named `WorkspaceTaskMergeError`
+lets callers distinguish this permanent routing error from a transient merge failure
+and avoid burning mergeRetries.
 */
 
 /**
@@ -1359,7 +1522,7 @@ export class WorkspaceTaskMergeError extends Error {
 export function assertNotWorkspaceTaskMerge(task: Pick<Task, "id" | "workspaceWorktrees">): void {
   if (isWorkspaceTask(task)) {
     throw new WorkspaceTaskMergeError(
-      `Workspace task ${task.id} cannot merge until per-repo merge support (master-plan U6) lands`,
+      `Workspace task ${task.id} reached a single-repo merge path; workspace tasks must land per-repo via landWorkspaceTask`,
     );
   }
 }
@@ -1454,6 +1617,8 @@ export interface TaskCreateInput {
   baseBranch?: string;
   /** Actual git working branch name used for this task's worktree. */
   branch?: string;
+  /** Required with `branch` so durable ownership never has to guess the writer. */
+  branchWriteOrigin?: "operator" | "engine";
   /** Optional planning/mission branch-group metadata carried across related tasks. */
   branchContext?: TaskBranchContext;
   /**
@@ -1486,7 +1651,6 @@ export interface TaskCreateInput {
    *  task can be replicated/created; flag-OFF creation only ever uses legacy ids. */
   column?: ColumnId;
   dependencies?: string[];
-  breakIntoSubtasks?: boolean;
   /** When true, this task is expected to complete without creating git commits. */
   noCommitsExpected?: boolean;
   /** IDs of workflow steps to enable for this task */
@@ -1560,7 +1724,7 @@ export interface TaskCreateInput {
   planningThinkingLevel?: ThinkingLevel;
   /** Independent per-task merger reasoning-effort override; unset inherits merger settings. */
   mergerThinkingLevel?: ThinkingLevel;
-  /** When true, trigger AI title summarization if description is long and no title provided */
+  /** Explicitly force an AI title attempt for this create when no title is provided; project automatic policy is separate. */
   summarize?: boolean;
   /** Mission ID to link this task to (for mission hierarchy) */
   missionId?: string;

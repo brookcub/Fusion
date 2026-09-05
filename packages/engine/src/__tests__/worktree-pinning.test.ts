@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { workspaceRepoSegment, workspaceWorktreeGroupSegment } from "@fusion/core";
 import {
   isTaskPinnedWorktreeNaming,
   pinnedWorktreeSlug,
@@ -10,12 +11,9 @@ import {
 
 describe("worktree-pinning", () => {
   describe("isTaskPinnedWorktreeNaming", () => {
-    it("is true only for task-id naming", () => {
-      expect(isTaskPinnedWorktreeNaming({ worktreeNaming: "task-id" })).toBe(true);
-      expect(isTaskPinnedWorktreeNaming({ worktreeNaming: "random" })).toBe(false);
-      expect(isTaskPinnedWorktreeNaming({ worktreeNaming: "task-title" })).toBe(false);
-      expect(isTaskPinnedWorktreeNaming({})).toBe(false);
-      expect(isTaskPinnedWorktreeNaming(undefined)).toBe(false);
+    it("is always true because every task now has a task-ID worktree", () => {
+      expect(isTaskPinnedWorktreeNaming()).toBe(true);
+      expect(isTaskPinnedWorktreeNaming({})).toBe(true);
     });
   });
 
@@ -50,25 +48,41 @@ describe("worktree-pinning", () => {
       const b = pinnedWorktreePathForTask("FN-9", {}, "/repo");
       expect(a).toBe(b);
     });
+
+    it("groups task-id paths by workspace and repository under a configured root", () => {
+      const workspaceRoot = "/projects/PRD-1234-my-slug";
+      const settings = { worktreesDir: "/shared/worktrees" };
+      const api = pinnedWorktreePathForTask("FN-9162", settings, join(workspaceRoot, "api"), {
+        workspaceRootDir: workspaceRoot,
+        repoRelPath: "api",
+      });
+      const web = pinnedWorktreePathForTask("FN-9162", settings, join(workspaceRoot, "web"), {
+        workspaceRootDir: workspaceRoot,
+        repoRelPath: "web",
+      });
+      expect(api).toBe(join("/shared/worktrees", workspaceWorktreeGroupSegment(workspaceRoot), workspaceRepoSegment("api"), "fn-9162"));
+      expect(web).toBe(join("/shared/worktrees", workspaceWorktreeGroupSegment(workspaceRoot), workspaceRepoSegment("web"), "fn-9162"));
+      expect(api).not.toBe(web);
+    });
   });
 
   describe("preservedWorktreeTargetPathForTask", () => {
-    it("uses the task id for task-pinned naming", () => {
+    it("uses the task ID regardless of stale source metadata", () => {
       expect(preservedWorktreeTargetPathForTask(
         "FN-8400",
         "/legacy/recover-fn-8400",
-        { worktreeNaming: "task-id" },
+        {},
         "/repo",
       )).toBe("/repo/.worktrees/fn-8400");
     });
 
-    it("preserves the legacy basename for non-pinned naming", () => {
+    it("does not preserve a legacy basename", () => {
       expect(preservedWorktreeTargetPathForTask(
         "FN-8400",
         "/legacy/recover-fn-8400",
-        { worktreeNaming: "random" },
+        {},
         "/repo",
-      )).toBe("/repo/.worktrees/recover-fn-8400");
+      )).toBe("/repo/.worktrees/fn-8400");
     });
   });
 });

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import {
   makeTask,
   noop,
@@ -20,7 +20,7 @@ afterEach(async () => {
 });
 
 describe("TaskDetailModal spec-lock report", () => {
-  it("renders persisted Mission-statement divergence and immutable provenance in the shared Definition surface", async () => {
+  it("renders persisted Mission-statement divergence and immutable provenance from Details diagnostics", async () => {
     const { fetchSpecLock } = await import("../../api");
     vi.mocked(fetchSpecLock).mockResolvedValue({
       latestLock: {
@@ -55,11 +55,10 @@ describe("TaskDetailModal spec-lock report", () => {
 
     render(
       <TaskDetailContent
-        initialTab="definition"
+        initialTab="details"
         active
         task={makeTask({ prompt: "## Mission\n\nChanged" })}
         onRequestClose={noop}
-        onMoveTask={noopMove}
         onDeleteTask={noopDelete}
         onMergeTask={noopMerge}
         onOpenDetail={noopOpenDetail}
@@ -68,6 +67,7 @@ describe("TaskDetailModal spec-lock report", () => {
       />,
     );
 
+    fireEvent.click(screen.getByRole("button", { name: "Expand debug details" }));
     const report = await screen.findByTestId("spec-lock-report");
     expect(report).toHaveAccessibleName("Spec lock alignment");
     expect(report).toHaveTextContent("diverged-needs-review");
@@ -75,6 +75,65 @@ describe("TaskDetailModal spec-lock report", () => {
     expect(report).toHaveTextContent("source revision 42");
     expect(report).toHaveTextContent("source hash source-hash");
     expect(report).toHaveTextContent("Retained history: lock v1; plan v1, plan v2; 2 reports");
+    expect(screen.getByRole("button", { name: "Details" })).toHaveClass("detail-tab-active");
+    expect(screen.queryByText("Progress", { exact: true })).toBeNull();
     await waitFor(() => expect(fetchSpecLock).toHaveBeenCalledWith("FN-099", undefined));
+  });
+
+  it("keeps an unavailable all-null report at the end without rendering findings", async () => {
+    const { fetchSpecLock } = await import("../../api");
+    vi.mocked(fetchSpecLock).mockResolvedValue({
+      latestLock: null,
+      activeLock: null,
+      currentPlan: null,
+      report: null,
+      latestReport: null,
+      history: { locks: [], currentPlans: [], reports: [] },
+    });
+
+    render(
+      <TaskDetailContent
+        initialTab="details"
+        active
+        task={makeTask()}
+        onRequestClose={noop}
+        onDeleteTask={noopDelete}
+        onMergeTask={noopMerge}
+        onOpenDetail={noopOpenDetail}
+        addToast={vi.fn()}
+        onTaskUpdated={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand debug details" }));
+    const report = await screen.findByTestId("spec-lock-report");
+    expect(report).toHaveTextContent("unavailable");
+    expect(report).toHaveTextContent("v—");
+    expect(report.querySelector(".spec-lock-findings")).toBeNull();
+    expect(screen.getByRole("button", { name: "Details" })).toHaveClass("detail-tab-active");
+  });
+
+  it("does not leave a spec-lock shell when no spec-lock data exists", async () => {
+    const { fetchSpecLock } = await import("../../api");
+    vi.mocked(fetchSpecLock).mockResolvedValue(null as never);
+
+    render(
+      <TaskDetailContent
+        initialTab="details"
+        active
+        task={makeTask()}
+        onRequestClose={noop}
+        onDeleteTask={noopDelete}
+        onMergeTask={noopMerge}
+        onOpenDetail={noopOpenDetail}
+        addToast={vi.fn()}
+        onTaskUpdated={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand debug details" }));
+    await waitFor(() => expect(fetchSpecLock).toHaveBeenCalledWith("FN-099", undefined));
+    expect(screen.queryByTestId("spec-lock-report")).toBeNull();
+    expect(screen.getByText("No debug details available.")).toBeInTheDocument();
   });
 });

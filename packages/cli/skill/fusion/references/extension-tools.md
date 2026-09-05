@@ -19,6 +19,8 @@ Create a new task on the Fusion task board. The task enters the planning column 
 | `agentId` | string | — | Agent ID to assign this task to (e.g. 'agent-abc123') |
 | `priority` | string(enum) | — | Task priority (low, normal, high, urgent) |
 | `workflow_id` | string | — | Workflow ID to select for the new task (e.g. 'WF-003' or 'builtin:coding'). Omit to inherit the project default workflow. Use fn_workflow_list to discover valid IDs. |
+| `github_tracking` | boolean | — | Per-task GitHub issue tracking override. true links a tracking issue to this task; false disables tracking even when the project/global default enables it. Omit to inherit the project/global default. |
+| `github_repo` | string | — | "owner/repo" override for the GitHub tracking issue's repository. Omit to use the project/global default repo. |
 
 ### fn_task_update
 
@@ -54,7 +56,7 @@ Show full details for a task including steps, progress, and log entries.
 
 ### fn_task_logs_read
 
-Read a task's full persisted agent log with pagination and optional type filtering.
+Read a task's persisted agent log with pagination and optional type filtering. Tool detail is previewed per row by default; detail: full lifts the row preview while the whole response remains bounded.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -62,6 +64,7 @@ Read a task's full persisted agent log with pagination and optional type filteri
 | `limit` | number | — | Maximum matching entries to return (default 100). |
 | `offset` | number | — | Number of matching entries to skip from newest (default 0). |
 | `type` | union | — | Only return entries of this agent-log type. |
+| `detail` | union | — | Tool-detail mode. Preview (default) bounds each detail row; full lifts that row preview while the whole response remains bounded. |
 
 ### fn_task_attach
 
@@ -141,13 +144,14 @@ Unarchive an archived task (move from archived → its restore column). Restores
 
 ### fn_task_delete
 
-Soft-delete a task from active Fusion board views. The task row and artifacts are preserved; optional allowResurrection marks the ID for intentional recreation. If the task is still referenced as a lineage parent by another task, deletion is rejected unless removeLineageReferences:true is passed.
+Soft-delete a task from active Fusion board views. The task row and artifacts are preserved; optional allowResurrection marks the ID for intentional recreation. If live lineage children or dependents still reference the task, deletion is rejected unless the matching explicit reference-removal option is passed.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `id` | string | ✓ | Task ID to delete (e.g. FN-001) |
 | `allowResurrection` | boolean | — | When true, mark this tombstone as explicitly reusable for future recreation. |
 | `removeLineageReferences` | boolean | — | When true, clear incoming lineage-parent references (child sourceParentTaskId) before deleting, so a task still referenced as a lineage parent can be removed. |
+| `removeDependencyReferences` | boolean | — | When true, remove incoming dependency edges before soft deletion. Omit or pass false to retain the dependent-conflict refusal. |
 
 ### fn_task_browse_gitlab_project_issues
 
@@ -523,6 +527,23 @@ Link a feature to a fn task for implementation. Updates the feature status to 't
 |-----------|------|----------|-------------|
 | `featureId` | string | ✓ | Feature ID to link (e.g., F-001) |
 | `taskId` | string | ✓ | Task ID to link to (e.g., FN-001) |
+
+### fn_feature_repoint_task
+
+Atomically re-point an already-linked feature's single-valued taskId to a different task. Corrects a feature pinned to the wrong task (for example a shared vision doc) without the status-lossy unlink then link two-step. The target task must be live; same-task re-point is an idempotent no-op.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `featureId` | string | ✓ | Feature ID to re-point (e.g., F-001) |
+| `taskId` | string | ✓ | Task ID to re-point to (e.g., FN-001) |
+
+### fn_feature_unlink_task
+
+Detach a feature from its linked task entirely, clearing its single-valued taskId and demoting its status to 'defined'. Use before the documented safe duplicate-cleanup and reconcile-done flow. Returns a clear error if the feature is not currently linked to any task.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `featureId` | string | ✓ | Feature ID to unlink (e.g., F-001) |
 
 ### fn_feature_set_status
 

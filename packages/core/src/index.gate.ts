@@ -42,31 +42,54 @@ version of this file was falsified: 141/335 gate tests failed on missing
 etc. pulled in by production modules, not test files).
 */
 
-export { COLUMNS, DEFAULT_COLUMN, isColumn, normalizeColumnId, COLUMN_LABELS, COLUMN_DESCRIPTIONS, VALID_TRANSITIONS, DEFAULT_SETTINGS, DEFAULT_GLOBAL_SETTINGS, DEFAULT_PROJECT_SETTINGS, GLOBAL_SETTINGS_KEYS, PROJECT_SETTINGS_KEYS, isGlobalSettingsKey, isProjectSettingsKey, isMergeRequestContractShadowEnabled, resolvePersistAgentThinkingLog, THINKING_LEVELS, ANTHROPIC_AUTH_PREFERENCES, THEME_MODES, COLOR_THEMES, SUPPORTED_LOCALES, DEFAULT_LOCALE, isLocale, AGENT_PERMISSIONS, PERMANENT_AGENT_ACTION_CATEGORIES, AGENT_PERMISSION_POLICY_ACTION_CATEGORIES, AGENT_PROVISIONING_APPROVAL_MODES, SANDBOX_PROVISIONING_APPROVAL_MODES, AGENT_PERMISSION_POLICY_PRESET_IDS, LEGACY_AGENT_PERMISSION_POLICY_ACTION_CATEGORY_ALIASES, APPROVAL_REQUEST_STATUSES, APPROVAL_REQUEST_AUDIT_EVENT_TYPES, normalizeApprovalRequestActionCategory, isValidApprovalRequestTransition, agentToConfigSnapshot, diffConfigSnapshots, isEphemeralAgent, hasAgentIdentity, CheckoutConflictError, DEFAULT_HEARTBEAT_PROCEDURE_PATH, getDefaultHeartbeatProcedurePath, EXECUTION_MODES, DEFAULT_EXECUTION_MODE, PLANNER_OVERSIGHT_LEVELS, DEFAULT_PLANNER_OVERSIGHT_LEVEL, TASK_PRIORITIES, DEFAULT_TASK_PRIORITY, WORKFLOW_WORK_ITEM_KINDS, WORKFLOW_WORK_ITEM_STATES, HIGH_FANOUT_BLOCKER_TODO_THRESHOLD, STALE_HIGH_FANOUT_BLOCKER_AGE_THRESHOLD_MS, DASHBOARD_USER_ID, normalizeMessageParticipant, validateMessageMetadata, resolveEphemeralTaskCreationPolicy, validateDockerNodeConfig, sanitizeDockerNodeConfigForResponse, normalizeMergeIntegrationWorktreeMode, normalizeMergeAdvanceAutoSyncMode, DEFAULT_GITLAB_API_BASE_URL, DEFAULT_GITLAB_INSTANCE_URL, resolveGitlabConfig, resolveGitlabEnabled, MERGE_ADVANCE_AUTO_SYNC_MODES, normalizeMergeConflictStrategy, normalizeMergeStrategyOverlapBehavior, normalizePostMergeAuditMode, POST_MERGE_AUDIT_MODES, normalizeMergeAuditAutoRecovery, MERGE_AUDIT_AUTO_RECOVERY_MODES, normalizeMergerMode, MERGER_MODES, normalizeAutoRecovery, AUTO_RECOVERY_MODES, buildResearchDocumentKey, REPO_OVERRIDE_RE, SHARED_STATE_SNAPSHOT_VERSION, sanitizeCliAgentSettings, sanitizeCliAgentsSettings, sanitizeMcpServers, CLI_AGENT_ADAPTER_IDS, CLI_AGENT_AUTONOMY_MODES, isMcpSecretRef, OVERSEER_INTERVENTION_MUTATION } from "./types.js";
-export type { Column, ColumnId, IssueInfo, IssueState, TaskSourceIssue, TaskGitLabTracking, TaskGitLabTrackedItem, GitLabTrackedItemKind, PrInfo, PrConflictState, PrConflictDiagnostics, PrCheckState, PrCheckStatus, PrStatus, BranchGroup, BranchGroupCreateInput, BranchGroupUpdate, BranchGroupPrState, Task, TaskReleaseGateVerdict, TaskTokenUsage, TaskTokenUsagePerModel, TaskAttachment, TaskComment, TaskCommentInput, TaskDocument, TaskDocumentRevision, TaskDocumentCreateInput, ArchivedTaskDocumentAdditionInput, ArchivedTaskDocumentAdditionResult, TaskDocumentWithTask, ArtifactType, Artifact, ArtifactCreateInput, ArtifactWithTask, NativeStructureRef, NativeStructureOpenTarget, NativeStructurePreviewPayload, NativeStructureUnavailablePayload, NativeStructurePreviewResult, TaskCreateInput, TaskSource, SourceType, TaskDetail, RetrySummary, InboxTask, TodoList, TodoItem, TodoListCreateInput, TodoListUpdateInput, TodoItemCreateInput, TodoItemUpdateInput, TodoListWithItems, AgentLogEntry, AgentLogType, AgentRole, BoardConfig, DistributedTaskIdReserveInput, DistributedTaskIdReserveResult, DistributedTaskIdCommitInput, DistributedTaskIdCommitResult, DistributedTaskIdAbortInput, DistributedTaskIdAbortResult, DistributedTaskIdStateInput, DistributedTaskIdStateResult, AutostashOrphanRecord, AutostashOutcome, MergeDetails, MergeResult, MergeIntegrationWorktreeMode, MergeAdvanceAutoSyncMode, MergeConflictStrategy, CanonicalMergeConflictStrategy, MergeStrategyOverlapBehavior, PostMergeAuditMode, MergeAuditAutoRecoveryMode, MergerMode, MergerSettings, AutoRecoveryMode, AutoRecoveryFailureClass, AutoRecoverySettings, DirectMergeCommitStrategy, Settings, GlobalSettings, ProjectSettings, ReportMode, ReportActionType, ReportTarget, SecretsEnvConfig, WebSearchBackend, ResearchEnabledSources, ResearchGlobalDefaults, ResearchProjectLimits, ResearchProjectSettings, SandboxBackendName, SandboxFailureMode, SandboxPolicy, SandboxProjectSettings, EvalFollowUpPolicy, EvalProjectSettings, ResolvedEvalSettings, SettingsScope, DaemonTokenSettings, TaskStep, StepStatus, TaskLogEntry, RunMutationContext, ActivityLogEntry, ActivityEventType, ThinkingLevel, AnthropicAuthPreference, ThemeMode, ColorTheme, Locale, ExecutionMode, PlannerOversightLevel, TaskPriority, MergeQueueEntry, MergeQueueEnqueueOptions, MergeQueueAcquireOptions, MergeQueueReleaseOutcome, MergeRequestState, MergeRequestRecord, MergeRequestWorkflowProjectionOptions, CompletionHandoffMarker, WorkflowWorkItem, WorkflowWorkItemDueFilter, WorkflowWorkItemKind, WorkflowWorkItemState, WorkflowWorkItemTransitionPatch, WorkflowWorkItemUpsertInput, HandoffEvidence, HandoffToReviewOptions, UnavailableNodePolicy, OwningNodeHandoffPolicy, PlanningQuestion, PlanningSummary, PlanningResponse, PlanningQuestionType, ArchivedTaskEntry, BatchStatusRequest, BatchStatusResponse, BatchStatusEntry, BatchStatusResult, GithubIssueAction, ModelPreset, WorkflowStep, WorkflowStepMode, WorkflowStepGateMode, WorkflowStepPhase, WorkflowReviewKind, WorkflowStepInput, WorkflowStepResult, WorkflowStepTemplate, Agent, OrgTreeNode, AgentState, AgentDetail, AgentCreateInput, AgentUpdateInput, AgentApiKey, AgentApiKeyCreateResult, AgentCapability, AgentPromptTemplate, AgentPromptsConfig, AgentPermission, PermanentAgentActionCategory, PermanentAgentSensitiveActionCategory, PermanentAgentGatingContext, AgentPermissionPolicy, AgentPermissionPolicyRules, AgentPermissionPolicyToolRules, AgentPermissionPolicyActionCategory, AgentProvisioningApprovalMode, SandboxProvisioningApprovalMode, LegacyAgentPermissionPolicyActionCategory, ApprovalRequestActionCategoryInput, ApprovalRequestActionCategory, AgentPermissionPolicyDisposition, AgentPermissionPolicyPresetId, ApprovalRequestStatus, ApprovalRequestAuditEventType, ApprovalRequestActorSnapshot, ApprovalRequestTargetAction, ApprovalRequestAuditEvent, ApprovalRequest, ApprovalRequestCreateInput, ApprovalRequestDecisionInput, ApprovalRequestCompletionInput, ApprovalRequestListInput, TaskAssignSource, AgentAccessState, AgentHeartbeatConfig, AgentBudgetConfig, AgentBudgetStatus, InstructionsBundleConfig, MessageResponseMode, AgentHeartbeatEvent, AgentHeartbeatRun, BlockedStateSnapshot, HeartbeatInvocationSource, AgentTaskSession, AgentRating, AgentRatingSummary, AgentRatingInput, AgentConfigSnapshot, RevisionFieldDiff, AgentConfigRevision, AgentStats, ReflectionTrigger, ReflectionMetrics, AgentReflection, AgentPerformanceSummary, NtfyNotificationEvent, NotificationEvent, NotificationPayload, NotificationProviderConfig, CustomProvider, SteeringComment, ParticipantType, MessageType, Message, MessageCreateInput, MessageFilter, MessageMetadata, ProposedTaskMetadata, EphemeralTaskCreationPolicy, MessageReplyReference, MailKind, MailReportSection, MailReport, Mailbox, CheckoutLease, CheckoutClaimPrecondition, TaskClaimRow, CentralClaimStore, RunAuditDomain, RunAuditEvent, RunAuditEventInput, RunAuditEventFilter, AgentMemoryInclusionMode, HeartbeatPromptTemplate, HeartbeatScopeDisciplineMode, WorktrunkSettings, WorktrunkOnFailure, TaskBranchContext, CliAgentSettings, McpSecretRef, McpSensitiveValue, McpStdioTransport, McpSseTransport, McpStreamableHttpTransport, McpTransport, McpServerDefinition, McpServersSettings, GitlabConfigSettingsSource, ResolvedGitlabConfig, ResolveGitlabConfigInput, GitlabAuthTokenType, PlannerOversightStage, PlannerInterventionAction, PlannerInterventionOutcome, PlannerInterventionSourceLink, PlannerInterventionEntry, BackupSettingsMigrationCandidate, BackupSettingsMigrationConflict } from "./types.js";
+export { resolveTaskOutputLanguage, isTaskOutputLanguage } from "./ai/ai-output-language.js";
+export type { TaskOutputLanguage, ResolvedTaskOutputLanguage } from "./ai/ai-output-language.js";
+export { COLUMNS, DEFAULT_COLUMN, isColumn, normalizeColumnId, COLUMN_LABELS, COLUMN_DESCRIPTIONS, VALID_TRANSITIONS, DEFAULT_SETTINGS, DEFAULT_GLOBAL_SETTINGS, DEFAULT_PROJECT_SETTINGS, GLOBAL_SETTINGS_KEYS, PROJECT_SETTINGS_KEYS, isGlobalSettingsKey, isProjectSettingsKey, isMergeRequestContractShadowEnabled, resolvePersistAgentThinkingLog, THINKING_LEVELS, ANTHROPIC_AUTH_PREFERENCES, THEME_MODES, COLOR_THEMES, SUPPORTED_LOCALES, DEFAULT_LOCALE, isLocale, AGENT_PERMISSIONS, PERMANENT_AGENT_ACTION_CATEGORIES, AGENT_PERMISSION_POLICY_ACTION_CATEGORIES, AGENT_PROVISIONING_APPROVAL_MODES, SANDBOX_PROVISIONING_APPROVAL_MODES, AGENT_PERMISSION_POLICY_PRESET_IDS, LEGACY_AGENT_PERMISSION_POLICY_ACTION_CATEGORY_ALIASES, APPROVAL_REQUEST_STATUSES, APPROVAL_REQUEST_AUDIT_EVENT_TYPES, normalizeApprovalRequestActionCategory, isValidApprovalRequestTransition, agentToConfigSnapshot, diffConfigSnapshots, isEphemeralAgent, hasAgentIdentity, CheckoutConflictError, DEFAULT_HEARTBEAT_PROCEDURE_PATH, getDefaultHeartbeatProcedurePath, EXECUTION_MODES, DEFAULT_EXECUTION_MODE, PLANNER_OVERSIGHT_LEVELS, DEFAULT_PLANNER_OVERSIGHT_LEVEL, TASK_PRIORITIES, DEFAULT_TASK_PRIORITY, WORKFLOW_WORK_ITEM_KINDS, WORKFLOW_WORK_ITEM_STATES, HIGH_FANOUT_BLOCKER_TODO_THRESHOLD, STALE_HIGH_FANOUT_BLOCKER_AGE_THRESHOLD_MS, DASHBOARD_USER_ID, normalizeMessageParticipant, validateMessageMetadata, resolveEphemeralTaskCreationPolicy, validateDockerNodeConfig, sanitizeDockerNodeConfigForResponse, normalizeMergeIntegrationWorktreeMode, normalizeMergeAdvanceAutoSyncMode, DEFAULT_GITLAB_API_BASE_URL, DEFAULT_GITLAB_INSTANCE_URL, resolveGitlabConfig, resolveGitlabEnabled, MERGE_ADVANCE_AUTO_SYNC_MODES, normalizeMergeConflictStrategy, normalizeMergeStrategyOverlapBehavior, normalizePostMergeAuditMode, POST_MERGE_AUDIT_MODES, normalizeMergeAuditAutoRecovery, MERGE_AUDIT_AUTO_RECOVERY_MODES, normalizeMergerMode, MERGER_MODES, normalizeAutoRecovery, AUTO_RECOVERY_MODES, buildResearchDocumentKey, REPO_OVERRIDE_RE, SHARED_STATE_SNAPSHOT_VERSION, sanitizeCliAgentSettings, sanitizeCliAgentsSettings, normalizeChatSnippetName, normalizeChatSnippets, readChatSnippets, CHAT_SNIPPET_RESERVED_NAMES, CHAT_SNIPPET_MAX_ENTRIES, CHAT_SNIPPET_MAX_NAME_LENGTH, CHAT_SNIPPET_MAX_PROMPT_LENGTH, sanitizeMcpServers, CLI_AGENT_ADAPTER_IDS, CLI_AGENT_AUTONOMY_MODES, isMcpSecretRef, OVERSEER_INTERVENTION_MUTATION } from "./types.js";
+export type { ChatSnippet, Column, ColumnId, IssueInfo, IssueState, TaskSourceIssue, TaskGitLabTracking, TaskGitLabTrackedItem, GitLabTrackedItemKind, PrInfo, PrConflictState, PrConflictDiagnostics, PrCheckState, PrCheckStatus, PrStatus, BranchGroup, BranchGroupCreateInput, BranchGroupUpdate, BranchGroupPrState, Task, TaskReleaseGateVerdict, TaskTokenUsage, TaskTokenUsagePerModel, TaskAttachment, TaskComment, TaskCommentInput, TaskDocument, TaskDocumentRevision, TaskDocumentCreateInput, ArchivedTaskDocumentAdditionInput, ArchivedTaskDocumentAdditionResult, TaskDocumentWithTask, ArtifactType, Artifact, ArtifactCreateInput, ArtifactWithTask, NativeStructureRef, NativeStructureOpenTarget, NativeStructurePreviewPayload, NativeStructureUnavailablePayload, NativeStructurePreviewResult, TaskCreateInput, TaskSource, SourceType, TaskDetail, RetrySummary, InboxTask, TodoList, TodoItem, TodoListCreateInput, TodoListUpdateInput, TodoItemCreateInput, TodoItemUpdateInput, TodoListWithItems, AgentLogEntry, AgentLogType, AgentRole, BoardConfig, DistributedTaskIdReserveInput, DistributedTaskIdReserveResult, DistributedTaskIdCommitInput, DistributedTaskIdCommitResult, DistributedTaskIdAbortInput, DistributedTaskIdAbortResult, DistributedTaskIdStateInput, DistributedTaskIdStateResult, AutostashOrphanRecord, AutostashOutcome, MergeDetails, MergeResult, MergeIntegrationWorktreeMode, MergeAdvanceAutoSyncMode, MergeConflictStrategy, CanonicalMergeConflictStrategy, MergeStrategyOverlapBehavior, PostMergeAuditMode, MergeAuditAutoRecoveryMode, MergerMode, MergerSettings, AutoRecoveryMode, AutoRecoveryFailureClass, AutoRecoverySettings, DirectMergeCommitStrategy, Settings, GlobalSettings, ProjectSettings, ReportMode, ReportActionType, ReportTarget, SecretsEnvConfig, WebSearchBackend, ResearchEnabledSources, ResearchGlobalDefaults, ResearchProjectLimits, ResearchProjectSettings, SandboxBackendName, SandboxFailureMode, SandboxPolicy, SandboxProjectSettings, EvalFollowUpPolicy, EvalProjectSettings, ResolvedEvalSettings, SettingsScope, DaemonTokenSettings, TaskStep, TaskStepReport, StepStatus, TaskLogEntry, RunMutationContext, ActivityLogEntry, ActivityEventType, ThinkingLevel, AnthropicAuthPreference, ThemeMode, ColorTheme, Locale, ExecutionMode, PlannerOversightLevel, TaskPriority, MergeQueueEntry, MergeQueueEnqueueOptions, MergeQueueAcquireOptions, MergeQueueReleaseOutcome, MergeRequestState, MergeRequestRecord, MergeRequestWorkflowProjectionOptions, CompletionHandoffMarker, WorkflowWorkItem, WorkflowWorkItemDueFilter, WorkflowWorkItemKind, WorkflowWorkItemState, WorkflowWorkItemTransitionPatch, WorkflowWorkItemUpsertInput, HandoffEvidence, HandoffToReviewOptions, UnavailableNodePolicy, OwningNodeHandoffPolicy, PlanningQuestion, PlanningSummary, PlanningResponse, PlanningQuestionType, ArchivedTaskEntry, BatchStatusRequest, BatchStatusResponse, BatchStatusEntry, BatchStatusResult, GithubIssueAction, ModelPreset, WorkflowStep, WorkflowStepMode, WorkflowStepGateMode, WorkflowStepPhase, WorkflowReviewKind, WorkflowStepInput, WorkflowStepResult, WorkflowStepTemplate, Agent, OrgTreeNode, AgentState, AgentDetail, AgentCreateInput, AgentUpdateInput, AgentApiKey, AgentApiKeyCreateResult, AgentCapability, AgentPromptTemplate, AgentPromptsConfig, AgentPermission, PermanentAgentActionCategory, PermanentAgentSensitiveActionCategory, PermanentAgentGatingContext, AgentPermissionPolicy, AgentPermissionPolicyRules, AgentPermissionPolicyToolRules, AgentPermissionPolicyActionCategory, AgentProvisioningApprovalMode, SandboxProvisioningApprovalMode, LegacyAgentPermissionPolicyActionCategory, ApprovalRequestActionCategoryInput, ApprovalRequestActionCategory, AgentPermissionPolicyDisposition, AgentPermissionPolicyPresetId, ApprovalRequestStatus, ApprovalRequestAuditEventType, ApprovalRequestActorSnapshot, ApprovalRequestTargetAction, ApprovalRequestAuditEvent, ApprovalRequest, ApprovalRequestCreateInput, ApprovalRequestDecisionInput, ApprovalRequestCompletionInput, ApprovalRequestListInput, TaskAssignSource, AgentAccessState, AgentHeartbeatConfig, AgentBudgetConfig, AgentBudgetStatus, InstructionsBundleConfig, MessageResponseMode, AgentHeartbeatEvent, AgentHeartbeatRun, BlockedStateSnapshot, HeartbeatInvocationSource, AgentTaskSession, AgentRating, AgentRatingSummary, AgentRatingInput, AgentConfigSnapshot, RevisionFieldDiff, AgentConfigRevision, AgentStats, ReflectionTrigger, ReflectionMetrics, AgentReflection, AgentPerformanceSummary, NtfyNotificationEvent, NotificationEvent, NotificationPayload, NotificationProviderConfig, CustomProvider, SteeringComment, ParticipantType, MessageType, Message, MessageCreateInput, MessageFilter, MessageMetadata, ProposedTaskMetadata, EphemeralTaskCreationPolicy, MessageReplyReference, MailKind, MailReportSection, MailReport, Mailbox, CheckoutLease, CheckoutClaimPrecondition, TaskClaimRow, CentralClaimStore, RunAuditDomain, RunAuditEvent, RunAuditEventInput, RunAuditEventFilter, AgentMemoryInclusionMode, HeartbeatPromptTemplate, HeartbeatScopeDisciplineMode, WorktrunkSettings, WorktrunkOnFailure, TaskBranchContext, CliAgentSettings, McpSecretRef, McpSensitiveValue, McpStdioTransport, McpSseTransport, McpStreamableHttpTransport, McpTransport, McpServerDefinition, McpServersSettings, GitlabConfigSettingsSource, ResolvedGitlabConfig, ResolveGitlabConfigInput, GitlabAuthTokenType, PlannerOversightStage, PlannerInterventionAction, PlannerInterventionOutcome, PlannerInterventionSourceLink, PlannerInterventionEntry, BackupSettingsMigrationCandidate, BackupSettingsMigrationConflict } from "./types.js";
 export { AGENT_VALID_TRANSITIONS, DUPLICATE_OF_METADATA_KEY, REPORT_ATTACHMENT_SOURCE, assertNotWorkspaceTaskMerge, isWorkspaceTask, WorkspaceTaskMergeError, normalizeAgentRoles } from "./types.js";
+export { MAX_TASK_STEP_REPORTS, MAX_TASK_STEP_REPORT_SUMMARY_CHARS, appendTaskStepReport } from "./workflows/task-step-reports.js";
 export {
   resolveEntryPointBranchAssignment,
   sanitizeBranchSegment,
   derivePerTaskBranchName,
   deriveAutoTaskBranchName,
+  BranchWriteProvenanceError,
   isValidBranchGroupBranchName,
   validateBranchGroupBranchName,
+  isValidTaskBranchName,
+  validateTaskBranchName,
+  classifyTaskBranchOrigin,
+  isFusionDeletableBranch,
+  isOperatorAttachEligibleBranch,
+  resolveTaskPrHeadBranch,
   filterTasksByBranchGroup,
 } from "./branch/branch-assignment.js";
 export type {
   EntryPointAssignmentMode,
   EntryPointBranchAssignmentInput,
   EntryPointBranchAssignment,
+  TaskBranchOrigin,
 } from "./branch/branch-assignment.js";
 export { customProviderRegistryKey } from "./ai/custom-provider-key.js";
 export {
   ANTHROPIC_PROVIDER_ID,
+  ANTHROPIC_API_KEY_PROVIDER_ID,
+  CLAUDE_FABLE_5_1_MODEL_ID,
   CLAUDE_SONNET_5_MODEL_ID,
   SUPPLEMENTAL_ANTHROPIC_PROVIDER_REGISTRATION,
   mergeSupplementalAnthropicModels,
+  toExecutionModelProviderId,
 } from "./ai/anthropic-models.js";
 export type { AnthropicProviderRegistration } from "./ai/anthropic-models.js";
+export {
+  ANTHROPIC_MODEL_MIN_CLAUDE_CODE_VERSION,
+  buildAnthropicClaudeCodeIdentityHeaders,
+  CLAUDE_CODE_CLIENT_VERSION_ENV,
+  CLAUDE_CODE_IMPERSONATED_VERSION,
+  compareClaudeCodeVersions,
+  parseClaudeCodeVersion,
+  resolveClaudeCodeClientVersion,
+} from "./ai/claude-code-identity.js";
 export {
   OPENAI_CODEX_PROVIDER_ID,
   GPT_5_6_LUNA_MODEL_ID,
@@ -78,6 +101,12 @@ export {
 export type { OpenAiCodexProviderRegistration } from "./ai/openai-models.js";
 export { detectImageMimeFromBytes } from "./i18n/image-mime.js";
 export type { DetectedImageMime } from "./i18n/image-mime.js";
+export { resolveUpdateAutomationSettings } from "./config/update-automation.js";
+export {
+  EXTERNALLY_MANAGED_UPDATES_ENV,
+  EXTERNALLY_MANAGED_UPDATE_MESSAGE,
+  resolveUpdatesExternallyManaged,
+} from "./config/update-management.js";
 export { redactSecrets } from "./secrets/redact-secrets.js";
 export {
   evaluatePromptCondition,
@@ -85,7 +114,7 @@ export {
   resolveEffectivePluginSettings,
 } from "./plugins/plugin-prompt-condition.js";
 export type { PromptConditionEvaluationResult } from "./plugins/plugin-prompt-condition.js";
-export { computePlanApprovalFingerprint, isPlanReviewSatisfied, resolvePlanApprovalRequired } from "./planner/plan-approval.js";
+export { buildPreservedPlanRespecifyPatch, computePlanApprovalFingerprint, isPlanReviewSatisfied, resolvePlanApprovalRequired, supersedePlanReviewResults } from "./planner/plan-approval.js";
 export { canonicalizePlan, createCurrentPlanEvidence, diffSpecLocks, isSpecLockActive, SPEC_LOCK_PARSER_VERSION } from "./planner/spec-lock.js";
 export { evaluateSpecDrift, hasPriorLockDivergence, isCurrentSpecDriftReport } from "./planner/drift-report.js";
 export type { CanonicalPlan, CanonicalPlanSection, CurrentPlanEvidence, SpecLock, SpecLockDiff, SpecLockSection } from "./planner/spec-lock.js";
@@ -275,8 +304,28 @@ export {
   resolveWorkflowOptionalSteps,
   resolveDefaultOnOptionalGroupIds,
   isWorkflowOptionalGroupEnabled,
+  isReportingOnlyOptionalGroup,
 } from "./workflows/workflow-optional-steps.js";
 export type { ResolvedWorkflowOptionalStep } from "./workflows/workflow-optional-steps.js";
+export { resolveWorkflowStepVerdictRequirement } from "./workflows/review-verdict-authority.js";
+export type { WorkflowStepVerdictRequirementInput } from "./workflows/review-verdict-authority.js";
+export {
+  FAST_LANE_STEP_NAME,
+  FAST_LANE_SKIP_VALUE,
+  FAST_MODE_BYPASS_ACTOR,
+  FAST_LANE_STEP_REVIEW_ROUTE_VALUE,
+  isFastExecutionMode,
+  isFastLaneSkippableCustomNode,
+  isFastLaneBypassedTemplateNode,
+  resolveFastLaneRoute,
+} from "./workflows/workflow-fast-lane.js";
+export type { FastLaneRoute, FastLaneTask } from "./workflows/workflow-fast-lane.js";
+export { resolveRequiredPreMergeStepIds, resolvePreMergeGateForTask } from "./merge/required-pre-merge-steps.js";
+export type { ResolvedPreMergeGate } from "./merge/required-pre-merge-steps.js";
+export { resolveStepReopenPolicy } from "./workflows/workflow-step-reopen-policy.js";
+/* FNXC:ReviewLaneRecommendations 2026-08-26-07:34: shared with the engine so a review-lane projection is screened by the same rule as the store boundary. */
+export { normalizeTaskRecommendations } from "./tasks/recommendation-validation.js";
+export type { StepReopenPolicy } from "./workflows/workflow-step-reopen-policy.js";
 export {
   applyPromptOverridesToIr,
   enumeratePromptBearingWorkflowNodes,
@@ -315,18 +364,41 @@ export {
 } from "./config/moved-settings.js";
 export {
   ensureGitRepositoryForProjectPath,
+  ensureProjectGitReadiness,
   GitRepositoryInitializationError,
+  WorkspaceRepoValidationError,
   detectWorkspaceRepos,
+  addWorkspaceRepo,
   loadWorkspaceConfig,
   saveWorkspaceConfig,
+  removeWorkspaceConfig,
+  setWorkspaceModeInConfig,
+  applyWorkspaceModeToggle,
+  withWorkspaceModeLock,
 } from "./git/git-repository.js";
 export type {
   GitRepositoryCommandResult,
   GitRepositoryCommandRunner,
   GitRepositoryEnsureOutcome,
   EnsureGitRepositoryOptions,
+  ProjectGitReadiness,
   WorkspaceConfig,
+  WorkspaceRepoValidationReason,
+  WorkspaceModeToggleOps,
+  WorkspaceModeToggleResult,
 } from "./git/git-repository.js";
+export {
+  WELL_KNOWN_INTEGRATION_BRANCHES,
+  selectIntegrationBranch,
+  ensureIntegrationBranchLocalRef,
+} from "./git/integration-branch-readiness.js";
+export type {
+  IntegrationBranchSource,
+  IntegrationBranchSelectionInput,
+  IntegrationBranchSelection,
+  IntegrationBranchReconciliation,
+  EnsureIntegrationBranchLocalRefOptions,
+} from "./git/integration-branch-readiness.js";
 
 // ── Trait model (U2) ─────────────────────────────────────────────────
 export type {
@@ -392,6 +464,7 @@ export {
   registerBuiltinStepParsers,
   parseStepHeadings,
   parseJsonSteps,
+  resolveAuthoredStepHeadingOffset,
   __resetStepParserRegistryForTests,
 } from "./tasks/step-parsers.js";
 export type {
@@ -440,7 +513,7 @@ export {
 } from "./plugins/plugin-gate-verdict.js";
 export type { PluginGateVerdict, ColumnPluginGate } from "./plugins/plugin-gate-verdict.js";
 // ── U6: workflow capacity (WIP) resolution shared by store + sweep ───────────
-export { resolveColumnCapacity, DEFAULT_WORKFLOW_POOL_ID, resolveCapacityPoolId, resolveWorktreeCapacityLimit} from "./workflows/workflow-capacity.js";
+export { resolveColumnCapacity, DEFAULT_WORKFLOW_POOL_ID, resolveCapacityPoolId, resolveWorktreeCapacityLimit, resolveMaxConcurrentSetting, resolveEffectiveConcurrency, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_WORKTREES } from "./workflows/workflow-capacity.js";
 export type { ColumnCapacity } from "./workflows/workflow-capacity.js";
 // ── U5: workflow lifecycle reconciliation (switch / edit / delete) ───────────
 export {
@@ -570,6 +643,7 @@ export {
   applyReviewSeverityGate,
   formatFindingsByPriority,
   formatResolvedFindings,
+  isActionableReviewFinding,
   isBlockingFinding,
   isReviewBlockingSeverity,
   resolveReviewBlockingSeverity,
@@ -614,12 +688,20 @@ export {
 } from "./db/archive-worktree-disposer.js";
 export {
   disposeTaskBeforeMove,
+  disposeTaskBeforeReset,
   getTaskMoveDisposer,
+  getTaskResetDisposer,
   registerTaskMoveDisposer,
+  registerTaskResetDisposer,
   type TaskMoveDisposer,
+  type TaskResetDisposer,
   type TaskMoveDisposalInput,
   type TaskMoveSource,
 } from "./tasks/task-move-disposer.js";
+export {
+  __setResetPublicationFailureForTesting,
+  resetTaskPublicationImpl,
+} from "./task-store/reset-lifecycle.js";
 export {
   acquireWorktreePathReservation,
   withWorktreePathReservation,
@@ -643,6 +725,10 @@ export {
   type RunningAgentCountSource,
   type RunningAgentCounts,
 } from "./agents/live-agent-count.js";
+export {
+  isWorktreeCapacityHolder,
+  type WorktreeCapacityTaskShape,
+} from "./agents/worktree-capacity-holder.js";
 export {
   setTaskCreatedHook,
   getTaskCreatedHook,
@@ -764,6 +850,7 @@ export {
   HandoffInvariantViolationError,
   TransitionRejectionError,
   type LegacyAutoMergeStampReconcileResult,
+  type MoveTaskOptions,
 } from "./store.js";
 export {
   STOPWORDS,
@@ -799,6 +886,23 @@ export {
   type NoOpCompletionMarker,
   type NoOpCompletionMarkerKind,
 } from "./merge/no-op-completion-marker.js";
+export {
+  REMEDIATION_VERIFICATION_STEP_NAME,
+  planRemediationPlacement,
+  resolveTrailingVerificationStepIndex,
+  type RemediationPlacementPlan,
+} from "./tasks/remediation-step-placement.js";
+export {
+  formatRemediationStepName,
+  isRemediationStep,
+  hasPendingRemediationWork,
+  hasPendingReviewRemediationWork,
+  remediationWaveCount,
+  hasOpenEquivalentRemediationStep,
+  remediationDeclaredFiles,
+} from "./tasks/remediation-steps.js";
+export type { RemediationStepInput } from "./tasks/remediation-steps.js";
+export type { AppendRemediationStepsOptions, AppendRemediationStepsResult } from "./task-store/remediation-step-ops.js";
 export { evaluateNoCommitsNoOpFinalize } from "./merge/no-commits-finalize-guard.js";
 export type { NoCommitsNoOpFinalizeEvaluation } from "./merge/no-commits-finalize-guard.js";
 export {
@@ -965,6 +1069,26 @@ export {
   buildAutoPauseClearPatch,
   buildManualRetryResetPatch,
 } from "./tasks/manual-retry-reset.js";
+export {
+  RESTART_STAGE_FENCE_REASON,
+  planTaskColumnRestart,
+} from "./tasks/task-column-restart.js";
+export {
+  EXTERNAL_BLOCK_STATUS,
+  EXTERNAL_BLOCK_PAUSE_REASON,
+  isTaskExternallyBlocked,
+  buildTaskExternalBlockPatch,
+  buildTaskExternalBlockClearPatch,
+  formatTaskExternalBlockReason,
+} from "./tasks/task-external-block.js";
+export type { TaskExternalBlock, TaskExternalBlockOrigin } from "./tasks/task-external-block.js";
+export { emitBoundedRunAudit } from "./run-audit/emit-bounded-run-audit.js";
+export type {
+  TaskColumnRestartEntryNode,
+  TaskColumnRestartPlan,
+  TaskColumnRestartRefusal,
+  TaskColumnRestartScope,
+} from "./tasks/task-column-restart.js";
 export type {
   TaskIdIntegrityAnomaly,
   TaskIdIntegrityAnomalyKind,
@@ -1050,7 +1174,13 @@ export { getPrimaryPrInfo, taskHasManualOpenPullRequest } from "./tasks/task-hel
 export {
   collectLandedMemberReviewAdvisories,
   getTaskMergeBlocker,
+  isPreMergeStepsNotRunBlocker,
+  PreMergeStepsNotRunError,
+  PRE_MERGE_STEPS_NOT_RUN_BLOCKER,
   getTaskHardMergeBlocker,
+  getMergeConfirmedFinalizationBlocker,
+  getUnfinishedStepTitles,
+  hasNonTerminalSteps,
   REVIEW_ELIGIBLE_SENTINEL_COLUMN,
   MERGE_CONFIRMED_TRANSIENT_STATUSES,
   clearMergeConfirmedTransientStatus,
@@ -1071,6 +1201,19 @@ export {
   type MergeTargetResolution,
   type MergeTargetResolverOptions,
 } from "./merge/task-merge.js";
+export { describeMergeContentShape } from "./merge/merge-content-descriptor.js";
+export type { MergeContentDescriptor } from "./merge/merge-content-descriptor.js";
+export {
+  AUTOMATED_BYPASS_ACTORS,
+  evaluatePreMergeApprovals,
+  isAuditedOperatorBypass,
+  requiresAuthoredReviewVerdict,
+  requiresContentReviewProof,
+  resolveUnprovenReviewApproval,
+} from "./merge/pre-merge-approval.js";
+export { getPostMergeFinalizeBlocker, planConfirmedMergeChecklistReconciliation } from "./merge/confirmed-merge-reconciliation.js";
+export type { ConfirmedMergeChecklistReconciliation } from "./merge/confirmed-merge-reconciliation.js";
+export type { PreMergeApproval, PreMergeApprovalState } from "./merge/pre-merge-approval.js";
 export {
   isBranchGroupMemberLanded,
   isBranchGroupComplete,
@@ -1116,6 +1259,8 @@ export {
   resolveConsecutiveToolFailureRetryBackoffMs,
   resolveConsecutiveToolFailureThreshold,
   resolveExecutorEscalationTarget,
+  resolveReviewConvergenceEscalationTarget,
+  resolveReviewArbitrationTarget,
 } from "./tasks/in-review-stall.js";
 export type { ExecutorEscalationTarget, InReviewStallSignal, InReviewStallCode, ProviderErrorClassification } from "./tasks/in-review-stall.js";
 export {
@@ -1436,11 +1581,13 @@ export {
   runBackupCommand,
   syncBackupAutomation,
   syncBackupRoutine,
+  planBackupRoutineSync,
+  buildBackupScheduleStatus,
   BACKUP_SCHEDULE_NAME,
   resolveBackendConnectionString,
   resolveGlobalBackupRoot,
 } from "./backup/backup.js";
-export type { BackupInfo, BackupOptions, BackupFileInfo, BackupPairInfo } from "./backup/backup.js";
+export type { BackupInfo, BackupOptions, BackupFileInfo, BackupPairInfo, BackupRoutineSyncPlan, BackupScheduleStatus } from "./backup/backup.js";
 export { GlobalRoutineStore } from "./automation/global-routine-store.js";
 export { migrateBackupSettingsToGlobalOnce, planBackupSettingsMigration, resolveBackupSettingsMigrationConflict } from "./backup/backup-settings-migration.js";
 export type { BackupSettingKey } from "./backup/backup-settings-migration.js";
@@ -1516,6 +1663,8 @@ export {
   applyTestModeOverrides,
   isTestModeActive,
   resolveExecutionSettingsModel,
+  resolveFastCheapSettingsModel,
+  resolveFastCheapThinkingLevel,
   resolveExecutorFallbackModel,
   resolvePlanningFallbackModel,
   resolveValidatorFallbackModel,
@@ -1589,11 +1738,15 @@ export {
 export type {
   TaskPrioritySortable,
   TaskColumnSortable,
+  TaskColumnSortMode,
+  ColumnSortMode,
   DoneColumnSortMode,
   DisplayColumnSortOptions,
   BuildUnblockWeightMapOptions,
   PriorityFanoutComparatorContext,
 } from "./tasks/task-priority.js";
+export { fileScopeLeaseBlocksCandidate, normalizeOverlapScopeForTask, taskHoldsUnmergedCheckout } from "./tasks/file-scope-lease.js";
+export type { FileScopeLeaseClassification, FileScopeLeaseKind } from "./tasks/file-scope-lease.js";
 
 // ── Mission Hierarchy Types ────────────────────────────────────────────
 
@@ -1885,6 +2038,7 @@ export {
   readProjectMemoryWithBackend,
   searchProjectMemory,
   getProjectMemory,
+  buildProactiveMemoryCueBlock,
   resolveMemoryInstructionContext,
   type MemoryInstructionContext,
 } from "./memory/project-memory.js";
@@ -1937,14 +2091,67 @@ export {
   readMemory,
   writeMemory,
   memoryExists,
+  captureMemory,
   MEMORY_BACKEND_SETTINGS_KEYS,
   DEFAULT_MEMORY_BACKEND,
   isQmdAvailable,
 } from "./memory/memory-backend.js";
 
-export { MemoryBackendError } from "./memory/memory-backend.js";
+export {
+  MemoryBackendError,
+  type MemoryBackendErrorCode,
+} from "./memory/memory-backend-error.js";
 
-export type { MemoryBackendCapabilities, MemoryFileInfo, MemoryGetOptions, MemoryGetResult, MemorySearchOptions, MemorySearchResult } from "./memory/memory-backend.js";
+// FNXC:StashBackend 2026-08-13-16:35: (RUFU-068) expose the Stash backend.
+export {
+  StashMemoryBackend,
+  DEFAULT_STASH_URL,
+  // FNXC:RUFU121CoreExports 2026-08-18-19:53: RUFU-121 recall + delete-sync helpers.
+  normalizeStashSearchQuery,
+  queryStashEvents,
+  deleteStashChatSession,
+  // FNXC:RUFU125CoreExports 2026-08-19-06:07: RUFU-125 bulk archival delete-sync helpers.
+  DEFAULT_STASH_BULK_MAX_PAGES,
+  deleteStashChatSessions,
+  bulkDeleteStashChatSessions,
+} from "./memory/memory-backend-stash.js";
+export type {
+  StashEvent,
+  StashHttpMethod,
+  StashHttpClient,
+  StashEventQueryFilters,
+  StashChatSessionDeleteResult,
+  // FNXC:RUFU125CoreExports 2026-08-19-06:07: RUFU-125 bulk delete-sync types.
+  StashBulkChatSessionDeleteResult,
+  StashBulkChatSessionSyncSummary,
+  StashBulkDeleteStore,
+} from "./memory/memory-backend-stash.js";
+
+// FNXC:RUFU121StashSettingsInCore 2026-08-18-19:53: (RUFU-121) Stash settings/secret
+// resolution moved from @fusion/engine into core (dashboard delete-sync consumer).
+export {
+  STASH_SECRET_KEY,
+  STASH_SECRET_SCOPE,
+  resolveStashMemorySettings,
+} from "./memory/stash-settings.js";
+export type {
+  MemoryBackendSettings,
+  StashSecretsReader,
+} from "./memory/stash-settings.js";
+
+export type {
+  MemoryBackendCapabilities,
+  MemoryFileInfo,
+  MemoryGetOptions,
+  MemoryGetResult,
+  MemorySearchOptions,
+  MemorySearchResult,
+  MemoryCaptureEvent,
+  MemoryCaptureResult,
+  MemoryCaptureEventType,
+  // FNXC:RUFU121CoreExports 2026-08-18-19:53: RUFU-121 write() identity meta.
+  MemoryWriteIdentity,
+} from "./memory/memory-backend.js";
 
 export {
   agentDailyMemoryPath,
@@ -2050,7 +2257,7 @@ export type {
   ResearchCancellationState,
 } from "./research/research-types.js";
 
-export { isExperimentalFeatureEnabled, GRAPH_NATIVE_POST_MERGE_FLAG } from "./config/experimental-features.js";
+export { isExperimentalFeatureEnabled, GRAPH_NATIVE_POST_MERGE_FLAG, CHAT_FOCUS_FLAG } from "./config/experimental-features.js";
 export {
   POST_MERGE_VERIFICATION_GROUP_ID,
   postMergeOptionalGroupNode,
@@ -2278,7 +2485,7 @@ export {
 export type { StoredAuthCredential } from "./secrets/oauth-credential-interop.js";
 
 // ── Error helpers ─────────────────────────────────────────
-export { getErrorMessage } from "./process/error-message.js";
+export { getErrorMessage, describeErrorChain, summarizeErrorForOperator } from "./process/error-message.js";
 
 // ── Secrets crypto ───────────────────────────────────────
 export {
@@ -2317,10 +2524,35 @@ export {
 } from "./secrets/secrets-sync-passphrase.js";
 export { suggestTaskPrefix } from "./tasks/task-prefix.js";
 /*
+FNXC:WorkspaceWorktree 2026-08-20-02:45:
+The engine-core gate barrel must expose the shared workspace worktree layout helpers because engine path resolution imports them at runtime.
+*/
+export {
+  WORKSPACE_GROUP_MARKER_FILENAME,
+  sanitizePathSegment,
+  assertWorkspaceRepoRelPath,
+  workspaceWorktreeGroupSegment,
+  workspaceRepoSegment,
+  LEGACY_WORKTREES_DIRNAME,
+  resolveWorktreesDirLayout,
+  resolveLegacyWorktreesDirLayout,
+  resolveWorktreesDirCandidates,
+  isStrictDescendantPath,
+  resolveWorkspaceTaskWorktreeDir,
+  resolveWorkspaceRepoWorktreePath,
+  isLegacyWorkspaceWorktreeLayout,
+} from "./tasks/worktree-layout.js";
+export type { WorkspaceWorktreeContext } from "./tasks/worktree-layout.js";
+export { buildTaskResetWorktreePlan, SINGULAR_RESET_WORKTREE_REPO_REL } from "./tasks/task-reset-targets.js";
+export type { BuildTaskResetWorktreePlanOptions, TaskResetWorktreePlan, TaskResetWorktreeTarget } from "./tasks/task-reset-targets.js";
+/*
 FNXC:WorkflowStepResults 2026-07-19-01:00:
 Keep this gate-safe barrel's workflow-step-results re-exports in SYNC with the main barrel (index.ts). The `engine-core` vitest project builds its @fusion/core from THIS file (scripts/build-engine-core-gate-bundle.mjs), so any lease/step-result export present in index.ts but missing here resolves to `undefined` ONLY under engine-core — which is exactly how U3's `classifyReviewLease` went missing and threw "classifyReviewLease is not a function" on every defaultOn Plan Review run in that project (caught by task-pipeline-smoke). When adding an export to the index.ts workflow-step-results block, add it here too.
 */
 export {
+  WORKFLOW_STEP_NOT_RUN_REASONS,
+  isWorkflowStepNotRun,
+  type WorkflowStepNotRunReason,
   upsertWorkflowStepResult,
   normalizeWorkflowReviewFindings,
   isWorkflowReviewFindingSeverity,
@@ -2328,15 +2560,25 @@ export {
   isOpenWorkflowReviewFinding,
   normalizeSupersededFindingIds,
   applySupersededFindingIds,
+  applySupersededPriorAttemptFindingIds,
+  archiveTerminalWorkflowStepFailures,
+  archiveArbitratedWorkflowStepFailure,
+  isArchivedRemediationCarrier,
+  collectDisputedFindings,
+  closeUnrebuttedDisputedFindings,
   MAX_WORKFLOW_REVIEW_FINDINGS,
   WORKFLOW_REVIEW_FINDING_SEVERITIES,
   WORKFLOW_REVIEW_FINDING_RESOLUTIONS,
   MAX_WORKFLOW_STEP_PRIOR_ATTEMPTS,
   PLAN_REVIEW_LEASE_STALENESS_MS,
+  REMEDIATION_ATTEMPT_CLAIM_STALENESS_MS,
+  classifyRemediationAttemptClaim,
   classifyReviewLease,
   makeReviewLeaseRecord,
   isTerminalStepResult,
   type ReviewLeaseDisposition,
+  type RemediationAttemptClaimDisposition,
+  type ArbitrationFailureFence,
 } from "./workflows/workflow-step-results.js";
 export { PLAN_REVIEW_COMPLETENESS_POLICY } from "./agents/planning-review-policy.js";
 /*
@@ -2350,12 +2592,13 @@ export type { WorkflowEventBus, WorkflowEventSubscriber, WorkflowEventSubscripti
 export { findWorkflowEventShapeViolations, isIdsOnlyWorkflowEvent, MAX_ID_VALUE_LENGTH, IMPLEMENTATION_EXITS } from "./types/workflow-events.js";
 export type { ImplementationExit } from "./types/workflow-events.js";
 export type { WorkflowLifecycleEvent, WorkflowLifecycleEventType, WorkflowLifecycleEventBase, TaskTransitionedEvent, NodeEnteredEvent, NodeCompletedEvent, RunSuspendedEvent, RunResumedEvent, WorkflowEventShapeViolation } from "./types/workflow-events.js";
-export { columnsWithFlag, columnHasFlag, resolveReboundTarget, resolveCompleteColumn, resolveMergeOrchestrationColumn, resolveLifecycleColumns, resolveTaskLifecycleColumns, resolveReviewColumns, resolveTerminalColumns} from "./workflows/workflow-lifecycle-traits.js";
+export { columnsWithFlag, columnHasFlag, resolveReboundTarget, resolveContainedBackwardTarget, resolveCompleteColumn, resolveMergeOrchestrationColumn, resolveLifecycleColumns, resolveTaskLifecycleColumns, resolveReviewColumns, resolveTerminalColumns} from "./workflows/workflow-lifecycle-traits.js";
 export type { LifecycleColumns } from "./workflows/workflow-lifecycle-traits.js";
 export { resolveReviewLevelSteps, applyReviewLevelPreset } from "./tasks/review-level-preset.js";
 export { LEGACY_STATUS_ADOPTION, resolveLegacyStatusAdoption, resolveReviewLevelBackfill, planLegacyAdoption, resolveOrphanedPendingStepResults, type LegacyAdoptionPlan, type LegacyAdoptionCandidate, type LegacyAdoptionAction, type LegacyAdoptionKind } from "./db/legacy-adoption.js";
 export { hashWorkflowIr, computeWorkflowIrPin, detectWorkflowDrift, type WorkflowIrPin } from "./workflows/workflow-ir-resolver.js";
-export { evaluateTransitionInvariants, evaluateMergeBlockerPostcondition, evaluateTerminalReentryPostcondition, evaluateCapacityRejection, isWipColumn, isTerminalColumn, isCompleteColumn, isHoldColumn, isHoldToWipBoundary, type CapacityFacts } from "./workflows/workflow-transition-policy.js";
+export { classifyLifecycleRole, classifyLifecycleDirection, evaluateForbiddenLifecyclePath, isSanctionedEngineBackwardMove, ENGINE_BACKWARD_MOVE_REASONS, LIFECYCLE_ROLE_RANK, type LifecycleRole, type LifecycleDirection, type ForbiddenLifecyclePath, type EngineBackwardMoveReason } from "./workflows/workflow-lifecycle-direction.js";
+export { evaluateTransitionInvariants, evaluateMergeBlockerPostcondition, evaluateTerminalReentryPostcondition, evaluateLifecycleDirectionPostcondition, evaluateCapacityRejection, isWipColumn, isTerminalColumn, isCompleteColumn, isHoldColumn, isHoldToWipBoundary, type CapacityFacts } from "./workflows/workflow-transition-policy.js";
 export { resolveProjectColumnsForRoles, resolveArchivedLanes, REVIEW_ROLES, TERMINAL_ROLES, LEGACY_COLUMN_IDS_BY_ROLE, type ProjectLaneVocabularyStore } from "./project-lane-vocabulary.js";
 // FNXC:GateBarrelSync 2026-07-19-12:20: stale-binary guard exports mirrored per the sync rule above (PR #2341 review).
 export { StaleBinarySchemaError, assertBinaryNotOlderThanDatabase } from "./postgres/schema-applier.js";

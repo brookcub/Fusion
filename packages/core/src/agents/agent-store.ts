@@ -104,6 +104,7 @@ import {
   clearLastBlockedState as clearLastBlockedStateAsync,
 } from "../async-stores/async-agent-store.js";
 import { createLogger } from "../process/logger.js";
+import { truncateAgentLogDetail } from "./agent-log-constants.js";
 import { FsWatchPollController } from "../process/fs-watch-poll-controller.js";
 import {
   BUILTIN_WORKFLOW_AGENT_BUNDLE_CONFIG,
@@ -1503,8 +1504,12 @@ export class AgentStore extends EventEmitter {
 
       await this.writeAgent(updated);
       this.emit("agent:stateChanged", agentId, currentState, newState);
-      /* FNXC:AgentActivityStream 2026-08-09-09:09: monitoring is fail-soft and still probes this in-memory agent against the live roster. */
-      if (this.asyncLayer) try { await appendAgentActivityEvent(this.asyncLayer, { type: "agent:state-changed", attributionClaim: resolveAgentActivityAttribution([{ id: agentId, provenance: "roster" }], "executor"), taskId: updated.taskId, occurredAt: updated.updatedAt, discriminator: updated.updatedAt, metadata: { fromState: currentState, toState: newState, source: "update" } }); } catch { /* monitoring must not block a state transition */ }
+      /*
+      FNXC:AgentActivityStream 2026-08-14-19:18:
+      FN-9041 removes roster state churn from the durable work-activity feed. State remains
+      observable through the roster and this live agent:stateChanged event without consuming
+      outbox retention reserved for task and workflow activity.
+      */
       this.emit("agent:updated", updated, currentState);
 
       return updated;
@@ -2164,10 +2169,10 @@ export class AgentStore extends EventEmitter {
   }
 
   /*
-  FNXC:MemoryAgent 2026-08-11-09:41:
-  Memory Keeper is custom because it is not a workflow-stage principal. Unlike the four routed
-  owners its heartbeat is enabled, while auto-claim remains off because it only maintains memory.
-  This runs during init, where createAgent name collisions would abort startup; preflight probes,
+  FNXC:MemoryAgent 2026-08-16-02:31:
+  Memory Keeper is custom because it is not a workflow-stage principal. Its heartbeat defaults off
+  until an operator opts in, while auto-claim remains off because it only maintains memory. This
+  runs during init, where createAgent name collisions would abort startup; preflight probes,
   a fallback name, a null degraded result, and the init-side catch keep an operator's same-named
   agent untouched and the project runnable.
   */
@@ -2200,7 +2205,13 @@ export class AgentStore extends EventEmitter {
             roles: [...BUILTIN_MEMORY_AGENT_DEFAULT.roles],
             title: BUILTIN_MEMORY_AGENT_DEFAULT.title,
             metadata: { [BUILTIN_MEMORY_AGENT_PROVENANCE_KEY]: true },
-            runtimeConfig: { enabled: true, autoClaimRelevantTasks: false, heartbeatIntervalMs: 3_600_000 },
+            /*
+            FNXC:MemoryAgent 2026-08-16-02:31:
+            Memory consolidation is opt-in: newly provisioned Memory Keepers must not begin
+            hourly autonomous heartbeats until an operator enables the existing heartbeat toggle.
+            Keep auto-claim off and the one-hour interval ready for that later opt-in.
+            */
+            runtimeConfig: { enabled: false, autoClaimRelevantTasks: false, heartbeatIntervalMs: 3_600_000 },
             instructionsText: BUILTIN_MEMORY_AGENT_DEFAULT.instructionsText,
             soul: BUILTIN_MEMORY_AGENT_DEFAULT.soul,
             bundleConfig: { ...BUILTIN_MEMORY_AGENT_DEFAULT.bundleConfig, files: [...BUILTIN_MEMORY_AGENT_DEFAULT.bundleConfig.files] },
@@ -2215,7 +2226,19 @@ export class AgentStore extends EventEmitter {
         return owner;
       }
       const metadata = { ...(owner.metadata ?? {}), [BUILTIN_MEMORY_AGENT_PROVENANCE_KEY]: true };
-      const runtimeConfig = { ...(owner.runtimeConfig ?? {}), enabled: true, autoClaimRelevantTasks: false, heartbeatIntervalMs: 3_600_000 };
+      const currentRuntimeConfig = owner.runtimeConfig ?? {};
+      /*
+      FNXC:MemoryAgent 2026-08-16-02:31:
+      Startup convergence owns the safe maintenance defaults but never an operator's explicit
+      heartbeat choice. Preserve either boolean direction across init runs; missing legacy config
+      adopts the opt-in default without unnecessarily rewriting an already-converged owner.
+      */
+      const enabled = typeof currentRuntimeConfig.enabled === "boolean" ? currentRuntimeConfig.enabled : false;
+      const runtimeConfig = currentRuntimeConfig.enabled === enabled
+        && currentRuntimeConfig.autoClaimRelevantTasks === false
+        && currentRuntimeConfig.heartbeatIntervalMs === DEFAULT_AGENT_HEARTBEAT_INTERVAL_MS
+        ? currentRuntimeConfig
+        : { ...currentRuntimeConfig, enabled, autoClaimRelevantTasks: false, heartbeatIntervalMs: DEFAULT_AGENT_HEARTBEAT_INTERVAL_MS };
       const updates: Partial<Agent> = {
         roles: [...BUILTIN_MEMORY_AGENT_DEFAULT.roles],
         role: "custom",
@@ -2225,7 +2248,9 @@ export class AgentStore extends EventEmitter {
         instructionsText: owner.instructionsText?.trim() ? owner.instructionsText : BUILTIN_MEMORY_AGENT_DEFAULT.instructionsText,
         soul: owner.soul?.trim() ? owner.soul : BUILTIN_MEMORY_AGENT_DEFAULT.soul,
       };
-      owner = { ...owner, ...updates, updatedAt: new Date().toISOString() };
+      const nextOwner = { ...owner, ...updates };
+      if (JSON.stringify(nextOwner) === JSON.stringify(owner)) return owner;
+      owner = { ...nextOwner, updatedAt: new Date().toISOString() };
       await this.writeAgent(owner, executor);
       return owner;
     };
@@ -2786,13 +2811,20 @@ export class AgentStore extends EventEmitter {
    * @param runId - The run ID
    * @param entry - The log entry to append
    */
+  /*
+  FNXC:AgentLogging 2026-08-29-05:06:
+  FN-253 makes tool detail default-persisted and dual-sunk by heartbeat loggers. Run logs previously
+  bypassed the shared task-log detail bound, so normalize tool detail before the existing 64 KB outer
+  guard while writing and emitting the same safe entry for reconnect-safe live viewers.
+  */
   async appendRunLog(agentId: string, runId: string, entry: AgentLogEntry): Promise<void> {
     const cap = AgentStore.RUN_LOG_ENTRY_MAX_BYTES;
+    const normalizedDetail = truncateAgentLogDetail(entry.detail, entry.type);
     const safeEntry: AgentLogEntry = {
       ...entry,
       text: entry.text.length > cap ? `${entry.text.slice(0, cap)}\n\n... (truncated, ${entry.text.length} chars)` : entry.text,
-      ...(entry.detail !== undefined && {
-        detail: entry.detail.length > cap ? `${entry.detail.slice(0, cap)}\n\n... (truncated, ${entry.detail.length} chars)` : entry.detail,
+      ...(normalizedDetail !== undefined && {
+        detail: normalizedDetail.length > cap ? `${normalizedDetail.slice(0, cap)}\n\n... (truncated, ${normalizedDetail.length} chars)` : normalizedDetail,
       }),
     };
     const line = JSON.stringify(safeEntry) + "\n";
@@ -3411,23 +3443,11 @@ export class AgentStore extends EventEmitter {
         if (stateChanged) {
           this.emit("agent:stateChanged", agent.id, previousState, agent.state);
           /*
-          FNXC:AgentActivityStream 2026-08-09-09:38:
-          A separate-process state transition may only become visible through this reconciliation observer. Reuse its durable updatedAt identity so an originating writer dedupes, while an older writer still gains one outbox row. Monitoring remains fail-soft.
+          FNXC:AgentActivityStream 2026-08-14-19:18:
+          FN-9041 keeps cross-process reconciliation on the roster/live state channel rather than
+          writing state churn to the durable work-activity outbox. Cache updates and both emitted
+          events remain intact so separate-process state observers still receive this transition.
           */
-          if (this.asyncLayer) {
-            try {
-              await appendAgentActivityEvent(this.asyncLayer, {
-                type: "agent:state-changed",
-                attributionClaim: resolveAgentActivityAttribution([{ id: agent.id, provenance: "roster" }], "executor"),
-                taskId: agent.taskId,
-                occurredAt: agent.updatedAt,
-                discriminator: agent.updatedAt,
-                metadata: { fromState: previousState, toState: agent.state, source: "reconciliation" },
-              });
-            } catch {
-              // Monitoring must not interrupt roster reconciliation.
-            }
-          }
           this.emit("agent:updated", agent, previousState);
         } else {
           this.emit("agent:updated", agent);

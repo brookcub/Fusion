@@ -66,6 +66,18 @@ describe("resolve model-lane thinking levels", () => {
     expect(resolveExecutorThinkingLevel(undefined, { defaultThinkingLevel: "low" })).toBe("low");
   });
 
+  it("resolves Fast thinking as task override → Fast lane → execution fallback", () => {
+    const settings = {
+      fastCheapThinkingLevel: "low",
+      fastCheapGlobalThinkingLevel: "medium",
+      executionThinkingLevel: "high",
+    } as const;
+    expect(resolveExecutorThinkingLevel("xhigh", settings, "fast")).toBe("xhigh");
+    expect(resolveExecutorThinkingLevel(undefined, settings, "fast")).toBe("low");
+    expect(resolveExecutorThinkingLevel(undefined, { fastCheapGlobalThinkingLevel: "medium", executionThinkingLevel: "high" }, "fast")).toBe("medium");
+    expect(resolveExecutorThinkingLevel(undefined, { executionThinkingLevel: "high" }, "fast")).toBe("high");
+  });
+
   it("resolves planning, reviewer, and summarization lane overrides before the global default", () => {
     expect(resolvePlanningThinkingLevel({ planningThinkingLevel: "low", planningGlobalThinkingLevel: "minimal", defaultThinkingLevel: "high" })).toBe("low");
     expect(resolvePlanningThinkingLevel({ planningThinkingLevel: "low", defaultThinkingLevel: "high" }, "xhigh")).toBe("xhigh");
@@ -257,6 +269,29 @@ describe("resolve session model parity", () => {
       provider: "anthropic",
       modelId: "claude-sonnet-4-5",
       credentialInstanceId: "work",
+    });
+  });
+
+  it("uses the Fast & Cheap lane only when Fast lacks an explicit task model", () => {
+    const fastSettings = {
+      ...settings,
+      fastCheapProvider: "openai",
+      fastCheapCredentialInstanceId: "cheap-credential",
+      fastCheapModelId: "gpt-4.1-mini",
+    };
+    expect(resolveExecutorSessionModel(undefined, undefined, fastSettings, undefined, undefined, "fast")).toEqual({
+      provider: "openai",
+      modelId: "gpt-4.1-mini",
+      credentialInstanceId: "cheap-credential",
+    });
+    expect(resolveExecutorSessionModel("task-provider", "task-model", fastSettings, undefined, "task-credential", "fast")).toEqual({
+      provider: "task-provider",
+      modelId: "task-model",
+      credentialInstanceId: "task-credential",
+    });
+    expect(resolveExecutorSessionModel(undefined, undefined, settings, undefined, undefined, "fast")).toEqual({
+      provider: "openai",
+      modelId: "gpt-4.1",
     });
   });
 
@@ -693,6 +728,111 @@ describe("createResolvedAgentSession", () => {
     );
   });
 
+  /*
+  FNXC:RuntimeSubscribeCompat 2026-08-22-02:36:
+  Workflow steps subscribe unconditionally, so the shared runtime boundary must
+  adapt callback-only plugin sessions instead of requiring every bundled and
+  vendored runtime to duplicate the same event bridge.
+  */
+  it("adds isolated subscribe delivery to callback-only plugin sessions", async () => {
+    const callbackSession = { dispose: vi.fn() } as any;
+    const createSessionMock = vi.fn().mockResolvedValue({ session: callbackSession });
+    const runtimePrompt = vi.fn(async () => {
+      const runtimeOptions = createSessionMock.mock.calls[0][0];
+      runtimeOptions.onText?.("answer");
+      runtimeOptions.onThinking?.("reasoning");
+      runtimeOptions.onToolStart?.("read_file", { path: "README.md" });
+      runtimeOptions.onToolEnd?.("read_file", false, { text: "ok" });
+    });
+    resolveRuntimeMock.mockResolvedValue({
+      runtime: {
+        id: "hermes",
+        name: "Hermes Runtime",
+        createSession: createSessionMock,
+        promptWithFallback: runtimePrompt,
+        describeModel: vi.fn(() => "hermes/test"),
+      },
+      runtimeId: "hermes",
+      wasConfigured: true,
+    });
+    const onText = vi.fn();
+    const onThinking = vi.fn();
+    const onToolStart = vi.fn();
+    const onToolEnd = vi.fn();
+
+    const { session } = await createResolvedAgentSession({
+      sessionPurpose: "executor",
+      cwd: "/tmp/project",
+      systemPrompt: "system",
+      onText,
+      onThinking,
+      onToolStart,
+      onToolEnd,
+    });
+    const events: unknown[] = [];
+    const unsubscribeThrowing = session.subscribe(() => {
+      throw new Error("broken subscriber");
+    });
+    const unsubscribe = session.subscribe((event) => events.push(event));
+
+    await (session as any).promptWithFallback("review");
+
+    expect(onText).toHaveBeenCalledWith("answer");
+    expect(onThinking).toHaveBeenCalledWith("reasoning");
+    expect(onToolStart).toHaveBeenCalledWith("read_file", { path: "README.md" });
+    expect(onToolEnd).toHaveBeenCalledWith("read_file", false, { text: "ok" });
+    expect(events).toEqual([
+      {
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "answer" },
+      },
+      {
+        type: "message_update",
+        assistantMessageEvent: { type: "thinking_delta", contentIndex: 1, delta: "reasoning" },
+      },
+      { type: "tool_execution_start", toolName: "read_file", args: { path: "README.md" } },
+      { type: "tool_execution_end", toolName: "read_file", isError: false, result: { text: "ok" } },
+    ]);
+
+    unsubscribeThrowing();
+    unsubscribe();
+    await (session as any).promptWithFallback("second review");
+    expect(events).toHaveLength(4);
+  });
+
+  it("preserves native subscription delivery on non-pi plugin sessions", async () => {
+    const nativeUnsubscribe = vi.fn();
+    const nativeSubscribe = vi.fn(() => nativeUnsubscribe);
+    const nativeSession = { subscribe: nativeSubscribe, dispose: vi.fn() } as any;
+    const createSessionMock = vi.fn().mockResolvedValue({ session: nativeSession });
+    resolveRuntimeMock.mockResolvedValue({
+      runtime: {
+        id: "acp",
+        name: "ACP Runtime",
+        createSession: createSessionMock,
+        promptWithFallback: vi.fn(),
+        describeModel: vi.fn(() => "acp/test"),
+      },
+      runtimeId: "acp",
+      wasConfigured: true,
+    });
+    const onText = vi.fn();
+
+    const { session } = await createResolvedAgentSession({
+      sessionPurpose: "executor",
+      cwd: "/tmp/project",
+      systemPrompt: "system",
+      onText,
+    });
+    const handler = vi.fn();
+
+    expect(session.subscribe).toBe(nativeSubscribe);
+    expect(session.subscribe(handler)).toBe(nativeUnsubscribe);
+    createSessionMock.mock.calls[0][0].onText?.("native answer");
+    expect(onText).toHaveBeenCalledWith("native answer");
+    expect(handler).not.toHaveBeenCalled();
+  });
+
   it("forwards plugin skill names and body paths to runtime session factory", async () => {
     const createSessionMock = vi.fn().mockResolvedValue({
       session: { prompt: vi.fn() },
@@ -970,6 +1110,30 @@ describe("createResolvedAgentSession", () => {
       }),
     );
     expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("preserves an identity-scoped Fusion subset without trusting injected fn_* names", async () => {
+    const createSessionMock = vi.fn().mockResolvedValue({ session: { prompt: vi.fn() } });
+    resolveRuntimeMock.mockResolvedValue({
+      runtime: { id: "cursor", name: "Cursor", createSession: createSessionMock, promptWithFallback: vi.fn(), describeModel: vi.fn(() => "cursor/auto") },
+      runtimeId: "cursor",
+      wasConfigured: true,
+    });
+    const trusted = { name: "fn_task_list", description: "", parameters: {}, execute: vi.fn() } as any;
+    const injected = { name: "fn_evil", description: "", parameters: {}, execute: vi.fn() } as any;
+
+    await createResolvedAgentSession({
+      sessionPurpose: "executor",
+      cwd: "/tmp/project",
+      systemPrompt: "system",
+      customTools: [injected, trusted],
+      fusionTools: [trusted],
+    });
+
+    const passed = createSessionMock.mock.calls[0][0];
+    expect(passed.customTools.map((tool: { name: string }) => tool.name)).toEqual(["fn_evil", "fn_task_list"]);
+    expect(passed.fusionTools.map((tool: { name: string }) => tool.name)).toEqual(["fn_task_list"]);
+    expect(passed.fusionTools[0]).toBe(passed.customTools[1]);
   });
 
   it("does not pre-wrap customTools for the pi runtime (createFnAgent owns the chain)", async () => {

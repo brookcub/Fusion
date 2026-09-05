@@ -8,7 +8,8 @@
  */
 import {TaskStore, storeLog} from "../store.js";
 import {InvalidFileScopeError, SelfDefeatingDependencyError, detectSelfDefeatingDependency, TombstonedTaskResurrectionError} from "./errors.js";
-import {mkdir, rename, rm, writeFile} from "node:fs/promises";
+import {and, eq, inArray, isNull, sql} from "drizzle-orm";
+import {mkdir, readFile, rename, rm} from "node:fs/promises";
 import {join} from "node:path";
 import {existsSync} from "node:fs";
 import {randomUUID} from "node:crypto";
@@ -17,6 +18,7 @@ import "../builtin-traits.js";
 import {applyReviewLevelPreset} from "../tasks/review-level-preset.js";
 import {normalizeTaskPriority} from "../tasks/task-priority.js";
 import {sanitizeTitle, summarizeTitle} from "../ai/ai-summarize.js";
+import {resolveTaskOutputLanguage} from "../ai/ai-output-language.js";
 import {extractTaskIdTokens, normalizeTitleForTaskId} from "../tasks/task-title-id-drift.js";
 import {resolveTitleSummarizerSettingsModel} from "../ai/model-resolution.js";
 import {resolveEffectiveSettingsById} from "../workflows/workflow-settings-resolver.js";
@@ -30,20 +32,71 @@ import type {WorkflowIr} from "../workflows/workflow-ir-types.js";
 import {DEFAULT_WORKFLOW_ID, getBuiltinWorkflow, isBuiltinWorkflowId} from "../workflows/builtin-workflows.js";
 import {columnsWithFlag} from "../workflows/workflow-lifecycle-traits.js";
 import {validateFileScopeInPromptContent} from "../task-store/file-scope.js";
-import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
+import {__setTaskActivityLogLimitsForTesting, rewriteHeadingLine} from "../task-store/comments.js";
 import {withTaskBranchContextInSourceMetadata} from "../task-store/branch-context.js";
 import {resolveCreateDeclaredSymbols} from "../tasks/task-symbol-resolution.js";
 import {softDeleteTaskRow as softDeleteTaskRowAsync, insertTaskRowInTransaction, isTaskIdConflictError} from "../task-store/async/async-persistence.js";
 import {recordRunAuditEvent as recordRunAuditEventAsync} from "../task-store/async/async-audit.js";
-import {recordRunAuditEventWithinTransaction} from "../postgres/data-layer.js";
+import {projectScopeFor, recordRunAuditEventWithinTransaction, taskProjectScope} from "../postgres/data-layer.js";
+import {withTaskWorkflowSerialization} from "./async/async-workflow-workitems.js";
+import * as schema from "../postgres/schema/index.js";
 import type {DbTransaction} from "../postgres/data-layer.js";
 import { resolveTaskPrefix } from "./task-prefix.js";
 import {assertValidProviderInstanceId} from "../provider-instance.js";
+import {writePromptFileAtomic} from "./prompt-file.js";
+import {BranchWriteProvenanceError, validateTaskBranchName} from "../branch/branch-assignment.js";
+import {loadWorkspaceConfig} from "../git/git-repository.js";
 import {
   getInternalIntakeOwnershipExemptionReason,
   resolveTaskIntakeOwner,
   type IntakeOwnershipExemption,
 } from "../tasks/task-intake-owner-resolver.js";
+
+/*
+FNXC:BranchNaming 2026-08-20-03:40:
+Creation is a branch-write boundary too: require an explicit origin so ownership is
+never inferred from a prefix, and preserve an operator's `fusion/...` branch marker.
+*/
+function normalizeCreateBranchProvenance(input: TaskCreateInput): TaskCreateInput {
+  if (input.branch === undefined) return input;
+  if (input.branchWriteOrigin !== "operator" && input.branchWriteOrigin !== "engine") {
+    throw new BranchWriteProvenanceError();
+  }
+  validateTaskBranchName(input.branch);
+  if (input.branchWriteOrigin === "operator") {
+    const existing = input.branchContext?.branchOverride;
+    if (existing?.branch === input.branch) return input;
+    return {
+      ...input,
+      branchContext: {
+        ...(input.branchContext ?? {}),
+        branchOverride: {by: "operator", at: new Date().toISOString(), branch: input.branch},
+      },
+    };
+  }
+  const {branchOverride: _override, ...branchContext} = input.branchContext ?? {};
+  return {...input, branchContext: Object.keys(branchContext).length > 0 ? branchContext : undefined};
+}
+
+/*
+FNXC:RepositoryScope 2026-08-29-08:50:
+FN-258 gives every workspace task the complete configured repository set at creation. The workspace
+configuration, rather than a task description or caller input, confirms that scope so subsequent
+acquisition, review, and landing share one unambiguous membership snapshot.
+*/
+async function resolveInitialRepositoryScope(store: TaskStore, now: string): Promise<Task["repositoryScope"]> {
+  const repositories = [...new Set(((await loadWorkspaceConfig(store.getRootDir()))?.repos ?? [])
+    .map((repo) => repo.trim())
+    .filter(Boolean))].sort();
+  if (repositories.length === 0) return undefined;
+  return {
+    repositories,
+    state: "confirmed",
+    revision: 1,
+    confirmedAt: now,
+    confirmedBy: "workspace",
+  };
+}
 
 type CreateTaskWithAfterInsert = TaskCreateInput & {
   /** Internal transaction hook; never persisted in task source metadata. */
@@ -137,9 +190,68 @@ async function resolveDefaultWorkflowIntakeColumn(store: TaskStore): Promise<str
   }
 }
 
+/*
+FNXC:TitleSummarization 2026-08-19-14:29:
+The deferred writer uses a fast preflight read for the common deleted/already-titled case, but the
+PostgreSQL UPDATE predicate is the authority. A title supplied by another process after that read
+must make the generated write a no-op rather than being overwritten by a later full-row update.
+*/
+async function persistDeferredTaskTitleIfUntitled(
+  store: TaskStore,
+  taskId: string,
+  title: string,
+): Promise<boolean> {
+  const observed = await store.getTask(taskId).catch(() => undefined);
+  if (!observed || observed.title?.trim()) return false;
+
+  const layer = store.asyncLayer!;
+  const updated = await layer.transactionImmediate(async (tx) => {
+    const scope = taskProjectScope(layer);
+    const conditions = [
+      eq(schema.project.tasks.id, taskId),
+      isNull(schema.project.tasks.deletedAt),
+      sql`btrim(coalesce(${schema.project.tasks.title}, '')) = ''`,
+      ...(scope ? [scope] : []),
+    ];
+    const [row] = await tx
+      .update(schema.project.tasks)
+      .set({ title, updatedAt: new Date().toISOString() })
+      .where(and(...conditions))
+      .returning();
+    return row ? store.rowToTask(store.pgRowToTaskRow(row)) : undefined;
+  });
+
+  if (!updated) return false;
+  await store.writeTaskJsonFile(store.taskDir(taskId), updated);
+  if (store.isWatching) store.taskCache.set(taskId, { ...updated });
+
+  // FNXC:TitleSummarization 2026-08-19-14:29: Keep the operator-visible prompt heading aligned without a second title mutation.
+  try {
+    const promptPath = join(store.taskDir(taskId), "PROMPT.md");
+    if (existsSync(promptPath)) {
+      const existingPrompt = await readFile(promptPath, "utf-8");
+      const triageStyle = /^#\s+Task:\s+[A-Z]+-\d+\s+-\s+/m.test(existingPrompt);
+      const heading = triageStyle
+        ? `Task: ${updated.id} - ${updated.title}`
+        : `${updated.id}: ${updated.title}`;
+      const nextPrompt = rewriteHeadingLine(existingPrompt, heading);
+      if (nextPrompt !== existingPrompt) await writePromptFileAtomic(promptPath, nextPrompt);
+    }
+  } catch (err) {
+    storeLog.warn(`[title-summarization] failed to sync PROMPT.md heading for ${taskId}`, {
+      taskId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  store.emitTaskLifecycleEventSafely("task:updated", [updated]);
+  return true;
+}
+
 export async function createTaskBackendImpl(store: TaskStore, input: TaskCreateInput, options?: {
  onSummarize?: (description: string) => Promise<string | null>; settings?: { autoSummarizeTitles?: boolean }; invokeTaskCreatedHook?: boolean; onProposalClaimConflict?: (task: Task) => void; ownershipExemption?: IntakeOwnershipExemption; },): Promise<Task> {
   /* FNXC:CredentialInstanceSelection 2026-08-01-05:43: validate task authoring input before persistence; ids are stored but runtime credential resolution remains unchanged. */
+  input = normalizeCreateBranchProvenance(input);
   for (const key of ["credentialInstanceId", "validatorCredentialInstanceId", "planningCredentialInstanceId", "mergerCredentialInstanceId"] as const) {
     const value = (input as unknown as Record<string, unknown>)[key];
     if (value !== undefined && value !== null) assertValidProviderInstanceId(value);
@@ -159,7 +271,7 @@ export async function createTaskBackendImpl(store: TaskStore, input: TaskCreateI
     successful prior proposal into a failed retry or emit a second owner signal.
     */
     if (input.proposalClaimId) {
-      const existing = (await store.listTasks()).find((task) => task.proposalClaimId === input.proposalClaimId);
+      const existing = await store.findTaskByProposalClaimId(input.proposalClaimId);
       if (existing) {
         options?.onProposalClaimConflict?.(existing);
         return existing;
@@ -201,6 +313,8 @@ export async function createTaskBackendImpl(store: TaskStore, input: TaskCreateI
         // Never-throw: fall back to the base settings (global lane only).
       }
       const summarizerModel = resolveTitleSummarizerSettingsModel(summarizerSettings);
+      /* FNXC:TaskOutputLanguage 2026-08-19-14:56: Capture the target before the deferred title call; its late writer must not observe a later settings change. */
+      const titleLanguageTarget = resolveTaskOutputLanguage(summarizerSettings, input.description);
       if (summarizerModel.provider && summarizerModel.modelId) {
         onSummarize = async (description: string) => {
           try {
@@ -209,6 +323,7 @@ export async function createTaskBackendImpl(store: TaskStore, input: TaskCreateI
               store.getRootDir(),
               summarizerModel.provider,
               summarizerModel.modelId,
+              titleLanguageTarget,
             );
           } catch {
             return null;
@@ -218,9 +333,15 @@ export async function createTaskBackendImpl(store: TaskStore, input: TaskCreateI
     }
 
     const title = input.title?.trim() || undefined;
+    /*
+    FNXC:TitleSummarization 2026-08-19-13:43:
+    The project-scoped autoSummarizeTitles snapshot is the sole automatic eligibility policy.
+    Do not reintroduce a description-length branch: every non-empty untitled create follows the
+    same setting, while summarize:true remains an explicit per-create force request.
+    */
     const shouldSummarize =
       !title &&
-      input.description.length > 200 &&
+      input.description.trim().length > 0 &&
       (input.summarize === true || resolvedSettings?.autoSummarizeTitles === true);
     const hasPendingSummarization = shouldSummarize && typeof onSummarize === "function";
     const shouldInvokeTaskCreatedHook = options?.invokeTaskCreatedHook !== false;
@@ -424,12 +545,9 @@ export async function createTaskBackendImpl(store: TaskStore, input: TaskCreateI
           if (sanitizedTitle) {
             await store.trackDeferredTaskCreatedWork(async () => {
               if (store.closing) return;
-              const currentTask = await store.getTask(id);
-              if (currentTask && !currentTask.title) {
-                const normalizedTitle = normalizeTitleForTaskId(sanitizedTitle, id);
-                if (normalizedTitle.title && !store.closing) {
-                  await store.updateTask(id, { title: normalizedTitle.title });
-                }
+              const normalizedTitle = normalizeTitleForTaskId(sanitizedTitle, id);
+              if (normalizedTitle.title && !store.closing) {
+                await persistDeferredTaskTitleIfUntitled(store, id, normalizedTitle.title);
               }
             });
           }
@@ -480,6 +598,7 @@ export class TaskIntakeOwnerResolutionError extends Error {
 }
 
 export async function _createTaskInternalBackendImpl(store: TaskStore, input: TaskCreateInput, title: string | undefined, resolvedWorkflowSteps: string[] | undefined, id: string, options?: { createdAt?: string; updatedAt?: string; promptOverride?: string; invokeTaskCreatedHook?: boolean; resolvedEntryColumn?: string; resolvedWorkflowIdForOwnership?: string; onProposalClaimConflict?: (task: Task) => void; deferTaskCreatedEvent?: boolean; onTaskInserted?: (task: Task) => void; ownershipExemption?: IntakeOwnershipExemption; },): Promise<Task> {
+    input = normalizeCreateBranchProvenance(input);
     const layer = store.asyncLayer!;
     const now = options?.createdAt ?? new Date().toISOString();
     /*
@@ -589,6 +708,7 @@ export async function _createTaskInternalBackendImpl(store: TaskStore, input: Ta
       ? { manual: false as boolean, intake: undefined as string | undefined, hold: undefined as string | undefined }
       : await resolveWorkflowIntakeFacts(store, input.workflowId ?? undefined);
     const declaredSymbols = resolveCreateDeclaredSymbols(input, options?.promptOverride);
+    const repositoryScope = await resolveInitialRepositoryScope(store, now);
     const task: Task = {
       id,
       lineageId: input.lineageId ?? generateTaskLineageId(),
@@ -618,8 +738,8 @@ export async function _createTaskInternalBackendImpl(store: TaskStore, input: Ta
       // no explicit column is given (main FN-7591 parity).
       column: input.column || options?.resolvedEntryColumn || fallbackIntakeColumn || "triage",
       dependencies: input.dependencies || [],
-      breakIntoSubtasks: input.breakIntoSubtasks === true ? true : undefined,
       noCommitsExpected: input.noCommitsExpected === true ? true : undefined,
+      repositoryScope,
       enabledWorkflowSteps: resolvedWorkflowSteps,
       modelPresetId: input.modelPresetId,
       assignedAgentId: ownership.status === "selected" ? ownership.agentId : undefined,
@@ -788,7 +908,7 @@ export async function _createTaskInternalBackendImpl(store: TaskStore, input: Ta
           throw new InvalidFileScopeError(id, validation.invalid);
         }
       }
-      await writeFile(join(stagingDir, "PROMPT.md"), prompt);
+      await writePromptFileAtomic(join(stagingDir, "PROMPT.md"), prompt);
     } catch (error) {
       await cleanupPreparedTaskFiles();
       if ((error as NodeJS.ErrnoException).code === "EEXIST") {
@@ -802,11 +922,43 @@ export async function _createTaskInternalBackendImpl(store: TaskStore, input: Ta
     // A duplicate-ID collision raises a unique_violation (23505) which we
     // catch and surface as "Task ID already exists" (matching the SQLite path).
     const context = store.createTaskPersistSerializationContext(task);
+    const dependencyIds = [...new Set((task.dependencies ?? []).map((dependencyId) => dependencyId.trim()))]
+      .filter((dependencyId) => dependencyId.length > 0)
+      .sort();
     try {
       await layer.transactionImmediate(async (tx) => {
-        // FNXC:MultiProjectIsolation 2026-07-10: stamp the bound projectId so the
-        // new task row is attributed to (and later filtered under) this project.
-        await insertTaskRowInTransaction(tx, task as unknown as Record<string, unknown>, context, layer.projectId);
+        /*
+        FNXC:DependencyIntegrity 2026-08-20-18:03:
+        Creation is a dependency writer too. Lock each normalized prerequisite in deterministic order
+        and revalidate its live row in this insertion transaction, so a missing, soft-deleted, or
+        concurrently forced-deleted task can never become a durable dependency edge.
+        */
+        const insertAfterDependencyValidation = async (): Promise<void> => {
+          await (store as unknown as { __afterDependencyTargetLocksForTest?: () => void | Promise<void> }).__afterDependencyTargetLocksForTest?.();
+          if (dependencyIds.length > 0) {
+            const liveDependencies = await tx.select({ id: schema.project.tasks.id })
+              .from(schema.project.tasks)
+              .where(and(
+                projectScopeFor(schema.project.tasks.projectId, layer.projectId),
+                isNull(schema.project.tasks.deletedAt),
+                inArray(schema.project.tasks.id, dependencyIds),
+              ));
+            if (liveDependencies.length !== dependencyIds.length) {
+              const liveIds = new Set(liveDependencies.map((row) => row.id));
+              const missingDependencyId = dependencyIds.find((dependencyId) => !liveIds.has(dependencyId));
+              throw new Error(`Dependency task ${missingDependencyId} not found`);
+            }
+          }
+          // FNXC:MultiProjectIsolation 2026-07-10: stamp the bound projectId so the
+          // new task row is attributed to (and later filtered under) this project.
+          await insertTaskRowInTransaction(tx, task as unknown as Record<string, unknown>, context, layer.projectId);
+        };
+        const serializeDependencyTargets = async (index: number): Promise<void> => {
+          if (index >= dependencyIds.length) return insertAfterDependencyValidation();
+          return withTaskWorkflowSerialization(tx, layer.projectId, dependencyIds[index], () =>
+            serializeDependencyTargets(index + 1));
+        };
+        await serializeDependencyTargets(0);
         /*
         FNXC:MissionAdmission 2026-07-23-19:00:
         The row insert establishes this task as the sole winner before its staged
@@ -845,7 +997,7 @@ export async function _createTaskInternalBackendImpl(store: TaskStore, input: Ta
       workflow materialization. Other unique violations remain task-ID errors.
       */
       if (input.proposalClaimId && isTaskIdConflictError(error)) {
-        const existing = (await store.listTasks()).find((candidate) => candidate.proposalClaimId === input.proposalClaimId);
+        const existing = await store.findTaskByProposalClaimId(input.proposalClaimId);
         if (existing) {
           options?.onProposalClaimConflict?.(existing);
           return existing;
@@ -916,7 +1068,7 @@ export async function createTaskWithReservedIdImpl(store: TaskStore, input: Task
       to its project-scoped partial index, so this replay read must not touch the
       removed SQLite backend before the shared insert boundary handles a race.
       */
-      const existing = (await store.listTasks()).find((task) => task.proposalClaimId === input.proposalClaimId);
+      const existing = await store.findTaskByProposalClaimId(input.proposalClaimId);
       if (existing) return existing;
     }
 
@@ -1044,7 +1196,7 @@ export async function createTaskWithReservedIdImpl(store: TaskStore, input: Task
       // materialized above would orphan with no task/selection pointing at them.
       await store.cleanupOrphanedMaterializedSteps(pendingWorkflowSelection?.stepIds);
       if (input.proposalClaimId && isTaskIdConflictError(err)) {
-        const existing = (await store.listTasks()).find((candidate) => candidate.proposalClaimId === input.proposalClaimId);
+        const existing = await store.findTaskByProposalClaimId(input.proposalClaimId);
         if (existing) return existing;
       }
       throw err;
@@ -1078,6 +1230,7 @@ export async function createTaskWithReservedIdImpl(store: TaskStore, input: Task
   }
 
 export async function _createTaskInternalImpl(store: TaskStore, input: TaskCreateInput, title: string | undefined, resolvedWorkflowSteps: string[] | undefined, id: string, options?: { createdAt?: string; updatedAt?: string; promptOverride?: string; invokeTaskCreatedHook?: boolean; resolvedEntryColumn?: string; onProposalClaimConflict?: (task: Task) => void; },): Promise<Task> {
+    input = normalizeCreateBranchProvenance(input);
     const now = options?.createdAt ?? new Date().toISOString();
     // FN-5077: null normalized titles are treated as "no title" and allow standard fallback/summarization behavior.
     const normalizedTitle = normalizeTitleForTaskId(title, id);
@@ -1108,6 +1261,7 @@ export async function _createTaskInternalImpl(store: TaskStore, input: TaskCreat
       ? { manual: false as boolean, intake: undefined as string | undefined, hold: undefined as string | undefined }
       : await resolveWorkflowIntakeFacts(store, input.workflowId ?? undefined);
     const declaredSymbols = resolveCreateDeclaredSymbols(input, options?.promptOverride);
+    const repositoryScope = await resolveInitialRepositoryScope(store, now);
     const task: Task = {
       id,
       lineageId: input.lineageId ?? generateTaskLineageId(),
@@ -1137,8 +1291,8 @@ export async function _createTaskInternalImpl(store: TaskStore, input: TaskCreat
       // no explicit column is given (main FN-7591 parity).
       column: input.column || options?.resolvedEntryColumn || fallbackIntakeColumn || "triage",
       dependencies: input.dependencies || [],
-      breakIntoSubtasks: input.breakIntoSubtasks === true ? true : undefined,
       noCommitsExpected: input.noCommitsExpected === true ? true : undefined,
+      repositoryScope,
       enabledWorkflowSteps: resolvedWorkflowSteps,
       modelPresetId: input.modelPresetId,
       assignedAgentId: input.assignedAgentId,
@@ -1279,7 +1433,7 @@ export async function _createTaskInternalImpl(store: TaskStore, input: TaskCreat
       }
     }
     await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, "PROMPT.md"), prompt);
+    await writePromptFileAtomic(join(dir, "PROMPT.md"), prompt);
 
     await store._maybeAutoArchiveSameAgentDuplicate(task, input);
 
@@ -1339,7 +1493,7 @@ export async function resolveSameAgentDuplicateIntake(store: TaskStore, task: Ta
     const nowMs = Date.now();
     const settings = await store.getSettings();
     const stickyWindowDays = Math.max(0, settings.tombstoneStickyWindowDays ?? 7);
-    const allCandidates = await store.listTasks({ slim: true, includeArchived: true, includeDeleted: true });
+    const allCandidates = await store.listTasksBySourceLineage({ sourceAgentId, sourceParentTaskId });
     const matches = findSameAgentDuplicates(
       { title: input.title ?? task.title, description: input.description, sourceParentTaskId },
       allCandidates.flatMap<SameAgentDuplicateCandidate>((candidate) => {

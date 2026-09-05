@@ -64,6 +64,11 @@ function makeFakeAcpAdapter(overrides?: {
 }
 
 describe("GrokRuntimeAdapter (ACP)", () => {
+  /*
+  FNXC:GrokAcp 2026-08-15-12:41:
+  Grok CLI v1.0.0 rejects `--no-auto-update`, so default ACP sessions must
+  omit it. The low-level argv builder retains the flag as an explicit opt-in.
+  */
   it("creates a session with default model fallback", async () => {
     const settingsOut: Record<string, unknown>[] = [];
     const adapter = new GrokRuntimeAdapter({ createAcpAdapter: makeFakeAcpAdapter({ settingsOut }) });
@@ -71,7 +76,7 @@ describe("GrokRuntimeAdapter (ACP)", () => {
     expect(result.session.model).toBe("grok/default");
     expect(result.session.systemPrompt).toBe("sys");
     const args = settingsOut[0]?.acpArgs as string[];
-    expect(args).toContain("--no-auto-update");
+    expect(args).not.toContain("--no-auto-update");
     expect(args).toContain("agent");
     expect(args).toContain("--plugin-dir");
     expect(args.at(-1)).toBe("stdio");
@@ -85,12 +90,13 @@ describe("GrokRuntimeAdapter (ACP)", () => {
     expect(session.model).toBe("grok-4.5");
     expect(settingsOut[0]?.acpBinaryPath).toBe("grok");
     const args = settingsOut[0]?.acpArgs as string[];
-    expect(args).toContain("--no-auto-update");
+    expect(args).not.toContain("--no-auto-update");
     expect(args).toContain("--plugin-dir");
     expect(args).toEqual(expect.arrayContaining(["-m", "grok-4.5", "stdio"]));
-    // plugin-dir precedes model flag; no-auto-update precedes agent
-    expect(args.indexOf("--no-auto-update")).toBeLessThan(args.indexOf("agent"));
+    // Agent leads the argv; plugin-dir precedes the selected model.
+    expect(args[0]).toBe("agent");
     expect(args.indexOf("--plugin-dir")).toBeLessThan(args.indexOf("-m"));
+    expect(args.at(-1)).toBe("stdio");
   });
 
   it("forwards operator MCP servers and Fusion custom tools into createSession", async () => {

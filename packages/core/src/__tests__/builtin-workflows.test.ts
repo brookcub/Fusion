@@ -13,7 +13,7 @@ import { BUILTIN_CODING_WORKFLOW_IR } from "../workflows/builtin-coding-workflow
 import { BUILTIN_STEPWISE_CODING_WORKFLOW_IR } from "../workflows/builtin-stepwise-coding-workflow-ir.js";
 import { BUILTIN_PR_WORKFLOW_IR } from "../workflows/builtin-pr-workflow-ir.js";
 import { BROWSER_VERIFICATION_GROUP_ID, BROWSER_VERIFICATION_STEP_NODE_ID } from "../workflows/builtin-browser-verification-group.js";
-import { CODE_REVIEW_STEP_NODE_ID } from "../workflows/builtin-code-review-group.js";
+import { CODE_REVIEW_STEP_NODE_ID, DEFAULT_CODE_REVIEW_MAX_REVISIONS } from "../workflows/builtin-code-review-group.js";
 import { PLAN_REVIEW_GROUP_ID, PLAN_REVIEW_STEP_NODE_ID } from "../workflows/builtin-plan-review-group.js";
 import { builtinPromptConfig, BUILTIN_SEAM_PROMPTS } from "../workflows/builtin-workflow-prompts.js";
 import { BUILTIN_WORKFLOW_SETTINGS } from "../workflows/builtin-workflow-settings.js";
@@ -59,6 +59,26 @@ describe("built-in workflows", () => {
     for (const wf of BUILTIN_WORKFLOWS) {
       expect(isBuiltinWorkflowId(wf.id)).toBe(true);
       expect(() => parseWorkflowIr(wf.ir)).not.toThrow();
+    }
+  });
+
+  /*
+  FNXC:PlanReviewNoOp 2026-08-22-03:37:
+  Every built-in that offers Plan Review must route CLOSE_NO_OP to the terminal no-op action.
+  A custom workflow without this route fails closed by holding at Plan Review; it never restarts planning.
+  */
+  it("routes Plan Review CLOSE_NO_OP verdicts to the terminal no-op action", () => {
+    for (const workflow of BUILTIN_WORKFLOWS) {
+      const planReview = workflow.ir.nodes.find((node) => node.id === "plan-review");
+      if (!planReview) continue;
+      expect(
+        workflow.ir.edges.some((edge) =>
+          edge.from === planReview.id
+          && edge.condition === "outcome:close-no-op"
+          && workflow.ir.nodes.find((node) => node.id === edge.to)?.config?.workflowAction === "plan-review-no-op",
+        ),
+        workflow.id,
+      ).toBe(true);
     }
   });
 
@@ -211,27 +231,65 @@ describe("built-in workflows", () => {
               ? 3
               : workflow.id === "builtin:compound-engineering" && gate === "code-review"
                 ? 2
-                : "unbounded",
+                : gate === "code-review"
+                  ? DEFAULT_CODE_REVIEW_MAX_REVISIONS
+                  : "unbounded",
         });
       }
     }
   });
 
-  it("all built-in workflows generate a task completion summary as a graph node", () => {
+  /*
+  FNXC:WorkflowCompletion 2026-08-25-10:20:
+  The invariant is that every built-in PRODUCES a card summary, not that it owns a node called
+  `completion-summary`. `builtin:coding-ideas-v2` folds the summary into its Documentation milestone,
+  writing it in the same pass as the delivery note and saving a model call per card. Pinning the node
+  id would have forced a second read-only session that exists only to satisfy a test.
+  What must NOT weaken: a workflow with neither a summary node nor a summary-writing milestone still
+  fails here, so a future built-in cannot ship with no card summary at all.
+
+  FNXC:WorkflowCompletion 2026-08-26-07:34:
+  THE MILESTONE BRANCH USED TO ASSERT A PROMPT STRING (`fn_task_done(summary=`), and that is how this
+  guard stayed green while the product lost its card summary. `fn_task_done` is NOT available to a
+  `toolMode: "readonly"` workflow step — the allowlist is read/grep/find/ls plus a few read-only task
+  reads — so the prompt was asking for a call that could never happen. The test proved the milestone
+  had been TOLD to write a summary, not that one could ever be written.
+  The mechanism is `summaryTarget: "task"`, the projection contract that persists a node's own output.
+  Assert that, wherever the node lives: a top-level node or inside an optional-group template, since
+  the executing node of a group is its template child.
+  */
+  it("all built-in workflows produce a task completion summary", () => {
     for (const workflow of BUILTIN_WORKFLOWS) {
       if (workflow.kind === "fragment") continue;
       const summaryNodes = workflow.ir.nodes.filter((node) => node.id === "completion-summary");
-      expect(summaryNodes, workflow.id).toHaveLength(1);
-      expect(summaryNodes[0]?.kind, workflow.id).toBe("prompt");
-      expect(summaryNodes[0]?.config?.summaryTarget, workflow.id).toBe("task");
-      expect(summaryNodes[0]?.config?.toolMode, workflow.id).toBe("readonly");
+      if (summaryNodes.length > 0) {
+        expect(summaryNodes, workflow.id).toHaveLength(1);
+        expect(summaryNodes[0]?.kind, workflow.id).toBe("prompt");
+        expect(summaryNodes[0]?.config?.summaryTarget, workflow.id).toBe("task");
+        expect(summaryNodes[0]?.config?.toolMode, workflow.id).toBe("readonly");
+        continue;
+      }
+
+      const writesSummary = workflow.ir.nodes.some((node) => {
+        const template = node.config?.template as { nodes?: Array<{ config?: Record<string, unknown> }> } | undefined;
+        return node.config?.summaryTarget === "task"
+          || (template?.nodes ?? []).some((child) => child.config?.summaryTarget === "task");
+      });
+      expect(writesSummary, `${workflow.id} has no completion-summary node and no milestone that writes the card summary`).toBe(true);
     }
   });
 
   it("merge-capable built-ins expose a default-off post-merge verification node after merge proof", () => {
     for (const workflow of BUILTIN_WORKFLOWS) {
       if (workflow.kind === "fragment") continue;
-      if (workflow.id === "builtin:coding-ideas") continue; // intentionally minimal pipeline
+      /*
+      FNXC:WorkflowCatalog 2026-08-25-14:40:
+      Coding (Ideas) is an intentionally minimal pipeline with no post-merge verification, and
+      `builtin:coding-ideas-v2` DERIVES from it — it inherits the absence rather than declining the
+      node. Its own review lane is where verification is judged; adding a post-merge node would
+      re-open the checks after the merge that its review already covered.
+      */
+      if (workflow.id === "builtin:coding-ideas" || workflow.id === "builtin:coding-ideas-v2") continue;
       const mergeNode = workflow.ir.nodes.find((node) => node.id === "merge-attempt" || node.id === "merge");
       if (!mergeNode) continue;
 
@@ -291,9 +349,12 @@ describe("built-in workflows", () => {
     expect(ir.nodes.some((n) => n.id === "browser-verification" && n.kind === "optional-group")).toBe(true);
     expect(ir.nodes.some((n) => n.id === "code-review" && n.kind === "optional-group")).toBe(true);
     expect(ir.edges.some((edge) => edge.from === "steps" && edge.to === "browser-verification" && edge.condition === "success")).toBe(true);
-    expect(ir.edges.some((edge) => edge.from === "browser-verification" && edge.to === "code-review" && edge.condition === "success")).toBe(true);
-    expect(ir.edges.some((edge) => edge.from === "code-review" && edge.to === "completion-summary" && edge.condition === "success")).toBe(true);
-    expect(ir.edges.some((edge) => edge.from === "completion-summary" && edge.to === "merge-gate" && edge.condition === "success")).toBe(true);
+    // FNXC:WorkflowBuiltins 2026-08-23-22:55: FN-120 (10c399d01e) moved completion-summary AHEAD of
+    // code-review so no built-in agent can reopen the reviewed worktree. Suffix is now
+    // browser-verification -> completion-summary -> code-review -> merge-gate.
+    expect(ir.edges.some((edge) => edge.from === "browser-verification" && edge.to === "completion-summary" && edge.condition === "success")).toBe(true);
+    expect(ir.edges.some((edge) => edge.from === "completion-summary" && edge.to === "code-review" && edge.condition === "success")).toBe(true);
+    expect(ir.edges.some((edge) => edge.from === "code-review" && edge.to === "merge-gate" && edge.condition === "success")).toBe(true);
     expect(ir.nodes.some((node) => node.id === "review")).toBe(false);
     const foreach = ir.nodes.find((n) => n.kind === "foreach");
     expect(foreach).toBeDefined();
@@ -319,8 +380,9 @@ describe("built-in workflows", () => {
     expect(ir.nodes.some((node) => node.id === "review")).toBe(false);
     expect(ir.edges.some((edge) => edge.from === "plan" && edge.to === "plan-review" && edge.condition === "success")).toBe(true);
     expect(ir.edges.some((edge) => edge.from === "plan-review" && edge.to === "parse" && edge.condition === "success")).toBe(true);
-    expect(ir.edges.some((edge) => edge.from === "code-review" && edge.to === "completion-summary" && edge.condition === "success")).toBe(true);
-    expect(ir.edges.some((edge) => edge.from === "completion-summary" && edge.to === "merge-gate" && edge.condition === "success")).toBe(true);
+    // FNXC:WorkflowBuiltins 2026-08-23-22:55: post-FN-120 suffix — completion-summary precedes code-review.
+    expect(ir.edges.some((edge) => edge.from === "completion-summary" && edge.to === "code-review" && edge.condition === "success")).toBe(true);
+    expect(ir.edges.some((edge) => edge.from === "code-review" && edge.to === "merge-gate" && edge.condition === "success")).toBe(true);
 
     const foreach = ir.nodes.find((node) => node.kind === "foreach");
     expect(foreach).toBeDefined();
@@ -742,7 +804,7 @@ describe("built-in workflows", () => {
     });
     expect(ir.settings?.find((setting) => setting.id === "codeReviewMaxRevisions")).toMatchObject({
       type: "number",
-      description: expect.stringMatching(/workflow's authored default/i),
+      description: expect.stringMatching(/workflow's authored bounded default/i),
     });
   });
 
@@ -816,6 +878,7 @@ describe("built-in workflows", () => {
       "plan-replan",
       "browser-verification-remediation",
       "code-review-remediation",
+      "plan-review-no-op",
     ]);
 
     const execute = design!.ir.nodes.find((node) => node.id === "execute");
@@ -868,13 +931,21 @@ describe("built-in workflows", () => {
     expect(defaultEnabledBuiltinWorkflowIds()).not.toContain("builtin:pr-workflow");
     expect(getBuiltinWorkflow("builtin:pr-workflow")!.kind).toBe("fragment");
     expect(defaultEnabledBuiltinWorkflowIds().length).toBeGreaterThanOrEqual(5);
+    /*
+    FNXC:WorkflowCatalog 2026-08-25-14:40:
+    `builtin:coding-ideas-v2` sits third, immediately after the Ideas workflow it derives from, which
+    is where a reader looking for the coding lane expects it. It displaced `builtin:review-heavy`
+    from this five-entry window; the window exists to pin ORDER STABILITY and `builtin:coding` first,
+    not to freeze the catalog size, and `review-heavy` is still asserted as enabled below.
+    */
     expect(defaultEnabledBuiltinWorkflowIds().slice(0, 5)).toEqual([
       "builtin:coding",
       "builtin:coding-ideas",
+      "builtin:coding-ideas-v2",
       "builtin:legacy-coding",
       "builtin:quick-fix",
-      "builtin:review-heavy",
     ]);
+    expect(defaultEnabledBuiltinWorkflowIds()).toContain("builtin:review-heavy");
     expect(defaultEnabledBuiltinWorkflowIds()).toContain("builtin:stepwise-coding");
   });
 
@@ -1066,6 +1137,7 @@ describe("built-in workflows", () => {
       "plan-replan",
       "browser-verification-remediation",
       "code-review-remediation",
+      "plan-review-no-op",
     ]);
     expect(ce.ir.nodes.some((node) => node.config?.seam === "review")).toBe(false);
 
@@ -1166,21 +1238,44 @@ describe("built-in workflows", () => {
       expect(await store.getWorkflowDefinition("builtin:coding")).toBeDefined();
     });
 
-    it("filters disabled built-ins from normal listings but keeps direct resolution", async () => {
-      await store.updateSettings({ enabledBuiltinWorkflowIds: ["builtin:coding"] });
+    it("filters disabled built-ins, resolves an enabled effective default, and keeps direct resolution", async () => {
+      await store.updateSettings({
+        defaultWorkflowId: "builtin:coding",
+        enabledBuiltinWorkflowIds: ["builtin:quick-fix"],
+      });
 
       const list = await store.listWorkflowDefinitions();
       expect(list.filter((workflow) => workflow.id.startsWith("builtin:")).map((workflow) => workflow.id)).toEqual([
-        "builtin:coding",
+        "builtin:quick-fix",
       ]);
-      expect(await store.getWorkflowDefinition("builtin:review-heavy")).toBeDefined();
+      expect(await store.getDefaultWorkflowId()).toBe("builtin:quick-fix");
+      expect(await store.getWorkflowDefinition("builtin:coding")).toBeDefined();
+      const task = await store.createTask({ description: "inherit the enabled workflow" });
+      expect(await store.getTaskWorkflowSelectionAsync(task.id)).toMatchObject({ workflowId: "builtin:quick-fix" });
+    });
+
+    it("requires one valid enabled built-in and rejects malformed sets atomically", async () => {
+      await store.updateSettings({ enabledBuiltinWorkflowIds: ["builtin:quick-fix"] });
+      const invalidSets = [
+        [],
+        ["builtin:not-a-workflow"],
+        ["builtin:pr-workflow"],
+        ["builtin:brainstorming"],
+        ["builtin:compound-engineering"],
+        ["builtin:quick-fix", "builtin:quick-fix"],
+      ];
+
+      for (const enabledBuiltinWorkflowIds of invalidSets) {
+        await expect(store.updateSettings({ enabledBuiltinWorkflowIds })).rejects.toThrow(/enabledBuiltinWorkflowIds/);
+        expect((await store.getSettings()).enabledBuiltinWorkflowIds).toEqual(["builtin:quick-fix"]);
+      }
     });
 
     it("can include disabled built-ins for workflow management surfaces", async () => {
-      await store.updateSettings({ enabledBuiltinWorkflowIds: [] });
+      await store.updateSettings({ enabledBuiltinWorkflowIds: ["builtin:quick-fix"] });
 
       const normalList = await store.listWorkflowDefinitions();
-      expect(normalList.some((workflow) => workflow.id.startsWith("builtin:"))).toBe(false);
+      expect(normalList.some((workflow) => workflow.id === "builtin:coding")).toBe(false);
 
       const managementList = await store.listWorkflowDefinitions({ includeDisabledBuiltins: true });
       expect(managementList.some((workflow) => workflow.id === "builtin:coding")).toBe(true);
@@ -1239,8 +1334,9 @@ describe("built-in workflows", () => {
       expect((plan?.config as { prompt?: string } | undefined)?.prompt).toContain("You are a task specification agent");
       expect(steps?.kind).toBe("foreach");
       expect(codeReview?.kind).toBe("optional-group");
-      expect(coding?.ir.edges.some((edge) => edge.from === "code-review" && edge.to === "completion-summary")).toBe(true);
-      expect(coding?.ir.edges.some((edge) => edge.from === "completion-summary" && edge.to === "merge-gate")).toBe(true);
+      // FNXC:WorkflowBuiltins 2026-08-23-22:55: post-FN-120 suffix — completion-summary precedes code-review.
+      expect(coding?.ir.edges.some((edge) => edge.from === "completion-summary" && edge.to === "code-review")).toBe(true);
+      expect(coding?.ir.edges.some((edge) => edge.from === "code-review" && edge.to === "merge-gate")).toBe(true);
       expect((legacyExecute?.config as { prompt?: string } | undefined)?.prompt).toContain("You are a task execution agent");
       // No `merge` seam node post-FN-6035 — merge runs as native primitives.
       expect(coding?.ir.nodes.find((node) => node.id === "merge")).toBeUndefined();

@@ -14,6 +14,7 @@ import type { EngineRunContext } from "../util/run-audit.js";
 import { resolveTerminalColumnsFor } from "./lifecycle-columns.js";
 import { latestFailedPreMergeWorkflowStep } from "./graph-failure-pure.js";
 import { optionalStepRevisionLogOutcome } from "./optional-step-revision.js";
+import { resolveRemediationCheckout } from "./resolve-remediation-checkout.js";
 
 export type RouteRetryableRemediationDeps = {
   store: TaskStore;
@@ -37,15 +38,21 @@ export async function routeRetryableRemediationGraphFailureToPreMergeFix(
   if (!await deps.isPreMergeRemediationGraphNode(live.id, failedNode)) return false;
   if (live.deletedAt || live.paused || live.userPaused === true) return false;
   if ((await resolveTerminalColumnsFor(deps.store, live.id)).includes(live.column)) return false;
-  if (!live.worktree) return false;
+  const target = latestFailedPreMergeWorkflowStep(live);
+  if (!target || !resolveRemediationCheckout(live, target)) return false;
   const settings = await deps.store.getSettings().catch(() => undefined);
   if (!settings || settings.globalPause === true || settings.enginePaused === true) return false;
   if (!allowsAutoMergeProcessing(live, settings) && !(await deps.isLiveSharedBranchGroupMember(live))) return false;
-  const target = latestFailedPreMergeWorkflowStep(live);
-  if (!target) return false;
   const budget = await deps.resolveFailedPreMergeWorkflowStepBudget(live, target);
   if (!budget.unbounded && (!Number.isFinite(budget.max) || budget.max <= 0)) return false;
-  if (!budget.unbounded && budget.attempts >= budget.max) return false;
+  /*
+  FNXC:ReviewConvergence 2026-08-22-06:03:
+  This router has an independent budget guard, so it must delegate exhaustion to the
+  recovery requester rather than parking before FN-149's shared convergence ladder runs.
+  */
+  if (!budget.unbounded && budget.attempts >= budget.max) {
+    return deps.recoverFailedPreMergeWorkflowStep(live);
+  }
 
   const nextCount = budget.attempts + 1;
   const totalFixCount = (live.postReviewFixCount ?? 0) + 1;

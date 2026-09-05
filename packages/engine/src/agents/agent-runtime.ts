@@ -20,6 +20,7 @@ import type { SkillSelectionContext } from "../cli-runtime/skill-resolver.js";
 import type { FallbackModelUsedPayload } from "../pi.js";
 import type { AgentActionGateContext } from "./agent-action-gate.js";
 import type { SystemPromptLayers } from "../execution/prompt-layers.js";
+import type { SandboxCapabilities, SandboxPolicy } from "../sandbox/types.js";
 
 /**
  * Options for creating an agent session.
@@ -30,6 +31,20 @@ export interface AgentRuntimeContext {
   toolMode?: "coding" | "readonly";
   customToolNames?: string[];
   requestedSkillNames?: string[];
+}
+
+/**
+ * Declares the filesystem contract for a task session. Workspace tasks have one
+ * task-directory root while repository children retain their own Git metadata.
+ */
+export interface SessionBoundaryDescriptor {
+  kind: "task-worktree" | "workspace-task-dir" | "read-only-root";
+  writableRoot: string | null;
+  projectRoot: string;
+  readOnlyRoots?: readonly string[];
+  /** Absolute roots writable under an otherwise read-only boundary. */
+  writableAllowlist?: readonly string[];
+  repoRoots?: readonly { repoRelPath: string; repoRootDir: string }[];
 }
 
 /**
@@ -65,6 +80,12 @@ export function normalizeAgentRuntimeMcpServers(
 export interface AgentRuntimeOptions {
   /** Working directory for the agent session */
   cwd: string;
+  /** Explicit task boundary. Undeclared sessions retain legacy inference. */
+  sessionBoundary?: SessionBoundaryDescriptor;
+  /** Resolved task-lane sandbox selection; native preserves the legacy spawn path. */
+  sandboxBackendId?: SandboxCapabilities["id"];
+  /** Prepared policy derived from the declared session boundary. */
+  sandboxPolicy?: SandboxPolicy;
   /** System prompt for the agent */
   systemPrompt: string;
   /*
@@ -74,6 +95,8 @@ export interface AgentRuntimeOptions {
   */
   /** Lane purpose (executor/merger/triage/…). Used for host-extension policy and diagnostics. */
   sessionPurpose?: string;
+  /** True only when this session is executing a board task (FN-125). */
+  taskExecutionSession?: boolean;
   /**
    * Optional structured prompt layers for cross-session caching.
    * When present, runtimes that support prompt caching use the `stable`
@@ -89,6 +112,15 @@ export interface AgentRuntimeOptions {
   tools?: "coding" | "readonly";
   /** Additional custom tools to merge with the base toolset */
   customTools?: ToolDefinition[];
+  /**
+   * Engine-owned Fusion tools that a runtime may publish through an external bridge.
+   * This must be an identity-based subset of customTools; plugin/MCP tools remain custom-only.
+   *
+   * FNXC:CursorMcpBridge 2026-08-15-23:46:
+   * Cursor must never infer Fusion ownership from an `fn_` name or a forgeable marker.
+   * The engine records provenance structurally before plugin-runtime wrappers run.
+   */
+  fusionTools?: ToolDefinition[];
   /** Per-result shared tool-output cap. `null` disables the wrapper; undefined uses the built-in default. */
   toolOutputMaxChars?: number | null;
   /** Callback for text output from the agent */
@@ -125,6 +157,8 @@ export interface AgentRuntimeOptions {
   sessionManager?: SessionManager;
   /** Optional skill selection context */
   skillSelection?: SkillSelectionContext;
+  /** Receives resolved skill availability after the runtime loader applies settings. */
+  onSkillSummary?: (summary: { availableCount: number; forcedSkillNames: string[]; unresolvedForcedSkills: Array<{ requestedName: string; reason: string }> }) => void | Promise<void>;
   /** Convenience: skill names to include in the session */
   skills?: string[];
   /** Extra directories to scan for skills (each holding `<id>/SKILL.md`), in
@@ -148,6 +182,9 @@ export interface AgentRuntimeOptions {
    * logging server contents.
    */
   mcpServers?: AgentRuntimeMcpServerConfig[];
+  /** Read-only MCP opt-in and server narrowing; MCP-incapable runtimes ignore both without logging definitions. */
+  allowMcpToolsInReadonly?: boolean;
+  readonlyMcpServerAllowlist?: string[];
   /** Optional task-scoped environment variables for session-local subprocesses. */
   taskEnv?: NodeJS.ProcessEnv;
   /**

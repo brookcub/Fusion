@@ -38,13 +38,13 @@ export const ACTION_GATE_PROVISIONING_POLICY_TOOLS: ReadonlySet<string> = new Se
 
 /**
  * FNXC:ToolGovernance 2026-06-27-12:00:
- * Newly exposed mutating heartbeat tools must be positively classified before agents receive them, otherwise the action gate's unrecognized-tool fallback silently allows them. Verification and workspace acquisition execute subprocess/git-worktree work, so both gating paths use command_execution instead of a coordination exemption.
+ * Newly exposed mutating heartbeat tools must be positively classified before agents receive them, otherwise the action gate's unrecognized-tool fallback silently allows them. Verification and the planning-only dependency installer execute engine-owned commands, so both gating paths use command_execution instead of a coordination exemption.
  */
 export const COMMAND_EXECUTION_FN_TOOLS: ReadonlySet<string> = new Set([
   "fn_run_verification",
   // FNXC:TaskVerificationRequest 2026-07-30-00:00: queuing ultimately executes an executor-owned subprocess.
   "fn_task_request_verification",
-  "fn_acquire_repo_worktree",
+  "fn_install_worktree_dependencies",
 ]);
 
 /**
@@ -112,6 +112,8 @@ const PERMANENT_TASK_AGENT_ONLY_TOOLS = [
   "fn_milestone_delete",
   "fn_slice_activate",
   "fn_feature_link_task",
+  "fn_feature_unlink_task",
+  "fn_feature_repoint_task",
   "fn_feature_update",
   "fn_feature_repair_validation",
   "fn_feature_set_status",

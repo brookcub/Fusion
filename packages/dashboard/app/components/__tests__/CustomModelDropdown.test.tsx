@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { useEffect, useRef, useState } from "react";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { loadAllAppCss } from "../../test/cssFixture";
 import { CustomModelDropdown } from "../CustomModelDropdown";
@@ -58,6 +58,28 @@ describe("CustomModelDropdown", () => {
       removeEventListener: vi.fn(),
       dispatchEvent: vi.fn(),
     } as MediaQueryList));
+  });
+
+  it("stops portal touch events without stopping model option clicks", async () => {
+    const onChange = vi.fn();
+    const documentTouchStart = vi.fn();
+    const documentTouchEnd = vi.fn();
+    document.addEventListener("touchstart", documentTouchStart);
+    document.addEventListener("touchend", documentTouchEnd);
+    render(<CustomModelDropdown label="Model" value="" onChange={onChange} models={MOCK_MODELS} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Model" }));
+    const portal = await screen.findByTestId("model-combobox-portal");
+    expect(portal).toHaveAttribute("data-portal-surface", "model-menu");
+    fireEvent.touchStart(portal);
+    fireEvent.touchEnd(portal);
+    expect(documentTouchStart).not.toHaveBeenCalled();
+    expect(documentTouchEnd).not.toHaveBeenCalled();
+
+    fireEvent.click(within(portal).getByText("GPT-4o"));
+    expect(onChange).toHaveBeenCalledWith("openai/gpt-4o");
+    document.removeEventListener("touchstart", documentTouchStart);
+    document.removeEventListener("touchend", documentTouchEnd);
   });
 
   it("keeps the search wrapper background opaque to prevent list bleed-through", () => {
@@ -359,7 +381,7 @@ describe("CustomModelDropdown", () => {
     expect(thinkingSelect).toHaveAccessibleName("Thinking Level");
     expect(thinkingSelect.closest(".model-combobox-dropdown")).not.toBeNull();
     expect(within(thinkingSelect).getByRole("option", { name: "Default (off)" })).toBeTruthy();
-    for (const optionName of ["Off", "Minimal", "Low", "Medium", "High", "Very High"]) {
+    for (const optionName of ["Off", "Minimal", "Low", "Medium", "High", "Very High", "Max"]) {
       expect(within(thinkingSelect).getByRole("option", { name: optionName })).toBeTruthy();
     }
 
@@ -367,6 +389,35 @@ describe("CustomModelDropdown", () => {
     expect(onThinkingLevelChange).toHaveBeenLastCalledWith("xhigh");
     await user.selectOptions(thinkingSelect, "");
     expect(onThinkingLevelChange).toHaveBeenLastCalledWith("");
+  });
+
+  it("filters model-bound thinking options to documented max support without clearing the persisted value", async () => {
+    const user = userEvent.setup();
+    const onThinkingLevelChange = vi.fn();
+    render(
+      <CustomModelDropdown
+        label="Codex Model"
+        value="openai-codex/gpt-5.6-luna"
+        onChange={vi.fn()}
+        models={[{
+          provider: "openai-codex",
+          id: "gpt-5.6-luna",
+          name: "GPT-5.6 Luna",
+          reasoning: true,
+          contextWindow: 372000,
+          supportedThinkingLevels: ["off", "minimal", "low", "medium", "high", "max"],
+        }]}
+        showThinkingLevel
+        thinkingLevel=""
+        onThinkingLevelChange={onThinkingLevelChange}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Codex Model" }));
+    const select = await screen.findByTestId("custom-model-dropdown-thinking");
+    expect(within(select).queryByRole("option", { name: "Max" })).toBeTruthy();
+    expect(within(select).queryByRole("option", { name: "Very High" })).toBeNull();
+    await user.selectOptions(select, "max");
+    expect(onThinkingLevelChange).toHaveBeenCalledWith("max");
   });
 
   it("renders concrete-only thinking control without Default when no defaultThinkingLevel is supplied", async () => {
@@ -387,7 +438,7 @@ describe("CustomModelDropdown", () => {
     const thinkingSelect = await screen.findByTestId("custom-model-dropdown-thinking");
 
     expect(within(thinkingSelect).queryByRole("option", { name: /Default/ })).toBeNull();
-    expect(within(thinkingSelect).getAllByRole("option")).toHaveLength(6);
+    expect(within(thinkingSelect).getAllByRole("option")).toHaveLength(7);
   });
 
   it("keeps thinking control inert when callers do not opt in", async () => {

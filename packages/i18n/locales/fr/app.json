@@ -30,7 +30,9 @@
     "showMore": "Afficher plus",
     "update": "Mettre à jour",
     "yes": "Oui",
-    "clear": ""
+    "clear": "",
+    "open": "",
+    "remove": ""
   },
   "activityFeed": {
     "emptyHint": "",
@@ -82,7 +84,10 @@
       "minutesAgo_other": ""
     },
     "title": "Journal d'activité",
-    "typeFilterBadge": ""
+    "typeFilterBadge": "",
+    "taskId": "ID de tâche",
+    "taskIdSearchPlaceholder": "Rechercher un ID de tâche (par ex. FN-066)",
+    "taskIdFilterBadge": "Tâche : {{taskId}}"
   },
   "agentError": {
     "copied": "Copié",
@@ -132,7 +137,10 @@
     "toolEntriesHidden_other": "",
     "toolsOff": "Outils : Désactivé",
     "toolsOn": "Outils : Activé",
-    "usingDefault": "Utilisant la valeur par défaut"
+    "usingDefault": "Utilisant la valeur par défaut",
+    "missingToolDetailHint": "Some tool details are unavailable. They may have been recorded while detail saving was disabled; check Settings → Global General to save future tool details.",
+    "showLessDetail": "Show less {{detailLabel}}",
+    "showMoreDetail": "Show more {{detailLabel}}{{lineCount}}"
   },
   "agentMention": {
     "membersOf": "Membres de #{{roomName}}",
@@ -1003,15 +1011,15 @@
     "setupModeAriaLabel": "Mode de configuration de l'agent",
     "showSystemAgents": "Afficher les agents système",
     "skills": "Compétences",
-    "skillsDescription": "Gérez les compétences disponibles pour cet agent.",
+    "skillsDescription": "Toutes les compétences activées peuvent être consultées automatiquement par tout agent. Sélectionnez-en pour obliger cet agent à les lire avant de commencer.",
     "skillsErrors_one": "",
     "skillsErrors_other": "",
     "skillsFound_one": "",
     "skillsFound_other": "",
-    "skillsHint": "Compétences facultatives à attribuer à cet agent",
+    "skillsHint": "Toutes les compétences activées peuvent être consultées automatiquement par tout agent. Sélectionnez-en pour obliger cet agent à les lire avant de commencer.",
     "skillsImported_one": "",
     "skillsImported_other": "",
-    "skillsNone": "Aucune compétence assignée",
+    "skillsNone": "Aucune",
     "skillsSelected_one": "",
     "skillsSelected_other": "",
     "skillsSkipped_one": "",
@@ -1145,7 +1153,9 @@
     "disableHeartbeatsSummary": "{{count}} battements désactivés ; {{skipped}} ignorés",
     "enableHeartbeatsCountHint": "Activer {{count}} battements désactivés",
     "disableHeartbeatsCountHint": "Désactiver {{count}} battements activés",
-    "bulkFailures": "{{count}} échecs"
+    "bulkFailures": "{{count}} échecs",
+    "detailLabel": "",
+    "lastCompletedStep": ""
   },
   "app": {
     "backendError": {
@@ -1193,10 +1203,10 @@
       "capacityExhausted": "",
       "guardRejected": "",
       "mergeBlocked": "",
-      "promoteRejected": "",
       "unknownColumn": "",
       "unplannedForExecution": "",
-      "workflowMismatch": ""
+      "workflowMismatch": "",
+      "staleMovePrecondition": ""
     },
     "todo": "À faire",
     "triage": "Triage",
@@ -1246,6 +1256,7 @@
     "cancelButton": "Annuler",
     "clearConversationFailed": "Échec de l'effacement de la conversation",
     "closeQuickChat": "Fermer le chat rapide",
+    "openInNewWindow": "Ouvrir dans une nouvelle fenêtre",
     "conversationArchived": "Conversation archivée",
     "conversationDeleted": "Conversation supprimée",
     "conversationName": "",
@@ -1262,7 +1273,6 @@
     "deleteRoom": "Supprimer le salon {{name}}",
     "deleteRoomBody": "Cette action est irréversible. Ce salon et tous ses messages seront définitivement supprimés.",
     "deleteRoomTitle": "Supprimer le salon ?",
-    "dismissQueuedMessage": "Ignorer le message en file d'attente",
     "failedToArchiveConversation": "Impossible d'archiver la conversation",
     "failedToClearConversation": "Impossible d'effacer la conversation",
     "failedToClearRoomConversation": "Impossible d'effacer la conversation du salon",
@@ -1293,6 +1303,7 @@
     "modeAgent": "Agent",
     "modeModel": "Modèle",
     "newChat": "Nouvelle discussion",
+    "newChatOpenInNewWindowHint": "Ctrl/Cmd + clic pour ouvrir la nouvelle conversation dans une fenêtre séparée",
     "newChatModeAgent": "Agent",
     "newChatModeModel": "Modèle",
     "newChatTitle": "Nouvelle discussion",
@@ -1304,6 +1315,10 @@
     "noSkillsAvailable": "Aucune compétence disponible",
     "noSkillsFound": "Aucune compétence trouvée",
     "openQuickChat": "Ouvrir le chat rapide",
+    "preserveToStash": "",
+    "preserveToStashDone": "",
+    "preserveToStashFailed": "",
+    "preserveToStashWorking": "",
     "questionAnsweredLabel": "",
     "questionAnsweredWithoutContent": "",
     "questionConfirmNo": "",
@@ -1315,6 +1330,17 @@
     "questionSubmittedAnswerLabel": "",
     "questionTextPlaceholder": "",
     "queuedMessage": "En file d'attente : {{preview}}",
+    "pendingLabel": "Messages en attente",
+    "pendingHeading": "Messages en attente",
+    "editPending": "Modifier le message en attente",
+    "savePendingEdit": "Enregistrer le message en attente",
+    "cancelPendingEdit": "Annuler la modification du message en attente",
+    "movePendingEarlier": "Avancer le message en attente",
+    "movePendingLater": "Reculer le message en attente",
+    "deletePending": "Supprimer le message en attente",
+    "forcePending": "Forcer l’envoi du message en attente",
+    "forcePendingShort": "Forcer l’envoi",
+    "pendingEditEmpty": "Les messages en attente ne peuvent pas être vides",
     "quickChatTitle": "Chat rapide",
     "relativeTimeDays_one": "",
     "relativeTimeDays_other": "",
@@ -1349,6 +1375,13 @@
     "scopeRooms": "Salons",
     "scrollMessageToTop": "Faire défiler le message vers le haut",
     "searchConversations": "Rechercher des conversations…",
+    "conversationSearchPlaceholder": "Rechercher dans la conversation",
+    "conversationSearchLabel": "Rechercher dans la conversation",
+    "conversationSearchNoMatches": "Aucun résultat",
+    "conversationSearchMatchCount": "{{current}} sur {{count}} résultats",
+    "conversationSearchPrevious": "Résultat précédent",
+    "conversationSearchNext": "Résultat suivant",
+    "conversationSearchClose": "Fermer la recherche",
     "selectAgentForNewChat": "Sélectionner un agent pour le nouveau chat",
     "selectAgentPlaceholder": "Sélectionnez un agent pour commencer à discuter",
     "selectModel": "Choisir un modèle",
@@ -1382,6 +1415,9 @@
     "workingStatus": "Traitement en cours…",
     "you": "Vous",
     "contextWindowAria": "Estimated {{used}} of {{total}} context tokens",
+    "contextWindowMeasuredAria": "",
+    "contextWindowPendingAria": "",
+    "contextWindowPendingValue": "",
     "noMessage": "",
     "modelAgentSection": "Model / Agent",
     "thinkingLevelSection": "Thinking level",
@@ -1389,7 +1425,17 @@
     "currentAgentTarget": "Current agent: {{name}}",
     "currentModelTarget": "Current model: {{model}}",
     "currentDefaultTarget": "Using the default chat target",
-    "newNotAllowedForTaskChat": ""
+    "newNotAllowedForTaskChat": "",
+    "restore": "",
+    "quoteMessage": "Citer le message",
+    "agentRepliesFailed": "Certains agents n’ont pas pu répondre : {{agents}}",
+    "noDefaultModelConfigured": "Configurez un modèle de chat par défaut dans les Paramètres avant de créer une conversation.",
+    "minimizeAllChats": "Réduire tous les chats",
+    "restoreAllChats": "Restaurer tous les chats",
+    "slashSuggestions": "Suggestions de barre oblique",
+    "loadingSlashSuggestions": "Chargement des suggestions…",
+    "snippetSuggestion": "Insérer le prompt enregistré",
+    "snippetSuggestions": "Suggestions d’extraits"
   },
   "chatRooms": {
     "error": {
@@ -1476,7 +1522,6 @@
     "autoMerge": "Fusion automatique",
     "autoMergeDisabled": "Fusion automatique désactivée",
     "autoMergeEnabled": "Fusion automatique activée",
-    "cancelMove": "Annuler le déplacement",
     "collapseArchivedLabel": "Réduire les tâches archivées",
     "collapseArchivedTitle": "Réduire les tâches archivées",
     "expandArchivedLabel": "Développer les tâches archivées",
@@ -1485,41 +1530,21 @@
     "keepProgress": "Conserver la progression",
     "loadMore_one": "",
     "loadMore_other": "",
-    "moveAllToTodo": "Déplacer tout vers À faire",
-    "moveAllToTodoMessage_one": "",
-    "moveAllToTodoMessage_other": "",
-    "moveAllToTodoTitle": "Déplacer tout vers À faire",
-    "movedToPlanning_one": "",
-    "movedToPlanning_other": "",
-    "movedToTodo_one": "",
-    "movedToTodo_other": "",
-    "movePartialFailure": "{{moved}} tâche(s) sur {{total}} déplacée(s) ; {{failed}} échouée(s)",
-    "moveToTodoHint_one": "",
-    "moveToTodoHint_other": "",
-    "moveToTodoPartialFailure": "{{moved}} tâche(s) sur {{total}} déplacée(s) vers À faire ; {{failed}} échouée(s)",
     "newTask": "Nouvelle tâche",
     "noManuallyPausableTasks": "Aucune tâche pouvant être mise en pause manuellement",
     "noTasks": "Aucune tâche",
     "noTasksInColumn": "Aucune tâche dans cette colonne",
     "pauseHint_one": "",
     "pauseHint_other": "",
-    "preserveProgressMessage": "Cette tâche a des étapes terminées. Conserver la progression avant de déplacer ?",
-    "preserveProgressMoveTodoMessage": "Certaines tâches ont des étapes terminées. Conserver la progression avant de déplacer vers À faire ?",
     "preserveProgressTitle": "Conserver la progression ?",
-    "promoteUnplannedCancel": "",
-    "promoteUnplannedConfirm": "",
-    "promoteUnplannedMessage": "",
-    "promoteUnplannedTitle": "",
     "replanAll": "Replanifier tout",
-    "replanAllHint_one": "",
-    "replanAllHint_other": "",
-    "replanAllMessage_one": "",
-    "replanAllMessage_other": "",
+    "replanAllHint_one": "Replan {{count}} task{{plural}} from its original description",
+    "replanAllHint_other": "Replan {{count}} task{{plural}} from its original description",
+    "replanAllMessage_one": "Replan {{count}} task{{plural}} from its original description? Its current plan will be discarded.",
+    "replanAllMessage_other": "Replan {{count}} task{{plural}} from its original description? Its current plan will be discarded.",
     "replanAllTitle": "Replanifier toutes les tâches",
     "resetProgress": "Réinitialiser la progression",
     "resetProgressConfirm": "Réinitialiser la progression",
-    "resetProgressMessage": "Réinitialiser la progression de toutes les étapes avant de déplacer cette tâche ?",
-    "resetProgressMoveTodoMessage": "Réinitialiser la progression des étapes des tâches avant de déplacer vers À faire ?",
     "resetProgressTitle": "Réinitialiser la progression ?",
     "stopAll": "Arrêter tout",
     "stopAllMessage_one": "",
@@ -1527,7 +1552,15 @@
     "stopAllTitle": "Arrêter toutes les tâches",
     "stopPartialFailure": "{{paused}} tâche(s) sur {{total}} arrêtée(s) ; {{failed}} échouée(s)",
     "stoppedTasks_one": "",
-    "stoppedTasks_other": ""
+    "stoppedTasks_other": "",
+    "sortControlLabel": "",
+    "sortArrivalDesc": "",
+    "sortArrivalDescHint": "",
+    "sortTaskIdDesc": "",
+    "sortTaskIdDescHint": "",
+    "replannedTasks_one": "Replanned {{count}} task{{plural}}",
+    "replannedTasks_other": "Replanned {{count}} task{{plural}}",
+    "replanPartialFailure": "Replanned {{replanned}} of {{total}} tasks; {{failed}} failed"
   },
   "commandCenter": {
     "activity": {
@@ -1919,6 +1952,7 @@
       "rangeNote": "Time range filters loaded events; it is not sent to the server.",
       "openTask": "Open task {{taskId}}",
       "openAgent": "Open agent {{agentId}}",
+      "workflowGateNotRun": "Workflow gate not executed",
       "eventTypes": {
         "task:started": "Task started",
         "task:handed-off": "Task handed off",
@@ -1928,7 +1962,9 @@
         "workflow:gate-failed": "Workflow gate failed",
         "approval:requested": "Approval requested"
       }
-    }
+    },
+    "taskVerification": "",
+    "verificationRequests": ""
   },
   "comments": {
     "addButton": "Ajouter un commentaire",
@@ -2006,7 +2042,20 @@
     "toLabel": "À :",
     "wakeAgentCheckbox": "Réveiller l'agent immédiatement",
     "wakeAlwaysImmediate": "(l'agent est déjà en mode de réponse immédiate)",
-    "wakeOneOff": "(remplacement ponctuel pour ce message uniquement)"
+    "wakeOneOff": "(remplacement ponctuel pour ce message uniquement)",
+    "addSection": "",
+    "ariaLabel": "",
+    "attachStructure": "",
+    "mode": "",
+    "noStructures": "",
+    "quickMessage": "",
+    "removeSection": "",
+    "removeStructure": "",
+    "report": "",
+    "reportTitle": "",
+    "sectionBody": "",
+    "sectionHeading": "",
+    "selectStructure": ""
   },
   "confirm": {
     "cancel": "Annuler",
@@ -3059,7 +3108,7 @@
     "selectProject": "Sélectionner un projet",
     "settings": "Paramètres",
     "showScripts": "Afficher les scripts",
-    "skillsView": "Compétences",
+    "skillsView": "Compétences et extraits",
     "startAiEngine": "Démarrer le moteur IA",
     "stashRecoveryView": "Récupération de stash",
     "stopAiEngine": "Arrêter le moteur IA",
@@ -3393,7 +3442,9 @@
     "useProjectDefault": "Utiliser le défaut du projet",
     "viewOptions": "Options d'affichage",
     "workflowLabel": "",
-    "statusReplan": "Replanifier"
+    "statusReplan": "Replanifier",
+    "statusWaiting": "",
+    "statusWaitingOn": ""
   },
   "mailbox": {
     "agent": "Agent",
@@ -3482,7 +3533,36 @@
     "typeSystem": "Système",
     "typeUserToAgent": "Vous → Agent",
     "user": "Utilisateur",
-    "you": "Vous"
+    "you": "Vous",
+    "all": "",
+    "approvalStatus": "",
+    "approvalUnavailable": "",
+    "approve": "",
+    "archive": "",
+    "archived": "",
+    "artifact": "",
+    "audioArtifactAria": "",
+    "createTask": "",
+    "createTaskError": "",
+    "creatingTask": "",
+    "deny": "",
+    "inboxFilter": "",
+    "loadingApproval": "",
+    "noArchivedMessages": "",
+    "openArtifact": "",
+    "openArtifactAria": "",
+    "optionalComment": "",
+    "recommendationsUnavailable": "",
+    "reportsApprovals": "",
+    "restore": "",
+    "retryCreatingTask": "",
+    "taskCreatedView": "",
+    "taskProposalDismissed": "",
+    "taskRecommendations": "",
+    "videoArtifactAria": "",
+    "viewTask": "",
+    "viewTaskAria": "",
+    "viewTaskLabel": ""
   },
   "memory": {
     "auditChecksTitle": "Vérifications d'audit",
@@ -3608,7 +3688,20 @@
     "testSearchHint": "Exécute le même chemin memory_search basé sur qmd qu'utilisent les agents.",
     "title": "Mémoire",
     "totalInsights": "Total des insights",
-    "workingMemoryLabel": "Mémoire de travail"
+    "workingMemoryLabel": "Mémoire de travail",
+    "tabGraph": "Knowledge Graph",
+    "graphLoading": "Loading knowledge graph…",
+    "graphUnavailable": "Graph unavailable",
+    "graphBuild": "Build graph",
+    "graphNodes": "nodes",
+    "graphEdges": "edges",
+    "graphForce": "Force rebuild",
+    "graphRebuilding": "Rebuilding…",
+    "graphRebuild": "Rebuild",
+    "graphFilters": "Graph filters",
+    "graphClearFilters": "Clear filters",
+    "graphResults": "results",
+    "graphNoResults": "No matching nodes."
   },
   "merge": {
     "advanced": "Avancé",
@@ -3638,7 +3731,11 @@
     "shortstatTitle": "Statistiques courtes finales du commit ; pour voir le diff complet de tous les commits de tâches, consultez l'onglet Modifications.",
     "smartPull": "Pull intelligent",
     "status": "État",
-    "title": "Détails de la fusion"
+    "title": "Détails de la fusion",
+    "targetBranch": "",
+    "strategy": "",
+    "method": "",
+    "noOpReason": ""
   },
   "mesh": {
     "ariaLabel": "Visualisation de la topologie du maillage de nœuds",
@@ -4049,6 +4146,7 @@
       "minimal": "Minimal",
       "off": "Désactivé",
       "xhigh": "Très élevé",
+      "max": "Maximum",
       "defaultWithLevel": "Default ({{level}})"
     },
     "placeholders": {
@@ -4130,13 +4228,14 @@
     "settings": "Paramètres",
     "showScriptsAriaLabel": "Afficher les scripts",
     "sidebarAriaLabel": "",
-    "skills": "Compétences",
+    "skills": "Compétences et extraits",
     "stashRecovery": "Récupération de stash",
     "tasks": "Tâches",
     "terminal": "Terminal",
     "todos": "Tâches à faire",
     "usage": "Utilisation",
-    "workflows": "Workflows"
+    "workflows": "Workflows",
+    "patchnode": ""
   },
   "newTaskModal": {
     "addDependencies": "Ajouter des dépendances",
@@ -5290,7 +5389,14 @@
     "resize": "",
     "viewExpanded": "",
     "views": "",
-    "resizeExpandedView": ""
+    "resizeExpandedView": "",
+    "archivedCopy": "",
+    "doneHiddenCopy": "",
+    "emptyCopy": "",
+    "hideDone": "",
+    "noActiveTasks": "",
+    "noTasksYet": "",
+    "showDone": ""
   },
   "routine": {
     "andMore_one": "",
@@ -5762,7 +5868,11 @@
       "taskPopupsBoardListOnlyHelp": "",
       "taskDetailChatFirstHelp": "",
       "showCostBadgeOnCards": "",
-      "showCostBadgeOnCardsHelp": ""
+      "showCostBadgeOnCardsHelp": "",
+      "chatMessageLayout": "",
+      "chatMessageLayoutBubbles": "",
+      "chatMessageLayoutFullWidth": "",
+      "chatMessageLayoutHelp": ""
     },
     "auth": {
       "apiKeyCleared": "Clé API effacée",
@@ -5774,6 +5884,7 @@
       "copiedCodeToClipboard": "Code copié dans le presse-papiers",
       "copyCode": "Copier le code",
       "enterCodeOnGitHub": "Entrez ce code sur GitHub",
+      "enterCodeToContinue": "",
       "failedToCopyCode": "Échec de la copie du code — copiez-le manuellement depuis la zone ci-dessus",
       "groupAuthenticated": "Authentifié",
       "groupAvailable": "Disponible",
@@ -5791,8 +5902,15 @@
       "manualPasteTitle": "Attention — un collage manuel est requis",
       "noProviders": "Aucun fournisseur disponible",
       "openGitHub": "Ouvrir GitHub",
+      "openVerificationPage": "",
       "pasteRedirectUrlFirst": "Collez d'abord l'URL de redirection complète ou le code d'autorisation.",
       "reopenOnboarding": "Rouvrir le guide de démarrage",
+      "refreshModels": "Actualiser les modèles",
+      "refreshModelsPending": "Actualisation des modèles…",
+      "refreshModelsSuccess": "Modèles actualisés.",
+      "refreshModelsTimedOut": "L’actualisation a expiré ; les derniers modèles disponibles sont affichés. Réessayez.",
+      "refreshModelsDeferred": "Une autre actualisation est en cours ; les derniers modèles disponibles sont affichés. Réessayez bientôt.",
+      "refreshModelsFailed": "Échec de l’actualisation ; les derniers modèles disponibles sont affichés. Réessayez.",
       "reopenOnboardingHint": "Relancez l'assistant de configuration pour revoir ou mettre à jour votre configuration de fournisseur et de modèle IA.",
       "savingKey": "Enregistrement…",
       "signInHint": "Connectez-vous à au moins un fournisseur pour commencer à utiliser les modèles IA.",
@@ -5805,7 +5923,8 @@
       "anthropicPreferenceApiKey": "API key",
       "anthropicPreferenceSubscription": "Claude subscription",
       "credentialInUse": "In use",
-      "credentialOverridden": "Overridden below"
+      "credentialOverridden": "Overridden below",
+      "legacyAnthropicOAuthNotice": ""
     },
     "authentication": {
       "enterAPIKey": "",
@@ -5821,7 +5940,6 @@
       "backupDirectory": "",
       "backupNow": "Sauvegarder maintenant",
       "backups": "",
-      "backupS": "",
       "backupScheduleCron": "",
       "creating": "Création…",
       "cronExpressionForBackupTimingDefault02": "",
@@ -5849,11 +5967,23 @@
       "projectOnlyFusionMemory": "",
       "retentionCount": "",
       "totalSize": "",
-      "view": "",
       "whenEnabledProjectAndAgentMemoryFilesAre": "",
       "whenEnabledTheDatabaseIsBackedUpAutomatically": "",
       "createFailed": "",
-      "memoryBackupScopeHint": ""
+      "memoryBackupScopeHint": "",
+      "scheduleStatus": "",
+      "status": "",
+      "on": "",
+      "off": "",
+      "cron": "",
+      "nextRun": "",
+      "lastRun": "",
+      "succeeded": "",
+      "failed": "",
+      "lastOutput": "",
+      "runCount": "",
+      "scheduleNotRegistered": "",
+      "noBackupsYet": ""
     },
     "clearToDefault": "",
     "cliAgents": {
@@ -5983,6 +6113,7 @@
       "allowEphemeralAgentsToCreateTasksHint": "",
       "quickChatCloseOnOutsideClickHint": "",
       "disabledFusionWorkflowsAreHiddenFromWorkflow": "",
+      "builtinWorkflowAtLeastOneEnabled": "",
       "autoTranslateImportedIssues": "",
       "autoTranslateImportedIssuesHelp": "",
       "translationTargetLanguage": "",
@@ -6040,12 +6171,13 @@
       "refinementTaskWorkflowHelp": "",
       "maxRecommendationsPerTask": "",
       "maxRecommendationsPerTaskHelp": "",
+      "requireTaskRecommendations": "",
+      "requireTaskRecommendationsHelp": "",
       "recommendationMailboxNoticeEnabled": "",
       "recommendationMailboxNoticeEnabledHelp": ""
     },
     "globalGeneral": {
       "andShowsUpdateNoticesInTheCLIAnd": "",
-      "autoReloadDashboardOnVersionChange": "",
       "checkForThe": "",
       "checkForUpdatesAutomatically": "",
       "cLIBinaryOnPATH": "",
@@ -6074,8 +6206,7 @@
       "saveToolOutputInAgentLogs": "",
       "updates": "",
       "weekly": "",
-      "whenDisabledToolRowsAreStillLoggedBut": "",
-      "whenEnabledDefaultTheDashboardAutomaticallyReloadsWhen": "",
+      "whenDisabledToolRowsAreStillLoggedBut": " When disabled, tool rows are still logged but detailed tool payloads are omitted. Very large tool payloads may still be clipped even when this stays enabled. Default: enabled. ",
       "whenEnabledFusionChecksNpmForNewVersions": "",
       "whenEnabledTheDashboardProbesForAGlobally": "",
       "gitLabEnabledHint": "",
@@ -6092,14 +6223,21 @@
       "releaseChannelHelp": "",
       "autoUpdateAndRestart": "",
       "autoUpdateAndRestartHelp": "",
+      "autoUpdateEnabled": "",
+      "autoUpdateEnabledHelp": "",
+      "autoRestartAfterUpdate": "",
+      "autoRestartAfterUpdateHelp": "",
       "channelStable": "",
       "channelBeta": "",
       "agentToolOutputLimit": "",
       "agentToolOutputLimitHint": "",
       "noLimitOnAgentToolOutput": "",
-      "noLimitOnAgentToolOutputHint": ""
+      "noLimitOnAgentToolOutputHint": "",
+      "quickAddSubmitOnEnter": "",
+      "quickAddSubmitOnEnterHint": ""
     },
     "globalModels": {
+      "modelOverrides": "",
       "allow": "",
       "commaSeparatedValuesSentToOpenRouterModelSync": "",
       "controlsHowMuchReasoningEffortTheAIModel": "",
@@ -6142,6 +6280,8 @@
       "usedAutomaticallyIfThePrimaryDefaultModelHits": "",
       "useDefault": "",
       "whenEnabledStartupFetchesTheLatestAvailableModels": "",
+      "syncOrcaRouterModelListAtStartup": "",
+      "whenEnabledStartupFetchesTheLatestOrcaRouterModels": "",
       "whenEnabledStartupRefreshesModelsThroughTheLocal": "",
       "commaSeparatedValuesSentToOpenRouterModelSyncOutputModalities": "",
       "openRouterRoutingOrderHint": "",
@@ -6149,7 +6289,9 @@
       "openRouterRoutingOnlyHint": "",
       "openRouterAllowFallbacksHint": "",
       "openRouterRoutingSortHint": "",
-      "requireParametersHint": ""
+      "requireParametersHint": "",
+      "fastAndCheapModel": "Modèle rapide et économique",
+      "fastAndCheapModelHelp": "Sélectionnez ici un modèle pas cher pour les éditions rapides. Celui-ci sera utilisé pour le Fast Mode lors de la création d'une tâche."
     },
     "header": {
       "discord": "Discord",
@@ -6200,6 +6342,19 @@
     "keepRemote": "Garder la version distante",
     "loading": "Chargement…",
     "memory": {
+      "backendFile": "",
+      "backendHelp": "",
+      "backendLabel": "",
+      "backendQmd": "",
+      "backendReadonly": "",
+      "backendStash": "",
+      "capOnTranscriptEventsUploadedPerTask": "",
+      "executorSessionCapture": "",
+      "maxTranscriptEventsPerTask": "",
+      "stashUrlHelp": "",
+      "stashUrlLabel": "",
+      "stashUrlPlaceholder": "",
+      "uploadTaskAgentLogTranscriptToStash": "",
       "03": "",
       "agentsGetMemorySearchMemoryGetAndMemory": "",
       "agentsSearchWithQmdFirstFallBackTo": "",
@@ -6246,7 +6401,9 @@
       "turnsDailyNotesIntoDREAMSMdAndPromotes": "",
       "qmdInstalled": "",
       "qmdInstallFailed": "",
-      "qmdInstallUnavailable": ""
+      "qmdInstallUnavailable": "",
+      "saveBeforeCompacting": "",
+      "saveBeforeSwitching": ""
     },
     "merge": {
       "abort": "",
@@ -6524,6 +6681,10 @@
       "plugins": ""
     },
     "projectModels": {
+      "modelOverrides": "",
+      "projectLanesSubheading": "",
+      "summarizationPointer": "",
+      "workflowLanesSubheading": "",
       "addPreset": "",
       "advancedWorkflowPolicy": "",
       "aIMergeCommitSummaries": "",
@@ -6531,8 +6692,11 @@
       "automaticallyCompactContextWhenApproachingThisTokenCount": "",
       "autoSelectPresetBasedOnTaskSize": "",
       "autoSummarizeLongDescriptionsAsTitles": "",
-      "taskDefinitionInInputLanguage": "",
-      "taskDefinitionInInputLanguageHelp": "",
+      "taskOutputLanguage": "AI-authored task language",
+      "taskOutputLanguageHelp": "Choose the language for AI-authored task plans, titles, steps, summaries, and recommendations. No stored default — unset resolves English. Changes apply to new generation sessions only.",
+      "taskOutputLanguageEnglish": "English (default)",
+      "taskOutputLanguageInput": "User input language",
+      "taskOutputLanguageInterface": "Fusion interface language",
       "configuredPresets": "",
       "configuresTheModelUsedForTwoShortSummary": "",
       "defaultWorkflowModelLaneActions": "",
@@ -6570,17 +6734,13 @@
       "prTitlePromptInstructionsHelp": "",
       "prDescriptionPromptInstructionsHelp": "",
       "chatHeading": "Chat",
-      "chatDescription": "Choose the default target for new Direct chats and whether New Chat should prompt or immediately use that default.",
-      "chatNewSessionMode": "New Chat behavior",
-      "chatNewSessionModePrompt": "Prompt for model each time",
-      "chatNewSessionModeAlwaysDefault": "Always use configured default",
-      "chatNewSessionModeHelp": "Prompt mode opens New Chat with this default preselected. Always-default mode skips the dialog when the configured default is complete.",
+      "chatDescription": "Choose the default target for new Direct chats. New Chat always creates the conversation immediately from this default.",
       "chatDefaultKind": "Chat default target",
       "chatDefaultKindModel": "Model",
       "chatDefaultKindAgent": "Agent",
       "chatDefaultModel": "Chat Default Model",
       "selectChatDefaultModel": "Select a chat default model",
-      "chatDefaultModelHelp": "Model-mode New Chat uses the built-in Fusion chat agent with this provider/model pair. Leave empty to fall back to prompting.",
+      "chatDefaultModelHelp": "Model-mode New Chat uses the built-in Fusion chat agent with this provider/model pair. Leave empty to use the project or global default model.",
       "chatDefaultAgent": "Chat Default Agent",
       "loadingAgents": "Loading agents…",
       "selectChatDefaultAgent": "Select a chat default agent",
@@ -6661,7 +6821,9 @@
       "installationFailed": "",
       "acceptRoutesHint": "",
       "shortLivedEnabledHint": "",
-      "shortLivedTtlMsHint": ""
+      "shortLivedTtlMsHint": "",
+      "cloudflareTunnelURL": "",
+      "tunnelURL": ""
     },
     "researchGlobal": {
       "advancedExternalSearchProviders": "",
@@ -6860,27 +7022,21 @@
       "maxWorktrees": "",
       "worktreeLimitEnabled": "",
       "worktreeLimitEnabledHelp": "",
-      "offByDefaultOptInWhenEnabledCompleted": "",
       "openApprovals": "Ouvrir les approbations",
       "optionalLeaveBlankToAutoResolveFusionWill": "",
       "optionalSupports": "",
       "pnpmInstallFrozenLockfile": "",
-      "randomNamesEGSwiftFalcon": "",
       "rebaseFromRemoteBeforeMerge": "",
       "rebaseRemote": "",
-      "recycleWorktrees": "",
       "selectWorktreesDir": "Sélectionner le répertoire des worktrees",
       "shellCommandToRunInEachNewWorktree": "",
       "stopsOnWorktrunkErrorsForExplicitOperatorRecovery": "",
-      "taskIDEGFN042": "",
-      "taskTitleEGFixLoginBug": "",
       "tryAgain": "Réessayer",
       "useGitDefault": "",
       "whenEnabledTheMergerFetchesFromTheConfigured": "",
       "whenUnsetOnlyAffectsNewlyCreatedWorktrees": "",
       "whichRemoteToFetchForThePreMerge": "",
       "worktreeInitCommand": "",
-      "worktreeNamingStyle": "",
       "worktrees": "",
       "worktreesDirectory": "",
       "worktrunk": "",
@@ -6889,10 +7045,7 @@
       "worktrunkIntegration": "",
       "worktreesPickerNote": "",
       "showWorktreeGroupingHelp": "",
-      "copyFilesHelp": "",
-      "namingStyleNotApplicableWhenRecycling": "",
-      "howToNameFreshWorktreeDirectories": "",
-      "recycleNotApplicableWithTaskIdNaming": ""
+      "copyFilesHelp": ""
     },
     "fileBrowser": {
       "currentDirectory": "",
@@ -6903,7 +7056,11 @@
       "projectTitle": "Project MCP servers",
       "globalDescription": "Configure MCP servers shared by all projects. Project settings may override or disable these servers by name.",
       "projectDescription": "Configure project-specific MCP servers, overrides, and disabled inherited servers.",
-      "enabledHint": ""
+      "enabledHint": "",
+      "transport": "",
+      "transportHttp": "",
+      "transportSse": "",
+      "transportStdio": ""
     },
     "search": {
       "allSections": "",
@@ -6980,7 +7137,32 @@
       "modelFailed": "",
       "runtimeModuleMissing": "",
       "runtimePlatformLoadFailed": "",
-      "runtimeIncompatible": ""
+      "runtimeIncompatible": "The installed voice runtime is incompatible. Repair it, then re-check the runtime.",
+      "recheckRuntime": "Re-check runtime",
+      "recheckingRuntime": "Re-checking runtime…"
+    },
+    "jira": {
+      "configuration": "",
+      "enable": "",
+      "enabledHelp": "",
+      "baseUrl": "",
+      "globalBaseUrl": "",
+      "baseUrlHelp": "",
+      "apiBaseUrl": "",
+      "globalApiBaseUrl": "",
+      "apiBaseUrlHelp": "",
+      "email": "",
+      "globalEmail": "",
+      "emailHelp": "",
+      "secretKey": "",
+      "globalSecretKey": "",
+      "secretHelp": "",
+      "secretScope": "",
+      "globalSecretScope": "",
+      "scopeHelp": "",
+      "template": "",
+      "globalTemplate": "",
+      "templateHelp": ""
     }
   },
   "setup": {
@@ -7385,7 +7567,7 @@
     "catalogSection": "Catalogue des compétences",
     "catalogUnavailable": "Le catalogue n'est pas disponible pour le moment. Veuillez réessayer plus tard.",
     "closeDetail": "Fermer le détail de la compétence",
-    "closeView": "Fermer la vue des compétences",
+    "closeView": "Fermer la vue des compétences et extraits",
     "disabled": "Compétence désactivée",
     "disableSkill": "Désactiver {{name}}",
     "discovered": "découvertes",
@@ -7418,10 +7600,54 @@
     "removeSkill": "Supprimer {{name}}",
     "searchLabel": "Rechercher des compétences",
     "searchPlaceholder": "Rechercher des compétences...",
-    "title": "Compétences",
+    "title": "Compétences et extraits",
     "toggleError": "Impossible de basculer la compétence",
     "toggleFailed": "Impossible de basculer la compétence : {{message}}",
-    "viewDetails": "Afficher les détails de {{name}}"
+    "viewDetails": "Afficher les détails de {{name}}",
+    "autoAvailable": "Auto-available",
+    "autoAvailableTitle": "Enabled skills are available automatically.",
+    "forced": "Forced",
+    "disabledSkill": "Disabled",
+    "disabledSkillTitle": "Disabled skills are not delivered to sessions, even when forced.",
+    "notDiscovered": "Not discovered",
+    "notDiscoveredTitle": "This stored skill is no longer discovered by the project.",
+    "skillStatePending": "Checking availability",
+    "skillStatePendingTitle": "Skill discovery is loading or could not be refreshed.",
+    "filter": "Filter skills",
+    "noMatches": "No matching skills",
+    "loadError": "Skills could not be loaded.",
+    "hiddenUnavailable": "Hidden skills include disabled or not-discovered entries",
+    "snippetsReservedName": "Ce nom est réservé à une commande de chat.",
+    "snippetsInvalidName": "Utilisez 1 à 48 lettres, chiffres, tirets bas ou tirets.",
+    "snippetsPromptRequired": "Saisissez un prompt pour cet extrait.",
+    "snippetsPromptTooLong": "Les prompts peuvent contenir au maximum {{count}} caractères.",
+    "snippetsDuplicateName": "Un extrait portant ce nom existe déjà.",
+    "snippetsLimitReached": "Vous pouvez enregistrer jusqu’à {{count}} extraits.",
+    "snippetsSaveError": "L’extrait n’a pas pu être enregistré. Actualisez puis réessayez.",
+    "snippetsDeleteError": "L’extrait n’a pas pu être supprimé. Actualisez puis réessayez.",
+    "snippetsTitle": "Extraits de chat",
+    "snippetsCount": "{{count}} enregistrés",
+    "snippetsDescription": "Enregistrez des prompts réutilisables, puis saisissez /nom dans un chat pour en insérer un sans l’envoyer.",
+    "snippetsLoading": "Chargement des extraits...",
+    "snippetsLoadError": "Les extraits n’ont pas pu être actualisés. La dernière liste chargée reste affichée.",
+    "snippetsFormLabel": "Éditeur d’extraits de chat",
+    "snippetsNameLabel": "Nom",
+    "snippetsNameHelp": "Lettres, chiffres, tirets bas ou tirets ; 48 caractères maximum.",
+    "snippetsPromptLabel": "Prompt",
+    "snippetsPromptHelp": "{{count}} / {{max}} caractères",
+    "snippetsSaving": "Enregistrement...",
+    "snippetsSaveChanges": "Enregistrer les modifications",
+    "snippetsAdd": "Ajouter un extrait",
+    "snippetsEmpty": "Aucun extrait enregistré.",
+    "snippetsEdit": "Modifier /{{name}}",
+    "snippetsDelete": "Supprimer /{{name}}",
+    "tabSkills": "Compétences",
+    "tabSnippets": "Extraits",
+    "tabsLabel": "Sections des compétences et des extraits",
+    "skillsDescription": "Parcourez, activez et installez les compétences disponibles pour ce projet.",
+    "snippetsEmptyHint": "Créez-en un ici, puis saisissez /nom dans un chat pour l’insérer.",
+    "refreshSkillsLabel": "Actualiser les compétences",
+    "refreshSnippetsLabel": "Actualiser les extraits"
   },
   "specEditor": {
     "edit": "Modifier",
@@ -7736,7 +7962,14 @@
       "overlapBlocker": "Bloqueur de chevauchement de portée de fichier :",
       "removeTitle": "Supprimer la dépendance {{id}}",
       "searchPlaceholder": "Rechercher des tâches…",
-      "stale": "(obsolète)"
+      "stale": "(obsolète)",
+      "overlapFiles": {
+        "loading": "",
+        "error": "",
+        "noScope": "",
+        "none": "",
+        "matches": ""
+      }
     },
     "description": {
       "showLess": "Afficher moins",
@@ -7746,7 +7979,8 @@
       "btn": "Dupliquer",
       "message": "Dupliquer {{id}} ? Cela créera une nouvelle tâche dans Triage avec la même description et invite.",
       "success": "{{id}} dupliqué → {{newId}}",
-      "title": "Dupliquer la tâche"
+      "title": "Dupliquer la tâche",
+      "workflowLabel": ""
     },
     "edit": {
       "autosaveHint": "Les modifications sont enregistrées automatiquement",
@@ -7822,7 +8056,8 @@
     "header": {
       "back": "Retour",
       "backToList": "Retour à la liste des tâches",
-      "editTask": "Modifier la tâche"
+      "editTask": "Modifier la tâche",
+      "popOut": ""
     },
     "inputTokens": "Entrée",
     "lastUsed": "Dernière utilisation",
@@ -7831,6 +8066,10 @@
       "activity": "Activité",
       "activityHeading": "Activité",
       "agentLog": "Journal de l'agent",
+      "copy": "",
+      "copyDisplayed": "",
+      "copyFailure": "",
+      "copySuccess": "",
       "loadingActivity": "",
       "noActivity": "(aucune activité)",
       "truncated_one": "",
@@ -7846,21 +8085,8 @@
       "noBranchToMerge": "aucune branche à fusionner",
       "title": "Fusionner la tâche"
     },
-    "move": {
-      "backToInProgress": "Retour à En cours",
-      "backTo": "Retour à {{column}}",
-      "cancelMove": "Annuler le déplacement",
-      "keepProgress": "Conserver la progression",
-      "movedTo": "Déplacé vers {{column}}",
-      "moveTo": "Déplacer vers {{column}}",
-      "preserveProgressMessage": "Cette tâche a des étapes terminées. Conserver la progression avant de déplacer ?",
-      "preserveProgressTitle": "Conserver la progression ?",
-      "resetProgress": "Réinitialiser la progression",
-      "resetProgressMessage": "Réinitialiser toute la progression des étapes avant de déplacer cette tâche ?",
-      "resetProgressTitle": "Réinitialiser la progression ?"
-    },
     "nearDuplicate": {
-      "actions": "Choisissez Archiver pour déplacer cette tâche vers les archives, ou Conserver pour continuer avec cette tâche.",
+      "actions": "This task continues normally. Archive it if the work is already covered, or clear this flag once you have read it.",
       "archiveBtn": "Archiver",
       "archiveConfirm": "Archiver",
       "archived": "{{id}} archivé",
@@ -7868,14 +8094,14 @@
       "archiveTitle": "Archiver la tâche quasi-dupliquée",
       "copy": "Cette tâche semble être un quasi-doublon de",
       "headline": "Doublon potentiel détecté",
-      "keepBtn": "Conserver",
-      "kept": "{{id}} conservé et avertissement de doublon ignoré",
       "deleteBtn": "Supprimer",
       "deleteConfirm": "Supprimer",
       "deleted": "Supprimé {{id}}",
       "deleteMessage": "Supprimer {{id}} comme doublon de {{duplicateOf}} ?",
       "deleteTitle": "Supprimer la tâche en double",
-      "triageActions": "Choisissez Supprimer pour retirer ce doublon, ou Conserver pour continuer."
+      "triageActions": "This task stays paused until you clear this flag or delete it. Delete it if the work is already covered.",
+      "dismissBtn": "Mark the duplicate flag for {{id}} as read",
+      "dismissed": "Duplicate flag cleared for {{id}}"
     },
     "nextRecoveryAt": "Prochaine récupération à {{time}}",
     "no": "Non",
@@ -7960,7 +8186,7 @@
       "createBtn": "Créer une tâche de raffinement",
       "creating": "Création...",
       "feedbackRequired": "Veuillez saisir des commentaires décrivant ce qui doit être affiné",
-      "feedbackTooLong": "Le commentaire ne peut pas dépasser 2000 caractères",
+      "feedbackTooLong": "",
       "help": "Décrivez ce qui doit être affiné ou amélioré...",
       "modalTitle": "Affiner",
       "placeholder": "Saisissez votre commentaire ici...",
@@ -7968,11 +8194,13 @@
     },
     "reset": {
       "btn": "Réinitialiser",
-      "confirmMessage": "Cela effacera toute la progression de {{id}} et relancera la tâche depuis le début. Continuer ?",
-      "resetSuccess": "{{id}} réinitialisé — une nouvelle exécution sera allouée"
-    },
-    "respecify": {
-      "btn": "Respécifier"
+      "confirmMessage": "Restart this task from nothing but the original request. Its plan, worktree, branch and commits, and reviews are permanently deleted and cannot be recovered.",
+      "resetSuccess": "{{id}} réinitialisé — une nouvelle exécution sera allouée",
+      "confirmTitle": "Reset this task?",
+      "descriptionHelp": "",
+      "descriptionLabel": "",
+      "descriptionRequired": "",
+      "submitting": ""
     },
     "retries": {
       "branchConflict": "Récupération après conflit de branche",
@@ -8003,7 +8231,18 @@
     "retriesLabel": "Nouvelles tentatives (récupération / workflow / fusion / tâche terminée)",
     "retry": {
       "btn": "Réessayer",
-      "retried": "{{id}} relancé"
+      "retried": "{{id}} relancé",
+      "confirmTitle": "Retry this stage?",
+      "confirmLabel": "Retry",
+      "planConfirmMessage": "Rebuild the plan from the original request. This card stays in its current column.",
+      "implementationConfirmMessage": "Discard the in-flight work and start it again on the approved plan. This card stays in its current column.",
+      "reviewConfirmMessage": "Discard the review verdicts and review the produced work again. This card stays in its current column.",
+      "genericConfirmMessage": "Repeat the current stage and keep this card in its current column.",
+      "planSuccess": "Planning will restart in this column.",
+      "implementationSuccess": "Work will restart in this column.",
+      "reviewSuccess": "Review will run again in this column.",
+      "genericSuccess": "This stage will restart in its current column.",
+      "pendingAutomaticRecovery": "Automatic recovery is pending. You can Retry now to restart this stage."
     },
     "runtimeLinks": "Liens d'exécution",
     "runtimeStatus": "Statut d'exécution",
@@ -8067,8 +8306,10 @@
       "worktreeTerminal": "Terminal",
       "workflow": "Workflow",
       "summary": "Summary",
-      "cost": "",
-      "recommendations": ""
+      "recommendations": "",
+      "dependencies": "",
+      "details": "",
+      "debug": ""
     },
     "terminal": {
       "loading": ""
@@ -8101,30 +8342,7 @@
     "workflowTimedSteps": "Étapes chronométrées du workflow",
     "yes": "Oui",
     "summaryTab": {
-      "agentWorkHeading": "Work done by agents",
-      "cachedTokens": "Cached",
-      "changedHeading": "What changed",
-      "commit": "Commit",
-      "completedSteps": "Completed steps",
-      "completionHeading": "Completion summary",
-      "cost": "Cost",
-      "costUnavailable": "No pricing for this model",
-      "deletions": "Removed",
-      "filesChanged": "Files",
-      "inputTokens": "Input",
-      "insertions": "Added",
-      "model": "Model",
-      "noAgentWork": "No completed steps or workflow results are available for this task.",
-      "noChangedFiles": "No changed-file list is available for this task.",
-      "noCompletionSummary": "No completion summary was recorded for this task.",
-      "noTokenUsage": "No token usage recorded for this task yet.",
-      "outputTokens": "Output",
-      "retries": "Agents retried this task {{count}} time{{plural}}.",
-      "tokenCostHeading": "Token usage & cost",
-      "totalCost": "Total cost",
-      "totalTokens": "Total",
-      "unknownModel": "(unknown)",
-      "workflowResults": "Workflow results"
+      "agentWorkHeading": "Work done by agents"
     },
     "gitlabTracking": {
       "collapse": "",
@@ -8179,6 +8397,38 @@
       "retry": "",
       "create": "",
       "error": ""
+    },
+    "reverted": {
+      "deleteAria": ""
+    },
+    "revise": "",
+    "specLock": {
+      "accepted": "",
+      "alignment": "",
+      "alignmentLabel": "",
+      "captured": "",
+      "currentPlan": "",
+      "findings": "",
+      "latestLock": "",
+      "lockState": "",
+      "relockChanged": "",
+      "retainedHistory": ""
+    },
+    "aiMergeReview": {
+      "title": "",
+      "approvedWithPending": "",
+      "candidate": "",
+      "dismissFinding": "",
+      "terminalGuidance": ""
+    },
+    "debug": {
+      "none": ""
+    },
+    "details": {
+      "expandRouting": "",
+      "collapseRouting": "",
+      "expandDebug": "",
+      "collapseDebug": ""
     }
   },
   "taskDocuments": {
@@ -8406,7 +8656,16 @@
     "attachFileFailed": "Échec de la pièce jointe {{fileName}} : {{error}}",
     "awaitingApproval": "En attente d'approbation",
     "baseBranch": "Base",
-    "blockedByTooltip": "Bloqué par {{taskId}} (conflit de fichiers)",
+    "blockedByTooltip": "En attente de {{taskId}} (conflit de fichiers)",
+    "externalBlock": {
+      "title": "Bloquée",
+      "unknownCode": "NON_CLASSÉE",
+      "genericMessage": "Un obstacle extérieur nécessite une intervention opérateur",
+      "explain": "Expliquer cette erreur",
+      "explainPrompt": "Explique moi cette erreur {{error}} et comment la résoudre.",
+      "resuming": "Reprise…",
+      "retry": "Réessayer"
+    },
     "branch": "Branche",
     "branchMetadata": "Métadonnées de branche",
     "branchProgress": "",
@@ -8450,9 +8709,8 @@
     "depsCount_other": "",
     "descriptionPlaceholder": "Description de la tâche",
     "descriptionRefined": "Description affinée par l'IA",
-    "doneNoMerge": "Terminé (sans fusion)",
     "duplicateCheckFailed": "Vérification des doublons échouée ; création de la tâche quand même.",
-    "duplicateDismissed": "{{taskId}} conservé ; avertissement de doublon ignoré",
+    "duplicateDismissed": "Duplicate flag cleared for {{taskId}}",
     "duplicateOf": "Doublon de {{id}}",
     "editTask": "Modifier la tâche",
     "enterDescriptionFirst": "Saisir d'abord une description",
@@ -8488,10 +8746,7 @@
     "issueClosed": "fermé",
     "issueDeleted": "supprimé",
     "issueLeft": "laissé",
-    "keep": "Conserver",
-    "keepFailed": "Impossible de conserver {{taskId}} : {{error}}",
     "keepProgress": "Conserver la progression",
-    "keepTaskTitle": "Conserver cette tâche et ignorer l'avertissement de doublon",
     "leaveUnchanged": "Laisser intact",
     "lineageConflict": "{{taskId}} a des enfants de lignée ({{children}}) qui le référencent comme parent source.\n\nSupprimer quand même en dissociant d'abord ces références ?",
     "linkedIssueChipAriaLabel": "Issue GitHub liée #{{number}}",
@@ -8515,7 +8770,7 @@
     "moved": "{{taskId}} déplacé vers {{column}}",
     "moveFailed": "Impossible de déplacer {{taskId}} : {{error}}",
     "moveTask": "Déplacer la tâche",
-    "nearDuplicateTitle": "Potentiel quasi-doublon de {{id}}",
+    "nearDuplicateTitle": "Flagged as a possible duplicate of {{id}}. This task continues normally; clear the flag once you have read it.",
     "needsInput": "",
     "noAgentsAvailable": "Aucun agent disponible",
     "node": "Nœud",
@@ -8535,9 +8790,6 @@
     "prNodeTitle": "",
     "prNodeWithNumber": "",
     "projectDefaultLocal": "Défaut du projet / local",
-    "promote": "",
-    "promoteTask": "",
-    "promoting": "",
     "queued": "En file d'attente",
     "refine": "Affiner",
     "refineAddDetails": "Ajouter des détails",
@@ -8620,7 +8872,18 @@
     "refinesOfTitle": "",
     "revertedTasks": "",
     "revertedResolutionActions": "",
-    "revise": ""
+    "revise": "",
+    "dismissDuplicateFlag": "Mark the duplicate flag for {{id}} as read",
+    "nearDuplicateHeldTitle": "Flagged as a duplicate of {{id}}. This task stays paused until you clear this flag or delete it.",
+    "duplicateDismissFailed": "Failed to clear the duplicate flag for {{taskId}}: {{error}}",
+    "planApproval": {
+      "approve": "",
+      "approveFailed": "",
+      "approving": "",
+      "copy": "",
+      "replanCapCopy": "",
+      "title": ""
+    }
   },
   "terminal": {
     "arrowKeysLabel": "",
@@ -8868,7 +9131,15 @@
     "statusSkipped": "",
     "submitAndResume": "",
     "submitting": "",
-    "waitingForOutput": ""
+    "waitingForOutput": "",
+    "aggregateNotFullyExecuted": "Not fully executed",
+    "notRunReasonExecutionModeSkip": "fast mode skipped this check",
+    "notRunReasonNotConfigured": "no test or build command is configured",
+    "notRunReasonRepositoryContextUnresolved": "the workspace repository context could not be resolved",
+    "notRunReasonToolingUnavailable": "a required tool was unavailable",
+    "statusNotRunWithReason": "Not executed — {{reason}}",
+    "summaryNotExecuted_one": "{{count}} not executed",
+    "summaryNotExecuted_other": "{{count}} not executed"
   },
   "workflowColumns": {
     "add": "",
@@ -9265,7 +9536,9 @@
   },
   "worktree": {
     "unassigned": "Non assigné",
-    "upNext": "Suivant"
+    "upNext": "Suivant",
+    "workspaceRepos_one": "{{label}} · {{count}} dépôt",
+    "workspaceRepos_other": "{{label}} · {{count}} dépôts"
   },
   "worktrunk": {
     "assetUrl": "URL de l'actif",
@@ -9315,7 +9588,12 @@
     "toolNames": "",
     "toolResult": "",
     "you": "",
-    "youMessage": ""
+    "youMessage": "",
+    "missingOutput": "",
+    "missingOutputTimestamp": "",
+    "statusUpdate": "",
+    "statusUpdateTimestamp": "",
+    "toolDetailsMissing": "Some tool details are unavailable. They may have been recorded while detail saving was disabled; check Settings → Global General to save future tool details."
   },
   "engineBanner": {
     "body": "The engine for this project is not running, so task automation and live updates may be paused. Start it now to reconnect the dashboard.",
@@ -9338,6 +9616,234 @@
     "targetLabel": "Cible de dépôt",
     "targetInherit": "Utiliser la cible configurée pour l’action",
     "targetIssue": "Issue GitHub",
-    "targetDiscussion": "Discussion GitHub"
+    "targetDiscussion": "Discussion GitHub",
+    "activityTrace": "",
+    "capturingScreenshot": "",
+    "close": "",
+    "confirmDataPoint": "",
+    "confirmScreenshotRetention": "",
+    "duplicateReview": "",
+    "file": "",
+    "final": "",
+    "menu": "",
+    "returnToPrompt": "",
+    "review": "",
+    "storeScreenshot": "",
+    "structured": "",
+    "structuredDataPoint": "",
+    "suggestedHelp": "",
+    "summary": "",
+    "viewGitHub": ""
+  },
+  "composeChat": {
+    "ariaLabel": "",
+    "draft": "",
+    "draftNarrative": "",
+    "emptyDraft": "",
+    "useDraft": ""
+  },
+  "fixture": {
+    "floatingTaskDetail": "",
+    "floatingTaskDetailBody": "",
+    "genericFloatingWindow": "",
+    "genericFloatingWindowBody": "",
+    "genericWindowHeader": "",
+    "headerAction": "",
+    "headerlessTaskDetail": "",
+    "taskDetail": "",
+    "taskDetailBody": ""
+  },
+  "floatingWindow": {
+    "close": "",
+    "resize": ""
+  },
+  "githubImport": {
+    "github": "",
+    "gitlab": ""
+  },
+  "ideation": {
+    "addCandidate": "",
+    "converge": "",
+    "convergedToMission": "",
+    "description": "",
+    "divergentCandidate": "",
+    "noSessions": "",
+    "persisted": "",
+    "selectOrStart": "",
+    "sessionTitle": "",
+    "start": "",
+    "title": ""
+  },
+  "knowledgeGraph": {
+    "allFnxcAreas": "",
+    "allOwners": "",
+    "allSymbolKinds": "",
+    "bothDirections": "",
+    "depth": "",
+    "distance": "",
+    "edgeKinds": "",
+    "findPath": "",
+    "incoming": "",
+    "limitResults": "",
+    "neighbors": "",
+    "next": "",
+    "noNeighbors": "",
+    "noPath": "",
+    "nodeKinds": "",
+    "none": "",
+    "outgoing": "",
+    "ownerDerived": "",
+    "ownerFile": "",
+    "pathLimitReached": "",
+    "previous": "",
+    "provenance": "",
+    "raiseHopLimit": "",
+    "refreshNeighbors": "",
+    "searching": "",
+    "selectNodeHint": "",
+    "shortestPath": "",
+    "showingOf": "",
+    "useSelectedFrom": "",
+    "useSelectedTo": ""
+  },
+  "mermaid": {
+    "diagram": ""
+  },
+  "nativeStructure": {
+    "loadFailed": "",
+    "loading": "",
+    "openAria": "",
+    "previewUnavailable": "",
+    "unavailable": ""
+  },
+  "providerLogin": {
+    "approveInBrowser": "",
+    "authorizationReceived": "",
+    "cancel": "",
+    "connected": "",
+    "exchangingCode": "",
+    "finishInBrowser": "",
+    "handAuthorizationBack": "",
+    "openSignInAgain": "",
+    "pasteRedirectUrl": "",
+    "signingInTo": ""
+  },
+  "taskVerification": {
+    "failed": "",
+    "heading": "",
+    "passed": "",
+    "queued": "",
+    "requestRejected": "",
+    "running": ""
+  },
+  "whatsapp": {
+    "allowedSenders": "",
+    "choosePairingMethod": "",
+    "connectedAs": "",
+    "connectedSuccess": "",
+    "description": "",
+    "installPlugin": "",
+    "instructionsLabel": "",
+    "loggingOut": "",
+    "logoutRepair": "",
+    "pairing": "",
+    "pairingConfiguration": "",
+    "phoneNumber": "",
+    "qrCode": "",
+    "refreshStatus": "",
+    "repairInstructions": "",
+    "requestPairingCode": "",
+    "requestingCode": "",
+    "status": "",
+    "waitConnected": "",
+    "waitingQr": ""
+  },
+  "thinking": {
+    "expandAll": "Tout développer",
+    "collapseAll": "Tout réduire",
+    "noDetail": "Aucun raisonnement capturé pour cette étape",
+    "untitledSection": "Raisonnement sans titre",
+    "sectionCount": "{{count}} section",
+    "sectionCountPlural": "",
+    "showRaw": "",
+    "showSections": ""
+  },
+  "artifactImageViewer": {
+    "openTask": "",
+    "close": "",
+    "loading": "",
+    "retry": "",
+    "zoomIn": "",
+    "zoomOut": "",
+    "resetZoom": "",
+    "zoomLevel": ""
+  },
+  "taskHistory": {
+    "stage": {
+      "plan": "",
+      "code": "",
+      "review": ""
+    },
+    "empty": {
+      "plan": "",
+      "code": "",
+      "review": ""
+    },
+    "entry": {
+      "noBody": "",
+      "completionSummary": "",
+      "stepReport": "",
+      "merged": "",
+      "noOpMerge": "",
+      "verdictNoNotes": "",
+      "duration": ""
+    },
+    "meta": {
+      "commit": "",
+      "targetBranch": "",
+      "strategy": "",
+      "method": "",
+      "files": "",
+      "insertions": "",
+      "deletions": "",
+      "pr": "",
+      "noOpReason": ""
+    },
+    "loading": "",
+    "verdict": {
+      "approve": "",
+      "approve-with-notes": "",
+      "revise": "",
+      "close-no-op": "",
+      "passed": "",
+      "failed": "",
+      "advisory-failure": "",
+      "skipped": "",
+      "pending": ""
+    }
+  },
+  "patchnode": {
+    "cancelled": "",
+    "empty": "",
+    "entryCount_one": "",
+    "entryCount_other": "",
+    "error": "",
+    "loadMore": "",
+    "loading": "",
+    "loadingMore": "",
+    "noResults": "",
+    "retry": "",
+    "reverted": "",
+    "searchAriaLabel": "",
+    "searchPlaceholder": "",
+    "title": "",
+    "today": "",
+    "yesterday": ""
+  },
+  "toolCallDetails": {
+    "line": "line",
+    "lines": "lines",
+    "showLess": "Show less",
+    "showMore": "Show more ({{count}} {{lineLabel}})"
   }
 }

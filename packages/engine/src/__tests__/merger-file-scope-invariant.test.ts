@@ -507,3 +507,32 @@ describe("file-scope invariant wiring", () => {
     expect(mockedExecSync).not.toHaveBeenCalledWith("git reset --merge", expect.objectContaining({ cwd: "/tmp/root" }));
   });
 });
+
+describe("scope transform seam", () => {
+  it("evaluates the transformed workspace-local scope after resolving prompt scope", async () => {
+    const store = createInvariantStore(["repo-a/src/**"]);
+    mockStagedFiles(["src/index.ts"]);
+    await expect(assertSquashOverlapsFileScope({
+      store: store as never,
+      taskId: "FN-9050",
+      rootDir: "/tmp/root",
+      stagedFilesReader,
+      task: await (store as any).getTask("FN-4073"),
+      scopeTransform: (scope) => scope.map((entry) => entry.replace("repo-a/", "")),
+    })).resolves.toBeUndefined();
+  });
+
+  it("does not invoke the transform when scopeOverride bypasses enforcement", async () => {
+    const store = createInvariantStore(["repo-a/src/**"], { scopeOverride: true });
+    const transform = vi.fn((scope: string[]) => scope);
+    await expect(assertSquashOverlapsFileScope({
+      store: store as never,
+      taskId: "FN-9050",
+      rootDir: "/tmp/root",
+      stagedFilesReader,
+      task: await (store as any).getTask("FN-4073"),
+      scopeTransform: transform,
+    })).resolves.toBeUndefined();
+    expect(transform).not.toHaveBeenCalled();
+  });
+});

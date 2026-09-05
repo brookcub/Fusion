@@ -1,6 +1,8 @@
+import { readFileSync } from "node:fs";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { runAutoUpdateCycle, startAutoUpdateWatcher } from "../auto-update.js";
+import { buildAutoUpdateDeps, runAutoUpdateCycle, startAutoUpdateWatcher } from "../auto-update.js";
 import type { AutoUpdateDeps } from "../auto-update.js";
+import { UpdateInstallCoordinator } from "../update-install-coordinator.js";
 
 /*
 FNXC:AutoUpdate 2026-07-25-10:05:
@@ -43,7 +45,7 @@ describe("runAutoUpdateCycle", () => {
 
     await expect(runAutoUpdateCycle(deps)).resolves.toBe("restarting");
 
-    expect(deps.installUpdate).toHaveBeenCalledWith("1.0.0", "2.0.0", { fusionDir: deps.fusionDir });
+    expect(deps.installUpdate).toHaveBeenCalledWith("1.0.0", "2.0.0", { fusionDir: deps.fusionDir, installMethod: { sourceWorkspaceRoot: undefined } });
     expect(deps.requestRestart).toHaveBeenCalledWith("auto-update");
   });
 
@@ -63,6 +65,16 @@ describe("runAutoUpdateCycle", () => {
 
     await expect(runAutoUpdateCycle(deps)).resolves.toBe("checks-disabled");
     expect(deps.checkForUpdate).not.toHaveBeenCalled();
+  });
+
+  it("does not check, install, or restart when updates are externally managed", async () => {
+    const deps = makeDeps({ externallyManaged: true });
+
+    await expect(runAutoUpdateCycle(deps)).resolves.toBe("externally-managed");
+
+    expect(deps.checkForUpdate).not.toHaveBeenCalled();
+    expect(deps.installUpdate).not.toHaveBeenCalled();
+    expect(deps.requestRestart).not.toHaveBeenCalled();
   });
 
   it("never installs on an unsupervised host", async () => {
@@ -99,6 +111,23 @@ describe("runAutoUpdateCycle", () => {
     });
   });
 
+  it("waits for restart without rechecking after another surface installed an update", async () => {
+    const coordinator = new UpdateInstallCoordinator();
+    await coordinator.install("2.0.0", async () => ({
+      currentVersion: "1.0.0",
+      latestVersion: "2.0.0",
+      updated: true,
+      outcome: "installed",
+    }));
+    const deps = makeDeps({ coordinator });
+
+    await expect(runAutoUpdateCycle(deps)).resolves.toBe("restart-waiting");
+
+    expect(deps.checkForUpdate).not.toHaveBeenCalled();
+    expect(deps.installUpdate).not.toHaveBeenCalled();
+    expect(deps.requestRestart).not.toHaveBeenCalled();
+  });
+
   it("does not install or restart when already up to date", async () => {
     const deps = makeDeps();
     deps.checkForUpdate.mockResolvedValue({
@@ -123,6 +152,20 @@ describe("runAutoUpdateCycle", () => {
     });
 
     await expect(runAutoUpdateCycle(deps)).resolves.toBe("install-failed");
+    expect(deps.requestRestart).not.toHaveBeenCalled();
+  });
+
+  it("does not restart when the install discovers no update remains", async () => {
+    const deps = makeDeps();
+    deps.installUpdate.mockResolvedValue({
+      currentVersion: "1.0.0",
+      latestVersion: "2.0.0",
+      updated: false,
+      outcome: "no-update-available",
+      message: "Fusion is already up to date.",
+    });
+
+    await expect(runAutoUpdateCycle(deps)).resolves.toBe("up-to-date");
     expect(deps.requestRestart).not.toHaveBeenCalled();
   });
 
@@ -223,4 +266,23 @@ describe("startAutoUpdateWatcher", () => {
     releaseInstall?.();
     stop();
   });
+  it("skips unsupported source-checkout installs without restart", async () => {
+    const deps = makeDeps({ sourceWorkspaceRoot: "/repo/fusion" });
+    deps.installUpdate.mockResolvedValue({ currentVersion: "1.0.0", latestVersion: "2.0.0", updated: false, outcome: "unsupported-install-method", message: "source checkout" });
+    await expect(runAutoUpdateCycle(deps)).resolves.toBe("unsupported-install-method");
+    expect(deps.installUpdate).toHaveBeenCalledWith("1.0.0", "2.0.0", { fusionDir: deps.fusionDir, installMethod: { sourceWorkspaceRoot: "/repo/fusion" } });
+    expect(deps.requestRestart).not.toHaveBeenCalled();
+  });
+
+  it("ratchets production watcher wiring through buildAutoUpdateDeps", () => {
+    const serverSource = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
+    expect(serverSource).toContain("startAutoUpdateWatcher(buildAutoUpdateDeps(");
+    expect(serverSource).not.toMatch(/startAutoUpdateWatcher\(\s*\{\s*getSettings:/s);
+  });
+
+  it("buildAutoUpdateDeps preserves host system-control context", () => {    const systemControl = { supervised: true, requestRestart: vi.fn(), sourceWorkspaceRoot: "/repo/fusion" };
+    const deps = buildAutoUpdateDeps({ getSettings: async () => ({}), currentVersion: "1.0.0", systemControl, log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } });
+    expect(deps).toMatchObject({ supervised: true, requestRestart: systemControl.requestRestart, sourceWorkspaceRoot: "/repo/fusion" });
+  });
+
 });

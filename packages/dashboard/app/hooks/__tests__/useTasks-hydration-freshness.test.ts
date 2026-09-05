@@ -22,7 +22,13 @@ import type { Task } from "@fusion/core";
 import { applyLocalTaskPatch, mergeTaskSnapshot, useTasks } from "../useTasks";
 import * as api from "../../api";
 import { SWR_CACHE_KEYS } from "../../utils/swrCache";
-import { isTaskStuck, countStuckTasks } from "../../utils/taskStuck";
+/*
+FNXC:StuckTagRemoval 2026-08-17-22:30:
+Stuck-task tagging was removed from the dashboard, so these freshness assertions now use the
+underlying isOverdue primitive (utils/dataFreshness) that agentHealth and other consumers still
+share. The invariant under test is unchanged: lastFetchTimeMs is the as-of clock for every row.
+*/
+import { isOverdue } from "../../utils/dataFreshness";
 import { isTaskAgentActive } from "../../utils/taskActivity";
 
 /*
@@ -82,6 +88,8 @@ const CACHE_KEY = `${SWR_CACHE_KEYS.TASKS_PREFIX}${PROJECT_ID}`;
 const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
 /** Project default from `packages/core/src/settings-schema.ts`. */
 const TASK_STUCK_TIMEOUT_MS = 600_000;
+const rowOverdue = (task: Task, dataAsOfMs: number | undefined): boolean =>
+  isOverdue(new Date(task.updatedAt).getTime(), TASK_STUCK_TIMEOUT_MS, dataAsOfMs);
 
 function createInProgressTask(id: string, updatedAtMs: number): Task {
   return {
@@ -346,6 +354,112 @@ describe("task snapshot lifecycle freshness", () => {
   });
 });
 
+describe("task prompt retention", () => {
+  const current = {
+    ...createInProgressTask("FN-PROMPT", Date.parse("2026-08-05T10:00:00.000Z")),
+    prompt: "# Loaded plan\n\n## What This Delivers\n\nStable summary",
+  } as Task;
+
+  it("retains a loaded plan for a newer sparse empty prompt", () => {
+    const incoming = {...current, prompt: "", updatedAt: "2026-08-05T10:01:00.000Z"} as Task;
+
+    expect(mergeTaskSnapshot(current, incoming).prompt).toBe(current.prompt);
+  });
+
+  it("retains a loaded plan for a newer sparse undefined prompt", () => {
+    const incoming = {...current, prompt: undefined, updatedAt: "2026-08-05T10:01:00.000Z"} as Task;
+
+    expect(mergeTaskSnapshot(current, incoming).prompt).toBe(current.prompt);
+  });
+
+  it("allows a full snapshot to clear a loaded plan", () => {
+    const incoming = {...current, prompt: "", updatedAt: "2026-08-05T10:01:00.000Z"} as Task;
+
+    expect(mergeTaskSnapshot(current, incoming, {fullSnapshot: true}).prompt).toBe("");
+  });
+
+  it("adopts a newer sparse non-blank plan", () => {
+    const incoming = {...current, prompt: "# Rewritten plan", updatedAt: "2026-08-05T10:01:00.000Z"} as Task;
+
+    expect(mergeTaskSnapshot(current, incoming).prompt).toBe("# Rewritten plan");
+  });
+
+  it.each(["", undefined] as const)(
+    "does not introduce a prompt key from a sparse %s prompt on a slim current row",
+    (prompt) => {
+      const slimCurrent = {...current} as Task & {prompt?: string};
+      delete slimCurrent.prompt;
+      const incoming = {...slimCurrent, prompt, updatedAt: "2026-08-05T10:01:00.000Z"} as Task;
+
+      const merged = mergeTaskSnapshot(slimCurrent, incoming);
+      expect(Object.prototype.hasOwnProperty.call(merged, "prompt")).toBe(false);
+    },
+  );
+});
+
+describe("activity journal retention", () => {
+  const journal = [{ timestamp: "2026-08-05T10:00:00.000Z", action: "Created task" }];
+  const current = {
+    ...createInProgressTask("FN-JOURNAL", Date.parse("2026-08-05T10:00:00.000Z")),
+    prompt: "# Complete task detail",
+    log: journal,
+  } as Task;
+
+  it("retains a populated journal for a newer stripped payload that carries a prompt", () => {
+    const incoming = {
+      ...current,
+      prompt: "# Board prompt",
+      log: [],
+      updatedAt: "2026-08-05T10:01:00.000Z",
+    } as Task;
+
+    expect(mergeTaskSnapshot(current, incoming).log).toEqual(journal);
+  });
+
+  it("retains a populated journal for a stripped payload with no prompt", () => {
+    const incoming = {
+      ...current,
+      prompt: undefined,
+      log: [],
+      updatedAt: "2026-08-05T10:01:00.000Z",
+    } as Task;
+
+    expect(mergeTaskSnapshot(current, incoming).log).toEqual(journal);
+  });
+
+  it("retains a populated journal for an authoritative task:moved payload", () => {
+    const incoming = {
+      ...current,
+      column: "in-review",
+      columnMovedAt: "2026-08-05T10:01:00.000Z",
+      log: [],
+      updatedAt: "2026-08-05T10:01:00.000Z",
+    } as Task;
+
+    expect(mergeTaskSnapshot(current, incoming, { authoritativeMove: true }).log).toEqual(journal);
+  });
+
+  it("uses a populated authoritative detail journal", () => {
+    const detailJournal = [{ timestamp: "2026-08-05T10:01:00.000Z", action: "Updated task" }];
+    const incoming = { ...current, log: detailJournal, updatedAt: "2026-08-05T10:01:00.000Z" } as Task;
+
+    expect(mergeTaskSnapshot(current, incoming, { fullSnapshot: true }).log).toEqual(detailJournal);
+  });
+
+  it("allows an authoritative empty detail journal to clear a populated cached journal", () => {
+    const incoming = { ...current, log: [], updatedAt: "2026-08-05T10:01:00.000Z" } as Task;
+
+    expect(mergeTaskSnapshot(current, incoming, { fullSnapshot: true }).log).toEqual([]);
+  });
+
+  it("uses an older populated authoritative detail journal over an empty stripped row", () => {
+    const emptyCurrent = { ...current, log: [], updatedAt: "2026-08-05T10:01:00.000Z" } as Task;
+    const olderDetail = { ...current, updatedAt: "2026-08-05T10:00:00.000Z" } as Task;
+
+    expect(mergeTaskSnapshot(emptyCurrent, olderDetail, { fullSnapshot: true }).log).toEqual(journal);
+  });
+});
+
 describe("useTasks hydration freshness (dataAsOfMs)", () => {
   it("reports the envelope savedAt, not now, on the first render after a 2-hour discard", () => {
     const savedAt = seedSnapshot([createInProgressTask("FN-1", Date.now() - TWO_HOURS_MS)], TWO_HOURS_MS);
@@ -358,7 +472,7 @@ describe("useTasks hydration freshness (dataAsOfMs)", () => {
     expect(result.current.lastFetchTimeMs).toBe(savedAt);
   });
 
-  it("does not mark a whole board stuck when the snapshot itself is hours old", () => {
+  it("does not report hydrated rows overdue when the snapshot itself is hours old", () => {
     const savedAt = Date.now() - TWO_HOURS_MS;
     // Each card was updated a minute before the snapshot was written: fresh RELATIVE TO the snapshot,
     // hours old relative to now. This is the operator's 6 in-progress cards after an iOS PWA discard.
@@ -372,23 +486,20 @@ describe("useTasks hydration freshness (dataAsOfMs)", () => {
     const dataAsOfMs = result.current.lastFetchTimeMs;
 
     expect(dataAsOfMs).toBe(savedAt);
-    // The reported surface: TaskCard's `isStuck` / status badge.
+    // Freshness verdicts must measure against the snapshot clock, not now.
     for (const task of result.current.tasks) {
-      expect(isTaskStuck(task, TASK_STUCK_TIMEOUT_MS, dataAsOfMs)).toBe(false);
+      expect(rowOverdue(task, dataAsOfMs)).toBe(false);
     }
-    // Column.activeTaskCount and ExecutorStatusBar/useExecutorStats counters read the same clock.
-    expect(countStuckTasks(result.current.tasks, TASK_STUCK_TIMEOUT_MS, dataAsOfMs)).toBe(0);
-    // TaskCard's agent pulse is suppressed by `isStuck`; with an honest clock it stays lit.
+    // The agent pulse stays lit for rows that are fresh relative to the snapshot.
     for (const task of result.current.tasks) {
-      const isStuck = isTaskStuck(task, TASK_STUCK_TIMEOUT_MS, dataAsOfMs);
-      expect(isTaskAgentActive(task, { isStuck })).toBe(true);
+      expect(isTaskAgentActive(task, {})).toBe(true);
     }
 
-    // Guard the exact regression: the old `undefined` clock (=> Date.now()) called all six stuck.
-    expect(countStuckTasks(result.current.tasks, TASK_STUCK_TIMEOUT_MS, undefined)).toBe(6);
+    // Guard the exact regression: the old `undefined` clock (=> Date.now()) called all six overdue.
+    expect(result.current.tasks.filter((task) => rowOverdue(task, undefined)).length).toBe(6);
   });
 
-  it("still reports a genuinely stuck card as stuck against the snapshot's own clock", () => {
+  it("still reports a genuinely idle card overdue against the snapshot's own clock", () => {
     const savedAt = Date.now() - TWO_HOURS_MS;
     seedSnapshot(
       [
@@ -403,10 +514,10 @@ describe("useTasks hydration freshness (dataAsOfMs)", () => {
     const { result } = renderHook(() => useTasks({ projectId: PROJECT_ID }));
     const dataAsOfMs = result.current.lastFetchTimeMs;
 
-    const stuckIds = result.current.tasks
-      .filter((task) => isTaskStuck(task, TASK_STUCK_TIMEOUT_MS, dataAsOfMs))
+    const overdueIds = result.current.tasks
+      .filter((task) => rowOverdue(task, dataAsOfMs))
       .map((task) => task.id);
-    expect(stuckIds).toEqual(["FN-STUCK"]);
+    expect(overdueIds).toEqual(["FN-STUCK"]);
   });
 
   it("advances the clock to now once the mount revalidation lands real data", async () => {
@@ -553,11 +664,9 @@ describe("useTasks freshness clock vs single-row live updates", () => {
       expect(result.current.tasks.map((task) => task.id)).toContain("FN-LIVE");
       // ...but it says nothing about the other three rows, so the board's age is unchanged.
       expect(result.current.lastFetchTimeMs).toBe(savedAt);
-      const stuckHydrated = hydrated.filter((task) =>
-        isTaskStuck(task, TASK_STUCK_TIMEOUT_MS, result.current.lastFetchTimeMs),
-      );
-      expect(stuckHydrated).toEqual([]);
-      expect(countStuckTasks(result.current.tasks, TASK_STUCK_TIMEOUT_MS, result.current.lastFetchTimeMs)).toBe(0);
+      const overdueHydrated = hydrated.filter((task) => rowOverdue(task, result.current.lastFetchTimeMs));
+      expect(overdueHydrated).toEqual([]);
+      expect(result.current.tasks.filter((task) => rowOverdue(task, result.current.lastFetchTimeMs)).length).toBe(0);
     },
   );
 

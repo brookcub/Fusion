@@ -9,8 +9,6 @@ import { createFnAgent } from "../pi.js";
 import { reviewStep as mockedReviewStepFn } from "../execution/reviewer.js";
 import { execSync } from "node:child_process";
 import { findWorktreeUser, aiMergeTask } from "../merger.js";
-import { WorktreePool } from "../worktree/worktree-pool.js";
-import { generateWorktreeName, slugify } from "../worktree/worktree-names.js";
 import type { Task, TaskDetail } from "@fusion/core";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { StepSessionExecutor } from "../execution/step-session-executor.js";
@@ -22,7 +20,6 @@ import {
   createWorkflowRoutingAgentStore,
   mockedCreateFnAgent,
   mockedSessionManager,
-  mockedGenerateWorktreeName,
   mockedFindWorktreeUser,
   mockedStepSessionExecutor,
   mockedWithRateLimitRetry,
@@ -349,7 +346,9 @@ describe("workflow routing fixture", () => {
 
   it("suspends an unrouted graph run before opening an implementation session", async () => {
     const store = createMockStore();
-    const executor = new TaskExecutor(store, "/tmp/test", {});
+    // Explicit `agentStore: undefined` opts out of the harness's default routing agent store
+    // (executor-test-helpers fills it for bare constructions) so the unrouted suspend stays testable.
+    const executor = new TaskExecutor(store, "/tmp/test", { agentStore: undefined });
 
     await executor.execute({
       id: "FN-routing", title: "Routing fixture", description: "", column: "in-progress",
@@ -567,7 +566,9 @@ describe("Code review verdict enforcement - fn_task_update blocking", () => {
     expect(capturedSystemPrompt).toContain("allowFullSuite: true");
     expect(capturedSystemPrompt).toContain("Do not call `fn_workflow_select` to change the workflow of the task you are executing");
     expect(capturedSystemPrompt).toContain("The only exception is when the user explicitly requested a specific workflow for this task");
-    expect(capturedSystemPrompt).toContain("You may still set the workflow on tasks you create via `fn_task_create` or `fn_delegate_task`");
+    expect(capturedSystemPrompt).toContain("Implement required in-scope work directly here");
+    expect(capturedSystemPrompt).not.toContain("set the workflow on tasks you create");
+    expect(capturedSystemPrompt).toContain("Task-execution sessions structurally withhold `fn_task_create` and `fn_delegate_task`");
   });
 
   // Note: The EXECUTOR_SYSTEM_PROMPT constant is tested indirectly via the buildExecutionPrompt test.

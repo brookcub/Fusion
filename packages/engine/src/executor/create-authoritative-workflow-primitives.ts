@@ -8,8 +8,8 @@
  * FNXC:WorkflowExecutionOwnership 2026-07-29-16:20:
  * runCodingSession is the live implementation owner and announces NodeCompleted exits.
  */
-import type { Settings, TaskDetail, TaskStore } from "@fusion/core";
-import { emitWorkflowLifecycleEvent, resolveTaskLifecycleColumns } from "@fusion/core";
+import type { ResolvedTaskOutputLanguage, Settings, TaskDetail, TaskStore } from "@fusion/core";
+import { emitWorkflowLifecycleEvent, resolveTaskLifecycleColumns, resolveTaskOutputLanguage } from "@fusion/core";
 import type { ImplementationExit } from "./implementation-exit.js";
 import type {
   AuditPrimitiveInput,
@@ -18,6 +18,7 @@ import type {
   WorkflowRuntimePrimitives,
 } from "../execution/runtime-primitives.js";
 import { WorkflowPlanningService } from "../workflows/workflow-planning-service.js";
+import { MERGE_BOUNDARY_UNPROVEN_VALUE } from "../workflows/workflow-merge-nodes.js";
 import {
   FOREACH_ACTIVE_CONTEXT_KEY,
   SEAM_GOVERNING_NODE_CONTEXT_KEY,
@@ -42,6 +43,7 @@ export type CreateAuthoritativeWorkflowPrimitivesDeps = {
   graphSeamGoverningNodeId: Map<string, string>;
   graphStepActiveContext: Map<string, unknown>;
   pausedAborted: Set<string>;
+  workflowLifecycleMovesInFlight: Set<string>;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- merge requester accepts optional signal bag
   mergeRequester?: ((taskId: string, opts?: any) => Promise<any>) | null;
   getRunContextFor: (taskId: string) => EngineRunContext | undefined;
@@ -59,6 +61,7 @@ export type CreateAuthoritativeWorkflowPrimitivesDeps = {
 export function createAuthoritativeWorkflowPrimitivesFromExecutor(
   deps: CreateAuthoritativeWorkflowPrimitivesDeps,
   settings: Settings,
+  outputLanguage?: ResolvedTaskOutputLanguage,
 ): WorkflowRuntimePrimitives {
     const logAudit = async (taskId: string | undefined, input: AuditPrimitiveInput): Promise<void> => {
       if (!taskId) return;
@@ -262,7 +265,7 @@ export function createAuthoritativeWorkflowPrimitivesFromExecutor(
             type: input.type,
             advisory: context[SPLIT_ACTIVE_CONTEXT_KEY] === true,
           } as const;
-          const seamResult = await deps.createAuthoritativeWorkflowSeams(settings).stepReview?.(
+          const seamResult = await deps.createAuthoritativeWorkflowSeams(settings, outputLanguage).stepReview?.(
             task,
             context,
             config,
@@ -275,7 +278,12 @@ export function createAuthoritativeWorkflowPrimitivesFromExecutor(
         }
         const live = await deps.store.getTask(task.id);
         await deps.persistTokenUsage(task.id);
-        await deps.handoffTaskToReview(live, "workflow-graph-review");
+        /*
+        FNXC:TaskOutputLanguage 2026-08-19-16:25:
+        The graph passes its fully resolved target, including original input, through this primitive.
+        Keep the live-description resolver only for legacy direct callers that have no graph snapshot.
+        */
+        await deps.handoffTaskToReview(live, "workflow-graph-review", undefined, outputLanguage ?? resolveTaskOutputLanguage(settings, live.description));
         return {
           outcome: "success",
           value: "in-review",
@@ -298,6 +306,37 @@ export function createAuthoritativeWorkflowPrimitivesFromExecutor(
       transitionTask: async (_ctx, task, input) => {
         const taskStore = deps.store;
         const patch: Partial<TaskDetail> = {};
+        /*
+        FNXC:EnginePause 2026-09-05-06:55:
+        Node-entry pause checks are necessary but not sufficient: pause may arrive after entry and
+        before this lifecycle side effect. Re-read immediately at the mutation boundary and return
+        the graph's typed abort result. Fail closed when the authority cannot be read.
+        */
+        const pauseRefusesMutation = async (): Promise<boolean> => {
+          let liveTask: TaskDetail;
+          let liveSettings: Settings;
+          try {
+            [liveTask, liveSettings] = await Promise.all([
+              taskStore.getTask(task.id),
+              taskStore.getSettings(),
+            ]);
+            if (!liveTask || !liveSettings) throw new Error("Pause authority missing");
+          } catch {
+            deps.markPausedAborted(task.id, "engine-abort", "workflow-transition:pause-state-unavailable");
+            return true;
+          }
+          if (
+            _ctx.signal?.aborted
+            || liveTask.paused === true
+            || liveTask.userPaused === true
+            || liveSettings.globalPause === true
+            || liveSettings.enginePaused === true
+          ) {
+            deps.markPausedAborted(task.id, "engine-abort", "workflow-transition:pause-gate");
+            return true;
+          }
+          return false;
+        };
         /*
         FNXC:WorkflowLifecycleColumns 2026-07-30-21:40:
         Resolve a requested ROLE to this task's own column, because the seam that asks cannot.
@@ -322,6 +361,9 @@ export function createAuthoritativeWorkflowPrimitivesFromExecutor(
         Workflow graph lifecycle transitions must use TaskStore move semantics, not raw `updateTask({ column })`, because ntfy/webhook notification delivery is subscribed to `task:moved`. Direct column writes make graph-owned tasks invisible to in-review/done lifecycle notifications and bypass column hooks.
         */
         if (targetColumn !== undefined) {
+          // FNXC:EnginePause 2026-09-05-10:05: role resolution is asynchronous.
+          // Read pause authority after it, immediately before each mutation.
+          if (await pauseRefusesMutation()) return { outcome: "failure", value: "aborted" };
           const moveOptions = {
             preserveProgress: input.preserveProgress,
             moveSource: "engine" as const,
@@ -337,13 +379,20 @@ export function createAuthoritativeWorkflowPrimitivesFromExecutor(
             moveTask?: typeof taskStore.moveTask;
           };
           if (typeof storeWithMove.moveTask === "function") {
-            await storeWithMove.moveTask(task.id, targetColumn, moveOptions);
+            const alreadyOwned = deps.workflowLifecycleMovesInFlight.has(task.id);
+            deps.workflowLifecycleMovesInFlight.add(task.id);
+            try {
+              await storeWithMove.moveTask(task.id, targetColumn, moveOptions);
+            } finally {
+              if (!alreadyOwned) deps.workflowLifecycleMovesInFlight.delete(task.id);
+            }
           } else {
             patch.column = targetColumn;
           }
         }
         if (input.status !== undefined && input.status !== null) patch.status = input.status;
         if (Object.keys(patch).length > 0) {
+          if (await pauseRefusesMutation()) return { outcome: "failure", value: "aborted" };
           await taskStore.updateTask(task.id, patch);
         }
         return { outcome: "success", value: input.reason };
@@ -359,12 +408,22 @@ export function createAuthoritativeWorkflowPrimitivesFromExecutor(
         if (ctx.signal?.aborted) {
           return { outcome: "failure", value: "merge-cancelled" };
         }
-        const mergeTask = await deps.ensureWorkflowMergeBoundaryTask(task, {
+        const mergeBoundary = await deps.ensureWorkflowMergeBoundaryTask(task, {
           reason: "workflow-merge-boundary",
           nodeId: ctx.node.node.id,
           workflowId: ctx.run.workflowId,
           runId: ctx.run.runId,
         });
+        /*
+        FNXC:WorkflowMerge 2026-08-20-00:50:
+        FN-9157 turns an unprovable boundary into a terminal graph failure. Do not
+        attach data.status:failed: direct merge-attempt classification rewrites an
+        unknown reason to merge-failed and re-enters the bounded retry.
+        */
+        if (mergeBoundary.blocked) {
+          return { outcome: "failure", value: MERGE_BOUNDARY_UNPROVEN_VALUE };
+        }
+        const mergeTask = mergeBoundary.task;
         /*
         FNXC:WorkflowMerge 2026-06-29-23:18:
         FN-7261 reached the merge node in fast mode with every legacy implementation step still pending, producing a no-op merge proof for work that never ran. A graph-native workflow may project its checklist at the merge boundary only when node workflow results prove implementation completed; otherwise incomplete legacy steps are authoritative and merge must fail before the merger can create stale no-op proof.

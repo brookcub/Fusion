@@ -21,6 +21,7 @@ import { ACTIVE_WORKFLOW_WORK_ITEM_STATES } from "@fusion/core";
 import { createStoreIrPinPersistence, type WorkflowIrPinStoreSurface } from "./workflows/workflow-column-boundary.js";
 import type { WorkflowColumnBoundaryHooks } from "./workflows/workflow-graph-task-runner.js";
 import { generateSyntheticRunId } from "./util/run-audit.js";
+import { emitBoundedRunAudit } from "./util/emit-bounded-run-audit.js";
 
 export interface ExecutorColumnBoundaryHooksDeps {
   store: TaskStore;
@@ -61,13 +62,25 @@ export function createExecutorColumnBoundaryHooks(
     // KTD-3 drift-park loop fix (PR #2342): detectDrift clears the stale pin
     // row fields so an ordinary requeue re-resolves the CURRENT IR fresh.
     clearPin: pinPersistence.clearPin,
-    /* FNXC:EnginePause 2026-08-01-00:20: settings re-read per node entry — event-independent. */
+    /*
+    FNXC:EnginePause 2026-09-05-06:55:
+    Re-read project and task pause authorities at every node entry. Continuation drains can bypass
+    scheduler dispatch, and enginePaused previously blocked timer ticks only, so a live graph could
+    start new nodes while the board advertised paused. An unavailable authority is not evidence of
+    permission to execute; fail closed until the next bounded continuation attempt.
+    */
     isPaused: async () => {
       try {
-        const settings = await store.getSettings();
-        return settings.globalPause === true;
+        const [settings, liveTask] = await Promise.all([
+          store.getSettings(),
+          store.getTask(task.id),
+        ]);
+        return settings.globalPause === true
+          || settings.enginePaused === true
+          || liveTask.paused === true
+          || liveTask.userPaused === true;
       } catch {
-        return false;
+        return true;
       }
     },
     onSuspend: async (suspension) => {
@@ -98,6 +111,7 @@ export function createExecutorColumnBoundaryHooks(
       try {
         await store.moveTask(task.id, toColumn, {
           moveSource: "engine",
+          lifecycleReason: "workflow-graph-node-column",
           workflowMoveSource: "workflow-graph",
           bypassGuards: true,
           preserveProgress: true,
@@ -108,7 +122,7 @@ export function createExecutorColumnBoundaryHooks(
       }
     },
     emitAudit: async (event) => {
-      await store.recordRunAuditEvent?.({
+      await emitBoundedRunAudit(store, {
         taskId: event.taskId,
         agentId: "executor",
         runId: generateSyntheticRunId("workflow-column-boundary", event.taskId),

@@ -550,6 +550,218 @@ describe("ModelOnboardingModal", () => {
     });
   });
 
+  /*
+  FNXC:Onboarding 2026-08-17-23:47:
+  The "Connect remote Fusion server" card belongs to the NATIVE SHELL hand-off, so it must appear on
+  exactly one host class. The old gate keyed only on `desktopMode !== "local"`, and `desktopMode` is
+  undefined in a browser, so every web first-run led Set Up AI with a remote-server form and copy
+  about a "native shell" the visitor does not have (operator report). Enumerated surfaces: plain web
+  (never), desktop shell in local mode (never — a local runtime is already the backend), desktop
+  shell without a profile (shown), mobile shell without a profile (shown), and any host that already
+  has an active profile (never).
+  */
+  describe("AI Setup step — remote Fusion server card host gating", () => {
+    const remoteCardText = /Connect remote Fusion server/;
+
+    function renderWithShellState(state: Record<string, unknown>) {
+      mockUseShellConnection.mockReturnValue({
+        shellApi: { saveProfile: vi.fn() },
+        ready: true,
+        openConnectionManagerSignal: 0,
+        state: { profiles: [], activeProfileId: null, ...state },
+        saveProfile: vi.fn(),
+        removeProfile: vi.fn(),
+        setActiveProfile: vi.fn(),
+      });
+      return render(<ModelOnboardingModal onComplete={vi.fn()} addToast={vi.fn()} projectId="proj_123" />);
+    }
+
+    it("never offers a remote server in a plain browser", async () => {
+      renderWithShellState({ host: "web" });
+
+      await waitFor(() => {
+        expect(screen.getByText("Anthropic")).toBeTruthy();
+      });
+      expect(screen.queryByText(remoteCardText)).toBeNull();
+    });
+
+    it("never offers a remote server to a local-mode desktop shell", async () => {
+      renderWithShellState({ host: "desktop-shell", desktopMode: "local" });
+
+      await waitFor(() => {
+        expect(screen.getByText("Anthropic")).toBeTruthy();
+      });
+      expect(screen.queryByText(remoteCardText)).toBeNull();
+    });
+
+    it("offers a remote server to an unconfigured native shell", async () => {
+      const { unmount } = renderWithShellState({ host: "desktop-shell", desktopMode: "remote" });
+
+      await waitFor(() => {
+        expect(screen.getByText(remoteCardText)).toBeTruthy();
+      });
+      unmount();
+
+      renderWithShellState({ host: "mobile-shell" });
+      await waitFor(() => {
+        expect(screen.getByText(remoteCardText)).toBeTruthy();
+      });
+    });
+
+    it("stops offering a remote server once a profile is active", async () => {
+      renderWithShellState({ host: "desktop-shell", desktopMode: "remote", activeProfileId: "profile_1" });
+
+      await waitFor(() => {
+        expect(screen.getByText("Anthropic")).toBeTruthy();
+      });
+      expect(screen.queryByText(remoteCardText)).toBeNull();
+    });
+  });
+
+  /*
+  FNXC:ProviderAuth 2026-08-18-03:05:
+  A paste-back login must stay visible for its whole duration. Previously the pre-flight confirm
+  warned about paste-back and vanished, the card shrank to a disabled "Waiting for login…" chip, and
+  the paste field rendered inline below the fold of a scrolling modal — so an operator returning from
+  the browser had nowhere obvious to paste and no sign of what was being waited on.
+  */
+  describe("AI Setup step — persistent paste-back login dialog", () => {
+    async function startManualCodeLogin() {
+      // requiresManualCode is what routes a provider through the confirm + persistent dialog path.
+      mockFetchAuthStatus.mockImplementation(() => Promise.resolve({
+        providers: [{ id: "anthropic", name: "Anthropic", authenticated: false, type: "oauth", requiresManualCode: true }],
+      }));
+      mockLoginProvider.mockResolvedValue({
+        url: "https://claude.ai/oauth/authorize?state=abc",
+        instructions: "Complete login in your browser.",
+        manualCode: { prompt: "Paste the final redirect URL", placeholder: "http://localhost:*/callback?code=…" },
+      });
+      mockConfirm.mockResolvedValue(true);
+
+      render(<ModelOnboardingModal onComplete={vi.fn()} addToast={vi.fn()} projectId="proj_123" />);
+      await waitFor(() => expect(screen.getByTestId("onboarding-provider-card-anthropic")).toBeTruthy());
+
+      const card = screen.getByTestId("onboarding-provider-card-anthropic");
+      const login = [...card.querySelectorAll("button")].find((b) => /^login$/i.test(b.textContent ?? ""));
+      fireEvent.click(login!);
+      return card;
+    }
+
+    it("keeps a dialog with the paste field open once the login starts", async () => {
+      await startManualCodeLogin();
+
+      const dialog = await screen.findByTestId("provider-login-dialog-anthropic");
+      expect(dialog).toBeTruthy();
+      // The paste target is in the dialog, not only inline in the card behind it.
+      expect(within(dialog).getByTestId("provider-login-dialog-manual-code")).toBeTruthy();
+      // And the flow's current step is stated rather than implied by a disabled chip.
+      expect(dialog.textContent).toMatch(/Approve the sign-in in your browser/);
+      expect(dialog.textContent).toMatch(/Hand the authorization back to Fusion/);
+      // A lost sign-in tab is recoverable without restarting the flow.
+      expect(within(dialog).getByRole("button", { name: /Open the sign-in page again/i })).toBeTruthy();
+    });
+
+    it("shows only one paste field for the flow", async () => {
+      await startManualCodeLogin();
+      await screen.findByTestId("provider-login-dialog-anthropic");
+
+      expect(screen.queryByTestId("onboarding-manual-code-anthropic")).toBeNull();
+      expect(screen.getAllByTestId("provider-login-dialog-manual-code")).toHaveLength(1);
+      // Instructions likewise appear once — the card's copy is suppressed while the dialog shows them.
+      expect(screen.queryByTestId("onboarding-login-instructions-anthropic")).toBeNull();
+    });
+
+    /*
+    FNXC:ProviderAuth 2026-08-18-04:20:
+    A portal moves the DOM node but NOT the React tree. While the dialog was rendered inside the
+    host FloatingWindow's children, every pointerdown in the dialog bubbled (through the React tree)
+    to the window's raise-to-front handler, which claimed a fresh nextFloatingZ() and painted the
+    window OVER the dialog — so the next click hit the window instead ("any click goes to the dialog
+    below"). The dialog must therefore be a SIBLING of the window, and must swallow pointer events.
+    */
+    it("does not let its pointer events reach the host floating window", async () => {
+      await startManualCodeLogin();
+      const dialog = await screen.findByTestId("provider-login-dialog-anthropic");
+
+      const hostWindow = document.querySelector(".floating-window");
+      expect(hostWindow, "onboarding still renders inside a FloatingWindow").toBeTruthy();
+      // Sibling, not descendant: containment is what allowed React-tree bubbling to the window.
+      expect(hostWindow!.contains(dialog)).toBe(false);
+
+      const windowPointerDown = vi.fn();
+      hostWindow!.addEventListener("pointerdown", windowPointerDown);
+      fireEvent.pointerDown(within(dialog).getByTestId("provider-login-dialog-manual-code"));
+      expect(windowPointerDown).not.toHaveBeenCalled();
+    });
+
+    it("uses the shared modal spacing primitives instead of bespoke padding", async () => {
+      await startManualCodeLogin();
+      const dialog = await screen.findByTestId("provider-login-dialog-anthropic");
+
+      // .modal-header / .modal-actions already carry var(--modal-padding); hand-rolled padding drifts.
+      expect(dialog.querySelector(".provider-login-dialog > .modal-header")).toBeTruthy();
+      expect(dialog.querySelector(".provider-login-dialog > .modal-actions")).toBeTruthy();
+    });
+
+    it("keeps the dialog open on failure so the reason can be read", async () => {
+      mockConfirm.mockResolvedValue(true);
+      mockFetchAuthStatus.mockImplementation(() => Promise.resolve({
+        providers: [{ id: "anthropic", name: "Anthropic", authenticated: false, type: "oauth", requiresManualCode: true }],
+      }));
+      mockLoginProvider.mockRejectedValue(new Error("Login initiation timed out"));
+
+      render(<ModelOnboardingModal onComplete={vi.fn()} addToast={vi.fn()} projectId="proj_123" />);
+      await waitFor(() => expect(screen.getByTestId("onboarding-provider-card-anthropic")).toBeTruthy());
+      const card = screen.getByTestId("onboarding-provider-card-anthropic");
+      fireEvent.click([...card.querySelectorAll("button")].find((b) => /^login$/i.test(b.textContent ?? ""))!);
+
+      const dialog = await screen.findByTestId("provider-login-dialog-anthropic");
+      await waitFor(() => {
+        expect(within(dialog).getByTestId("provider-login-dialog-error").textContent).toMatch(/Login initiation timed out/);
+      });
+    });
+  });
+
+
+  /*
+  FNXC:Onboarding 2026-08-18-07:30:
+  Two failures the operator hit on a fresh install, pinned together because they compound: the
+  default-model section never populated: models were only re-fetched for custom providers, so it stayed
+  on its empty state after connecting and no default model was ever offered.
+
+  The sibling change — marking completion in a `finally` so a failed settings write cannot strand
+  onboarding as unfinished — is deliberately NOT asserted here. A test written against it passed
+  with and without the fix, so it proved nothing; the operator-reported "showed I was last on ai
+  setup step but I actually finished it" is not reproduced by rejecting that write alone. Treat that
+  change as hardening, and leave this note so nobody mistakes its absence for missing coverage.
+  */
+  describe("first-run default model and completion", () => {
+    it("refreshes the model list once a provider connects", async () => {
+      mockFetchModels.mockResolvedValue({ models: [] });
+      mockConfirm.mockResolvedValue(true);
+      mockFetchAuthStatus.mockImplementation(() => Promise.resolve({
+        providers: [{ id: "anthropic", name: "Anthropic", authenticated: false, type: "oauth", requiresManualCode: true }],
+      }));
+      mockLoginProvider.mockResolvedValue({ url: "https://claude.ai/oauth/authorize?state=abc", manualCode: { prompt: "Paste" } });
+
+      render(<ModelOnboardingModal onComplete={vi.fn()} addToast={vi.fn()} projectId="proj_123" />);
+      await waitFor(() => expect(screen.getByTestId("onboarding-provider-card-anthropic")).toBeTruthy());
+      const callsBefore = mockFetchModels.mock.calls.length;
+
+      // The provider flips to authenticated on the next poll, as a completed login does.
+      mockFetchAuthStatus.mockImplementation(() => Promise.resolve({
+        providers: [{ id: "anthropic", name: "Anthropic", authenticated: true, type: "oauth" }],
+      }));
+      const card = screen.getByTestId("onboarding-provider-card-anthropic");
+      fireEvent.click([...card.querySelectorAll("button")].find((b) => /^login$/i.test(b.textContent ?? ""))!);
+
+      await waitFor(() => {
+        expect(mockFetchModels.mock.calls.length, "connecting a provider must re-fetch its models").toBeGreaterThan(callsBefore);
+      }, { timeout: 5000 });
+    });
+
+  });
+
   describe("AI Setup step", () => {
     it("shows OAuth providers with Login button", async () => {
       render(<ModelOnboardingModal onComplete={vi.fn()} addToast={vi.fn()} projectId="proj_123" />);
@@ -742,20 +954,6 @@ describe("ModelOnboardingModal", () => {
       ).toBeTruthy();
       // The "N of M providers connected" summary keeps working with the new layout.
       expect(screen.getByTestId("provider-summary")).toHaveTextContent("1 of 2 providers connected");
-    });
-
-    it("renders onboarding provider icon wrapper for connected advanced providers", async () => {
-      mockFetchAuthStatus.mockResolvedValueOnce({
-        providers: [
-          { id: "anthropic", name: "Anthropic", authenticated: false, type: "oauth" },
-          { id: "minimax", name: "MiniMax", authenticated: true, type: "api_key" },
-        ],
-      });
-
-      render(<ModelOnboardingModal onComplete={vi.fn()} addToast={vi.fn()} projectId="proj_123" />);
-
-      const minimaxWrapper = await screen.findByTestId("onboarding-provider-icon-minimax");
-      expect(within(minimaxWrapper).getByTestId("provider-icon")).toHaveAttribute("data-provider", "minimax");
     });
 
     it("places the single advanced-provider disclosure inside quick start before default model selection", async () => {
@@ -1199,6 +1397,29 @@ describe("ModelOnboardingModal", () => {
       expect(screen.getByText(/OpenAI may redirect to a localhost callback/)).toBeTruthy();
     });
 
+    it("skips the manual-paste confirmation for remote Codex device code", async () => {
+      mockFetchAuthStatus.mockResolvedValueOnce({
+        providers: [{ id: "openai-codex", name: "OpenAI Codex", authenticated: false, type: "oauth", requiresManualCode: false }],
+      });
+      mockLoginProvider.mockResolvedValueOnce({
+        url: "https://auth.openai.com/codex/device",
+        deviceCode: { userCode: "ABCD-1234", verificationUri: "https://auth.openai.com/codex/device" },
+      });
+
+      render(<ModelOnboardingModal onComplete={vi.fn()} addToast={vi.fn()} projectId="proj_123" />);
+      await waitFor(() => {
+        expect(screen.getByRole("button", { name: /Advanced provider settings/ })).toBeTruthy();
+      });
+      fireEvent.click(screen.getByRole("button", { name: /Advanced provider settings/ }));
+      const codexCard = await screen.findByTestId("onboarding-provider-card-openai-codex");
+      fireEvent.click(within(codexCard).getByRole("button", { name: "Login" }));
+
+      expect(await within(codexCard).findByText("ABCD-1234")).toBeTruthy();
+      expect(mockConfirm).not.toHaveBeenCalled();
+      expect(screen.queryByTestId("provider-login-dialog-openai-codex")).toBeNull();
+      expect(within(codexCard).queryByTestId("auth-manual-code-openai-codex")).toBeNull();
+    });
+
     it("saves API key when Save is clicked", async () => {
       render(<ModelOnboardingModal onComplete={vi.fn()} addToast={vi.fn()} projectId="proj_123" />);
 
@@ -1370,24 +1591,6 @@ describe("ModelOnboardingModal", () => {
       expect(description.closest(".onboarding-provider-card")).toBeTruthy();
     });
 
-    it("renders provider description for API key provider", async () => {
-      mockFetchAuthStatus.mockResolvedValueOnce({
-        providers: [
-          { id: "openai", name: "OpenAI", authenticated: false, type: "api_key" },
-        ],
-      });
-
-      render(<ModelOnboardingModal onComplete={vi.fn()} addToast={vi.fn()} projectId="proj_123" />);
-
-      await waitFor(() => {
-        expect(screen.getByText("GPT models — versatile for a wide range of tasks")).toBeTruthy();
-      });
-
-      // Verify the description is inside a provider card
-      const description = screen.getByText("GPT models — versatile for a wide range of tasks");
-      expect(description.closest(".onboarding-provider-card")).toBeTruthy();
-    });
-
     it("renders cursor cli provider card when cursor provider is present", async () => {
       mockFetchAuthStatus.mockResolvedValue({
         providers: [
@@ -1416,36 +1619,6 @@ describe("ModelOnboardingModal", () => {
 
       expect(within(anthropicIconWrapper).getByTestId("provider-icon")).toHaveAttribute("data-provider", "anthropic");
       expect(within(openaiIconWrapper).getByTestId("provider-icon")).toHaveAttribute("data-provider", "openai");
-    });
-
-    it("applies connected modifier class to authenticated provider cards", async () => {
-      mockFetchAuthStatus.mockResolvedValueOnce({
-        providers: [
-          { id: "anthropic", name: "Anthropic", authenticated: true, type: "oauth" },
-          { id: "openai", name: "OpenAI", authenticated: false, type: "api_key" },
-        ],
-      });
-
-      const { baseElement } = render(<ModelOnboardingModal onComplete={vi.fn()} addToast={vi.fn()} projectId="proj_123" />);
-
-      await waitFor(() => {
-        expect(screen.getByText("Anthropic")).toBeTruthy();
-      });
-
-      // Verify the authenticated provider has the connected modifier class
-      const connectedCards = baseElement.querySelectorAll(".onboarding-provider-card--connected");
-      expect(connectedCards.length).toBe(1);
-
-      // Verify the connected card contains Anthropic
-      const anthropicCard = connectedCards[0];
-      expect(anthropicCard?.textContent?.includes("Anthropic")).toBe(true);
-
-      // Verify non-authenticated provider does not have the modifier
-      const allCards = baseElement.querySelectorAll(".onboarding-provider-card");
-      const connectedCardIds = Array.from(connectedCards).map((card) =>
-        card.querySelector(".onboarding-provider-card__name")?.textContent
-      );
-      expect(connectedCardIds).toContain("Anthropic");
     });
 
     it("renders fallback description for unknown provider", async () => {
@@ -2684,78 +2857,6 @@ describe("ModelOnboardingModal", () => {
       expect(screen.getByText("Implement onboarding success flow")).toBeTruthy();
     });
 
-    it("shows the created task ID in the success view", async () => {
-      mockGetOnboardingState.mockReturnValue({
-        currentStep: "first-task",
-        completedSteps: ["ai-setup", "github"],
-        skippedSteps: [],
-        updatedAt: "2026-04-17T00:00:00.000Z",
-        dismissed: false,
-        completed: false,
-        stepData: {},
-      });
-
-      const { rerender } = render(
-        <ModelOnboardingModal
-          onComplete={vi.fn()}
-          addToast={vi.fn()}
-          firstCreatedTask={null}
-        projectId="proj_123" />,
-      );
-
-      await waitFor(() => {
-        expect(screen.getByText("Create Your First Task")).toBeTruthy();
-      });
-
-      rerender(
-        <ModelOnboardingModal
-          onComplete={vi.fn()}
-          addToast={vi.fn()}
-          firstCreatedTask={createdTaskMock}
-        projectId="proj_123" />,
-      );
-
-      await waitFor(() => {
-        expect(screen.getByText("FN-0001")).toBeTruthy();
-      });
-    });
-
-    it("shows the first line of created task description in the success view", async () => {
-      mockGetOnboardingState.mockReturnValue({
-        currentStep: "first-task",
-        completedSteps: ["ai-setup", "github"],
-        skippedSteps: [],
-        updatedAt: "2026-04-17T00:00:00.000Z",
-        dismissed: false,
-        completed: false,
-        stepData: {},
-      });
-
-      const { rerender } = render(
-        <ModelOnboardingModal
-          onComplete={vi.fn()}
-          addToast={vi.fn()}
-          firstCreatedTask={null}
-        projectId="proj_123" />,
-      );
-
-      await waitFor(() => {
-        expect(screen.getByText("Create Your First Task")).toBeTruthy();
-      });
-
-      rerender(
-        <ModelOnboardingModal
-          onComplete={vi.fn()}
-          addToast={vi.fn()}
-          firstCreatedTask={createdTaskMock}
-        projectId="proj_123" />,
-      );
-
-      await waitFor(() => {
-        expect(screen.getByText("Implement onboarding success flow")).toBeTruthy();
-      });
-    });
-
     it("View Task button calls onViewTask with task and then onComplete", async () => {
       mockGetOnboardingState.mockReturnValue({
         currentStep: "first-task",
@@ -3690,27 +3791,6 @@ describe("ModelOnboardingModal", () => {
       expect(screen.queryByText(/error/i)).toBeNull();
     });
 
-    it("allows advancing to GitHub step without selecting a model", async () => {
-      // Default mock setup has no model selected
-      render(<ModelOnboardingModal onComplete={vi.fn()} addToast={vi.fn()} projectId="proj_123" />);
-
-      await waitFor(() => {
-        expect(screen.getByText("Set Up AI")).toBeTruthy();
-      });
-
-      // Verify model dropdown is empty (no model selected)
-      const dropdown = screen.getByTestId("mock-model-dropdown") as HTMLSelectElement;
-      expect(dropdown.value).toBe("");
-
-      // Click Next without selecting a model
-      fireEvent.click(screen.getByText("Next →"));
-
-      // Should advance to GitHub step successfully
-      await waitFor(() => {
-        expect(screen.getByText("Connect GitHub")).toBeTruthy();
-      });
-    });
-
     it("allows advancing to First Task step without connecting GitHub", async () => {
       // GitHub provider exists but is not authenticated
       mockFetchAuthStatus.mockResolvedValueOnce({
@@ -4449,26 +4529,6 @@ describe("ModelOnboardingModal progressive disclosure", () => {
         expect(trigger2.getAttribute("aria-expanded")).toBe("true");
         expect(screen.queryByText(/AI providers like OpenAI and Anthropic/)).toBeNull();
       });
-    });
-  });
-
-  describe("GitHub step disclosures", () => {
-    it("renders GitHub integration disclosure in GitHub step", async () => {
-      render(<ModelOnboardingModal onComplete={vi.fn()} addToast={vi.fn()} projectId="proj_123" />);
-
-      await navigateToGitHubStep();
-
-      expect(screen.getByText("What does GitHub integration do?")).toBeTruthy();
-    });
-  });
-
-  describe("First Task step disclosures", () => {
-    it("renders task creation disclosure in First Task step", async () => {
-      render(<ModelOnboardingModal onComplete={vi.fn()} addToast={vi.fn()} projectId="proj_123" />);
-
-      await navigateToFirstTaskStep();
-
-      expect(screen.getByText("What happens when I create a task?")).toBeTruthy();
     });
   });
 

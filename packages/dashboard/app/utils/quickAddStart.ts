@@ -45,16 +45,51 @@ export function workflowSupportsQuickAddStart(workflow: ValidatedQuickAddWorkflo
  * Custom hold-workflow Start promotion uses the returned task's actual column and moves forward only to
  * a later working column. Missing data, holds, complete lanes, or no later destination are
  * successful create-only outcomes; Quick Add never guesses `todo` or moves backwards.
+ *
+ * FNXC:QuickAddStart 2026-08-26-19:19:
+ * The forward step is now the IMMEDIATELY following visible column, and a `hold` lane is a legal
+ * destination rather than something to skip. Skipping holds produced a move the server always
+ * refuses: column adjacency permits `intake -> hold | archived` only (ROLE_TRANSITIONS in
+ * packages/core/src/workflows/workflow-transitions.ts), and neighbour-derived adjacency for
+ * genuinely custom shapes permits the next declared column only. Jumping over a Planning hold lane
+ * into the WIP lane therefore returned 409 "Invalid transition: 'ideas' -> 'in-progress'", so Start
+ * created a card that never started. One legal forward step is the only promotion Quick Add can
+ * prove; anything further is the operator's move to make.
  */
 export function resolveQuickAddStartTargetColumn(workflow: ValidatedQuickAddWorkflow, createdColumn: unknown): string | null {
   if (typeof createdColumn !== "string" || !createdColumn.trim()) return null;
   const columns = visibleColumns(workflow);
   const createdIndex = columns.findIndex((column) => column.id === createdColumn);
   if (createdIndex < 0) return null;
-  for (const column of columns.slice(createdIndex + 1)) {
-    if (!column.flags.intake && !column.flags.hold && !column.flags.complete) return column.id;
-  }
-  return null;
+  const next = columns[createdIndex + 1];
+  if (!next || next.flags.intake || next.flags.complete) return null;
+  return next.id;
+}
+
+/*
+FNXC:QuickAddStart 2026-08-26-19:19:
+A DUPLICATED or hand-authored Ideas workflow ("Coding ideas V2") must start exactly like the
+built-in one. The atomic create-in-Planning path below keys on the literal `builtin:coding-ideas`
+id, so every copy fell through to the promotion path and its card stayed parked in Ideas.
+
+The destination is derived from the SAME traits the server uses, not from a name: a create lands in
+the planning lane pre-planned only when `resolveWorkflowIntakeFacts` classifies it as an unplanned
+Start create, and that check is `task.column === columnsWithFlag(ir, "hold")[0]` on a manual-intake
+workflow (packages/core/src/task-store/task-creation.ts). Submitting any OTHER column earns
+`generateSpecifiedPrompt` instead of the bootstrap seed, and triage only admits seed prompts — the
+card would sit in Planning looking planned, forever (FN-8587). So the candidate must be the first
+DECLARED hold column (hidden lanes included, exactly as the server scans them) and must sit
+immediately after the manual intake. Anything else fails closed to the one-step promotion path,
+which is legal under column adjacency.
+*/
+function resolveManualIntakePlanningColumn(workflow: ValidatedQuickAddWorkflow): string | null {
+  const columns = visibleColumns(workflow);
+  const intake = columns[0];
+  if (!intake || intake.flags.manualIntake !== true) return null;
+  const planning = columns[1];
+  if (!planning || planning.flags.hold !== true || planning.flags.intake || planning.flags.complete) return null;
+  if (workflow.columns.find((column) => column.flags.hold === true)?.id !== planning.id) return null;
+  return planning.id;
 }
 
 /**
@@ -64,8 +99,25 @@ export function resolveQuickAddStartTargetColumn(workflow: ValidatedQuickAddWork
  * precede one non-intake, non-complete Todo lane. Missing, hidden, reordered, or malformed
  * metadata fails closed rather than guessing a transition.
  */
+/*
+FNXC:NewTaskWorkflowStart 2026-08-19-00:17:
+The modal and QuickEntryBox must hide Start when the metadata proves manual intake but no later
+working lane exists. Resolve that proof from the same ordered workflow snapshot used for the actual
+create or move, retaining the Coding (Ideas) atomic-column special case.
+*/
+export function resolveQuickAddStartWorkflowTarget(workflow: ValidatedQuickAddWorkflow | null): string | null {
+  if (!workflow || !workflowSupportsQuickAddStart(workflow)) return null;
+  const initialColumn = resolveQuickAddStartInitialColumn(workflow);
+  if (initialColumn) return initialColumn;
+  if (workflow.id === "builtin:coding-ideas") return null;
+  const intakeColumn = visibleColumns(workflow)[0]?.id;
+  return intakeColumn ? resolveQuickAddStartTargetColumn(workflow, intakeColumn) : null;
+}
+
 export function resolveQuickAddStartInitialColumn(workflow: ValidatedQuickAddWorkflow): string | null {
-  if (workflow.id !== "builtin:coding-ideas") return null;
+  /* FNXC:QuickAddStart 2026-08-26-19:19: every other workflow — including a duplicate of this one —
+     resolves its planning lane from traits instead of returning null. */
+  if (workflow.id !== "builtin:coding-ideas") return resolveManualIntakePlanningColumn(workflow);
   const columns = visibleColumns(workflow);
   /*
   DELIBERATE-LITERAL — these are ONE NAMED BUILTIN's own declared ids, not a lifecycle guard.

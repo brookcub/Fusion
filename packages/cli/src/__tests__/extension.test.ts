@@ -22,7 +22,7 @@ vi.mock("../commands/task.js", () => ({
 }));
 
 import { __setCachedStoreForTesting, closeCachedStores, resolveTaskListFormatter } from "../extension.js";
-import { TaskStore, AgentStore, MANUAL_RETRY_RESET_COUNTER_KEYS, MAX_TASK_LIST_TEXT_CHARS, MissionBlockedClearConflictError, formatTaskListText, COLUMN_LABELS, drizzleSql } from "@fusion/core";
+import { TaskStore, AgentStore, MANUAL_RETRY_RESET_COUNTER_KEYS, MAX_TASK_LIST_TEXT_CHARS, MAX_TASK_MESSAGE_LENGTH, MissionBlockedClearConflictError, formatTaskListText, COLUMN_LABELS, drizzleSql } from "@fusion/core";
 import type { WorkflowIr } from "@fusion/core";
 import { isGhAvailable, isGhAuthenticated, runGhJsonAsync } from "@fusion/core/gh-cli";
 import { runTaskPlan } from "../commands/task.js";
@@ -87,11 +87,57 @@ describe("fn pi extension session lifecycle", () => {
     await expect(shutdownPromise).resolves.toBeUndefined();
   });
 });
+describe("fn_task_refine extension schema", () => {
+  afterEach(async () => {
+    await closeCachedStores();
+  });
+
+  it("uses the shared task-message maxLength", () => {
+    const api = createMockApi();
+    registerExtension(api);
+
+    const tool = requireTool(api, "fn_task_refine") as ToolWithParameters;
+    expect(tool.parameters?.properties?.feedback?.maxLength).toBe(MAX_TASK_MESSAGE_LENGTH);
+  });
+});
+
+describe("fn_task_logs_read extension payload bounds", () => {
+  afterEach(async () => {
+    await closeCachedStores();
+  });
+
+  it("uses the shared bounded builder for oversized default-preview pages", async () => {
+    const cwd = "/fn-253-extension-log-reader";
+    const entries = Array.from({ length: 100 }, (_, index) => ({
+      taskId: "FN-253",
+      timestamp: "2026-08-29T00:00:00.000Z",
+      text: `tool-${index}`,
+      type: "tool_result" as const,
+      detail: "x".repeat(4_096),
+    }));
+    __setCachedStoreForTesting(cwd, {
+      getAgentLogs: vi.fn().mockResolvedValue(entries),
+      getAgentLogCount: vi.fn().mockResolvedValue(entries.length),
+    } as unknown as TaskStore);
+
+    const api = createMockApi();
+    registerExtension(api);
+    const tool = requireTool(api, "fn_task_logs_read");
+    const result = await tool.execute("call", { id: "FN-253", detail: "preview" }, undefined, undefined, makeCtx(cwd));
+    const text = result.content[0]?.text ?? "";
+
+    expect(text.length).toBeLessThanOrEqual(12_000);
+    expect(text).toContain("Detail preview truncated:");
+    expect(text).toContain("smaller limit, offset, or type filter");
+  });
+});
+
 interface ToolMeta {
   description?: string;
   promptGuidelines?: string[];
 }
 interface ToolParameterSchema {
+  maxLength?: number;
   enum?: unknown[];
   anyOf?: { const?: string; enum?: unknown[] }[];
 }
@@ -306,6 +352,8 @@ legacyDescribe("fn pi extension (legacy exhaustive suite)", () => {
         "fn_milestone_delete",
         "fn_slice_activate",
         "fn_feature_link_task",
+        "fn_feature_repoint_task",
+        "fn_feature_unlink_task",
         "fn_feature_update",
         "fn_feature_repair_validation",
         "fn_feature_set_status",
@@ -2964,6 +3012,99 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
     expect(await missionStore.getFeature(feature.id)).toMatchObject({ status: "defined", loopState: "idle" });
   });
 
+  describe("fn_feature_repoint_task / fn_feature_unlink_task", () => {
+    it("re-points a linked feature to a second delivery task atomically", async () => {
+      const context = makeCtx(tmpDir);
+      const mission = await api.tools.get("fn_mission_create")!.execute("m", { title: "Repoint Mission" }, undefined, undefined, context);
+      const milestone = await api.tools.get("fn_milestone_add")!.execute("ms", { missionId: mission.details.missionId, title: "Milestone" }, undefined, undefined, context);
+      const slice = await api.tools.get("fn_slice_add")!.execute("sl", { milestoneId: milestone.details.milestoneId, title: "Slice" }, undefined, undefined, context);
+      const feature = await api.tools.get("fn_feature_add")!.execute("f", { sliceId: slice.details.sliceId, title: "Feature" }, undefined, undefined, context);
+      const taskA = await api.tools.get("fn_task_create")!.execute("ta", { description: "wrong task" }, undefined, undefined, context);
+      const taskB = await api.tools.get("fn_task_create")!.execute("tb", { description: "right delivery task" }, undefined, undefined, context);
+
+      // Original symptom reproduction: first pin to the wrong task (as fn_feature_link_task
+      // would naively do for the wrong target).
+      const link = await api.tools.get("fn_feature_link_task")!.execute("link", { featureId: feature.details.featureId, taskId: taskA.details.taskId }, undefined, undefined, context);
+      expect(link.isError).not.toBe(true);
+
+      const store = h.store();
+      const missionStore = store.getMissionStore();
+      expect((await missionStore.getFeature(feature.details.featureId))?.taskId).toBe(taskA.details.taskId);
+      const taskARow = (await store.getTask(taskA.details.taskId)) as any;
+      expect(taskARow.sliceId).toBe(slice.details.sliceId);
+      /*
+      FNXC:MissionFeatureRepointContract 2026-08-19-23:26 (RUFU-134 / PR #3491):
+      CodeRabbit flagged that this test asserted only ONE reverse field (`sliceId`).
+      `setTaskMissionLinkage` writes BOTH `missionId` AND `sliceId` onto the task row, so
+      the proof that the repoint moved the reverse link must assert BOTH fields on the new
+      task (set) and on the old task (cleared); asserting only `sliceId` would miss a
+      repoint that silently dropped `missionId`.
+      */
+      expect(taskARow.missionId).toBe(mission.details.missionId);
+
+      const repoint = await api.tools.get("fn_feature_repoint_task")!.execute("repoint", { featureId: feature.details.featureId, taskId: taskB.details.taskId }, undefined, undefined, context);
+      expect(repoint.isError).not.toBe(true);
+      expect(repoint.details.taskId).toBe(taskB.details.taskId);
+
+      const afterFeature = (await missionStore.getFeature(feature.details.featureId))!;
+      expect(afterFeature.taskId).toBe(taskB.details.taskId);
+      expect(afterFeature.status).toBe("triaged");
+      // Old reverse linkage cleared, new set. BOTH reverse fields (missionId + sliceId).
+      const oldTaskRow = (await store.getTask(taskA.details.taskId)) as any;
+      expect(oldTaskRow.sliceId).toBeUndefined();
+      expect(oldTaskRow.missionId).toBeUndefined();
+      const newTaskRow = (await store.getTask(taskB.details.taskId)) as any;
+      expect(newTaskRow.sliceId).toBe(slice.details.sliceId);
+      expect(newTaskRow.missionId).toBe(mission.details.missionId);
+    });
+
+    it("unlinks a linked feature (clearing taskId and demoting to defined) and errors on an already-unlinked feature", async () => {
+      const context = makeCtx(tmpDir);
+      const mission = await api.tools.get("fn_mission_create")!.execute("m", { title: "Unlink Mission" }, undefined, undefined, context);
+      const milestone = await api.tools.get("fn_milestone_add")!.execute("ms", { missionId: mission.details.missionId, title: "Milestone" }, undefined, undefined, context);
+      const slice = await api.tools.get("fn_slice_add")!.execute("sl", { milestoneId: milestone.details.milestoneId, title: "Slice" }, undefined, undefined, context);
+      const feature = await api.tools.get("fn_feature_add")!.execute("f", { sliceId: slice.details.sliceId, title: "Feature" }, undefined, undefined, context);
+      const task = await api.tools.get("fn_task_create")!.execute("t", { description: "linked delivery" }, undefined, undefined, context);
+      const store = h.store();
+      const missionStore = store.getMissionStore();
+
+      await api.tools.get("fn_feature_link_task")!.execute("link", { featureId: feature.details.featureId, taskId: task.details.taskId }, undefined, undefined, context);
+      expect((await missionStore.getFeature(feature.details.featureId))?.status).toBe("triaged");
+
+      const unlink = await api.tools.get("fn_feature_unlink_task")!.execute("unlink", { featureId: feature.details.featureId }, undefined, undefined, context);
+      expect(unlink.isError).not.toBe(true);
+      const after = (await missionStore.getFeature(feature.details.featureId))!;
+      expect(after.taskId).toBeUndefined();
+      expect(after.status).toBe("defined");
+      const taskRow = (await store.getTask(task.details.taskId)) as any;
+      expect(taskRow.sliceId).toBeUndefined();
+
+      const second = await api.tools.get("fn_feature_unlink_task")!.execute("unlink2", { featureId: feature.details.featureId }, undefined, undefined, context);
+      expect(second.isError).toBe(true);
+      expect(second.content[0].text).toContain("not linked");
+    });
+
+    it("re-points to a missing task with a clear error and handles an unknown feature", async () => {
+      const context = makeCtx(tmpDir);
+      const mission = await api.tools.get("fn_mission_create")!.execute("m", { title: "Repoint Err Mission" }, undefined, undefined, context);
+      const milestone = await api.tools.get("fn_milestone_add")!.execute("ms", { missionId: mission.details.missionId, title: "Milestone" }, undefined, undefined, context);
+      const slice = await api.tools.get("fn_slice_add")!.execute("sl", { milestoneId: milestone.details.milestoneId, title: "Slice" }, undefined, undefined, context);
+      const feature = await api.tools.get("fn_feature_add")!.execute("f", { sliceId: slice.details.sliceId, title: "Feature" }, undefined, undefined, context);
+
+      const toMissing = await api.tools.get("fn_feature_repoint_task")!.execute(
+        "repoint-missing-task", { featureId: feature.details.featureId, taskId: "FN-999" }, undefined, undefined, context,
+      );
+      expect(toMissing.isError).toBe(true);
+      expect(toMissing.content[0].text).toMatch(/not found|not on the active board/i);
+
+      const unknownFeature = await api.tools.get("fn_feature_repoint_task")!.execute(
+        "repoint-missing-feature", { featureId: "F-NOPE", taskId: "FN-1" }, undefined, undefined, context,
+      );
+      expect(unknownFeature.isError).toBe(true);
+      expect(unknownFeature.content[0].text).toContain("not found");
+    });
+  });
+
   describe("fn_mission_clear_blocked", () => {
     it("calls the attributed repair primitive and reports residual blockers", async () => {
       const clearMissionBlockedStatus = vi.fn().mockResolvedValue({
@@ -3422,6 +3563,58 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
     expect(result.content[0].text).toContain("requires an \"executor\"-role agent");
   });
 
+  it("fn_task_create persists per-task github tracking overrides from github_tracking/github_repo", async () => {
+    const createTool = api.tools.get("fn_task_create")!;
+    const result = await createTool.execute(
+      "create-gh-on",
+      { description: "Track me on GitHub", github_tracking: true, github_repo: "acme/widgets" },
+      undefined,
+      undefined,
+      makeCtx(tmpDir),
+    );
+    const task = await h.store().getTask(result.details.taskId);
+    expect(task.githubTracking?.enabled).toBe(true);
+    expect(task.githubTracking?.repoOverride).toBe("acme/widgets");
+
+    const invalid = await createTool.execute(
+      "create-gh-bad-repo",
+      { description: "Bad repo slug", github_repo: "not a slug" },
+      undefined,
+      undefined,
+      makeCtx(tmpDir),
+    );
+    expect(invalid.isError).toBe(true);
+    expect(invalid.content[0].text).toContain("owner/repo");
+  });
+
+  it("fn_task_create persists an explicit github_tracking:false even when the project default enables tracking", async () => {
+    await h.store().updateSettings({ githubTrackingEnabledByDefault: true });
+    try {
+      const createTool = api.tools.get("fn_task_create")!;
+      const offResult = await createTool.execute(
+        "create-gh-off",
+        { description: "Opt out of GitHub tracking", github_tracking: false },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+      const offTask = await h.store().getTask(offResult.details.taskId);
+      expect(offTask.githubTracking?.enabled).toBe(false);
+
+      const defaultResult = await createTool.execute(
+        "create-gh-default",
+        { description: "Inherit project GitHub tracking default" },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+      const defaultTask = await h.store().getTask(defaultResult.details.taskId);
+      expect(defaultTask.githubTracking?.enabled).toBe(true);
+    } finally {
+      await h.store().updateSettings({ githubTrackingEnabledByDefault: false });
+    }
+  });
+
   it("fn_task_update rejects reviewer assignment for implementation tasks", async () => {
     const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion"), asyncLayer: h.store().getAsyncLayer() });
     await agentStore.init();
@@ -3718,6 +3911,8 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
         error: "Refusing to start coding agent in missing worktree: /tmp/fusion-missing-worktree",
         worktree: "/tmp/fusion-missing-worktree",
         branch: `fusion/${task.id}`,
+        // FNXC:CliTests 2026-08-23-16:02: FN-107 requires branchWriteOrigin provenance on every branch write; this engine-simulated fixture predates that guard.
+        branchWriteOrigin: "engine",
         sessionFile: "/tmp/fusion-session.json",
         mergeRetries: 3,
         worktreeSessionRetryCount: 3,
@@ -4314,7 +4509,10 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
       expect(text).not.toMatch(new RegExp(`Current Task: ${triageTask.id}(?! \\()`));
     });
 
-    it("lists the four mandatory built-in workflow owners on a fresh project", async () => {
+    // FNXC:BuiltinAgents 2026-08-14-00:10: FN-8932 added the durable Memory Keeper owner alongside the
+    // four routed workflow principals, so a fresh project now seeds five built-in agents. Assert both the
+    // four workflow owners AND the Memory Keeper are present so the built-in-owner invariant stays fully covered.
+    it("lists the mandatory built-in workflow owners plus the Memory Keeper on a fresh project", async () => {
       const tool = api.tools.get("fn_list_agents")!;
       const result = await tool.execute("la-5", {}, undefined, undefined, makeCtx(tmpDir));
 
@@ -4322,7 +4520,8 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
       expect(result.content[0].text).toContain("Workflow Executor");
       expect(result.content[0].text).toContain("Workflow Reviewer");
       expect(result.content[0].text).toContain("Workflow Merger");
-      expect(result.details.count).toBe(4);
+      expect(result.content[0].text).toContain("Memory Keeper");
+      expect(result.details.count).toBe(5);
     });
   });
 
@@ -4582,7 +4781,15 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
       const agentId = await seedAgent(tmpDir, { name: "delegate-resolve-degrades" });
       const store = h.store();
 
-      const resolve = vi.spyOn(store, "getTaskWorkflowSelectionAsync").mockRejectedValueOnce(
+      /*
+      FNXC:WorkflowLifecycleColumns 2026-08-23-16:03:
+      THE UNREADABLE SELECTION MUST STAY UNREADABLE FOR THE WHOLE CALL. `createTask` itself now
+      resolves the task's workflow IR (`createTaskBackendImpl` -> `resolveWorkflowIrForTask`), so a
+      `...Once` rejection was consumed by the CREATE and the tool's own resolve then succeeded —
+      the degraded-resolve branch under test was never entered. A store whose selection read fails
+      fails it for every reader, which is what this scenario models.
+      */
+      const resolve = vi.spyOn(store, "getTaskWorkflowSelectionAsync").mockRejectedValue(
         new Error("workflow selection unreadable"),
       );
       const tool = api.tools.get("fn_delegate_task")!;
@@ -5099,7 +5306,9 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
       expect(result.content[0].text).toContain("org-report");
     });
 
-    it("shows the mandatory built-in workflow owners in a fresh project", async () => {
+    // FNXC:BuiltinAgents 2026-08-14-00:10: FN-8932 added the durable Memory Keeper owner alongside the
+    // four routed workflow principals, so the fresh-project org chart now enumerates five built-in agents.
+    it("shows the mandatory built-in workflow owners plus the Memory Keeper in a fresh project", async () => {
       const tool = api.tools.get("fn_agent_org_chart")!;
       const result = await tool.execute("oc-3", {}, undefined, undefined, makeCtx(tmpDir));
 
@@ -5107,7 +5316,8 @@ pgTest("fn pi extension (runnable structured-output regression slice)", () => {
       expect(result.content[0].text).toContain("Workflow Executor");
       expect(result.content[0].text).toContain("Workflow Reviewer");
       expect(result.content[0].text).toContain("Workflow Merger");
-      expect(result.details.count).toBe(4);
+      expect(result.content[0].text).toContain("Memory Keeper");
+      expect(result.details.count).toBe(5);
     });
 
     it("returns single agent for lone agent", async () => {

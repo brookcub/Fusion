@@ -45,6 +45,7 @@ import { MailboxArtifactAttachment } from "./MailboxArtifactAttachment";
 import { MailboxRelatedWorkLink, hasRelatedTaskLink } from "./MailboxRelatedWorkLink";
 import { MailboxNativeStructureEmbeds } from "./MailboxNativeStructureEmbeds";
 import { MailboxTaskProposal } from "./MailboxTaskProposal";
+import { MailboxTaskRecommendations } from "./MailboxTaskRecommendations";
 import { MailboxKindBadge, MailboxStructuralItem, isStructuralMail } from "./MailboxStructuralItem";
 import type { ChatReportHandoff } from "./chatReportHandoff";
 import { MessageComposer, type NativeStructureCandidate } from "./MessageComposer";
@@ -61,6 +62,19 @@ import { getRelativeTimeBucket } from "../utils/relativeTimeAgo";
 // ── Types ─────────────────────────────────────────────────────────────────
 
 type MailboxTab = "inbox" | "outbox" | "archived" | "agents" | "approvals";
+
+/*
+FNXC:LifecycleColumnCensus 2026-08-13-21:58:
+DELIBERATE-LITERAL — mailbox folder tab, not a board column.
+
+FN-9014 named a folder `archived`. The tab comparison is that folder switch. Converting it to
+resolveLifecycleColumns would ask a workflow which lane a mailbox folder is in. Keep the
+comparison inside this helper so a real board guard that happens to use the name `activeTab`
+still counts in the census.
+*/
+function isMailboxArchivedTab(tab: MailboxTab): boolean {
+  return tab === "archived";
+}
 
 interface MailboxViewProps {
   projectId?: string;
@@ -573,7 +587,7 @@ export function MailboxView({
   useEffect(() => {
     if (activeTab === "inbox") loadInbox();
     else if (activeTab === "outbox") loadOutbox();
-    else if (activeTab === "archived") loadArchivedInbox();
+    else if (isMailboxArchivedTab(activeTab)) loadArchivedInbox();
     else if (activeTab === "agents") loadAgents();
     else if (activeTab === "approvals") {
       void loadApprovals(approvalSubTab);
@@ -783,7 +797,7 @@ export function MailboxView({
     try {
       await archiveMessage(id, projectId);
       dismissMessage();
-      if (activeTab === "archived") loadArchivedInbox();
+      if (isMailboxArchivedTab(activeTab)) loadArchivedInbox();
       else if (activeTab === "outbox") loadOutbox();
       else if (activeTab === "inbox") loadInbox();
       else if (selectedAgentId === ALL_AGENTS_MAILBOX_ID) loadAllAgentsMailbox();
@@ -812,7 +826,7 @@ export function MailboxView({
       // Refresh current tab
       if (activeTab === "inbox") loadInbox();
       else if (activeTab === "outbox") loadOutbox();
-    else if (activeTab === "archived") loadArchivedInbox();
+    else if (isMailboxArchivedTab(activeTab)) loadArchivedInbox();
       else if (selectedAgentId === ALL_AGENTS_MAILBOX_ID) loadAllAgentsMailbox();
       else if (selectedAgentId) loadAgentMailbox(selectedAgentId);
       addToast?.("Message deleted", "success");
@@ -1003,11 +1017,11 @@ export function MailboxView({
             )}
             {selectedMessage.archived ? (
               <button className="btn btn-sm btn-secondary" onClick={() => handleUnarchiveMessage(selectedMessage.id)} data-testid="mailbox-unarchive">
-                <Archive size={14} /><span>Restore</span>
+                <Archive size={14} /><span>{t("mailbox.restore", "Restore")}</span>
               </button>
             ) : (
               <button className="btn btn-sm btn-secondary" onClick={() => handleArchiveMessage(selectedMessage.id)} data-testid="mailbox-archive">
-                <Archive size={14} /><span>Archive</span>
+                <Archive size={14} /><span>{t("mailbox.archive", "Archive")}</span>
               </button>
             )}
             {pendingDeleteMessageId === selectedMessage.id ? (
@@ -1090,6 +1104,7 @@ export function MailboxView({
                   />
                   <MailboxNativeStructureEmbeds message={msg} projectId={projectId} onOpen={onOpenNativeStructure} />
                   <MailboxTaskProposal messageId={msg.id} metadata={msg.metadata} projectId={projectId} onOpenTask={onOpenTask} />
+                  <MailboxTaskRecommendations metadata={msg.metadata} projectId={projectId} onOpenTask={onOpenTask} />
                 </div>
               );
             })}
@@ -1126,6 +1141,7 @@ export function MailboxView({
             />
             <MailboxNativeStructureEmbeds message={selectedMessage} projectId={projectId} onOpen={onOpenNativeStructure} />
             <MailboxTaskProposal messageId={selectedMessage.id} metadata={selectedMessage.metadata} projectId={projectId} onOpenTask={onOpenTask} />
+            <MailboxTaskRecommendations metadata={selectedMessage.metadata} projectId={projectId} onOpenTask={onOpenTask} />
           </>
         )}
       </div>
@@ -1134,10 +1150,10 @@ export function MailboxView({
 
   const renderListPane = () => (
     <>
-      {activeTab === "archived" && (
+      {isMailboxArchivedTab(activeTab) && (
         <div className="mailbox-list" data-testid="mailbox-archived-list">
           {isLoading && !archivedInbox && <MailboxSkeleton />}
-          {archivedInbox?.messages.length === 0 && <div className="mailbox-empty" data-testid="mailbox-archived-empty">No archived messages</div>}
+          {archivedInbox?.messages.length === 0 && <div className="mailbox-empty" data-testid="mailbox-archived-empty">{t("mailbox.noArchivedMessages", "No archived messages")}</div>}
           {archivedInbox?.messages.map((message) => (
             <button type="button" className="mailbox-item" key={message.id} onClick={() => void handleOpenMessage(message)} data-testid={`mailbox-item-${message.id}`}>
               <span className="mailbox-item-preview">{message.content}</span>
@@ -1147,9 +1163,9 @@ export function MailboxView({
       )}
       {activeTab === "inbox" && (
         <div className="mailbox-list" data-testid="mailbox-inbox-list">
-          <div className="mailbox-structural-filter" role="group" aria-label="Inbox filter">
-            <button type="button" className="btn btn-sm btn-secondary" aria-pressed={structuralFilter === "all"} data-testid="mailbox-structural-filter-all" onClick={() => setStructuralFilter("all")}>All</button>
-            <button type="button" className="btn btn-sm btn-secondary" aria-pressed={structuralFilter === "structural"} data-testid="mailbox-structural-filter-structural" onClick={() => setStructuralFilter("structural")}>Reports & approvals</button>
+          <div className="mailbox-structural-filter" role="group" aria-label={t("mailbox.inboxFilter", "Inbox filter")}>
+            <button type="button" className="btn btn-sm btn-secondary" aria-pressed={structuralFilter === "all"} data-testid="mailbox-structural-filter-all" onClick={() => setStructuralFilter("all")}>{t("mailbox.all", "All")}</button>
+            <button type="button" className="btn btn-sm btn-secondary" aria-pressed={structuralFilter === "structural"} data-testid="mailbox-structural-filter-structural" onClick={() => setStructuralFilter("structural")}>{t("mailbox.reportsApprovals", "Reports & approvals")}</button>
           </div>
           {isLoading && !inbox && <MailboxSkeleton />}
           {inbox && inbox.messages.length === 0 && (
@@ -1576,7 +1592,7 @@ export function MailboxView({
               onClick={() => {
                 if (activeTab === "inbox") loadInbox();
                 else if (activeTab === "outbox") loadOutbox();
-    else if (activeTab === "archived") loadArchivedInbox();
+    else if (isMailboxArchivedTab(activeTab)) loadArchivedInbox();
                 else if (activeTab === "approvals") loadApprovals(approvalSubTab);
                 else if (selectedAgentId === ALL_AGENTS_MAILBOX_ID) loadAllAgentsMailbox();
                 else if (selectedAgentId) loadAgentMailbox(selectedAgentId);
@@ -1610,7 +1626,7 @@ export function MailboxView({
           <Send size={14} />
           <span>{t("mailbox.outbox", "Outbox")}</span>
         </button>
-        <button className={`btn btn-sm btn-secondary mailbox-tab ${activeTab === "archived" ? "active" : ""}`} onClick={() => handleSelectTab("archived")} data-testid="mailbox-tab-archived">Archived</button>
+        <button className={`btn btn-sm btn-secondary mailbox-tab ${isMailboxArchivedTab(activeTab) ? "active" : ""}`} onClick={() => handleSelectTab("archived")} data-testid="mailbox-tab-archived">{t("mailbox.archived", "Archived")}</button>
         <button
           className={`btn btn-sm btn-secondary mailbox-tab ${activeTab === "agents" ? "active" : ""}`}
           onClick={() => handleSelectTab("agents")}

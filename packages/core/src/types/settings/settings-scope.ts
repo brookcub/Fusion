@@ -306,6 +306,11 @@ export interface VoiceInputSettings {
   language?: string;
 }
 
+export interface ChatSnippet {
+  name: string;
+  prompt: string;
+}
+
 export interface GlobalSettings {
   /** Maximum PostgreSQL server connections for Fusion's embedded database. Applied on the next Fusion restart. */
   embeddedPostgresMaxConnections?: number;
@@ -353,6 +358,16 @@ export interface GlobalSettings {
    * This global operator preference defaults to false. When enabled, the dashboard skips centralized critical-action confirmations and proceeds with their primary/default choice. It must never be project-scoped so shared projects cannot force destructive actions without a prompt.
    */
   skipConfirmationDialogs?: boolean;
+  /**
+   * FNXC:QuickEntry 2026-08-16-03:15:
+   * This global-only operator keyboard preference defaults to true to preserve Enter-submits behavior. When disabled, Enter inserts a newline and Cmd/Ctrl+Enter submits; shared projects must never change an operator's keyboard behavior.
+   */
+  quickAddSubmitOnEnter?: boolean;
+  /**
+   * FNXC:ChatSnippets 2026-09-03-15:56:
+   * Reusable dashboard-chat prompts are a global operator preference because direct and task chats span projects. They use the existing global settings transport and need neither project persistence nor a dedicated route.
+   */
+  chatSnippets?: ChatSnippet[];
   /** Active UI locale (e.g. `"en"`, `"zh-CN"`, `"fr"`). One of `SUPPORTED_LOCALES`.
    *  When unset, each surface resolves the locale at runtime (browser/env
    *  detection) and falls back to `DEFAULT_LOCALE` ("en"). */
@@ -517,6 +532,15 @@ export interface GlobalSettings {
    *  Distinct from dashboard `setupComplete` first-run flow state.
    *  Undefined means CLI onboarding has not completed yet. */
   cliOnboardingCompletedAt?: string;
+  /*
+  FNXC:GithubStarAsk 2026-08-19-03:59:
+  Fusion asks the operator to star the GitHub repo once, right after onboarding finishes. The ask is
+  one-shot: this ISO stamp is written the moment the operator answers EITHER way (dismissed, or took
+  the link), because both answers mean the same thing operationally — never ask this person again.
+  Any surface that shows the ask must check this field first, so the CLI and the dashboard cannot
+  each get their own free nag.
+  */
+  githubStarPromptDismissedAt?: string;
   /** List of favorite provider names. Favorite providers appear at the top of
    *  model selection dropdowns. Order is preserved - earlier entries appear higher. */
   favoriteProviders?: string[];
@@ -547,6 +571,10 @@ export interface GlobalSettings {
    *  opencode-go provider list without waiting for a later session bootstrap.
    *  Default: true. */
   opencodeGoModelSync?: boolean;
+  /** When true (default), startup syncs the OrcaRouter model catalog from
+   *  `https://api.orcarouter.ai/v1/models` into model pickers so operators can
+   *  select OrcaRouter-hosted models by name. Default: true. */
+  orcarouterModelSync?: boolean;
   /** When true (default), checks npm for new versions of @runfusion/fusion and
    *  shows update notices in the CLI and dashboard. The actual cadence is
    *  governed by `updateCheckFrequency`. Disabled = no automatic checks at all. */
@@ -581,6 +609,14 @@ export interface GlobalSettings {
   gitlabAuthToken?: string;
   /** Global fallback GitLab token type label. Defaults effectively to "personal" when a token exists and this is unset. */
   gitlabAuthTokenType?: GitlabAuthTokenType;
+  /** JIRA branch naming is opt-in and supports project-over-global configuration. */
+  jiraEnabled?: boolean;
+  jiraBaseUrl?: string;
+  jiraApiBaseUrl?: string;
+  jiraAuthEmail?: string;
+  jiraAuthTokenSecretKey?: string;
+  jiraAuthTokenSecretScope?: "project" | "global";
+  jiraBranchNameTemplate?: string;
   /** Cadence for automatic update checks. The dashboard's `/update-check`
    *  route uses this to decide whether to consult npm or return a cached
    *  result.
@@ -620,11 +656,14 @@ export interface GlobalSettings {
    * install entirely and logs why instead.
    */
   autoUpdateAndRestart?: boolean;
-  /** When true (default), the dashboard automatically reloads when a new build
-   *  version is detected via /version.json polling or service worker activation.
-   *  Set to false to suppress automatic reloads — the user must manually
-   *  refresh to pick up updates. */
-  autoReloadOnVersionChange?: boolean;
+  /*
+  FNXC:UpdateAutomation 2026-08-21-02:17:
+  Automatic installation and post-install restart are separate operator choices.
+  An explicit new value wins; the deprecated combined key is read only as a
+  compatibility fallback for existing opt-ins.
+  */
+  autoUpdateEnabled?: boolean;
+  autoRestartAfterUpdate?: boolean;
   /** When true, indicates the user has completed the AI model onboarding flow
    *  (connected at least one provider and selected a default model). When
    *  false/undefined, the dashboard will auto-open the onboarding modal.
@@ -752,6 +791,18 @@ export interface GlobalSettings {
   importTranslateGlobalModelId?: string;
   /** Optional global translate-lane thinking override. Inherits `defaultThinkingLevel` when unset. */
   importTranslateGlobalThinkingLevel?: ThinkingLevel;
+  /*
+  FNXC:FastCheapModelLane 2026-08-29-02:43:
+  Fast & Cheap execution is a dedicated route, so its model selection must not reuse the normal execution lane. A complete pair is optional and falls through to the execution lane when unset.
+  */
+  /** Global baseline provider for Fast & Cheap task execution. Must be paired with `fastCheapGlobalModelId`. */
+  fastCheapGlobalProvider?: string;
+  /** Optional credential instance for `fastCheapGlobalProvider`. */
+  fastCheapGlobalCredentialInstanceId?: string;
+  /** Global baseline model ID for Fast & Cheap task execution. Must be paired with `fastCheapGlobalProvider`. */
+  fastCheapGlobalModelId?: string;
+  /** Optional global Fast & Cheap thinking override. Inherits execution/default thinking when unset. */
+  fastCheapGlobalThinkingLevel?: ThinkingLevel;
   /** Optional global execution-lane thinking override. Inherits `defaultThinkingLevel` when unset. */
   executionGlobalThinkingLevel?: ThinkingLevel;
   /** Optional global planning-lane thinking override. Inherits `defaultThinkingLevel` when unset. */
@@ -808,12 +859,11 @@ export interface GlobalSettings {
    *  triggers a vitest auto-kill. Clamped to [50, 99] in the UI.
    *  Default: 90. */
   vitestKillThresholdPct?: number;
-  /** When true (default), persist tool argument/result payloads in task agent
-   *  logs for `tool`, `tool_result`, and `tool_error` entries. Very large tool
-   *  payloads may still be clipped server-side to keep dashboard log reads
-   *  responsive. When false, tool timeline rows are still stored, but their
-   *  verbose `detail` payload is omitted to reduce log size/noise. Distinct
-   *  from `persistAgentThinkingLog`, which controls `thinking` rows. */
+  /** When true (default), persist tool arguments and successful result payloads
+   *  in task agent logs. Failed `tool_error` detail remains a bounded diagnostic
+   *  signal even when false; tool timeline rows remain stored either way. Very
+   *  large payloads may still be clipped server-side. Distinct from
+   *  `persistAgentThinkingLog`, which controls `thinking` rows. */
   persistAgentToolOutput?: boolean;
   /** Per-result engine-injected tool-output budget. Unset/null uses 16,000 characters;
    * positive integers set a custom cap; 0 disables the shared clamp; invalid values
@@ -1035,6 +1085,14 @@ export interface ProjectSettings {
    */
   maxRecommendationsPerTask?: number;
   /**
+   * FNXC:TaskRecommendations 2026-08-19-13:05:
+   * Default-off project policy requiring an explicit completion recommendation
+   * evaluation when the cap is positive. The executor targets the cap for
+   * relevant, task-ready findings, but a shorter list or [] is correct when
+   * grounded candidates do not qualify; this setting never authorizes filler.
+   */
+  requireTaskRecommendations?: boolean;
+  /**
    * FNXC:TaskRecommendations 2026-08-13-03:56:
    * The operator requested an on/off switch for recommendation mailbox notices. This controls
    * best-effort observability only; disabling it never changes recommendation capture or storage.
@@ -1146,8 +1204,9 @@ export interface ProjectSettings {
    * positive integers set a custom cap; 0 disables the shared clamp; invalid values
    * fall back to the finite default. */
   agentToolOutputMaxChars?: number | null;
-  /** Maximum number of concurrent AI agents across all activity types
-   *  (triage specification, task execution, and merge operations). */
+  /** Maximum number of concurrent AI-active tasks across planning, execution,
+   *  review, and merge. This provider/LLM-load limit is independent of the
+   *  execution-worktree limit. */
   maxConcurrent: number;
   /**
    * FNXC:ExecutorToolFailureRetry 2026-08-06-14:56:
@@ -1170,20 +1229,26 @@ export interface ProjectSettings {
   executorEscalationProvider?: string;
   executorEscalationModelId?: string;
   executorEscalationNodeId?: string;
+  /** FNXC:ReviewConvergence 2026-08-22-05:42: workflow-native review-cycle recovery targets. */
+  reviewConvergenceEscalationEnabled?: boolean;
+  reviewConvergenceEscalationProvider?: string;
+  reviewConvergenceEscalationModelId?: string;
+  reviewArbitrationEnabled?: boolean;
+  reviewArbitrationProvider?: string;
+  reviewArbitrationModelId?: string;
   /**
    * FNXC:VerificationConcurrency 2026-07-15-03:35:
    * Max concurrent verification subprocesses (fn_run_verification / merge testCommand builds) across all tasks in this process. Caps stacked monorepo typecheck/build pegging CPU when many tasks are in-progress. Default 1. Raise only on high-core hosts.
    */
   maxConcurrentVerifications?: number;
+  /** Maximum number of live tasks that hold, or are entering, an execution
+   *  checkout. This host CPU/RAM/disk limit does not include checkout-free planning. */
   maxWorktrees: number;
   /**
-   * FNXC:CapacityModel 2026-07-28-22:15 (PR #2502 review):
-   * Whether Max Worktrees GATES DISPATCH for this project. Default true.
-   *
-   * Renamed from `worktreesEnabled`, which two reviewers read as "run tasks
-   * without worktrees" — it never meant that. Tasks always execute in their own
-   * git worktree; this only decides whether the worktree COUNT is a second limit
-   * alongside the agent count.
+   * FNXC:CapacityModel 2026-09-01-14:49:
+   * Whether Max Worktrees gates execution-checkout admission for this project.
+   * Default true. This is independent of the agent/provider limit: planning runs
+   * read-only on the project root and does not consume a worktree slot.
    *
    * When false the operator asked to "limit via total agents only": `maxWorktrees`
    * stops gating dispatch entirely — not raised, not skipped by convention, but
@@ -1192,12 +1257,8 @@ export interface ProjectSettings {
    * "maxWorktrees"). See `resolveWorktreeCapacityLimit` in workflow-capacity.ts
    * for why this is a boolean rather than `maxWorktrees: 0`.
    *
-   * SCOPE: this is a statement about COUNTING, not about isolation or execution.
-   * Both scheduler dispatch paths still allocate a worktree per task with this
-   * off, and planning still runs in the task's own worktree. It does not make
-   * concurrent agents safe to share one checkout — the non-worktree paths that
-   * exist today are fallbacks to the operator's own tree, one of which caused
-   * FN-8600. Turning this off does not grant shared-checkout concurrency.
+   * SCOPE: this is a statement about COUNTING, not execution isolation. Write-capable
+   * task execution still uses a private checkout even when this limit is disabled.
    */
   worktreeLimitEnabled?: boolean;
   pollIntervalMs: number;
@@ -1388,10 +1449,6 @@ export interface ProjectSettings {
   testCommand?: string;
   /** Custom build command for the project (e.g. "pnpm build") */
   buildCommand?: string;
-  /** When true, completed task worktrees are returned to an idle pool instead
-   *  of being deleted. New tasks acquire a warm worktree from the pool,
-   *  preserving build caches (node_modules, target/, dist/). Default: false. */
-  recycleWorktrees?: boolean;
   /**
    * Controls whether the board shows worktree grouping and worktree-name labels in WIP/processing columns.
    *
@@ -1426,6 +1483,11 @@ export interface ProjectSettings {
    */
   showCostBadgeOnCards?: boolean;
   /**
+   * FNXC:ChatMessageLayout 2026-08-18-20:27:
+   * One project-scoped choice controls message presentation in normal Chat and task Activity/Planner Chat. Missing or invalid persisted values resolve to the historical bubble layout.
+   */
+  chatMessageLayout?: "bubbles" | "full-width";
+  /**
    * FNXC:TaskDetailActivityFirst 2026-06-30-23:59:
    * Default-off keeps task details Activity-first so omitted non-done opens land on the legacy `chat` Activity → Live surface. Operators can set true to restore Chat-first ordering/default while explicit Activity/Chat/Logs deep links remain stable.
    */
@@ -1434,32 +1496,14 @@ export interface ProjectSettings {
    *  branches like `fusion/FN-123-2` when the canonical task branch is already
    *  checked out elsewhere. Default: false. */
   executorAllowSiblingBranchRename?: boolean;
-  /** Controls how worktree directory names are generated when creating fresh worktrees.
-   *  - "random": Human-friendly adjective-noun names (e.g., swift-falcon) — default
-   *  - "task-id": Use the task ID (e.g., fn-042) — ALSO enables task-pinned worktrees (see below)
-   *  - "task-title": Use a slugified version of the task title (e.g., fix-login-bug)
-   *  Default: "random".
-   *
-   *  For "random" and "task-title", this only affects the generated name and applies when
-   *  recycleWorktrees is NOT enabled (pooled worktrees retain their existing names).
-   *
-   *  FNXC:TaskPinnedWorktrees 2026-07-16-00:00:
-   *  "task-id" additionally enables the TASK-PINNED invariant: a task lives in exactly one derivable
-   *  directory `<worktreesDir>/<lowercased-task-id>` for its whole lifecycle. Acquisition
-   *  derives→validates→reuses-or-recreates at that same path (never suffixed), and `task.worktree` becomes a
-   *  self-correcting cache. Task pinning and `recycleWorktrees` are MUTUALLY EXCLUSIVE — enabling both is
-   *  rejected at the settings-write boundary (see `assertWorktreeNamingRecycleExclusive`), because pinning
-   *  each task to its own directory is incompatible with the cross-task recycle pool. Pinning therefore only
-   *  applies when `recycleWorktrees` is off; the runtime also degrades a legacy config that carries both back
-   *  to recycling. Worktrunk-managed layouts own their own path derivation, so pinning is bypassed when that
-   *  backend is on. */
-  worktreeNaming?: "random" | "task-id" | "task-title";
   /** Project-level worktrunk integration overrides.
    *  Merged with global `worktrunk` field-by-field so partial project values
    *  override only specified fields and inherit the rest. */
   worktrunk?: WorktrunkSettings;
   /** Optional container directory for task worktrees.
-   *  When unset, worktrees default to `<projectRoot>/.worktrees`.
+   *  When unset, worktrees default to `<projectRoot>/.fusion/worktrees`.
+   *  While unset, a pre-existing `<projectRoot>/.worktrees` root remains honored
+   *  for containment and cleanup sweeps so historic checkouts are not stranded.
    *  Supports leading `~` expansion and the `{repo}` token (basename of the project root).
    *  Accepts absolute paths or paths relative to the project root.
    *  Affects newly-created worktrees and pool/self-healing directory scans only;
@@ -1679,12 +1723,6 @@ export interface ProjectSettings {
    *  When mode is "ai" (default), the standalone AI merge path is used and the
    *  legacy merge settings above/below it do not apply. */
   merger?: MergerSettings;
-  /** Minimum branch net line volume before the pre-commit diff-volume gate evaluates a file. Default applied at read site: 20. */
-  mergeDiffVolumeMinLines?: number;
-  /** Minimum staged/branch-net ratio required by the pre-commit diff-volume gate. Default applied at read site: 0.2. */
-  mergeDiffVolumeThreshold?: number;
-  /** Additional file globs allowlisted by the pre-commit diff-volume gate on top of generated/lockfile patterns. Default applied at read site: []. */
-  mergeDiffVolumeAllowlist?: string[];
   /**
    * FNXC:PrMergeRequiredChecks 2026-08-09-06:39:
    * Fusion honors these names independently of GitHub's isRequired flag. Empty preserves
@@ -2077,6 +2115,14 @@ export interface ProjectSettings {
   gitlabAuthToken?: string;
   /** Project GitLab token type label. Defaults effectively to "personal" when a token exists and this is unset. */
   gitlabAuthTokenType?: GitlabAuthTokenType;
+  /** JIRA branch naming is opt-in and supports project-over-global configuration. */
+  jiraEnabled?: boolean;
+  jiraBaseUrl?: string;
+  jiraApiBaseUrl?: string;
+  jiraAuthEmail?: string;
+  jiraAuthTokenSecretKey?: string;
+  jiraAuthTokenSecretScope?: "project" | "global";
+  jiraBranchNameTemplate?: string;
   /**
    * FNXC:GitLabLifecycle 2026-07-02-00:00:
    * GitLab comment and auto-close settings mirror GitHub lifecycle side effects but remain disabled by default and use the configured GitLab instance/API URL so GitLab.com and self-managed hosts behave consistently.
@@ -2113,9 +2159,12 @@ export interface ProjectSettings {
    *  - "all": backups both project and per-agent memory
    *  Default: "all". */
   memoryBackupScope?: "project" | "agents" | "all";
-  /** When true, tasks created without titles but with descriptions longer than 200
-   *  characters will automatically receive an AI-generated title (max 60 chars).
-   *  Default: false. */
+  /*
+  FNXC:TitleSummarization 2026-08-19-13:43:
+  This project-scoped opt-in controls automatic title attempts for every non-empty task
+  description created without a title. It is a create-time snapshot, defaults to false, and
+  does not govern explicit per-request or manual summarization actions.
+  */
   autoSummarizeTitles?: boolean;
   /*
   FNXC:TaskDefinitionInputLanguage 2026-07-16-05:00:
@@ -2127,6 +2176,8 @@ export interface ProjectSettings {
   /** When true, writes generated task-definition prose in the operator's detected supported
    *  input language. Default: false; uncertain or unsupported input falls back to English. */
   taskDefinitionInInputLanguage?: boolean;
+  /** Project policy for human-readable AI-authored task output. Unset preserves legacy compatibility. */
+  taskOutputLanguage?: import("../../ai/ai-output-language.js").TaskOutputLanguage;
   /** When true, merge commit messages include an AI-generated summary of the
    *  changes instead of just listing step commit subjects. Body composition
    *  includes a narrative line, bullet summary, and `git diff --stat` when
@@ -2191,6 +2242,14 @@ export interface ProjectSettings {
   importTranslateModelId?: string;
   /** Optional project translate-lane thinking override. Inherits through global translate thinking then default thinking when unset. */
   importTranslateThinkingLevel?: ThinkingLevel;
+  /** Project provider for Fast & Cheap task execution. Must be paired with `fastCheapModelId`; unset falls through to the global Fast & Cheap lane, then execution. */
+  fastCheapProvider?: string;
+  /** Optional credential instance for `fastCheapProvider`. */
+  fastCheapCredentialInstanceId?: string;
+  /** Project model ID for Fast & Cheap task execution. Must be paired with `fastCheapProvider`. */
+  fastCheapModelId?: string;
+  /** Optional project Fast & Cheap thinking override. Inherits through global Fast & Cheap then execution/default thinking. */
+  fastCheapThinkingLevel?: ThinkingLevel;
   /*
   FNXC:GitHubImportTranslate 2026-07-15-09:30:
   Auto-translation is OFF by default. This reverses the original opt-in-only stance (PR #2128) at operator request: import panels routinely list issues in languages the operator cannot read, so translation may now run automatically — but only when explicitly enabled, so import provenance stays faithful for operators who never opt in.
@@ -2258,6 +2317,60 @@ export interface ProjectSettings {
    *  - Any registered custom backend type
    *  Default: "qmd" */
   memoryBackendType?: string;
+  // FNXC:StashConfig 2026-08-13-16:35: (RUFU-068) optional per-project Stash LCM
+  // memory backend config. stashUrl points at the operator's Stash server
+  // (default http://127.0.0.1:3457); stashApiKey is an override for hard
+  // isolation (separate Stash instance/account). The PRIMARY API key lives in
+  // the global secrets store ("stash-api-key") and is NEVER committed here;
+  // project value wins over global.
+  /** Base URL of the Stash server (optional LCM memory backend, e.g. http://127.0.0.1:3457).
+   *  Used only when memoryBackendType === "stash". Per-project override;
+   *  empty uses the built-in default. The API key is NEVER stored here — it
+   *  lives in the global secrets store ("stash-api-key"). */
+  stashUrl?: string;
+  /** Per-project Stash API key override for hard isolation (separate Stash
+   *  instance/account). The primary key lives in the global secrets store and
+   *  is never committed; this is an optional escape hatch populated by the
+   *  operator through the secrets path. */
+  stashApiKey?: string;
+  /*
+  FNXC:Rufu126VectorSearch 2026-08-19-10:50:
+  RUFU-126 (D3): opt-in vector (semantic) recall for the Stash memory backend.
+  Default-off = zero behavior change until the operator enables it (prototype;
+  rejected alternative was automatic capability detection). When true,
+  multi-word recall queries try GET /api/v1/me/sessions/events/semantic-search
+  first and fall back byte-identically to the RUFU-121 keyword path on any
+  vector failure (memory-backend-stash.ts search(); decisions D1–D5 in
+  docs/research/stash-vector-search-evaluation.md). Used only when
+  memoryBackendType === "stash". Schema-only — no UI row, consistent with
+  stashUrl/stashApiKey.
+  */
+  /** Opt-in vector (semantic) search for Stash memory recall (default off). */
+  stashVectorSearch?: boolean;
+  /*
+  FNXC:StashSessionCapture 2026-08-19-04:37:
+  (RUFU-122) Task-terminal transcript upload to Stash. On task terminalization
+  (done + failed/parked) the engine uploads the task's agent log (agent-log.jsonl)
+  as an ordered, typed transcript to the per-task Stash session
+  fusion-task-<taskId>, extending the RUFU-068 terminal anchor capture
+  (task_completion/task_failure). The operator's 2026-08-18 request fixes these
+  key names: transcript capture is operator-toggleable with a volume cap, and a
+  schema-only setting keeps `status` log entries in or out. All three are inert
+  unless memoryBackendType === "stash" and a Stash API key is present. The
+  RUFU-068 terminal anchor event is unaffected by executorSessionCaptureEnabled.
+  */
+  /** When false, task terminalization skips the agent-log transcript upload to
+   *  the per-task Stash session; the RUFU-068 terminal anchor event
+   *  (task_completion/task_failure) still fires. Default: true. */
+  executorSessionCaptureEnabled?: boolean;
+  /** Per-task cap on transcript events uploaded (the most recent N are kept;
+   *  older entries are dropped, never truncated mid-stream, and the full log
+   *  remains on disk). Default: 20000. */
+  executorSessionCaptureMaxEvents?: number;
+  /** When true, `status` agent-log entries are uploaded as `status` events;
+   *  when false (default) they are skipped. Schema-only setting — deliberately
+   *  NOT surfaced in the settings UI. Default: false. */
+  executorSessionCaptureIncludeStatus?: boolean;
   /** When true, enables automatic AI-powered summarization and compression of the
    *  working memory file when it exceeds the configured size threshold.
    *  Creates an automation schedule that checks memory size and compacts when needed.
@@ -2415,12 +2528,11 @@ export interface ProjectSettings {
   chatRoomSummaryMaxChars?: number;
   /**
    * FNXC:Workspace 2026-06-24-16:00:
-   * When true, the project root is treated as a workspace-mode parent directory containing
-   * multiple git sub-repos (recorded in .fusion/workspace.json), not a single git repo.
-   * ensureGitRepositoryForProjectPath skips `git init` for workspace roots, and the executor
-   * runs tasks per-sub-repo instead of at the root. Auto-detected at registration time when
-   * sub-repos are found, with an interactive confirmation prompt. Can be toggled per-project
-   * via the dashboard Settings modal or PUT /settings.
+   * Operator-facing project switch for a multi-repo parent directory. The universal publish seam
+   * serializes its workspace.json/config.json side effect per root and reconciles every writer to
+   * the disk-observed result with a field-scoped compare-and-set (unachievable enable becomes false,
+   * failed disable remains true, and superseded writes yield). The executor still keys runtime mode
+   * from workspace.json, not this persisted intent.
    */
   workspaceMode?: boolean;
 }
@@ -2482,6 +2594,13 @@ export {
   resolvePersistAgentThinkingLog,
   sanitizeCliAgentSettings,
   sanitizeCliAgentsSettings,
+  normalizeChatSnippetName,
+  normalizeChatSnippets,
+  readChatSnippets,
+  CHAT_SNIPPET_RESERVED_NAMES,
+  CHAT_SNIPPET_MAX_ENTRIES,
+  CHAT_SNIPPET_MAX_NAME_LENGTH,
+  CHAT_SNIPPET_MAX_PROMPT_LENGTH,
   sanitizeMcpServers,
   CLI_AGENT_ADAPTER_IDS,
   CLI_AGENT_AUTONOMY_MODES,

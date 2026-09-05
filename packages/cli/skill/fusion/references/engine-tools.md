@@ -11,7 +11,7 @@ This reference documents tools injected by the engine at runtime for specific ag
 
 | Tool | Agent Types | Purpose | Parameters |
 |---|---|---|---|
-| `fn_task_create` | triage, executor, heartbeat | Create a follow-up task from within an agent run | `description` (string), `dependencies?` (string[]), `priority?` (`low` \| `normal` \| `high` \| `urgent`), `workflow_id?` (string) |
+| `fn_task_create` | triage, heartbeat | Create a follow-up task from within an agent run | `description` (string), `dependencies?` (string[]), `priority?` (`low` \| `normal` \| `high` \| `urgent`), `workflow_id?` (string) |
 | `fn_task_log` | executor, heartbeat | Write significant task log entries | `message` (string), `outcome?` (string) |
 | `fn_task_document_write` | triage, executor, heartbeat; chat/planning (explicit `task_id`) | Save/update a named **live-task** document revision, optionally with CAS; archived parents remain read-only | `key` (string), `content` (string), `author?` (string), `expected_revision?` (non-negative integer), `expected_content_hash?` (`sha256:<64 lowercase hex>`); chat/planning also require `task_id` (string) |
 | `fn_task_document_read` | triage, executor, heartbeat; chat/planning (explicit `task_id`) | Read one named live or retained archived document; list mode remains live-only | `key?` (string); chat/planning also require `task_id` (string) |
@@ -38,7 +38,7 @@ Archived publication is deliberately absent from every runtime tool schema: ther
 | `fn_workflow_delete` | executor, chat, planning | Delete a custom workflow definition (built-ins cannot be deleted); selecting tasks are re-homed to the default workflow's entry column | `workflow_id` (string) |
 <!-- FNXC:SkillSync 2026-06-17-23:05: Engine session-scoped `fn_*` tools registered in `packages/engine` must be mirrored in this reference because `packages/cli/src/__tests__/skill-sync.test.ts` treats the backticked tool names here as the documentation source of truth and fails the CLI + gate suites on drift. -->
 | `fn_ask_question` | chat | Ask the user a structured question that renders as an interactive chat card; after calling it, end the turn and wait for the user's next message | `questions` (array of objects with `question`, optional `header`, optional `description`, optional `type`, optional `options`, optional `multiSelect`) |
-| `fn_task_promote` | executor | Promote a held task out of a manual-release hold column (defaults to the current task); `force` starts execution even when planning/plan review is still outstanding, waiving only that gate and cancelling the pending replan | `task_id?` (string), `force?` (boolean) |
+| `fn_task_promote` | executor | Promote a held task out of a manual-release hold column (defaults to the current task); an unplanned task remains held until planning or plan review completes | `task_id?` (string) |
 | `fn_task_file_scope_add` | executor | Add one or more repo-relative files/globs to this task's declared `## File Scope` when you must edit beyond the initial scope, so edits are not stranded by the scope-aware squash merge (merge-time cross-task overlap blocking remains the backstop) | `files` (string[]) |
 | `fn_trait_list` | executor, chat, planning | List the registered column trait catalog (built-in and plugin traits) | none |
 | `fn_memory_search` | triage, executor, heartbeat | Search project memory plus per-agent layered memory snippets | `query` (string), `limit?` (number) |
@@ -53,7 +53,7 @@ Archived publication is deliberately absent from every runtime tool schema: ther
 | `fn_update_identity` | heartbeat | Update the current agent's own `soul`, `instructionsText`, or `memory` fields | `soul?` (string), `instructionsText?` (string), `memory?` (string) |
 | `fn_reflect_on_performance` | executor, heartbeat (when reflection service enabled) | Generate reflection insights from prior runs | `focus_area?` (string) |
 | `fn_list_agents` | triage, executor, heartbeat | List agents (optionally filtered) | `role?` (string), `state?` (string), `includeEphemeral?` (boolean) |
-| `fn_delegate_task` | triage, executor, heartbeat | Create and assign a new task to a specific agent | `agent_id` (string), `description` (string), `dependencies?` (string[]), `workflow_id?` (string), `override?` (boolean) |
+| `fn_delegate_task` | triage, heartbeat | Create and assign a new task to a specific agent | `agent_id` (string), `description` (string), `dependencies?` (string[]), `workflow_id?` (string), `override?` (boolean) |
 | `fn_get_agent_config` | executor, heartbeat | Read full config for a direct-report agent | `agent_id` (string) |
 | `fn_update_agent_config` | executor, heartbeat | Update config fields for a direct-report, non-ephemeral agent | `agent_id` (string), optional: `soul`, `instructions_text`, `instructions_path`, `heartbeat_procedure_path`, `heartbeat_interval_ms`, `heartbeat_timeout_ms`, `max_concurrent_runs`, `message_response_mode` |
 | `fn_agent_create` | executor, heartbeat | Create a non-ephemeral direct-report agent | `name` (string), `role` (string), optional: `soul`, `instructions_text`, `instructions_path`, `reportsTo`, `heartbeat_interval_ms`, `heartbeat_timeout_ms`, `max_concurrent_runs`, `message_response_mode` |
@@ -74,17 +74,24 @@ Archived publication is deliberately absent from every runtime tool schema: ther
 | `fn_task_show` | Fetch full task detail including PROMPT.md | `id` (string) |
 | `fn_review_spec` | Spawn spec reviewer and return `APPROVE`/`REVISE`/`RETHINK`/`UNAVAILABLE` | none |
 
-## Executor-only runtime tools (`executor.ts`)
+## Planning-only dependency tool (`triage.ts`)
 
-Note: step-session execution (`step-session-executor.ts`) reuses executor coordination tools (`fn_send_message`, `fn_read_messages`, `fn_list_agents`, `fn_delegate_task`, task-document tools, and memory tools) so spawned/session-sliced execution keeps parity with main executor runs.
+Workspace tasks already contain every repository declared by `.fusion/workspace.json`; planners never select or acquire repositories on demand.
 
 | Tool | Purpose | Parameters |
 |---|---|---|
-| `fn_task_update` | Update a spec step status (`pending`/`in-progress`/`done`/`skipped`), task dependencies, and/or workflow-defined custom field values | `step?` (number, 0-indexed; matches `### Step N:` in PROMPT.md, Step 0 = Preflight), `status?` (enum), `dependencies?` (string[]), `custom_fields?` (object keyed by field id; validated against the workflow field schema, `null` clears a field) |
-| `fn_task_add_dep` | Add a dependency to current task (confirmation-gated) | `task_id` (string), `confirm?` (boolean) |
+| `fn_install_worktree_dependencies` | Ask Fusion to run a planner-selected dependency install in a prepared worktree, or record a reasoned no-install resolution for unrecognised evidence. Only Fusion-observed exit code `0` records installed readiness. | `action` (`install` \| `none`), `command` (required for `install`), `reason` (required for `none`), `repository?` (required for multi-repository workspaces) |
+
+## Executor-only runtime tools (`executor.ts`)
+
+Note: step-session execution (`step-session-executor.ts`) reuses executor coordination tools (`fn_send_message`, `fn_read_messages`, `fn_list_agents`, task-document tools, and memory tools) so spawned/session-sliced execution keeps parity with main executor runs.
+
+| Tool | Purpose | Parameters |
+|---|---|---|
+| `fn_task_update` | Update a spec step status (`pending`/`in-progress`/`done`/`skipped`), task dependencies (never a task it spawned), and/or workflow-defined custom field values | `step?` (number, 0-indexed; matches `### Step N:` in PROMPT.md, Step 0 = Preflight), `status?` (enum), `dependencies?` (string[]), `custom_fields?` (object keyed by field id; validated against the workflow field schema, `null` clears a field) |
+| `fn_task_add_dep` | Add a dependency to current task (confirmation-gated; never a task it spawned) | `task_id` (string), `confirm?` (boolean) |
 | `fn_task_done` | End the task: `outcome="completed"` (default) marks it complete; `outcome="blocked"` honestly parks it failed (`BLOCKED: <reason>`) with no completion claim, preserving steps/worktree and recording `blockedBy` as dependencies | `summary?` (string), `outcome?` (`completed` \| `blocked`), `blockedBy?` (string[]), `reason?` (string, required when blocked) |
 | `fn_spawn_agent` | Spawn child agent in separate worktree | `name` (string), `role` (enum), `task` (string) |
-| `fn_acquire_repo_worktree` | Acquire an isolated git worktree for a sub-repo in a workspace task (workspace mode only) | `repo` (string — must be one of the workspace's configured repos) |
 
 ## Merger-only runtime tools (`merger.ts`)
 

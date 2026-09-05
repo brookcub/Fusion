@@ -7,6 +7,8 @@
  * instance as its first parameter and performs byte-identical work.
  */
 import {type TaskStore, type MoveTaskOptions, type MoveTaskInternalOptions, storeLog} from "../store.js";
+import { buildPatchnodeEntryInput } from "../board/patchnode.js";
+import { appendPatchnodeEntryInTransaction } from "./async/async-patchnode.js";
 import * as schema from "../postgres/schema/index.js";
 import {TaskDeletedError, HandoffInvariantViolationError, TransitionRejectionError} from "./errors.js";
 
@@ -43,6 +45,7 @@ import {acquireTaskAdvisoryXactLock} from "./task-advisory-lock.js";
 import "../builtin-traits.js";
 import {recordRunAuditEventWithinTransaction} from "../postgres/data-layer.js";
 import {getTaskMergeBlocker} from "../merge/task-merge.js";
+import {resolveRequiredPreMergeStepIds} from "../merge/required-pre-merge-steps.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
 import {readTaskRow as readTaskRowAsync, readTaskRowInTransaction, upsertTaskRowInTransaction} from "./async/async-persistence.js";
 import {disposeTaskBeforeMove} from "../tasks/task-move-disposer.js";
@@ -84,20 +87,27 @@ precisely the R1 sentinel defect in a new costume: gate and counter talking abou
 different pools, so a finite limit cannot bind. One read in, both derived from it.
 */
 async function resolveWorkflowIrForSelectedWorkflowId(store: TaskStore, workflowId: string | undefined): Promise<WorkflowIr> {
+  /*
+  FNXC:DisabledBuiltinWorkflows 2026-08-19-00:18:
+  Move policy resolution is a no-selection path too. Read the store's effective
+  project default before falling back to the catalog Coding identity, so a task
+  without an explicit selection cannot be evaluated against a disabled workflow.
+  */
+  const effectiveWorkflowId = workflowId ?? await store.getDefaultWorkflowId();
   /* FNXC:WorkflowBuiltins 2026-07-19-10:24: every no-selection/unresolvable fallback goes through resolveDefaultWorkflowIr() so this resolver and prepareWorkflowMovePolicyPreflightImpl agree on the default IR (see the helper's note on the "preflight is stale" drift). */
-  if (!workflowId) {
+  if (!effectiveWorkflowId) {
     return store.applyBuiltInPromptOverridesAsync(DEFAULT_WORKFLOW_ID, resolveDefaultWorkflowIr());
   }
-  if (isBuiltinWorkflowId(workflowId)) {
-    const builtin = getBuiltinWorkflow(workflowId);
+  if (isBuiltinWorkflowId(effectiveWorkflowId)) {
+    const builtin = getBuiltinWorkflow(effectiveWorkflowId);
     const ir = builtin?.ir;
     return store.applyBuiltInPromptOverridesAsync(
-      workflowId,
+      effectiveWorkflowId,
       ir === undefined ? resolveDefaultWorkflowIr() : typeof ir === "string" ? parseWorkflowIr(ir) : ir,
     );
   }
   try {
-    const def = await store.getWorkflowDefinition(workflowId);
+    const def = await store.getWorkflowDefinition(effectiveWorkflowId);
     return def ? parseWorkflowIr(def.ir) : resolveDefaultWorkflowIr();
   } catch {
     return resolveDefaultWorkflowIr();
@@ -717,13 +727,26 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
         const toFacts = resolveTransitionColumnFacts(workflowIr, toColumn);
         const mergeBlockerReason =
           !bypassGuards && toFacts.flags.complete && fromFacts.flags.mergeBlocker === true
-            ? (getTaskMergeBlocker(task, { skipColumnIdentityCheck: true }) ?? null)
+            ? (getTaskMergeBlocker(task, {
+              skipColumnIdentityCheck: true,
+              requiredPreMergeStepIds: resolveRequiredPreMergeStepIds(workflowIr, task.enabledWorkflowSteps, task),
+            }) ?? null)
             : null;
+        /*
+        FNXC:LifecycleContainment 2026-08-28-01:09:
+        FN-207 applies the direction policy even to bypassed and recovery-rehome
+        moves, so this in-lock validator receives the raw option rather than the
+        resolved `moveSource`. An absent option remains an operator-compatible,
+        fail-open legacy route; explicit engine/scheduler movers are covered by
+        the move-reason census and forbidden-path tests.
+        */
         const decision = evaluateTransitionInvariants({
           taskId: id,
           from: fromFacts,
           to: toFacts,
           mergeBlockerReason,
+          moveSource: options?.moveSource,
+          lifecycleReason: options?.lifecycleReason,
         });
         if (!decision.allow) {
           throw new TransitionRejectionError(
@@ -891,9 +914,10 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
         validated as legal and then rejected by its own guard. Passing the resolved lane is what makes
         the outer and inner questions the same question.
         */
-        const mergeBlocker = getTaskMergeBlocker(task, moveLifecycle?.review
-          ? { reviewColumns: new Set([moveLifecycle.review]) }
-          : {});
+        const mergeBlocker = getTaskMergeBlocker(task, {
+          reviewColumns: moveLifecycle?.review ? new Set([moveLifecycle.review]) : undefined,
+          requiredPreMergeStepIds: resolveRequiredPreMergeStepIds(workflowIr, task.enabledWorkflowSteps, task),
+        });
         if (mergeBlocker) {
           throw new Error(`Cannot move ${id} to done: ${mergeBlocker}`);
         }
@@ -1225,6 +1249,21 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
         },
       });
 
+      /*
+      FNXC:PatchnodeLedger 2026-08-28-12:16:
+      Each genuine entry into the completion lane snapshots this delivery under its columnMovedAt occurrence. The next move overwrites that evidence, so this insert commits in the move transaction and intentionally aborts the move on failure; the move's early return, not conflict handling, prevents duplicate capture.
+
+      FNXC:PatchnodeLedger 2026-08-28-13:35:
+      Completion capture requires the store's real project partition. An unbound writer must fail this transaction instead of manufacturing a legacy project id whose entry the project-scoped feed can never read.
+      */
+      if (toColumn === (moveLifecycle?.complete ?? "done") && fromColumn !== toColumn && !internal.terminalFailureApply) {
+        await appendPatchnodeEntryInTransaction(
+          tx,
+          layer.projectId ?? "",
+          buildPatchnodeEntryInput(task, "completed", task.columnMovedAt ?? movedAt),
+        );
+      }
+
       // Dequeue from merge queue on column exit (if leaving in-review).
       await dequeueMergeQueueOnColumnExitInTransaction(tx, id, fromColumn, toColumn, movedAt, moveReviewColumns);
 
@@ -1488,8 +1527,25 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
       "legacy" — so a listener keeps its own fallback rather than being handed a wrong answer.
       */
       const lanes = toTaskMoveLanes(await resolveWorkflowIrForTask(store, task.id).catch(() => undefined));
-      store.laneCache.set(task.id, lanes);
-      store.emit("task:moved", { task, from: fromColumn, to: toColumn, source: moveSource, lanes });
+      /* FNXC:WorkflowEvents 2026-08-22-00:13: an unresolved payload is unknown; retain a warm real cache answer until its TTL expires. */
+      if (lanes) store.laneCache.set(task.id, lanes);
+      store.emit("task:moved", {
+        task,
+        from: fromColumn,
+        to: toColumn,
+        source: moveSource,
+        lanes,
+        requestedSource: options?.moveSource,
+        lifecycleReason: options?.lifecycleReason,
+        /*
+        FNXC:LifecycleContainment 2026-08-28-04:47:
+        FN-207 — the canonical emitter is the only place that holds the mover's graph provenance at
+        emit time. Withholding it made every forward graph transition unattributable downstream, so
+        the lifecycle log could only say "unattributed automatic move" for moves that were in fact
+        fully provenanced. Forward the raw option; the listener decides how to render it.
+        */
+        workflowMoveSource: options?.workflowMoveSource,
+      });
       /*
       FNXC:WorkflowEvents 2026-07-27-11:45 (U3 / R5, R6):
       THE post-commit emit point for lifecycle transitions. Its position is the

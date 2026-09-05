@@ -20,7 +20,17 @@ import type {
   AgentLogEntry,
   RunAuditEvent,
 } from "@fusion/core";
-import { AgentStore, ChatStore, queryRunAuditEvents, resolveGlobalDir, resolveReboundTargetForTask, setRunningAgentCountSource } from "@fusion/core";
+import {
+  AgentStore,
+  bulkDeleteStashChatSessions,
+  ChatStore,
+  cloudRedeemTicket,
+  loadCloudLinkState,
+  queryRunAuditEvents,
+  resolveGlobalDir,
+  resolveReboundTargetForTask,
+  setRunningAgentCountSource,
+} from "@fusion/core";
 import type { AuthStorageLike, ModelRegistryLike } from "./routes.js";
 import { createApiRoutes } from "./routes.js";
 import { createSSE, disconnectSSEClient, markSSEClientAlive } from "./sse.js";
@@ -33,6 +43,8 @@ import {
   setOnProjectFirstCreated,
 } from "./project-store-resolver.js";
 import { getOrCreateScopedChatStore } from "./chat-project-services.js";
+import { MAX_FILE_SIZE } from "./file-service.js";
+import { TerminalViewportRegistry } from "./terminal-viewport.js";
 import { getTerminalService, STALE_SESSION_THRESHOLD_MS } from "./terminal-service.js";
 import { WebSocketServer, type WebSocket } from "ws";
 import { terminalSessionManager } from "./terminal.js";
@@ -54,10 +66,6 @@ import {
   rehydrateFromStore as rehydratePlanningSessions,
 } from "./planning.js";
 import {
-  setAiSessionStore as setSubtaskAiSessionStore,
-  rehydrateFromStore as rehydrateSubtaskSessions,
-} from "./subtask-breakdown.js";
-import {
   setAiSessionStore as setMissionAiSessionStore,
   rehydrateFromStore as rehydrateMissionSessions,
 } from "./mission-interview.js";
@@ -70,6 +78,8 @@ import { CliChatSessionRunner } from "./cli-chat.js";
 import { stopAllDevServers } from "./dev-server-routes.js";
 import type { SkillsAdapter } from "./skills-adapter.js";
 import { createAuthMiddleware, authenticateUpgradeRequest, getDaemonToken } from "./auth-middleware.js";
+import { buildRemoteSessionCookie, createRemoteSessionStore, resolveRemoteSessionTtlMs } from "./remote-session.js";
+import { deploymentMaintenance } from "./deployment-maintenance.js";
 import { setupCliSessionWebSocket } from "./cli-session-ws.js";
 import { createCliSessionsRouter } from "./routes/cli-sessions.js";
 import { getProjectIdFromRequest, resolveStoreForProjectId } from "./routes/context.js";
@@ -77,7 +87,7 @@ import type { CliRelaunchRegistry } from "./cli-session-transport.js";
 import { validateRemoteAuthToken } from "./remote-auth.js";
 import { getCliPackageVersion, isUnresolvedCliPackageVersion } from "./cli-package-version.js";
 import { performUpdateCheck } from "./update-check.js";
-import { startAutoUpdateWatcher } from "./auto-update.js";
+import { buildAutoUpdateDeps, startAutoUpdateWatcher } from "./auto-update.js";
 import {
   dayHasSamples,
   fileScopeInvariantFailuresPerDay,
@@ -92,6 +102,7 @@ import {
 } from "./reliability-metrics.js";
 import { loadViewChunkManifest, type ViewChunkManifestEntry } from "./view-chunk-manifest.js";
 import { maybeStartOtelExporter, type OtelExporterHandle } from "./otel-exporter.js";
+import { createMetricsSampler } from "./metrics/index.js";
 import { requireAsyncLayer } from "./require-async-layer.js";
 import {
   evaluateDashboardPostgresHealth,
@@ -975,7 +986,18 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   });
 
   const app = express();
+  app.use(deploymentMaintenance);
   app.locals.hybridExecutor = options?.hybridExecutor;
+
+  /*
+  FNXC:MetricsEndpoint 2026-08-13-16:15:
+  RUFU-081: per-server /metrics observability. The orchestrator is created with
+  no side effects here; the spawn-count hook + tick timers start only on listen
+  and stop on close (co-located with the OTLP exporter). It runs in both
+  headless and non-headless servers. Its latency-recorder middleware is mounted
+  below, before route handlers, so it times the LIVE serving path.
+  */
+  const metricsSampler = createMetricsSampler();
   const runtimeLogger = options?.runtimeLogger ?? createRuntimeLogger("server");
   const mutationRateLimit = rateLimit(RATE_LIMITS.mutation);
   const setupRateLimit = rateLimit(RATE_LIMITS.api);
@@ -1009,13 +1031,48 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   };
   const jsonParser = express.json({ verify: preserveRawBody });
   const planningImageCaptureParser = express.json({ limit: "5mb", verify: preserveRawBody });
+  const chatMessageParser = express.json({ limit: 2 * 1024 * 1024, verify: preserveRawBody });
+  const fileSaveParser = express.json({ limit: 6 * MAX_FILE_SIZE + 1024, verify: preserveRawBody });
+
+  /*
+  FNXC:LargeTextPayloads 2026-08-21-04:35:
+  Large pasted logs must reach only production chat-message endpoints within a finite 2 MiB JSON
+  envelope, while generic workspace and task-file saves receive 6 * MAX_FILE_SIZE + 1 KiB. A
+  supported 1 MiB UTF-8 file can serialize each control byte as six JSON bytes; 1 KiB covers the
+  canonical object framing. Express warns that large bodies increase memory and latency, so the
+  approximately 6 MiB parser is limited to exact save routes: mkdir and literal copy/move/delete/
+  rename operations retain the 100 KiB default. Model context windows cannot define HTTP bytes:
+  parsing precedes model resolution, bytes are not tokens, and context is shared with history,
+  system/tool input, reasoning, and output.
+
+  FNXC:TaskMessageLength 2026-08-29-08:02:
+  Task-message routes use the same finite 2 MiB JSON envelope as chat because their application
+  limit is 100,000 characters. The default 100 KiB parser would otherwise return a bare 413 before
+  accented or newline-heavy operator text reaches route validation; exact task file-save paths keep
+  their dedicated parser and no broader task prefix is admitted.
+  */
+  const isChatMessagePath = (path: string): boolean =>
+    /^\/api\/chat\/(?:sessions|rooms)\/[^/]+\/messages\/?$/.test(path);
+  const isTaskMessagePath = (method: string, path: string): boolean =>
+    (method === "POST" && /^\/api\/tasks\/[^/]+\/(?:steer|comments|refine|spec\/revise)\/?$/.test(path))
+    || (method === "PATCH" && /^\/api\/tasks\/[^/]+\/comments\/[^/]+\/?$/.test(path));
+  const isTaskFileSavePath = (path: string): boolean =>
+    /^\/api\/tasks\/[^/]+\/files\/.+\/?$/.test(path);
+  const isWorkspaceFileSavePath = (path: string): boolean => {
+    if (!/^\/api\/files\/.+/.test(path) || /^\/api\/files\/mkdir\/?$/.test(path)) return false;
+    return !/^\/api\/files\/.+\/(?:copy|move|delete|rename)\/?$/.test(path);
+  };
   app.use((req, res, next) => {
     // Express treats trailing slashes as equivalent, so parser boundaries must do the same;
     // no broader prefix is exempted from the global rawBody-preserving parser.
     if (req.path === "/api/voice/transcribe" || req.path === "/api/voice/transcribe/") return next();
     const parser = req.path === "/api/planning/start-streaming" || req.path === "/api/planning/start-streaming/"
       ? planningImageCaptureParser
-      : jsonParser;
+      : ((req.method === "POST" && isChatMessagePath(req.path)) || isTaskMessagePath(req.method, req.path))
+        ? chatMessageParser
+        : req.method === "POST" && (isTaskFileSavePath(req.path) || isWorkspaceFileSavePath(req.path))
+          ? fileSaveParser
+          : jsonParser;
     return parser(req, res, (error) => {
       // Keep the established global and route-specific size rejections observable as 413 instead
       // of allowing Express's parser error to fall through to the generic 500 handler.
@@ -1023,6 +1080,16 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
       return next(error);
     });
   });
+
+  /*
+  FNXC:MetricsEndpoint 2026-08-13-16:15:
+  RUFU-081: mount the request-latency recorder head on every request (inside
+  /api and the SPA shell, headless or not) so it measures the real HTTP serving
+  pipeline cost, including /api/health — the single best event-loop-starvation
+  indicator. It only attaches a `finish` listener and calls next(); it never
+  blocks or serializes the render path.
+  */
+  app.use(metricsSampler.middleware());
 
   // Daemon mode: bearer token authentication middleware
   // Auth is enabled when daemon option is provided OR FUSION_DAEMON_TOKEN env var is set.
@@ -1034,8 +1101,15 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   const daemonToken = options?.noAuth
     ? undefined
     : options?.daemon?.token ?? process.env.FUSION_DAEMON_TOKEN;
+  /*
+  FNXC:RemoteAuth 2026-08-19-00:40:
+  Remote-login sessions live for the lifetime of this server instance. In-memory is the deliberate
+  choice: a session is a browser convenience, and a restart invalidating it fails in the SAFE
+  direction, whereas persisting it would write a credential to disk for no benefit.
+  */
+  const remoteSessions = createRemoteSessionStore();
   if (daemonToken) {
-    app.use(createAuthMiddleware(daemonToken));
+    app.use(createAuthMiddleware(daemonToken, { validateRemoteSession: (id) => remoteSessions.validate(id) }));
   }
 
   // Initialize terminal service with project root
@@ -1161,7 +1235,59 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
     FNXC:TaskDetailPlannerChatRetention 2026-06-30-18:45:
     Task-detail planner chats are retained after done when a user interacted, but task archival is the retention cutoff. Delete exact task-planner sessions on archive so normal chats and other tasks' planner chats remain intact while chat:session:deleted events clear dashboard caches.
     */
-      await chatStore.deleteSessionsForAgentId(`${TASK_PLANNER_CHAT_AGENT_ID_PREFIX}${data.task.id}`);
+      const plannerAgentId = `${TASK_PLANNER_CHAT_AGENT_ID_PREFIX}${data.task.id}`;
+      try {
+        /*
+        FNXC:RUFU125BulkArchiveSync 2026-08-19-06:07:
+        RUFU-125: snapshot the doomed local session ids BEFORE the local bulk delete —
+        no projectId (mirrors the RUFU-121 per-session route guard, which also omits it)
+        so the Stash sync targets exactly the rows the archive is about to drop. The read
+        is fail-open: a listSessions failure degrades to an empty list and must never
+        prevent the local delete below.
+        */
+        const doomed = await chatStore.listSessions({ agentId: plannerAgentId }).catch(() => []);
+        const deletedCount = await chatStore.deleteSessionsForAgentId(plannerAgentId);
+        if (deletedCount === 0 || doomed.length === 0) return;
+        /*
+        FNXC:RUFU125BulkArchiveSync 2026-08-19-06:07:
+        RUFU-125: the bulk local delete above bypasses the per-session DELETE route RUFU-121
+        hooks, so soft-delete the matching Stash rows in a SEPARATE fire-and-forget IIFE —
+        a Stash stall can never delay local archival bookkeeping. Mirrors the RUFU-121 route
+        sync (skip-guards, url fallback, never-throws): a skip is debug-logged with its
+        reason, and a partial window match (matched < doomed.length) is debug-logged as a
+        window miss with matched/total + truncated (the bounded lookback's documented
+        residual — rows older than 10 × 200 recent rows remain in Stash).
+        */
+        void (async () => {
+          try {
+            const summary = await bulkDeleteStashChatSessions(store, doomed.map((s) => s.id));
+            if (summary.skipped) {
+              severityAuditLog.debug(
+                `[RUFU-125] stash bulk sync skipped on archive task=${data.task.id} reason=${summary.skipReason}`,
+              );
+              return;
+            }
+            if (summary.result.matched < doomed.length) {
+              const r = summary.result;
+              severityAuditLog.debug(
+                `[RUFU-125] stash bulk sync window miss task=${data.task.id} matched=${r.matched}/${doomed.length} deleted=${r.deleted} truncated=${r.truncated} pagesScanned=${r.pagesScanned}`,
+              );
+            }
+          } catch (err: unknown) {
+            // bulkDeleteStashChatSessions never throws by core contract; this is the
+            // never-reject safety net for any future regression.
+            severityAuditLog.warn(
+              `[RUFU-125] stash bulk sync failed task=${data.task.id} (best-effort, non-blocking): ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        })();
+      } catch (err: unknown) {
+        // Unexpected failure in the archival chain (e.g. the local delete throwing —
+        // previously an unhandled rejection): warn, never reject the task:moved chain.
+        severityAuditLog.warn(
+          `[RUFU-125] archive chat cleanup failed task=${data.task.id} (non-blocking): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     })();
   });
   options?.engine?.attachChatStore?.(chatStore);
@@ -1285,7 +1411,20 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
         automationStore,
       )(req, res);
     } catch (err: unknown) {
-      sendErrorResponse(res, 500, err instanceof Error ? err.message : "Failed to open project event stream");
+      /*
+      FNXC:ProjectScoping 2026-08-16-05:28:
+      An SSE subscription for a nonexistent project (e.g. a stale client tab or an
+      e2e fixture page using projectId "fixture") is a client addressing error, not a
+      server fault. Surfacing the startup-factory construction chain as a 500 filled
+      operator logs with alarming "failed to construct TaskStore" errors on every
+      poll; map project-not-found to 404 with a clean message instead.
+      */
+      const message = err instanceof Error ? err.message : "Failed to open project event stream";
+      if (/Project (?:"[^"]*" )?not found/.test(message)) {
+        sendErrorResponse(res, 404, `Project "${projectId}" not found`);
+        return;
+      }
+      sendErrorResponse(res, 500, message);
     }
   });
 
@@ -1515,19 +1654,16 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
     // drains microtasks before I/O), and is best-effort regardless.
     void aiSessionStore.recoverStaleSessions();
     setPlanningAiSessionStore(aiSessionStore);
-    setSubtaskAiSessionStore(aiSessionStore);
     setMissionAiSessionStore(aiSessionStore);
     setMilestoneSliceAiSessionStore(aiSessionStore);
   }
 
   // Fire-and-forget rehydration; store references for logging.
   let planningRehydratedCount = 0;
-  let subtaskRehydratedCount = 0;
   let missionRehydratedCount = 0;
   let milestoneSliceRehydratedCount = 0;
   if (aiSessionStore) {
     void rehydratePlanningSessions(aiSessionStore).then((c) => { planningRehydratedCount = c; });
-    void rehydrateSubtaskSessions(aiSessionStore).then((c) => { subtaskRehydratedCount = c; });
     void rehydrateMissionSessions(aiSessionStore).then((c) => { missionRehydratedCount = c; });
     void rehydrateMilestoneSliceSessions(aiSessionStore).then((c) => { milestoneSliceRehydratedCount = c; });
   }
@@ -1541,7 +1677,6 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
     runtimeLogger.info("AI session rehydrate summary", {
       message: "Rehydrated AI sessions from PostgreSQL",
       planningRehydratedCount,
-      subtaskRehydratedCount,
       missionRehydratedCount,
       milestoneSliceRehydratedCount,
       totalRehydrated,
@@ -1779,20 +1914,19 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   if (options?.systemControl && shouldScheduleAiSessionCleanup()) {
     const systemControl = options.systemControl;
     stopAutoUpdateWatcher?.();
-    stopAutoUpdateWatcher = startAutoUpdateWatcher({
+    stopAutoUpdateWatcher = startAutoUpdateWatcher(buildAutoUpdateDeps({
       getSettings: async () => {
         const globalStore = store.getGlobalSettingsStore?.();
         return globalStore ? await globalStore.getSettings() : {};
       },
       currentVersion: cliPackageVersion,
-      supervised: systemControl.supervised,
-      requestRestart: (reason) => systemControl.requestRestart(reason),
+      systemControl,
       log: {
         info: (message, context) => runtimeLogger.info(message, context),
         warn: (message, context) => runtimeLogger.warn(message, context),
         error: (message, context) => runtimeLogger.error(message, context),
       },
-    });
+    }));
   }
 
   /*
@@ -1822,6 +1956,21 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
       cliPackageVersion,
       engineAvailable: hasDashboardEngine(options),
     }));
+  });
+
+  /*
+  FNXC:MetricsEndpoint 2026-08-13-16:15:
+  RUFU-081: the /metrics route is mounted at the app level (NOT under /api) so
+  it is public and scrapable like the SPA shell — daemon bearer-token auth only
+  protects /api/*. This is intentional: the body is pre-read numeric gauges
+  only (no secrets, no prose), served synchronously from the sampler snapshot
+  with zero awaited I/O so a scrape can never starve the event loop or itself
+  be subject to on-demand DB/ps work. It must be mounted before the SPA
+  catch-all below so it returns Prometheus text rather than index.html.
+  */
+  app.get("/metrics", (_req, res) => {
+    res.type("text/plain; version=0.0.4; charset=utf-8");
+    res.send(metricsSampler.render());
   });
 
   app.get("/api/engine/status", (req, res) => {
@@ -2141,12 +2290,43 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
     }
   });
 
-  app.get("/remote-login", async (req, res) => {
-    const remoteToken = typeof req.query.rt === "string" ? req.query.rt : undefined;
+  /*
+  FNXC:CloudLink 2026-08-21-22:30:
+  Unauthenticated cloudTicket redemption is not behind /api rate limits. Cap it so a
+  caller cannot fan out unbounded outbound redeem requests.
+  */
+  const cloudTicketRateLimit = rateLimit({
+    windowMs: 60_000,
+    max: 30,
+    message: "Too many cloud-link login attempts, please try again later.",
+  });
 
-    let settings: Awaited<ReturnType<typeof store.getSettings>>;
+  app.get("/remote-login", (req, res, next) => {
+    if (typeof req.query.cloudTicket === "string") {
+      cloudTicketRateLimit(req, res, next);
+      return;
+    }
+    next();
+  }, async (req, res) => {
+    const remoteToken = typeof req.query.rt === "string" ? req.query.rt : undefined;
+    /*
+    FNXC:CloudLink 2026-08-21-22:30:
+    Mode A handoff uses cloudTicket=jti.secret. Redeem against FUSION_CLOUD_HTTP_URL
+    (or linked ~/.fusion/cloud-link.json), then mint an HttpOnly remote session cookie.
+    Never put the daemon token in the redirect URL.
+    */
+    const cloudTicket =
+      typeof req.query.cloudTicket === "string" ? req.query.cloudTicket : undefined;
+
+    let settings: Awaited<ReturnType<ReturnType<typeof store.getGlobalSettingsStore>["getSettings"]>>;
     try {
-      settings = await store.getSettings();
+      /*
+      FNXC:RemoteAccessAuth 2026-08-18-06:49:
+      Remote links are public handoffs, but their tokens must be resolved from
+      canonical global settings rather than a project-merged snapshot. A token
+      minted by any remote surface must work while daemon authentication is on.
+      */
+      settings = await store.getGlobalSettingsStore().getSettings();
     } catch {
       res.status(401).json({ error: "Unauthorized", code: "remote_token_invalid" });
       return;
@@ -2156,6 +2336,42 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
     if (!remoteAccess) {
       res.status(401).json({ error: "Unauthorized", code: "remote_token_invalid" });
       return;
+    }
+
+    if (cloudTicket) {
+      try {
+        const linked = loadCloudLinkState();
+        const httpBase =
+          linked?.httpBaseUrl ||
+          process.env.FUSION_CLOUD_HTTP_URL?.trim() ||
+          "";
+        if (!httpBase) {
+          res.status(401).json({
+            error: "Unauthorized",
+            code: "cloud_ticket_cloud_url_missing",
+          });
+          return;
+        }
+        await cloudRedeemTicket(httpBase, {
+          ticket: cloudTicket,
+          engineId: linked?.engineId,
+        });
+        if (daemonToken) {
+          const ttlMs = resolveRemoteSessionTtlMs(remoteAccess, { tokenType: "short-lived" });
+          const session = remoteSessions.issue(ttlMs);
+          const secure = req.protocol === "https" || req.get("x-forwarded-proto") === "https";
+          res.setHeader("Set-Cookie", buildRemoteSessionCookie(session, { secure }));
+        }
+        res.redirect(302, "/");
+        return;
+      } catch (err) {
+        res.status(401).json({
+          error: "Unauthorized",
+          code: "cloud_ticket_invalid",
+          message: err instanceof Error ? err.message : "redeem failed",
+        });
+        return;
+      }
     }
 
     const result = validateRemoteAuthToken(remoteToken, remoteAccess);
@@ -2174,12 +2390,23 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
       return;
     }
 
-    const daemonTokenForRedirect = getDaemonToken(options);
-    if (daemonTokenForRedirect) {
-      const redirectUrl = new URL("/", `${req.protocol}://${req.get("host")}`);
-      redirectUrl.searchParams.set("token", daemonTokenForRedirect);
-      res.redirect(302, redirectUrl.pathname + redirectUrl.search);
-      return;
+    /*
+    FNXC:RemoteAuth 2026-08-19-00:40:
+    NEVER REDIRECT WITH THE DAEMON TOKEN. This used to hand back `/?token=<daemonToken>`, so anyone
+    who opened a shared remote link ended up holding the dashboard's real, non-expiring credential —
+    in their URL bar, their history, and any log that records URLs. It also made the remote token
+    pointless: revoking it left the recipient fully authenticated forever.
+
+    A validated remote token now mints an expiring, revocable session delivered as an HttpOnly
+    cookie, and the redirect carries nothing sensitive. TTL is capped by the remote token's own
+    remaining life when it is short-lived, so a 15-minute link cannot yield a longer session than the
+    link itself.
+    */
+    if (daemonToken) {
+      const ttlMs = resolveRemoteSessionTtlMs(remoteAccess, result);
+      const session = remoteSessions.issue(ttlMs);
+      const secure = req.protocol === "https" || req.get("x-forwarded-proto") === "https";
+      res.setHeader("Set-Cookie", buildRemoteSessionCookie(session, { secure }));
     }
 
     res.redirect(302, "/");
@@ -2340,6 +2567,22 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
       });
     }
 
+    // RUFU-081: start the /metrics samplers (spawn-count hook + unref'd tick
+    // timers). Synchronous and best-effort; a failure here must never break
+    // server startup or the request pipeline. The guard IS the failure
+    // isolation the comment promises — `runtime.installSpawnHook()` patches
+    // node:child_process members, and an unguarded throw would propagate out
+    // of listen() and abort startup (CodeRabbit Minor review fix 2026-08-18-11:53,
+    // matching the adjacent OTLP exporter pattern).
+    try {
+      metricsSampler.start();
+    } catch (error) {
+      runtimeLogger.warn("Metrics sampler failed to start", {
+        message: "Metrics sampler failed to start",
+        ...normalizeErrorForLog(error),
+      });
+    }
+
     if (!providerHealthMonitor && (options?.engineManager || options?.engine)) {
       const providerHealthLogger = runtimeLogger.child("provider-health");
       providerHealthMonitor = new ProviderHealthMonitor({
@@ -2363,6 +2606,18 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
       aiSessionStore?.stopScheduledCleanup();
       otelExporter?.stop();
       otelExporter = null;
+      // RUFU-081: stop the /metrics samplers and remove the spawn hook so no
+      // timer or wrapper outlives the server on restart/test teardown. Guarded
+      // so a teardown throw cannot skip providerHealthMonitor?.stop() and the
+      // remaining close handlers (CodeRabbit Minor review fix 2026-08-18-11:53).
+      try {
+        metricsSampler.stop();
+      } catch (error) {
+        runtimeLogger.warn("Metrics sampler failed to stop", {
+          message: "Metrics sampler failed to stop",
+          ...normalizeErrorForLog(error),
+        });
+      }
       providerHealthMonitor?.stop();
       providerHealthMonitor = null;
       (apiRouter as Router & { dispose?: () => void }).dispose?.();
@@ -2411,6 +2666,13 @@ export function setupTerminalWebSocket(
   store: TaskStore,
   options?: ServerOptions,
 ): void {
+  /*
+  FNXC:TerminalSharing 2026-08-19-02:45:
+  Per-session viewer sizes for the shared-PTY min-sizing rule. Server-scoped, matching the terminal
+  session registry's lifetime.
+  */
+  const terminalViewports = new TerminalViewportRegistry();
+
   const wss = new WebSocketServer({ noServer: true });
 
   // Default terminal service for stale eviction (uses default store's root dir)
@@ -2516,10 +2778,25 @@ export function setupTerminalWebSocket(
       });
     }
 
-    // Send scrollback buffer first
-    const scrollback = terminalService.getScrollbackAndClearPending(sessionId);
-    if (scrollback) {
-      ws.send(JSON.stringify({ type: "scrollback", data: scrollback }));
+    /*
+    FNXC:TerminalSharing 2026-08-19-03:05:
+    Terminal sessions are shared: several browsers can watch and drive the same PTY, so an attach
+    must not clear the pending-output queue. Flush it to whoever is already attached FIRST (this
+    socket has not subscribed yet, so it cannot double-receive), then send the scrollback, which now
+    contains those bytes for the newcomer.
+
+    FNXC:TerminalSharing 2026-08-19-02:45:
+    `sinceSeq` lets a RE-attaching client (tab backgrounded, laptop asleep, heartbeat timeout) ask
+    for only what it missed. Replaying the whole buffer into a terminal that still shows it appended
+    a duplicate copy of history on every reconnect; `reset` tells the client when it must clear
+    first because the delta could not be served from the retained window.
+    */
+    terminalService.flushPendingOutput(sessionId);
+    const sinceSeqRaw = url.searchParams.get("sinceSeq");
+    const sinceSeq = sinceSeqRaw === null ? undefined : Number(sinceSeqRaw);
+    const resume = terminalService.getScrollbackSince(sessionId, sinceSeq);
+    if (resume && (resume.data || resume.reset)) {
+      ws.send(JSON.stringify({ type: "scrollback", data: resume.data, seq: resume.seq, reset: resume.reset }));
     }
 
     // Send connection info
@@ -2528,6 +2805,17 @@ export function setupTerminalWebSocket(
       shell: session.shell,
       cwd: session.cwd,
     }));
+
+    /*
+    FNXC:TerminalSharing 2026-08-19-02:45:
+    One PTY, one size, many viewers. Register this viewer so resizes agree on the SMALLEST attached
+    window instead of last-writer-wins, which left every other viewer rendering a stale column count.
+    */
+    const viewerId = `${sessionId}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    const applyEffectiveViewport = () => {
+      const effective = terminalViewports.effectiveSize(sessionId);
+      if (effective) terminalService.resize(sessionId, effective.cols, effective.rows);
+    };
 
     // Subscribe to data events
     dataUnsub = terminalService.onData((id, data) => {
@@ -2602,7 +2890,8 @@ export function setupTerminalWebSocket(
             break;
           case "resize":
             if (typeof msg.cols === "number" && typeof msg.rows === "number") {
-              terminalService.resize(sessionId, msg.cols, msg.rows);
+              terminalViewports.set(sessionId, viewerId, { cols: msg.cols, rows: msg.rows });
+              applyEffectiveViewport();
             }
             break;
           case "ping":
@@ -2623,6 +2912,10 @@ export function setupTerminalWebSocket(
       clearInterval(pingInterval);
       if (dataUnsub) dataUnsub();
       if (exitUnsub) exitUnsub();
+      // FNXC:TerminalSharing 2026-08-19-02:45: a departing viewer no longer constrains the size, so
+      // the remaining viewers get their room back.
+      terminalViewports.remove(sessionId, viewerId);
+      applyEffectiveViewport();
       // Do NOT kill the PTY session on WebSocket close — the session should
       // survive transient disconnects and modal close/reopen cycles.  Sessions
       // are cleaned up through explicit kill paths (tab close, restart, shell

@@ -35,6 +35,16 @@ export const globalModelsSearchEntries: SettingsSearchEntry[] = [
   },
   {
     sectionId: "global-models",
+    key: "orcarouterModelSync",
+    labelKey: "settings.globalModels.syncOrcaRouterModelListAtStartup",
+    labelFallback: " Sync OrcaRouter model list at startup ",
+    helpKey: "settings.globalModels.whenEnabledStartupFetchesTheLatestOrcaRouterModels",
+    helpFallback:
+      " When enabled, startup fetches the latest available models from the OrcaRouter API so model pickers include the OrcaRouter catalog. Default: enabled. ",
+    keywords: ["refresh", "boot"],
+  },
+  {
+    sectionId: "global-models",
     key: "openrouterAppAttribution.referer",
     labelKey: "settings.globalModels.openRouterHTTPReferer",
     labelFallback: "OpenRouter HTTP-Referer",
@@ -124,5 +134,14 @@ export const globalModelsSearchEntries: SettingsSearchEntry[] = [
     helpKey: "settings.globalModels.requireParametersHint",
     helpFallback: "Default: disabled.",
     keywords: ["strict routing", "provider support"],
+  },
+  {
+    sectionId: "global-models",
+    key: "fastCheapGlobalModelId",
+    labelKey: "settings.globalModels.fastAndCheapModel",
+    labelFallback: "Fast & Cheap Model",
+    helpKey: "settings.globalModels.fastAndCheapModelHelp",
+    helpFallback: "Select a cheap model here for quick edits. It is used for Fast Mode when creating a task.",
+    keywords: ["fast", "cheap", "fast mode"],
   },
 ];

@@ -1,3 +1,4 @@
+import { commitIdentityArgs, resolveCommitIdentity } from "../git-identity.js";
 /**
  * Standalone AI merge path (FN-5633).
  *
@@ -44,28 +45,45 @@ import {
   assertNotWorkspaceTaskMerge,
   buildTaskLineageTrailer,
   evaluateNoCommitsNoOpFinalize,
+  evaluatePreMergeApprovals,
   getPlannerInterventionTimeline,
   getPrimaryPrInfo,
   getTaskMergeBlocker,
+  isFusionDeletableBranch,
+  isPreMergeStepsNotRunBlocker,
+  PreMergeStepsNotRunError,
   normalizeMergeAdvanceAutoSyncMode,
   resolvePersistAgentThinkingLog,
   resolveTaskMergeTarget,
   resolveValidatorSettingsModel,
   resolveMergerFallbackModel,
-  resolveReboundTarget,
+  resolveContainedBackwardTarget,
   resolveTerminalColumns,
   resolveWorkflowIrForTask,
+  resolveRequiredPreMergeStepIds,
+  resolvePreMergeGateForTask,
   type MergeDetails,
   type MergeResult,
   type MergeTargetResolution,
   type Settings,
+  resolveEngineIncarnationId,
+  resolveEngineNodeId,
   type Task,
-  type TaskStore, resolveReviewColumns
+  type TaskStore,
+  type WorkspaceLeaseHandle,
+  resolveReviewColumns,
 } from "@fusion/core";
 import { selectUserCommentsForAgentContext } from "../agents/agent-user-comments.js";
 import { resolveTaskWorkingBranch } from "../worktree/worktree-names.js";
 import { resolveIntegrationBranch } from "./integration-branch.js";
+import { captureMergeContentDescriptor } from "./merge-content-capture.js";
+import { probeReviewDiffFingerprint } from "../worktree/review-diff-fingerprint.js";
+import { isMergeActiveStatus, shouldClearOrphanedMergeStamp } from "./merge-active-status.js";
+
+import { recordWorkspaceBaseBranchDecision, resolveWorkspaceRepoBaseBranch } from "../worktree/workspace-base-branch.js";
+import { captureWorkspaceReviewEvidence } from "../worktree/workspace-review-evidence.js";
 import { advanceIntegrationBranchRef } from "./merger-ref-update-advance.js";
+import { enforceAiMergeSquashGates } from "./merger-ai-squash-gates.js";
 import {
   assertMergeGenerationOwned,
   createMergeWriteFence,
@@ -79,7 +97,9 @@ import { attachAgentUsageTelemetry, emitAgentSessionStart } from "../agents/agen
 import { withRateLimitRetry } from "../errors/rate-limit-retry.js";
 import { checkSessionError } from "../errors/usage-limit-detector.js";
 import { accumulateSessionTokenUsage } from "../execution/session-token-usage.js";
+import { moveTaskToContainedBackwardTarget } from "../execution/lifecycle-move.js";
 import { createRunAuditor, generateSyntheticRunId, type RunAuditor } from "../util/run-audit.js";
+import { emitBoundedRunAudit, type RunAuditSinkHost } from "../util/emit-bounded-run-audit.js";
 import { deriveExecutorSignalMemory, evaluateNoOpFinalizeExecutorVeto } from "../overseer/overseer-noop-finalize-veto.js";
 import { createLogger } from "../logger.js";
 import {
@@ -88,6 +108,7 @@ import {
   isNonFastForwardPushError,
   isRebaseInProgress,
   parsePushRemoteTarget,
+  pushWithTransientRetries,
   pushToRemoteAfterMerge,
   runMergeAdvanceAutoSync,
   syncGroupPrOnLanding,
@@ -95,8 +116,10 @@ import {
 } from "../merger.js";
 import { resolveBranchGroupMergeRouting, type BranchGroupMergeRouting, type SyncGroupPrFn } from "./group-merge-coordinator.js";
 import { DEFAULT_COMMIT_AUTHOR_EMAIL, DEFAULT_COMMIT_AUTHOR_NAME } from "../worktree/worktree-hooks.js";
-import { installWorktreeDependencies, LOCKFILE_CANDIDATES} from "./merge-dependency-sync.js";
+import { describeDependencySyncDecision, installWorktreeDependencies, LOCKFILE_CANDIDATES} from "./merge-dependency-sync.js";
 import { activeSessionRegistry } from "../agents/active-session-registry.js";
+import { MergeGateRevokedError } from "./merger-errors.js";
+import { cleanupLandedTaskWorktree, cleanupLandedWorkspaceTaskWorktrees } from "./post-landing-worktree-cleanup.js";
 import { resolveMcpServersForStore } from "../mcp/mcp-resolution.js";
 /*
 FNXC:Workspace 2026-06-22-14:10 (Phase D review G — cycle dissolved):
@@ -105,9 +128,14 @@ module so self-healing can import the predicate without re-entering the self-hea
 import cycle (merger-ai-worktree imports `MIN_TEMP_WORKTREE_REAP_AGE_MS` from self-healing).
 */
 import { isRepoLanded, findProvenLandedCommit, FUSION_TASK_ID_TRAILER_KEY } from "./workspace-land-predicate.js";
+import { resolveWorkspaceMergeReadiness } from "./workspace-merge-readiness.js";
+import { persistWorkspaceRepoLandFailure } from "./workspace-land-failure.js";
+import { ensureTenancyFenceRef, mergeDispatchFenceRef, publishWorkspaceIntegrationRef, WorkspaceFenceRefError, workspaceLandFenceRef } from "./workspace-fence-ref.js";
+import { isPushAfterMergeEnabled } from "./push-after-merge-policy.js";
+import { resolveWorkspaceIntegrationTarget, WorkspaceEnvironmentError, WorkspaceIntegrationTargetError, type WorkspaceIntegrationTarget } from "./workspace-integration-target.js";
 import { finalizeProvenAutoMergeTask } from "./auto-merge-finalization.js";
 import { getCommitTaskOwnership, detectAlreadyLandedOnMain } from "./already-merged-detector.js";
-import { resolveLegacyAiMergeRootPath } from "../worktree/worktree-paths.js";
+import { resolveAiMergeSearchRoots } from "../worktree/worktree-paths.js";
 import {
   cleanupAiMergeWorktree,
   pruneExistingAiMergeWorktrees,
@@ -120,11 +148,50 @@ import {
   buildReviewSystemPrompt,
   buildStashResolvePrompt,
   buildStashResolveSystemPrompt,
+  isAiMergeProtocolLine,
   parseReviewVerdict,
 } from "./merger-ai-prompts.js";
 
 const execFileAsync = promisify(execFile);
 const aiMergeLog = createLogger("merger-ai");
+
+/**
+ * FNXC:RunAudit 2026-08-20-05:22:
+ * FN-9175 requires an aborted merge to retain its original terminal signal before optional PR
+ * sync telemetry is considered. This production helper makes that ordering independently
+ * executable while retaining the fire-and-forget audit contract for ordinary sync failures.
+ */
+/*
+ * FNXC:ReviewGatedRemediation 2026-08-23-05:23:
+ * The AI empty-merge path must carry the selected workflow's required gates into the shared
+ * zero-diff guard; otherwise a review-gated card can finalize before deterministic verification.
+ */
+async function resolveNoOpFinalizeGateIds(store: TaskStore, task: Task): Promise<ReadonlySet<string> | undefined> {
+  const selection = store.getTaskWorkflowSelectionAsync
+    ? await store.getTaskWorkflowSelectionAsync(task.id)
+    : store.getTaskWorkflowSelection?.(task.id);
+  if (!selection) return undefined;
+  const ir = await resolveWorkflowIrForTask(store, task.id).catch(() => undefined);
+  return ir ? resolveRequiredPreMergeStepIds(ir, task.enabledWorkflowSteps) : undefined;
+}
+
+export function recordBranchGroupPrSyncFailureAudit(
+  store: RunAuditSinkHost,
+  taskId: string,
+  groupId: string,
+  error: unknown,
+): void {
+  if (isMergeAbortedError(error)) throw error;
+  void emitBoundedRunAudit(store, {
+    taskId,
+    agentId: "merger",
+    runId: `merge-${taskId}`,
+    domain: "git",
+    mutationType: "merge:branch-group-pr-sync-failed",
+    target: groupId,
+    metadata: { groupId, error: error instanceof Error ? error.message : String(error) },
+  }, { log: aiMergeLog });
+}
 
 const MAX_CONCURRENT_ADVANCE_RETRIES = 3;
 
@@ -178,50 +245,24 @@ function short(sha: string): string {
   return /^[0-9a-f]{7,40}$/i.test(sha) ? sha.slice(0, 8) : sha;
 }
 
-function getApprovedAiMergeReviewShas(task: Task | undefined): Set<string> {
-  const shas = new Set<string>();
-  for (const entry of task?.log ?? []) {
-    if (typeof entry.action !== "string") continue;
-    const match = entry.action.match(/AI merge review \(pass \d+\): approved(?:\s+(?:squash|commit)\s+([0-9a-f]{7,40}))?/i);
-    if (match?.[1]) shas.add(match[1].toLowerCase());
+const MAX_BLOCKING_REVIEW_REASONS = 8;
+
+function normalizeBlockingReviewReason(reason: string): string {
+  return reason.trim().toLocaleLowerCase().replace(/[\s\p{P}]+/gu, " ").trim();
+}
+
+function boundBlockingReviewReasons(reasons: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const bounded: string[] = [];
+  for (const reason of reasons) {
+    const display = reason.trim().replace(/\s+/g, " ");
+    const key = normalizeBlockingReviewReason(display);
+    if (!key || isAiMergeProtocolLine(display) || seen.has(key)) continue;
+    seen.add(key);
+    bounded.push(display);
+    if (bounded.length === MAX_BLOCKING_REVIEW_REASONS) break;
   }
-  return shas;
-}
-
-function taskHasApprovedAiMergeReview(task: Task | undefined): boolean {
-  return (task?.log ?? []).some((entry) =>
-    typeof entry.action === "string"
-    && /AI merge review \(pass \d+\): approved/.test(entry.action)
-  );
-}
-
-function getOutstandingBlockingMergeReasons(task: Task | undefined): string[] {
-  const actions = task?.log?.map((entry) => entry.action).filter((action): action is string => typeof action === "string") ?? [];
-  const reasons: string[] = [];
-  const addReasons = (value: string): void => {
-    for (const reason of value.split(/;\s*/).map((part) => part.trim()).filter(Boolean)) {
-      if (!reasons.includes(reason)) reasons.push(reason);
-    }
-  };
-  for (let index = actions.length - 1; index >= 0; index--) {
-    const action = actions[index];
-    if (/AI merge: (?:landed|finalized).*task → done/i.test(action)) return [];
-    if (/AI merge review \(pass \d+\): approved/i.test(action)) return [];
-    const blocked = action.match(/AI merge BLOCKED .*?unresolved correctness concern:\s*(.+)$/i);
-    if (blocked?.[1]) {
-      addReasons(blocked[1]);
-      return reasons;
-    }
-    const rejected = action.match(/AI merge review \(pass \d+\): rejected \(blocking\) —\s*(.+)$/i);
-    if (rejected?.[1]) addReasons(rejected[1]);
-  }
-  return reasons;
-}
-
-function matchesApprovedAiMergeSha(squashSha: string, approvedShas: Set<string>): boolean {
-  if (approvedShas.size === 0) return true;
-  const normalized = squashSha.toLowerCase();
-  return Array.from(approvedShas).some((approved) => normalized === approved || normalized.startsWith(approved) || approved.startsWith(normalized));
+  return bounded;
 }
 
 type PreexistingAiMergeRecoveryCandidate = {
@@ -233,7 +274,7 @@ type PreexistingAiMergeRecoveryCandidate = {
 
 function listAiMergeWorktreeCandidates(taskId: string, projectRootDir: string, settings?: Settings): string[] {
   const prefix = `fusion-ai-merge-${taskId.toLowerCase()}-`;
-  const roots = Array.from(new Set([resolveAiMergeRoot(projectRootDir, settings), resolveLegacyAiMergeRootPath(projectRootDir), tmpdir()]));
+  const roots = Array.from(new Set([resolveAiMergeRoot(projectRootDir, settings), ...resolveAiMergeSearchRoots(projectRootDir, settings), tmpdir()]));
   const testWorkerRoot = process.env.FUSION_TEST_WORKER_ROOT;
   if (testWorkerRoot) {
     try {
@@ -259,16 +300,22 @@ function listAiMergeWorktreeCandidates(taskId: string, projectRootDir: string, s
 
 async function recoverApprovedPreexistingAiMergeWorktree(
   repoRootDir: string,
+  branch: string,
   integrationBranch: string,
   ctx: LandRepoContext,
 ): Promise<LandOneRepoResult | null> {
   const { taskId, settings, store, audit, log, allowDirtyLocalCheckoutSync, stashResolveAgent, signal } = ctx;
   throwIfAborted(signal, taskId);
   const task = await store.getTask(taskId).catch(() => undefined);
-  if (!taskHasApprovedAiMergeReview(task)) return null;
-
-  const approvedShas = getApprovedAiMergeReviewShas(task);
+  const state = task?.aiMergeReviewReconciliation;
+  const sourceSha = await git(["rev-parse", "--verify", branch], repoRootDir);
   const tipSha = await git(["rev-parse", "--verify", `refs/heads/${integrationBranch}`], repoRootDir);
+  /*
+  FNXC:AIMergeReviewReconciliation 2026-08-20-22:27:
+  Recovery may land only the durable, twice-confirmed candidate for the current source and
+  integration identities. Task-log prose is audit history, never authority to revive a squash.
+  */
+  if (!state?.candidateSha || state.consecutiveCleanApprovals < 2 || state.sourceSha !== sourceSha || state.integrationTipSha !== tipSha) return null;
   const recoverableCandidates: PreexistingAiMergeRecoveryCandidate[] = [];
   for (const candidate of listAiMergeWorktreeCandidates(taskId, repoRootDir, settings)) {
     let mergeRoot = candidate;
@@ -278,8 +325,8 @@ async function recoverApprovedPreexistingAiMergeWorktree(
     try {
       throwIfAborted(signal, taskId);
       const squashSha = await git(["rev-parse", "--verify", "HEAD"], mergeRoot);
-      if (!squashSha || squashSha === tipSha) continue;
-      if (!matchesApprovedAiMergeSha(squashSha, approvedShas)) continue;
+      if (!squashSha || squashSha === tipSha || squashSha !== state.candidateSha) continue;
+      if (state.candidateTreeSha && await git(["rev-parse", `${squashSha}^{tree}`], mergeRoot) !== state.candidateTreeSha) continue;
       const show = await git(["show", "-s", "--format=%s%x1f%b", squashSha], mergeRoot);
       const [subject = "", body = ""] = show.split("\x1f");
       if (!getCommitTaskOwnership(taskId, task?.lineageId, subject, body).owned) continue;
@@ -294,8 +341,10 @@ async function recoverApprovedPreexistingAiMergeWorktree(
   }
 
   /*
-  FNXC:AIMergeRecovery 2026-07-10-23:06:
-  Approved clean-room recovery must bind the candidate commit to the reviewed squash. New review logs carry the squash SHA; legacy logs without a SHA can recover only when exactly one same-task candidate is possible, otherwise recovery defers to the normal merge path rather than finalizing the wrong clean room.
+  FNXC:AIMergeReviewReconciliation 2026-08-20-22:27:
+  A recovered clean room is safe only after structured reconciliation has bound its exact
+  candidate SHA/tree and current source/integration identity. Ambiguous candidates defer to a
+  fresh merge rather than turning historical review text into landing authority.
   */
   if (recoverableCandidates.length !== 1) {
     if (recoverableCandidates.length > 1) {
@@ -307,6 +356,8 @@ async function recoverApprovedPreexistingAiMergeWorktree(
   const selected = recoverableCandidates[0];
   throwIfAborted(signal, taskId);
   if (!selected.alreadyLanded) {
+    if (!task) throw new Error(`AI merge task ${taskId} disappeared before recovery squash gates`);
+    await enforceAiMergeSquashGates({ store, task, taskId, mergeRoot: selected.mergeRoot, branch, tipSha: selected.tipSha, squashSha: selected.squashSha, audit, log, repoRel: ctx.repoRel, repoKeys: ctx.repoKeys });
     const land = await landSquash({
       projectRootDir: repoRootDir,
       mergeRoot: selected.mergeRoot,
@@ -318,15 +369,18 @@ async function recoverApprovedPreexistingAiMergeWorktree(
       resolveConflicts: stashResolveAgent,
       allowDirtyLocalCheckoutSync,
       signal,
+      assertMergeGateStillOpen: () => assertMergeGateStillOpen(ctx, repoRootDir, ctx.repoRel),
     });
     if (land.outcome !== "advanced") return null;
+    await store.updateTask(taskId, { aiMergeReviewReconciliation: null });
     await log(`AI merge: recovered approved pre-existing clean-room commit ${short(selected.squashSha)} before pruning`);
     await audit.git({ type: "merge:ai-landed", target: integrationBranch, metadata: { taskId, landedSha: selected.squashSha, source: "pre-prune-clean-room-recovery", mergeRoot: selected.mergeRoot } }).catch(() => undefined);
-    return { outcome: "landed", squashSha: selected.squashSha, localSync: land.localSync, tipSha: selected.tipSha, integrationBranch };
+    return { outcome: "landed", squashSha: selected.squashSha, localSync: land.localSync, tipSha: selected.tipSha, integrationBranch, dependencySyncDecision: "recovered-no-new-sync" };
   }
 
+  await store.updateTask(taskId, { aiMergeReviewReconciliation: null });
   await log(`AI merge: recovered already-landed clean-room commit ${short(selected.squashSha)} before pruning`);
-  return { outcome: "landed", squashSha: selected.squashSha, localSync: "skipped-other-branch", tipSha: selected.tipSha, integrationBranch };
+  return { outcome: "landed", squashSha: selected.squashSha, localSync: "skipped-other-branch", tipSha: selected.tipSha, integrationBranch, dependencySyncDecision: "recovered-no-new-sync" };
 }
 
 export {
@@ -377,7 +431,13 @@ async function ensureCommitTaskMetadata(
   const missingTrailers = trailers.filter((t) => !fullMessage.includes(t));
   if (!needsPrefix && missingTrailers.length === 0) return;
 
-  const args = ["-c", "trailer.ifExists=addIfDifferent", "commit", "--amend"];
+  /*
+  FNXC:GitIdentity 2026-08-18-07:55:
+  This amend does not go through merger.ts's mergerCommitEnv, so it needs the identity applied to its
+  own argv — otherwise it is the one Fusion commit that still depends on ambient git config and fails
+  on a host that has none.
+  */
+  const args = [...commitIdentityArgs(resolveCommitIdentity()), "-c", "trailer.ifExists=addIfDifferent", "commit", "--amend"];
   if (needsPrefix) {
     // Rewrite the message with the task-id-prefixed subject (body, which already
     // carries any existing trailers, is preserved verbatim).
@@ -397,13 +457,18 @@ async function ensureCommitTaskMetadata(
 // ---------------------------------------------------------------------------
 
 export {
+  AI_MERGE_PROTOCOL_MARKERS,
+  PRIOR_FINDING_DISPOSITIONS_MARKER,
   REVIEW_VERDICT_MARKER,
+  RESOLVED_PRIOR_FINDINGS_MARKER,
+  SEVERITY_MARKER,
   buildMergePrompt,
   buildMergeSystemPrompt,
   buildReviewPrompt,
   buildReviewSystemPrompt,
   buildStashResolvePrompt,
   buildStashResolveSystemPrompt,
+  isAiMergeProtocolLine,
   parseReviewVerdict,
 } from "./merger-ai-prompts.js";
 export type { AiMergeReviewSeverity, AiMergeReviewVerdict } from "./merger-ai-prompts.js";
@@ -422,6 +487,19 @@ export class AiMergeBlockedError extends Error {
     this.name = "AiMergeBlockedError";
     this.taskId = taskId;
     this.reasons = reasons;
+  }
+}
+
+/**
+ * FNXC:AIMergeReviewReconciliation 2026-08-20-22:38:
+ * A dismissal or source/tip replacement invalidates the entire reconciliation episode. The
+ * clean-room caller catches this sentinel and starts a fresh episode rather than allowing a
+ * reviewer response captured against stale state to recreate the dismissed candidate.
+ */
+class AiMergeReviewReconciliationInvalidatedError extends Error {
+  constructor() {
+    super("AI merge review reconciliation was invalidated during review");
+    this.name = "AiMergeReviewReconciliationInvalidatedError";
   }
 }
 
@@ -637,16 +715,44 @@ export async function landSquash(input: {
    */
   allowDirtyLocalCheckoutSync?: boolean;
   signal?: AbortSignal;
+  /** FNXC:Workspace 2026-08-15-08:36: Workspace lands advance the shared remote under a durable tenant fence before local sync. */
+  workspaceFence?: { remote: string; fenceRefName: string; fenceRefSha: string };
+  /** A task-scoped dispatch pin supplements the repo pin for a workspace merge body. */
+  workspaceDispatchFence?: { fenceRefName: string; fenceRefSha: string };
+  /** Re-reads the task's positive review gate immediately before ref mutation. */
+  assertMergeGateStillOpen?: () => Promise<void>;
+  /** Records a repository-scoped observation when a fenced target CAS is safely re-observed. */
+  onWorkspaceRepublish?: (observedTargetSha?: string) => Promise<void> | void;
 }): Promise<LandResult> {
-  const { projectRootDir, mergeRoot, integrationBranch, tipSha, squashSha, taskId, audit, resolveConflicts, allowDirtyLocalCheckoutSync = false, signal } = input;
+  const { projectRootDir, mergeRoot, integrationBranch, tipSha, squashSha, taskId, audit, resolveConflicts, allowDirtyLocalCheckoutSync = false, signal, workspaceFence, workspaceDispatchFence, assertMergeGateStillOpen, onWorkspaceRepublish } = input;
   const emit = (outcome: LocalSyncOutcome, extra: Record<string, unknown> = {}) =>
     audit.git({ type: "merge:ai-local-sync", target: integrationBranch, metadata: { taskId, outcome, squashSha, ...extra } }).catch(() => undefined);
 
   const currentBranch = await git(["rev-parse", "--abbrev-ref", "HEAD"], projectRootDir).catch(() => "");
+  let sharedRefAdvanced = false;
+  const advanceSharedWorkspaceRef = async (): Promise<void> => {
+    if (!workspaceFence || sharedRefAdvanced) return;
+    const publication = await publishWorkspaceIntegrationRef({
+      cwd: mergeRoot,
+      remote: workspaceFence.remote,
+      sourceSha: squashSha,
+      targetRef: `refs/heads/${integrationBranch}`,
+      expectedTargetSha: tipSha,
+      fenceRefName: workspaceFence.fenceRefName,
+      fenceRefSha: workspaceFence.fenceRefSha,
+      ...(workspaceDispatchFence ? { additionalFenceRefs: [workspaceDispatchFence] } : {}),
+    });
+    if (publication.republishedFromObservedTip) {
+      await onWorkspaceRepublish?.(publication.observedTargetSha);
+    }
+    sharedRefAdvanced = true;
+  };
 
   // Case B — target not checked out here: bare CAS ref advance.
   if (currentBranch !== integrationBranch) {
     assertMergeGenerationOwned(signal, taskId);
+    await assertMergeGateStillOpen?.();
+    await advanceSharedWorkspaceRef();
     const adv = await advanceIntegrationBranchRef({
       rootDir: mergeRoot, projectRootDir, integrationBranch,
       newSha: squashSha, expectedCurrentSha: tipSha, taskId, audit,
@@ -699,6 +805,8 @@ export async function landSquash(input: {
     // stash hook failure). Don't risk `merge --ff-only` aborting/clobbering:
     // advance the ref atomically and leave the user's working tree as-is.
     assertMergeGenerationOwned(signal, taskId);
+    await assertMergeGateStillOpen?.();
+    await advanceSharedWorkspaceRef();
     const adv = await advanceIntegrationBranchRef({
       rootDir: mergeRoot, projectRootDir, integrationBranch,
       newSha: squashSha, expectedCurrentSha: tipSha, taskId, audit,
@@ -716,6 +824,8 @@ export async function landSquash(input: {
 
   // Fast-forward the checkout (and the branch ref) to the squash.
   assertMergeGenerationOwned(signal, taskId);
+  await assertMergeGateStillOpen?.();
+  await advanceSharedWorkspaceRef();
   if (!(await gitOk(["merge", "--ff-only", squashSha], projectRootDir))) {
     if (stashed) await gitOk(["stash", "pop"], projectRootDir); // restore the user's edits
     return { outcome: "concurrent", localSync: "skipped-other-branch" };
@@ -767,8 +877,9 @@ FNXC:Workspace 2026-06-21-23:40 (Phase C U1, KTD1):
 `runAiMerge`'s former inline clean-room closure: pre-merge prune (rooted at THIS
 repo) → mkdtemp clean room → `git worktree add --detach` → installWorktreeDependencies
 → mergeAndReview → landSquash → the concurrent-advance CAS retry loop → the
-activeSessionRegistry register/unregister + cleanup-finally. It advances ONE local
-integration ref (no remote push) and returns what landed. It deliberately does NOT
+activeSessionRegistry register/unregister + cleanup-finally. Single-repo callers advance one local
+integration ref; workspace callers pin a durable tenancy fence and atomically advance the shared
+remote integration ref before reconciling their local ref. It deliberately does NOT
 move the task or write task-level mergeDetails — that task-global finalization
 (`finalizeMerged`/`finalizeTask`/`evaluateNoCommitsNoOpFinalize`) stays with the
 caller, so the same primitive is callable per sub-repo from `landWorkspaceTask`
@@ -806,6 +917,9 @@ export interface LandRepoContext {
   off, preserving the documented hard-fail for the single-repo land path.
   */
   nonFatalDependencySync?: boolean;
+  /** Workspace repo-local File Scope context; omitted for single-repo lands. */
+  repoRel?: string;
+  repoKeys?: readonly string[];
   /*
   FNXC:MergeNoCommits 2026-07-17-12:00:
   When true, the task is expected to produce no code changes (audit, documentation, decision-only).
@@ -814,7 +928,75 @@ export interface LandRepoContext {
   resolvable in the engine process environment, and avoids unnecessary work.
   */
   noCommitsExpected?: boolean;
+  /** FNXC:Workspace 2026-08-15-08:36: Present only for workspace sub-repos; it fences the durable intent and remote ref advance. */
+  workspaceLand?: { getHandle: () => WorkspaceLeaseHandle; repoRelPath: string; remote: string; assertLive: () => void };
+  /** FNXC:WorkspaceMergeDispatch 2026-08-15-22:55: Task-level pin that fences every merge-body ref advance. */
+  workspaceDispatchFence?: { fenceRefName: string; fenceRefSha: string };
+  /** The admission descriptor is refreshed at the ref-advance boundary. */
+  mergeContent?: import("@fusion/core").MergeContentDescriptor;
   store: TaskStore;
+}
+
+async function assertMergeGateStillOpen(
+  ctx: LandRepoContext,
+  projectRootDir: string,
+  repository?: string,
+): Promise<void> {
+  /*
+  FNXC:MergeGateRecheck 2026-08-23-08:51:
+  FN-180 requires a durable read at the ref-advance boundary. A lightweight or dry-run store that
+  cannot read the current task must refuse landing rather than bypass a REVISE or review-lane exit.
+  */
+  if (typeof ctx.store.getTask !== "function") {
+    throw new MergeGateRevokedError(`Merge gate revoked for ${ctx.taskId}: current task could not be read`);
+  }
+  const task = await ctx.store.getTask(ctx.taskId).catch(() => {
+    throw new MergeGateRevokedError(`Merge gate revoked for ${ctx.taskId}: current task could not be read`);
+  });
+  let gate;
+  try {
+    gate = await resolvePreMergeGateForTask(ctx.store, task.id, task.enabledWorkflowSteps, task);
+  } catch {
+    throw new MergeGateRevokedError(`Merge gate revoked for ${task.id}: task workflow could not be resolved`);
+  }
+  if (gate.provenance === "default" && !gate.selectionAbsent) {
+    throw new MergeGateRevokedError(`Merge gate revoked for ${task.id}: task workflow could not be resolved`);
+  }
+
+  let mergeContent = ctx.mergeContent;
+  if (mergeContent?.kind === "workspace" && repository) {
+    const entry = task.workspaceWorktrees?.[repository];
+    const baseRef = entry?.baseCommitSha ?? (entry
+      ? await resolveWorkspaceRepoBaseBranch({
+        mode: "recorded", repoRootDir: projectRootDir, repoRelPath: repository,
+        task, settings: ctx.settings, recordedBaseBranch: entry.baseBranch,
+      }).then((resolved) => git(["merge-base", resolved.branch, entry.branch], projectRootDir)).catch(() => undefined)
+      : undefined);
+    const probe = await probeReviewDiffFingerprint(projectRootDir, baseRef, entry?.branch);
+    mergeContent = probe.state === "fingerprint" && mergeContent.repositories.state === "captured"
+      ? { kind: "workspace", repositories: { state: "captured", inScopeModified: mergeContent.repositories.inScopeModified, fingerprints: { ...mergeContent.repositories.fingerprints, [repository]: probe.fingerprint } } }
+      : { kind: "workspace", repositories: { state: "unavailable", reason: "workspace-repository-fingerprint-unavailable" } };
+  } else if (!mergeContent) {
+    mergeContent = await captureMergeContentDescriptor(task, { workspaceRootDir: projectRootDir, settings: ctx.settings });
+  }
+
+  /*
+  FNXC:MergeGateRecheck 2026-08-24-04:35:
+  FN-184: this fence re-reads the task from the store, so by construction it observes the
+  `status:"merging"` stamp `runAiMerge` wrote for THIS merge. `merging`/`merging-pr` are in
+  HARD_BLOCKING_TASK_STATUSES, so without neutralization the fence revokes the very merge it is
+  guarding and no ref ever advances. This is the same defect as the ProjectEngine in-flight watcher
+  and must stay fixed in both places: the watcher abort alone still left the merge dying here.
+  Only the owned task's own execution bookkeeping is cleared — a real REVISE, a review-lane exit,
+  `paused`, `queued`, or any other blocking status still revokes.
+  */
+  const gateView: Task = isMergeActiveStatus(task.status) ? { ...task, status: undefined } : task;
+  const blocker = getTaskMergeBlocker(gateView, {
+    reviewColumns: gate.reviewColumns.size ? gate.reviewColumns : new Set(["in-review"]),
+    requiredPreMergeStepIds: gate.requiredPreMergeStepIds,
+    mergeContent,
+  });
+  if (blocker) throw new MergeGateRevokedError(`Merge gate revoked for ${task.id}: ${blocker}`);
 }
 
 /** What a single repo's land produced. No task move / mergeDetails — the caller
@@ -825,6 +1007,7 @@ export type LandOneRepoResult =
       outcome: "empty";
       tipSha: string;
       integrationBranch: string;
+      dependencySyncDecision: string;
     }
   | {
       /** The squash landed; the local integration ref now points at `squashSha`. */
@@ -833,17 +1016,17 @@ export type LandOneRepoResult =
       localSync: LocalSyncOutcome;
       tipSha: string;
       integrationBranch: string;
+      dependencySyncDecision: string;
     };
 
 /**
- * Land `branch` onto `integrationBranch`'s LOCAL ref in `repoRootDir` via a
- * repo-scoped clean room, retrying on concurrent advance. No remote push. See
- * the FNXC note above for the extraction contract.
+ * Land `branch` through a repo-scoped clean room, retrying on concurrent advance.
+ * Workspace contexts publish the shared integration ref under their durable fence;
+ * standalone contexts retain the local-only land contract. See the FNXC note above.
  */
-// FNXC:Workspace 2026-06-22-09:30 (Phase C review B12): `landOneRepo` takes its store access
-// exclusively through the `ctx` callbacks (log/setStatus/audit) and pre-built agents — it never
-// touches a TaskStore directly. The former leading `store` param was dead and misleading at the
-// call sites (they looked like they forwarded a store the function ignored), so it was dropped.
+// FNXC:Workspace 2026-08-15-08:36: `landOneRepo` receives the TaskStore through its context so
+// workspace land intents are written immediately before the fenced shared-ref advance. The former
+// leading store parameter stays absent; context keeps all task-bound dependencies explicit.
 export async function landOneRepo(
   repoRootDir: string,
   branch: string,
@@ -851,16 +1034,29 @@ export async function landOneRepo(
   ctx: LandRepoContext,
 ): Promise<LandOneRepoResult> {
   const {
-    taskId, settings, audit, log, setStatus, maxPasses,
+    taskId, settings, audit, log: baseLog, setStatus, maxPasses,
     mergeAgent, reviewAgent, stashResolveAgent,
     includeTaskId, trailers, taskTitle, signal, store,
   } = ctx;
+  /*
+  FNXC:WorkspaceMergeLogs 2026-08-29-07:28:
+  A workspace task lands one clean room per repository. Prefix the existing task-scoped logger
+  once at the per-repository body boundary so clean-room, dependency-sync, review, and ref-advance
+  lines all identify the repository without adding durable-write call sites or changing single-repo
+  wording.
+  */
+  const repoRelPath = ctx.repoRel;
+  const log = repoRelPath
+    ? async (message: string) => baseLog(formatRepositoryMergeLog(repoRelPath, message))
+    : baseLog;
+  const repoContext = repoRelPath ? { ...ctx, log } : ctx;
+  let dependencySyncDecision = "not-run";
 
   // If a prior merger died after the clean-room squash was approved but before
   // landing/finalization, land that commit before the normal pre-merge prune can
   // delete the only easy reference to it.
-  const recovered = await recoverApprovedPreexistingAiMergeWorktree(repoRootDir, integrationBranch, ctx);
-  if (recovered) return recovered;
+  const recovered = await recoverApprovedPreexistingAiMergeWorktree(repoRootDir, branch, integrationBranch, repoContext);
+  if (recovered) return { ...recovered, dependencySyncDecision: "recovered-no-new-sync" };
 
   // Pre-merge prune is rooted at THIS sub-repo (KTD1): N per-repo clean rooms for
   // one task share the `fusion-ai-merge-<taskId>-` prefix, so a prune rooted at a
@@ -873,8 +1069,8 @@ export async function landOneRepo(
     await log(`AI merge: pre-merge prune failed: ${getErrorMessage(err)}`);
   }
   let advanceRetries = 0;
-  const taskAtStart = await store.getTask(taskId);
-  let outstandingReviewReasons = getOutstandingBlockingMergeReasons(taskAtStart);
+  // Structured reconciliation state is read by mergeAndReview; task logs are not a fallback authority.
+  let outstandingReviewReasons: string[] = [];
   while (true) {
     throwIfAborted(signal, taskId);
     const tipSha = await git(["rev-parse", "--verify", `refs/heads/${integrationBranch}`], repoRootDir);
@@ -893,7 +1089,7 @@ export async function landOneRepo(
     */
     if (Number.parseInt(aheadRaw.trim(), 10) === 0 && outstandingReviewReasons.length === 0) {
       await audit.git({ type: "merge:ai-empty", target: integrationBranch, metadata: { taskId, tipSha } });
-      return { outcome: "empty", tipSha, integrationBranch };
+      return { outcome: "empty", tipSha, integrationBranch, dependencySyncDecision: "not-run-empty" };
     }
 
     // 1. Clean-room worktree at the integration tip.
@@ -991,6 +1187,7 @@ export async function landOneRepo(
         }
       }
       if (noCommitsDepsSkipAllowed) {
+        dependencySyncDecision = "skipped-no-commits";
         await log(`AI merge: skipping dependency sync — no-commits task (no code changes expected)`);
       } else {
       const depsSyncStartedAt = Date.now();
@@ -1019,6 +1216,7 @@ export async function landOneRepo(
         throwIfAborted(signal, taskId);
         if (!ctx.nonFatalDependencySync) throw depsErr;
         const depsErrMessage = getErrorMessage(depsErr);
+        dependencySyncDecision = `failed-nonfatal; deps-unavailable; reason=${depsErrMessage}`;
         await log(`AI merge (workspace): dependency sync FAILED for this sub-repo's clean room — landing without dep-dependent verification (deps unavailable): ${depsErrMessage}`);
         await audit.git({
           type: "merge:ai-deps-sync",
@@ -1027,6 +1225,7 @@ export async function landOneRepo(
         });
       }
       if (depsSyncResult) {
+        dependencySyncDecision = describeDependencySyncDecision(depsSyncResult);
         await audit.git({
           type: "merge:ai-deps-sync",
           target: integrationBranch,
@@ -1046,15 +1245,26 @@ export async function landOneRepo(
           },
         });
       }
-      await log(`[timing] AI merge dependency sync completed in ${Date.now() - depsSyncStartedAt}ms${depsSyncResult ? (depsSyncResult.installCommand ? ` (${depsSyncResult.skipped ? "skipped" : "ran"}: ${depsSyncResult.installCommand})` : " (no command)") : " (failed — non-fatal, deps unavailable)"}`);
+      await log(`[timing] AI merge dependency sync completed: ${depsSyncResult
+        ? describeDependencySyncDecision(depsSyncResult)
+        : `failed-nonfatal; duration=${Date.now() - depsSyncStartedAt}ms; deps-unavailable`}`);
       }
 
       // 2 + 3. Merge + review loop (corrective passes).
-      const reviewResult = await mergeAndReview({
-        mergeRoot, branch, integrationBranch, tipSha, taskTitle, includeTaskId, trailers, taskId,
-        maxPasses, mergeAgent, reviewAgent, audit, log, setStatus, store, signal,
-        initialPriorReasons: outstandingReviewReasons,
-      });
+      let reviewResult: Awaited<ReturnType<typeof mergeAndReview>>;
+      try {
+        reviewResult = await mergeAndReview({
+          mergeRoot, branch, integrationBranch, tipSha, taskTitle, includeTaskId, trailers, taskId,
+          maxPasses, mergeAgent, reviewAgent, audit, log, setStatus, store, signal,
+          initialPriorReasons: outstandingReviewReasons,
+        });
+      } catch (error) {
+        if (error instanceof AiMergeReviewReconciliationInvalidatedError) {
+          await log("AI merge: reconciliation episode changed during review — rebuilding from current source and integration identities");
+          continue;
+        }
+        throw error;
+      }
       const squashSha = reviewResult.squashSha;
       outstandingReviewReasons = reviewResult.priorReasons;
 
@@ -1062,17 +1272,56 @@ export async function landOneRepo(
         // Branch had no net changes vs the tip — nothing to land. The caller
         // decides how to finalize the (possibly multi-repo) task.
         await audit.git({ type: "merge:ai-empty", target: integrationBranch, metadata: { taskId, tipSha } });
-        return { outcome: "empty", tipSha, integrationBranch };
+        return { outcome: "empty", tipSha, integrationBranch, dependencySyncDecision };
+      }
+
+      /*
+       * FNXC:AIMerge 2026-08-15-22:55:
+       * This is the sole production pre-land seam: the reviewer approved the
+       * clean-room squash but the integration ref has not advanced, so scope and
+       * shrinkage violations can still leave every integration branch untouched.
+       */
+      const freshTask = await store.getTask(taskId);
+      if (!freshTask) throw new Error(`AI merge task ${taskId} disappeared before squash gates`);
+      await enforceAiMergeSquashGates({ store, task: freshTask, taskId, mergeRoot, branch, tipSha, squashSha, audit, log, repoRel: ctx.repoRel, repoKeys: ctx.repoKeys });
+
+      // FNXC:Workspace 2026-08-15-08:36: Persist the recovery intent before the shared ref can
+      // move. A later reconciler can then settle an interrupted remote advance without re-squashing.
+      let workspaceFence: { remote: string; fenceRefName: string; fenceRefSha: string } | undefined;
+      if (ctx.workspaceLand) {
+        ctx.workspaceLand.assertLive();
+        const { repoRelPath, remote } = ctx.workspaceLand;
+        const handle = ctx.workspaceLand.getHandle();
+        if (!handle.fenceRefName || !handle.fenceRefSha) {
+          throw new Error(`Workspace land lease ${handle.leaseKey} is missing its fence pin`);
+        }
+        await store.recordWorkspaceLandIntent({
+          handle,
+          taskId,
+          repoRelPath,
+          remoteUrl: await git(["remote", "get-url", remote], repoRootDir),
+          integrationRef: `refs/heads/${integrationBranch}`,
+          intendedSha: squashSha,
+          expectedTip: tipSha,
+        });
+        workspaceFence = { remote, fenceRefName: handle.fenceRefName, fenceRefSha: handle.fenceRefSha };
       }
 
       // 4 + 5. Land the squash on the target branch and sync the user's
       //        checkout (AI reconciles a conflicting restore).
+      ctx.workspaceLand?.assertLive();
       await setStatus("landing");
       const landed = await landSquash({
         projectRootDir: repoRootDir, mergeRoot, integrationBranch, tipSha, squashSha, taskId, audit,
         resolveConflicts: stashResolveAgent,
         allowDirtyLocalCheckoutSync: ctx.allowDirtyLocalCheckoutSync === true,
         signal,
+        workspaceFence,
+        workspaceDispatchFence: ctx.workspaceDispatchFence,
+        assertMergeGateStillOpen: () => assertMergeGateStillOpen(ctx, repoRootDir, ctx.repoRel),
+        onWorkspaceRepublish: async (observedTargetSha) => {
+          await log(`AI merge (workspace): re-observed remote ${workspaceFence?.remote ?? "target"} at ${short(observedTargetSha ?? "absent")} before publishing ${integrationBranch}`);
+        },
       });
       if (landed.outcome === "concurrent") {
         if (advanceRetries < MAX_CONCURRENT_ADVANCE_RETRIES) {
@@ -1082,8 +1331,10 @@ export async function landOneRepo(
         }
         throw new Error(`AI merge could not advance ${integrationBranch} for ${taskId} after ${advanceRetries} retries (concurrent advances)`);
       }
+      /* FNXC:AIMergeReviewReconciliation 2026-08-20-22:27: once the exact confirmed candidate lands, clear its findings, confirmation count, and corrective budget together so completed work cannot be revived. */
+      await store.updateTask(taskId, { aiMergeReviewReconciliation: null });
       await log(`AI merge: advanced ${integrationBranch} → ${short(squashSha)} (local checkout: ${landed.localSync})`);
-      return { outcome: "landed", squashSha, localSync: landed.localSync, tipSha, integrationBranch };
+      return { outcome: "landed", squashSha, localSync: landed.localSync, tipSha, integrationBranch, dependencySyncDecision };
     } finally {
       for (const registeredPath of registeredMergePaths) {
         activeSessionRegistry.unregisterPath(registeredPath);
@@ -1113,27 +1364,36 @@ const LEGACY_ARCHIVED_COLUMN = "archived";
 const LEGACY_TERMINAL_COLUMNS: readonly string[] = [LEGACY_COMPLETE_COLUMN, LEGACY_ARCHIVED_COLUMN];
 const LEGACY_REBOUND_COLUMN = "todo";
 
-/**
- * Where a finalize-blocked card is returned to for operator review.
- *
- * KTD-10 ordering via `resolveReboundTarget` (hold → intake → first column) —
- * the same helper self-healing.ts:714 and mesh-lease-manager use for "requeue a
- * recovered card", so the recovery paths cannot drift apart.
- *
- * Fail-soft to the legacy literal: these rebounds PARK WORK for a human after a
- * no-commits / no-landed-proof / vetoed-no-op guard fires. Abandoning the
- * rebound because a workflow lookup failed would strand the card in the merge
- * lane with no owner, which is strictly worse than rebounding to a stale id.
- *
- * Exported for direct testing: the four call sites sit deep inside `runAiMerge`
- * and `landWorkspaceTask`, behind a real git repo and a full merge run.
- */
+/*
+FNXC:LifecycleContainment 2026-08-28-03:03:
+FN-207 treats finalize blockers as review-owned repair: a review card returns only to the workflow's
+WIP lane, never Planning. A declared workflow with no adjacent WIP target remains in review; only an
+unreadable task row retains the legacy fallback because no live source column is available to classify.
+
+FNXC:LifecycleContainment 2026-08-28-03:19:
+Every AI-merger finalize blocker uses one routing seam so production-family acceptance can prove the
+same adjacent target, no-target containment, and capacity deferral used by all five branches.
+*/
+export async function reboundAiMergeTask(store: TaskStore, taskId: string) {
+  return moveTaskToContainedBackwardTarget(store, taskId, "merge-failure-rebound", {
+    preserveProgress: true,
+    moveSource: "engine",
+  });
+}
+
+/** Resolve the adjacent implementation destination for a finalize-blocked card. */
 export async function resolveFinalizeReboundColumn(store: TaskStore, taskId: string): Promise<string> {
+  let live: Task;
   try {
-    const ir = await resolveWorkflowIrForTask(store, taskId);
-    return resolveReboundTarget(ir) ?? LEGACY_REBOUND_COLUMN;
+    live = await store.getTask(taskId);
   } catch {
     return LEGACY_REBOUND_COLUMN;
+  }
+  try {
+    const ir = await resolveWorkflowIrForTask(store, taskId);
+    return resolveContainedBackwardTarget(ir, live.column) ?? live.column;
+  } catch {
+    return live.column;
   }
 }
 
@@ -1218,6 +1478,44 @@ Returns the proof marker when landed; null when unproven.
 */
 const STRONG_LANDED_STRATEGIES: ReadonlySet<string> = new Set(["trailer", "ancestry", "patch-id"]);
 
+interface RecordedMergeLandingProof {
+  landedSha: string;
+  landedBranchTipSha: string;
+}
+
+class RecordedMergeBranchTipChangedError extends Error {
+  constructor(readonly branch: string, readonly expectedTipSha: string) {
+    super(`Task branch ${branch} changed after its recorded landing was proven`);
+    this.name = "RecordedMergeBranchTipChangedError";
+  }
+}
+
+async function proveRecordedMergeAlreadyLanded(
+  task: Task,
+  branch: string,
+  integrationBranch: string,
+  projectRootDir: string,
+): Promise<RecordedMergeLandingProof | null> {
+  const details = task.mergeDetails;
+  const landedSha = details?.commitSha?.trim();
+  const landedBranchTipSha = details?.landedBranchTipSha?.trim();
+  if (
+    branch === integrationBranch
+    || details?.mergeConfirmed !== true
+    || !landedSha
+    || !landedBranchTipSha
+    || (details.mergeTargetBranch !== undefined && details.mergeTargetBranch !== integrationBranch)
+  ) return null;
+
+  const [commitExists, commitReachedTarget, liveBranchTip] = await Promise.all([
+    gitOk(["cat-file", "-e", `${landedSha}^{commit}`], projectRootDir),
+    gitOk(["merge-base", "--is-ancestor", landedSha, `refs/heads/${integrationBranch}`], projectRootDir),
+    git(["rev-parse", "--verify", `refs/heads/${branch}`], projectRootDir).catch(() => ""),
+  ]);
+  if (!commitExists || !commitReachedTarget || liveBranchTip !== landedBranchTipSha) return null;
+  return { landedSha, landedBranchTipSha };
+}
+
 async function proveEmptyMergeAlreadyLanded(
   task: Task,
   branch: string,
@@ -1292,15 +1590,26 @@ export async function runAiMerge(
   The helper's own comment records this exact defect being fixed in `moves.ts`; these two merge
   entry points were missed. Resolve the task's own review lanes and pass them.
   */
-  const aiReviewColumns = new Set<string>(["in-review"]);
-  try {
-    const aiIr = await resolveWorkflowIrForTask(store, taskId);
-    if (aiIr) for (const id of resolveReviewColumns(aiIr)) aiReviewColumns.add(id);
-  } catch { /* degraded: the legacy id above still answers */ }
-  const blocker = getTaskMergeBlocker(task, { manual: options.manual === true, reviewColumns: aiReviewColumns });
-  if (blocker) throw new Error(`Cannot merge ${taskId}: ${blocker}`);
-
   const settings = await store.getSettings();
+  let mergeGate;
+  try {
+    mergeGate = await resolvePreMergeGateForTask(store, taskId, task.enabledWorkflowSteps, task);
+  } catch {
+    throw new Error(`Cannot merge ${taskId}: merge gate could not resolve the task workflow`);
+  }
+  if (mergeGate.provenance === "default" && !mergeGate.selectionAbsent) {
+    throw new Error(`Cannot merge ${taskId}: merge gate could not resolve the task workflow`);
+  }
+  const mergeContent = await captureMergeContentDescriptor(task, { workspaceRootDir: projectRootDir, settings });
+  const blocker = getTaskMergeBlocker(task, {
+    manual: options.manual === true,
+    reviewColumns: mergeGate.reviewColumns.size > 0 ? mergeGate.reviewColumns : new Set(["in-review"]),
+    requiredPreMergeStepIds: mergeGate.requiredPreMergeStepIds,
+    mergeContent,
+  });
+  /* FNXC:RequiredPreMergeSteps 2026-08-22-22:40: an unrun enabled gate is a deferral (typed), not a failure. */
+  if (blocker && isPreMergeStepsNotRunBlocker(blocker)) throw new PreMergeStepsNotRunError(taskId);
+  if (blocker) throw new Error(`Cannot merge ${taskId}: ${blocker}`);
   // Honor the task's own target branch when set; otherwise the project default
   // integration branch. The local checkout is only synced if it is on this same
   // target branch (see syncLocalCheckout).
@@ -1336,11 +1645,11 @@ export async function runAiMerge(
   const fence = createMergeWriteFence({
     taskId,
     signal: options.signal,
-    recordAudit: (category, interaction, suppressedCount) => store.recordRunAuditEvent?.({
+    recordAudit: (category, interaction, suppressedCount) => emitBoundedRunAudit(store, {
       taskId, agentId: "merger", runId: `merge-${taskId}`, domain: "git",
       mutationType: "merge:orphan-write-fenced", target: taskId,
       metadata: { taskId, category, interaction, suppressedCount },
-    }),
+    }, { log: aiMergeLog }),
   });
   // Surface progress on the task detail (status pill) + the task log stream.
   const log = async (message: string): Promise<void> => {
@@ -1371,6 +1680,82 @@ export async function runAiMerge(
       task.mergeDetails?.mergeConfirmed === true ||
       !!task.mergeDetails?.commitSha ||
       hasPriorAiNoOpFinalizationProof(task, branch, integrationBranch);
+    /*
+     * FNXC:NoCommitsBranchMissing 2026-08-08-19:46:
+     * No-commits tasks (observational audits, non-code deliverables) never create a git
+     * branch with substantive work. If a no-commits task WAS executed (baseCommitSha set)
+     * but its branch is missing and not already merged, route through evaluateNoCommitsNoOpFinalize
+     * BEFORE the "work appears lost" throw: all-done tasks finalize as a no-op (audit.git kind
+     * "no-commits-expected"), incomplete/skipped tasks demote to todo with progress preserved.
+     * Commit-expected tasks STILL throw below (invariant unchanged).
+     * Restored from RUFU-011 (commit 98dc396ec); the noCommitsExpected clause was dropped in
+     * the domain-folder move / dep-sync restructure.
+     */
+    if (wasExecuted && !alreadyMerged && task.noCommitsExpected === true) {
+      const noCommitsFinalize = evaluateNoCommitsNoOpFinalize(task);
+      if (noCommitsFinalize.blocked) {
+        const reason = noCommitsFinalize.reason ?? "no-commits task has incomplete work with no branch changes";
+        /*
+         * FNXC:RUFU146MergeFence 2026-08-21-13:35:
+         * RUFU-146 review (PRRT_kwDOSA-8Y86a7RaK): this lane's lifecycle
+         * writes were UNFENCED — if the merge generation is aborted after the
+         * branch lookup (successor generation owns the task), a stale
+         * generation's direct updateTask/logEntry/moveTask/finalizeTask could
+         * still demote the successor to todo or finalize it as done. Route
+         * every write through fence.write(...), stop after an orphaned
+         * signal, and hand the fence to finalizeTask — the same contract the
+         * ai-empty-merge lane and the missing-branch no-op finalize already
+         * follow.
+         */
+        await fence.write("lifecycle", () => store.updateTask(taskId, { error: reason }));
+        if (fence.isOrphaned()) return {
+          task, branch, merged: false, noOp: false, ok: true, reason, error: reason,
+          worktreeRemoved: false, branchDeleted: false,
+        };
+        const reboundColumn = await resolveFinalizeReboundColumn(store, taskId);
+        await fence.write("log", () => store.logEntry(
+          taskId,
+          `Finalize blocked (no-commits incomplete-work guard): ${reason} — contained recovery target ${reboundColumn} with progress preserved`,
+          JSON.stringify({
+            doneCount: noCommitsFinalize.doneCount,
+            incompleteCount: noCommitsFinalize.incompleteCount,
+            branch,
+            integrationBranch,
+            lane: "no-commits-branch-missing",
+          }, null, 2),
+        ));
+        await audit.database({
+          type: "task:no-commits-finalize-blocked-incomplete-steps" as Parameters<typeof audit.database>[0]["type"],
+          target: taskId,
+          metadata: {
+            reason,
+            doneCount: noCommitsFinalize.doneCount,
+            incompleteCount: noCommitsFinalize.incompleteCount,
+            branch,
+            integrationBranch,
+            lane: "no-commits-branch-missing",
+          },
+        });
+        await fence.write("lifecycle", () => reboundAiMergeTask(store, taskId));
+        return {
+          task,
+          branch,
+          merged: false,
+          noOp: false,
+          ok: true,
+          reason,
+          error: reason,
+          worktreeRemoved: false,
+          branchDeleted: false,
+        };
+      }
+      await audit.git({
+        type: "merge:ai-no-branch",
+        target: branch,
+        metadata: { taskId, kind: "no-commits-expected", noCommitsExpected: true },
+      });
+      return await finalizeTask(store, taskId, noOpResult(task, branch, "no-commits-expected"), undefined, undefined, projectRootDir, fence);
+    }
     if (wasExecuted && !alreadyMerged) {
       await audit.git({
         type: "merge:ai-no-branch",
@@ -1391,12 +1776,27 @@ export async function runAiMerge(
     return await finalizeTask(store, taskId, noOpResult(task, branch, alreadyMerged ? "already-merged" : "no-branch"), undefined, undefined, projectRootDir, fence);
   }
 
-  // The target branch must exist as a LOCAL ref to merge into it — surface a
-  // clear error rather than a cryptic `fatal: Needed a single revision` if a
-  // task targets a remote-only / mistyped branch.
+  /*
+  FNXC:IntegrationBranchReadiness 2026-08-24-00:49:
+  FN-183 treats an origin remote-tracking integration ref as an unambiguous, lossless
+  recovery at merge time. Never invent a branch from HEAD here: a target that exists
+  nowhere remains a loud failure so Fusion does not create history mid-merge.
+  */
   if (!(await gitOk(["rev-parse", "--verify", `refs/heads/${integrationBranch}`], projectRootDir))) {
-    await audit.git({ type: "merge:ai-no-branch", target: integrationBranch, metadata: { taskId, kind: "integration-branch-missing" } });
-    throw new Error(`AI merge for ${taskId}: target branch "${integrationBranch}" has no local ref (refs/heads/${integrationBranch}). Create or check out the branch locally before merging.`);
+    const remoteTarget = `refs/remotes/origin/${integrationBranch}`;
+    const materialized = (await gitOk(["rev-parse", "--verify", remoteTarget], projectRootDir))
+      && await gitOk(["branch", integrationBranch, remoteTarget], projectRootDir);
+    if (materialized) {
+      await log(`AI merge: materialized integration branch ${integrationBranch} from ${remoteTarget}`);
+      await audit.git({
+        type: "merge:ai-no-branch",
+        target: integrationBranch,
+        metadata: { taskId, kind: "integration-branch-materialized-from-remote" },
+      });
+    } else {
+      await audit.git({ type: "merge:ai-no-branch", target: integrationBranch, metadata: { taskId, kind: "integration-branch-missing" } });
+      throw new Error(`AI merge for ${taskId}: target branch "${integrationBranch}" has no local ref (refs/heads/${integrationBranch}). Create or check out the branch locally before merging.`);
+    }
   }
 
   const maxPasses = Math.max(0, Math.trunc(settings.merger?.maxReviewPasses ?? 3));
@@ -1414,6 +1814,52 @@ export async function runAiMerge(
   const taskTitle = task.title?.trim() ? task.title.split("\n")[0] : undefined;
 
   await setStatus("merging");
+  try {
+  /*
+  FNXC:AIMerge 2026-08-28-09:29:
+  FN-216 durably advanced main at 08:33:51.039Z, then entered a second clean room at
+  08:33:52.561Z because its waiting-caller dispatch skipped the queue's merge-confirmed fast path.
+  This point-of-use guard belongs in runAiMerge, the sole merge path, so every dispatcher receives
+  the same protection. landOneRepo cannot detect this through its zero-ahead check: a squash commit
+  is not in the task branch's history, so `<integration>..<branch>` remains non-zero after landing.
+  Every proof condition is required. In particular, FN-5627's poisoned merge-confirmed row must
+  fall through when its commit is not reachable, and a branch with post-landing commits must fall
+  through when its live tip no longer matches the landing pin.
+
+  FNXC:AIMerge 2026-08-28-09:50:
+  Proof is admission, not ownership: another writer can advance the task branch after this read.
+  Recorded-landing finalization therefore deletes the branch ref with Git's expected-old-value CAS
+  after removing its worktree. A mismatch preserves the advanced ref and falls through to the full
+  merge, so post-landing commits cannot be silently discarded.
+  */
+  const alreadyLanded = await proveRecordedMergeAlreadyLanded(task, branch, integrationBranch, projectRootDir);
+  if (alreadyLanded) {
+    await log(
+      `AI merge: ${branch} has a recorded landing on ${integrationBranch} at ${short(alreadyLanded.landedSha)} — verifying its pinned branch tip before skipping a second clean-room merge`,
+    );
+    try {
+      const finalized = await finalizeMerged(store, projectRootDir, taskId, task, branch, integrationBranch, alreadyLanded.landedSha, audit, log, {
+        empty: false,
+        expectedBranchTipSha: alreadyLanded.landedBranchTipSha,
+      }, mergeTarget, groupRouting, options.syncGroupPr, fence);
+      await audit.git({
+        type: "merge:ai-landed",
+        target: integrationBranch,
+        metadata: { taskId, landedSha: alreadyLanded.landedSha, source: "already-landed-short-circuit" },
+      }).catch(() => undefined);
+      await log(
+        `AI merge: ${branch} already landed on ${integrationBranch} at ${short(alreadyLanded.landedSha)} — skipped a second clean-room merge`,
+      );
+      await runPushAfterMergeStep({ store, projectRootDir, taskId, settings, integrationBranch, audit, log, options, result: finalized, fence });
+      return finalized;
+    } catch (error) {
+      if (!(error instanceof RecordedMergeBranchTipChangedError)) throw error;
+      await log(
+        `AI merge: ${branch} advanced after its recorded landing was proven — preserving the branch and running the full clean-room merge`,
+      );
+    }
+  }
+
   // FNXC:Workspace 2026-06-21-23:40 (Phase C U1, KTD1):
   // runAiMerge is now the SINGLE-REPO caller of the extracted `landOneRepo`. It
   // builds the same per-task context it always built and lands the project root
@@ -1427,18 +1873,28 @@ export async function runAiMerge(
     allowDirtyLocalCheckoutSync,
     // FNXC:MergeNoCommits 2026-07-17-12:00: no-commits tasks skip dependency sync in the clean room
     noCommitsExpected: task.noCommitsExpected === true,
+    mergeContent,
     store,
   });
 
   if (landResult.outcome === "empty") {
-    const noCommitsFinalize = evaluateNoCommitsNoOpFinalize(task);
+    const noCommitsFinalize = evaluateNoCommitsNoOpFinalize(task, {
+      requiredVerificationStepIds: await resolveNoOpFinalizeGateIds(store, task),
+    });
     if (noCommitsFinalize.blocked) {
       const reason = noCommitsFinalize.reason ?? "no-commits task has incomplete work with no net branch changes";
       /*
        * FNXC:Lifecycle 2026-06-14-20:02:
        * FN-6461/FN-6455 requires the AI empty-merge lane to demote no-commits tasks whose skipped/incomplete steps outweigh done steps instead of finalizing the operational work as done.
+       *
+       * FNXC:EmptyMergeFinalize 2026-08-28-13:14:
+       * Empty-merge blockers previously wrote only error, while merge-failure-rebound had no
+       * backward-move authority and getTaskMergeBlocker ignored error. The card therefore remained
+       * merge-eligible and repeated the same refusal forever. Persist a hard blocking failed status
+       * beside each guard's unchanged reason so the operator sees one terminal conclusion. Existing
+       * in-review Retry clears this park with progress preserved after evidence is corrected.
        */
-      await fence.write("lifecycle", () => store.updateTask(taskId, { error: reason }));
+      await fence.write("lifecycle", () => store.updateTask(taskId, { error: reason, status: "failed" }));
       if (fence.isOrphaned()) return {
         task, branch, merged: false, noOp: false, ok: true, reason, error: reason,
         worktreeRemoved: false, branchDeleted: false,
@@ -1446,7 +1902,7 @@ export async function runAiMerge(
       const reboundColumn = await resolveFinalizeReboundColumn(store, taskId);
       await fence.write("log", () => store.logEntry(
         taskId,
-        `Finalize blocked (no-commits incomplete-work guard): ${reason} — moving back to ${reboundColumn} with progress preserved`,
+        `Finalize blocked (no-commits incomplete-work guard): ${reason} — contained recovery target ${reboundColumn} with progress preserved`,
         JSON.stringify({
           doneCount: noCommitsFinalize.doneCount,
           incompleteCount: noCommitsFinalize.incompleteCount,
@@ -1465,9 +1921,10 @@ export async function runAiMerge(
           branch,
           integrationBranch,
           lane: "ai-empty-merge",
+          parkedStatus: "failed",
         },
       });
-      await fence.write("lifecycle", () => store.moveTask(taskId, reboundColumn, { preserveProgress: true, moveSource: "engine" } as Parameters<TaskStore["moveTask"]>[2]));
+      await fence.write("lifecycle", () => reboundAiMergeTask(store, taskId));
       return {
         task,
         branch,
@@ -1502,7 +1959,7 @@ export async function runAiMerge(
       if (!landedProof) {
         const reason =
           "branch had no net changes vs main — work may have been reverted or lost; operator review required";
-        await fence.write("lifecycle", () => store.updateTask(taskId, { error: reason }));
+        await fence.write("lifecycle", () => store.updateTask(taskId, { error: reason, status: "failed" }));
         if (fence.isOrphaned()) return {
           task, branch, merged: false, noOp: false, ok: true, reason, error: reason,
           worktreeRemoved: false, branchDeleted: false,
@@ -1510,7 +1967,7 @@ export async function runAiMerge(
         const reboundColumn = await resolveFinalizeReboundColumn(store, taskId);
         await fence.write("log", () => store.logEntry(
           taskId,
-          `Finalize blocked (empty-merge no-landed-proof guard): ${reason} — moving back to ${reboundColumn} with progress preserved`,
+          `Finalize blocked (empty-merge no-landed-proof guard): ${reason} — contained recovery target ${reboundColumn} with progress preserved`,
           JSON.stringify({ branch, integrationBranch, lane: "ai-empty-merge", baseCommitSha: task.baseCommitSha }, null, 2),
         ));
         await audit.database({
@@ -1523,9 +1980,10 @@ export async function runAiMerge(
             lane: "ai-empty-merge",
             baseCommitSha: task.baseCommitSha,
             hadPriorNoOpProof: false,
+            parkedStatus: "failed",
           },
         });
-        await fence.write("lifecycle", () => store.moveTask(taskId, reboundColumn, { preserveProgress: true, moveSource: "engine" } as Parameters<TaskStore["moveTask"]>[2]));
+        await fence.write("lifecycle", () => reboundAiMergeTask(store, taskId));
         return {
           task,
           branch,
@@ -1572,7 +2030,7 @@ export async function runAiMerge(
     const executorVeto = evaluateNoOpFinalizeExecutorVeto({ mergeIsEmpty: true, task, memory: executorMemory, settings });
     if (executorVeto.veto) {
       const vetoReason = executorVeto.reason ?? "overseer failed-executor no-op-finalize veto";
-      await fence.write("lifecycle", () => store.updateTask(taskId, { error: vetoReason }));
+      await fence.write("lifecycle", () => store.updateTask(taskId, { error: vetoReason, status: "failed" }));
       if (fence.isOrphaned()) return {
         task, branch, merged: false, noOp: false, ok: true, reason: vetoReason, error: vetoReason,
         worktreeRemoved: false, branchDeleted: false,
@@ -1580,7 +2038,7 @@ export async function runAiMerge(
       const reboundColumn = await resolveFinalizeReboundColumn(store, taskId);
       await fence.write("log", () => store.logEntry(
         taskId,
-        `Finalize blocked (overseer failed-executor veto): ${vetoReason} — moving back to ${reboundColumn} with progress preserved`,
+        `Finalize blocked (overseer failed-executor veto): ${vetoReason} — contained recovery target ${reboundColumn} with progress preserved`,
         JSON.stringify({
           executorSignal: executorMemory?.signal,
           executorSignalObservedAt: executorMemory?.observedAt,
@@ -1599,9 +2057,10 @@ export async function runAiMerge(
           branch,
           integrationBranch,
           lane: "ai-empty-merge",
+          parkedStatus: "failed",
         },
       });
-      await fence.write("lifecycle", () => store.moveTask(taskId, reboundColumn, { preserveProgress: true, moveSource: "engine" } as Parameters<TaskStore["moveTask"]>[2]));
+      await fence.write("lifecycle", () => reboundAiMergeTask(store, taskId));
       return {
         task,
         branch,
@@ -1621,9 +2080,34 @@ export async function runAiMerge(
     return noOpFinalized;
   }
 
-  const finalized = await finalizeMerged(store, projectRootDir, taskId, task, branch, integrationBranch, landResult.squashSha, audit, log, { empty: false }, mergeTarget, groupRouting, options.syncGroupPr, fence);
+  let finalized: MergeResult;
+  try {
+    finalized = await finalizeMerged(store, projectRootDir, taskId, task, branch, integrationBranch, landResult.squashSha, audit, log, { empty: false }, mergeTarget, groupRouting, options.syncGroupPr, fence);
+  } catch (error: unknown) {
+    const failure = getErrorMessage(error);
+    const landingMessage = `AI merge: landed ${short(landResult.squashSha)} on ${integrationBranch}, but post-landing finalization failed: ${failure}. The landing is durable; a retry will finalize without re-merging.`;
+    /*
+    FNXC:AIMerge 2026-08-28-09:29:
+    Process logging remains outside the write fence so an orphaned merge body still leaves a
+    diagnostic when its durable task writes are correctly suppressed. A live owner also records the
+    same landed-but-not-finalized evidence in the task log before the original error propagates.
+    */
+    aiMergeLog.warn(`${taskId}: ${landingMessage}`);
+    await fence.write("log", () => store.logEntry(taskId, landingMessage, "AiMerge")).catch(() => undefined);
+    throw error;
+  }
   await runPushAfterMergeStep({ store, projectRootDir, taskId, settings, integrationBranch, audit, log, options, result: finalized, fence });
   return finalized;
+  } finally {
+    /*
+    FNXC:MergeReliability 2026-08-20-02:00:
+    Authorization A clears the single-repo transient stamp through the aborted generation's write
+    fence. The read preserves terminal/confirmed finalization only; the fence, not this predicate,
+    prevents a late aborted body from clearing a successor's identical `merging` stamp.
+    */
+    const live = await store.getTask(taskId).catch(() => null);
+    if (live && shouldClearOrphanedMergeStamp(live)) await setStatus(null);
+  }
 }
 
 /*
@@ -1649,7 +2133,7 @@ async function runPushAfterMergeStep(input: {
   fence: MergeWriteFence;
 }): Promise<void> {
   const { store, projectRootDir, taskId, settings, integrationBranch, audit, log, options, result, fence } = input;
-  if (settings.pushAfterMerge !== true || settings.mergeStrategy === "pull-request") return;
+  if (!isPushAfterMergeEnabled(settings, { lane: "single-repo" })) return;
   try {
     const pushOutcome = await pushAfterMergeToRemote({
       store,
@@ -1760,6 +2244,8 @@ export interface WorkspaceRepoLandResult {
   landedSha?: string;
   /** How the sub-repo checkout was reconciled when landed. */
   localSync?: LocalSyncOutcome;
+  /** The clean-room dependency-readiness decision for this repository when a land ran. */
+  dependencySyncDecision?: string;
   /** Failure message when `status === "failed"`. */
   error?: string;
   /**
@@ -1778,11 +2264,13 @@ export interface WorkspaceMergeResult {
   /** True iff every acquired sub-repo landed (or was empty) with no failure. */
   allLanded: boolean;
   /**
-   * FNXC:Workspace 2026-06-22-00:30 (Phase C U2, KTD3):
-   * True iff the finalize-once move-to-done ran this call (only when `allLanded`).
-   * False on a partial land (the task stays put for the engine dispatch's auto-retry).
+   * FNXC:Workspace 2026-08-15-04:22:
+   * `allLanded` means no sub-repo failed, but `finalized` is the ONLY proof this call
+   * reached `done`. When all repos land but finalization is blocked, expose the
+   * operator-facing reason so every merge door reports a blocked outcome honestly.
    */
   finalized: boolean;
+  finalizeBlockedReason?: string;
 }
 
 /*
@@ -1882,6 +2370,21 @@ workspace-merger tests already consume; only the persist-failure window escalate
 so the engine parks/retries and A1's `isRepoLanded` ancestor-fallback skips the actually-landed
 repo on retry (no double-squash).
 */
+/*
+FNXC:WorkspaceFinalization 2026-08-21-08:46:
+Only an acquired repository lease with a real holder task can be reported as contention. Fence
+publication and durable-lease transport failures are technical retryable outcomes; representing
+those implementation markers as a repository/task identity sent operators to nonexistent owners.
+*/
+export class WorkspaceMergeTechnicalError extends Error {
+  public readonly retryable = true;
+  /* FNXC:WorkspaceIntegration 2026-08-21-21:46: target planning faults are internal-technical, while a user-correctable remote choice is represented by WorkspaceIntegrationTargetError. */
+  constructor(public readonly kind: "dispatch-fence-publication" | "repository-fence-publication" | "durable-lease" | "workspace-entry" | "integration-target", message: string) {
+    super(message);
+    this.name = "WorkspaceMergeTechnicalError";
+  }
+}
+
 export class WorkspacePartialLandError extends Error {
   public readonly retryable = true;
   constructor(
@@ -1894,15 +2397,64 @@ export class WorkspacePartialLandError extends Error {
   }
 }
 
+/*
+FNXC:Workspace 2026-08-15-04:22:
+A blocked workspace finalize is non-retryable because the empty-merge guard has already
+parked the task with `task.error`. Keep it distinct from retryable partial lands so callers
+never consume merge retries or report a merge success for work that did not reach `done`.
+*/
+export class WorkspaceFinalizeBlockedError extends Error {
+  constructor(
+    public readonly taskId: string,
+    public readonly reason: string,
+  ) {
+    super(`Workspace finalize blocked for ${taskId}: ${reason}`);
+    this.name = "WorkspaceFinalizeBlockedError";
+  }
+}
+
+/** A fenced merge pushed successfully, but a successor owns terminal finalization. */
+export type WorkspaceReviewAssessment = {
+  kind: "approval-missing" | "content-changed";
+  repositories: string[];
+  files: string[];
+};
+
+/**
+ * FNXC:WorkspaceReviewReroute 2026-08-21-19:25:
+ * Missing approval and changed reviewed content are recoverable review obligations, not merge
+ * transport failures. Keep their repository-qualified diagnostics structured so every merge door
+ * can re-enter Code Review without consuming a merge retry budget.
+ */
+export class WorkspaceReviewRequiredError extends Error {
+  constructor(public readonly taskId: string, public readonly assessment: WorkspaceReviewAssessment) {
+    const repositories = assessment.repositories.join(", ");
+    const files = assessment.files.join(", ");
+    super(assessment.kind === "approval-missing"
+      ? `Workspace Code Review approval is missing for ${taskId}: ${repositories}${files ? ` (${files})` : ""}`
+      : `Workspace Code Review content changed after approval for ${taskId}: ${repositories}${files ? ` (${files})` : ""}`);
+    this.name = "WorkspaceReviewRequiredError";
+  }
+}
+
+export class WorkspaceMergeDispatchSupersededError extends Error {
+  constructor(public readonly taskId: string) {
+    super(`Workspace merge dispatch lease was superseded before finalization for ${taskId}`);
+    this.name = "WorkspaceMergeDispatchSupersededError";
+  }
+}
+
 export async function landWorkspaceTask(
   store: TaskStore,
   task: Task,
   workspaceRootDir: string,
-  options: MergerOptions = {},
+  options: MergerOptions & { workspaceDispatchFence?: WorkspaceLeaseHandle } = {},
   deps: AgentDeps = {},
 ): Promise<WorkspaceMergeResult> {
   const taskId = task.id;
+  assertMergeGenerationOwned(options.signal, taskId);
   const settings = await store.getSettings();
+  const publishToRemote = isPushAfterMergeEnabled(settings, { lane: "workspace" });
   const audit = createRunAuditor(store, {
     runId: generateSyntheticRunId("ai-merge", taskId),
     agentId: "merger",
@@ -1912,11 +2464,11 @@ export async function landWorkspaceTask(
   const fence = createMergeWriteFence({
     taskId,
     signal: options.signal,
-    recordAudit: (category, interaction, suppressedCount) => store.recordRunAuditEvent?.({
+    recordAudit: (category, interaction, suppressedCount) => emitBoundedRunAudit(store, {
       taskId, agentId: "merger", runId: `merge-${taskId}`, domain: "git",
       mutationType: "merge:orphan-write-fenced", target: taskId,
       metadata: { taskId, category, interaction, suppressedCount },
-    }),
+    }, { log: aiMergeLog }),
   });
   const log = async (message: string): Promise<void> => {
     await fence.write("log", () => store.logEntry(taskId, message, "AiMerge").catch(() => undefined));
@@ -1940,13 +2492,266 @@ export async function landWorkspaceTask(
   const trailers = taskTrailers(taskId, task.lineageId, settings);
   const taskTitle = task.title?.trim() ? task.title.split("\n")[0] : undefined;
 
+  /*
+  FNXC:RepositoryScope 2026-08-21-00:44:
+  Landing captures qualified per-repository diffs at the merge boundary, after all execution and
+  review work has finished. Persisting this snapshot prevents a stale executor capture from
+  omitting a newly changed scoped repository from leases, review obligations, or land intents.
+  */
+  /*
+  FNXC:MergeGateRecheck 2026-08-23-08:51:
+  FN-180 forbids a store shape from bypassing the final merge fence. A durable task read is required
+  before workspace landing; an unavailable read refuses the ref advance rather than using a stale
+  caller snapshot that may predate a REVISE or review-lane exit.
+  */
+  const liveMergeBoundaryTask = await store.getTask(taskId).catch(() => undefined);
+  if (!liveMergeBoundaryTask) {
+    throw new MergeGateRevokedError(`Cannot read current task ${taskId} before workspace ref advance`);
+  }
+  const mergeBoundaryTask = liveMergeBoundaryTask.workspaceWorktrees ? liveMergeBoundaryTask : task;
+  /*
+  FNXC:WorkspaceFinalization 2026-08-21-09:09:
+  Direct CLI and UI-only callers reach this landing function without ProjectEngine's optional
+  admission callback. Apply the canonical pre-merge blocker before boundary evidence, transient
+  status, leases, or Git writes so a failed or pending Code Review cannot finalize an all-landed retry.
+  */
+  const reviewColumns = new Set<string>(["in-review"]);
+  const workflowIr = await resolveWorkflowIrForTask(store, taskId).catch(() => undefined);
+  if (workflowIr) for (const column of resolveReviewColumns(workflowIr)) reviewColumns.add(column);
+  const completeColumns = new Set<string>(["done"]);
+  if (workflowIr) for (const column of resolveTerminalColumns(workflowIr)) completeColumns.add(column);
+  if (!completeColumns.has(mergeBoundaryTask.column)) {
+    const mergeBlocker = getTaskMergeBlocker(mergeBoundaryTask, {
+      manual: options.manual === true,
+      reviewColumns,
+      // Content-bound workspace approval is evaluated after the one fresh
+      // boundary capture below; a result-only precheck would reject durable
+      // repository evidence before it can be compared.
+      requiredPreMergeStepIds: undefined,
+    });
+    if (mergeBlocker) throw new WorkspaceFinalizeBlockedError(taskId, mergeBlocker);
+  }
+  let mergeEvidence;
+  try {
+    mergeEvidence = await captureWorkspaceReviewEvidence({ task: mergeBoundaryTask, workspaceRootDir, settings });
+  } catch (error) {
+    throw new Error(`Cannot capture fresh merge evidence for workspace task ${taskId}: ${getErrorMessage(error)}`);
+  }
+  if (mergeEvidence.outOfScopeRepositories.size > 0) {
+    throw new Error(`Workspace repositories modified outside confirmed scope for ${taskId}: ${[...mergeEvidence.outOfScopeRepositories].sort().join(", ")}`);
+  }
+  const mergeBoundaryModifiedRepositories = mergeEvidence.modifiedRepositories;
+  const mergeBoundaryFingerprints = Object.fromEntries(mergeEvidence.repositories
+    .filter((repository) => repository.fingerprint)
+    .map((repository) => [repository.repository, repository.fingerprint!]));
+  const netZeroBranchRepositories = new Set(mergeEvidence.repositories
+    .filter((repository) => repository.netZero && mergeBoundaryTask.repositoryScope?.repositories.includes(repository.repository))
+    .map((repository) => repository.repository));
+  const normalizedMergeBoundaryFiles = mergeEvidence.modifiedFiles;
+  const persistedReviewFiles = [...new Set(mergeBoundaryTask.modifiedFiles ?? [])].sort();
+  /*
+  FNXC:RepositoryScope 2026-08-21-00:58:
+  Landing must not convert fresh evidence into approved evidence. A changed repository/file set after
+  Code Review has no matching reviewer episode, so return it through the normal review path instead
+  of silently persisting the new snapshot and landing it. Persist failure is likewise a hard fence:
+  a later recovery must never infer an unrecorded merge boundary.
+  */
+  /*
+  FNXC:WorkspacePreMergeApproval 2026-08-23-07:38:
+  FN-180 keeps admission and landing on one positive per-repository predicate.
+  This durable evidence survives result cleanup; direct legacy tasks stay open
+  only when no diff-domain review gate and no evidence record exist.
+  */
+  const requiresRepositoryReviewEvidence = mergeBoundaryTask.repositoryScope?.reviewEvidence !== undefined
+    || (mergeBoundaryTask.enabledWorkflowSteps ?? []).some((step) => /review/i.test(step));
+  const workspaceApproval = evaluatePreMergeApprovals(mergeBoundaryTask, {
+    requiredPreMergeStepIds: workflowIr && requiresRepositoryReviewEvidence
+      ? resolveRequiredPreMergeStepIds(workflowIr, mergeBoundaryTask.enabledWorkflowSteps)
+      : undefined,
+    mergeContent: {
+      kind: "workspace",
+      repositories: {
+        state: "captured",
+        fingerprints: mergeBoundaryFingerprints,
+        inScopeModified: [...mergeBoundaryModifiedRepositories].sort(),
+      },
+    },
+  }).find((candidate) => candidate.state !== "approved");
+  const approvedReviewEvidence = mergeBoundaryTask.repositoryScope?.reviewEvidence;
+  /*
+  FNXC:WorkspaceFinalization 2026-08-24-03:34:
+  An existing evidence map or enabled review gate always fails closed at the repository boundary,
+  including when the selected workflow resolves an explicit empty gate list. Compare repository
+  evidence directly while the canonical evaluator additionally enforces enabled workflow verdicts.
+  Legacy callers with neither signal retain the merge-agent review path.
+  */
+  const fallbackMissingRepositories = requiresRepositoryReviewEvidence
+    ? [...mergeBoundaryModifiedRepositories].filter((repository) => !approvedReviewEvidence?.[repository]).sort()
+    : [];
+  const fallbackStaleRepositories = requiresRepositoryReviewEvidence
+    ? Object.entries(mergeBoundaryFingerprints)
+      .filter(([repository, fingerprint]) => approvedReviewEvidence?.[repository]?.fingerprint !== fingerprint)
+      .map(([repository]) => repository)
+      .filter((repository) => !fallbackMissingRepositories.includes(repository))
+      .sort()
+    : [];
+  const approvalRepositories = [...new Set([
+    ...(workspaceApproval?.repositories ?? []),
+    ...fallbackMissingRepositories,
+  ])].sort();
+  const changedFiles = requiresRepositoryReviewEvidence
+    ? normalizedMergeBoundaryFiles.filter((file) => !persistedReviewFiles.includes(file)).sort()
+    : [];
+  if (workspaceApproval?.state === "missing" || fallbackMissingRepositories.length > 0) {
+    throw new WorkspaceReviewRequiredError(taskId, {
+      kind: "approval-missing",
+      repositories: approvalRepositories,
+      files: normalizedMergeBoundaryFiles.filter((file) => approvalRepositories.some((repository) => file.startsWith(`${repository}/`))).sort(),
+    });
+  }
+  if (workspaceApproval?.state === "stale-content" || fallbackStaleRepositories.length > 0 || changedFiles.length > 0) {
+    const repositories = [...new Set([
+      ...approvalRepositories,
+      ...fallbackStaleRepositories,
+      ...changedFiles.map((file) => file.split("/")[0]),
+    ])].sort();
+    throw new WorkspaceReviewRequiredError(taskId, {
+      kind: "content-changed",
+      repositories,
+      files: [...new Set([...changedFiles, ...normalizedMergeBoundaryFiles.filter((file) => repositories.some((repository) => file.startsWith(`${repository}/`)))])].sort(),
+    });
+  }
+  if (workspaceApproval && workspaceApproval.state !== "approved") {
+    throw new WorkspaceFinalizeBlockedError(taskId, "task has no provable approval for the content being merged");
+  }
+  /*
+  FNXC:WorkspaceFinalization 2026-08-21-08:46:
+  Do not replace the reviewed file snapshot with an empty second-pass capture. An already-landed
+  repository has no task-branch diff to capture, yet remains a required finalization obligation.
+  The readiness resolver retains that evidence and refuses unexplained empty sets before status,
+  dispatch fencing, leases, or Git writes.
+  */
+  const readiness = resolveWorkspaceMergeReadiness(
+    mergeBoundaryTask,
+    mergeBoundaryModifiedRepositories,
+    netZeroBranchRepositories,
+  );
+  if (readiness.kind === "blocked") throw new Error(readiness.reason);
+  if (readiness.kind === "no-op") {
+    throw new Error(`Workspace task ${taskId} has explicit no-commits policy and cannot enter repository landing`);
+  }
+  const retainedModifiedFiles = [...new Set([...normalizedMergeBoundaryFiles, ...readiness.preservedFiles])].sort();
+  await store.updateTask(taskId, { modifiedFiles: retainedModifiedFiles });
+  task = { ...mergeBoundaryTask, modifiedFiles: retainedModifiedFiles };
   const workspaceWorktrees = task.workspaceWorktrees ?? {};
-  // SORTED keys for deterministic land order (KTD1).
-  const repoKeys = Object.keys(workspaceWorktrees).sort();
+  const repoKeys = readiness.repositories;
+  /*
+  FNXC:WorkspaceIntegration 2026-08-21-21:46:
+  Plan every modified confirmed-scope repository before the first status, fence, intent, or ref
+  write. The dispatch fence is published only to remote targets; local-only repositories retain
+  durable leases and local CAS without running any remote Git command.
+  */
+  /*
+  FNXC:MergePush 2026-08-30-09:14:
+  FN-263 sends workspace publication through the same policy as single-repository merges. When it
+  is off, every repository uses FN-122's local-only contract: a durable per-repository lease and
+  local ref CAS. Target-kind guards already suppress dispatch/repository fence refs, land intents,
+  and fenced pushes, so this one planning decision prevents all remote writes.
+  */
+  const workspaceTargets = new Map<string, { integrationBranch: string; target: WorkspaceIntegrationTarget }>();
+  for (const repoRel of repoKeys) {
+    const entry = workspaceWorktrees[repoRel];
+    if (!entry) throw new WorkspaceMergeTechnicalError("workspace-entry", `Workspace repository entry is missing for ${repoRel}`);
+    const repoRootDir = join(workspaceRootDir, repoRel);
+    try {
+      const baseResolution = await resolveWorkspaceRepoBaseBranch({
+        mode: "recorded", repoRootDir, repoRelPath: repoRel, task, settings, recordedBaseBranch: entry.baseBranch,
+      });
+      await recordWorkspaceBaseBranchDecision({ store, audit, task, repoRelPath: repoRel, repoAbsPath: repoRootDir, resolution: baseResolution, stage: "land" });
+      const target = await resolveWorkspaceIntegrationTarget({
+        repository: repoRel,
+        cwd: repoRootDir,
+        integrationBranch: baseResolution.branch,
+        worktreeRebaseRemote: settings.worktreeRebaseRemote,
+        publishToRemote,
+      });
+      workspaceTargets.set(repoRel, { integrationBranch: baseResolution.branch, target });
+    } catch (error) {
+      if (error instanceof WorkspaceIntegrationTargetError) {
+        const message = `Workspace repository ${error.repository} needs ${error.resource}: ${error.action}.`;
+        await persistWorkspaceRepoLandFailure(store, taskId, repoRel, {
+          category: "environment",
+          message,
+          at: new Date().toISOString(),
+          branch: entry.branch,
+          repository: error.repository,
+          resource: error.resource,
+          action: error.action,
+          technicalDetail: error.message.slice(0, 2_000),
+        }).catch(() => undefined);
+        throw error;
+      }
+      throw new WorkspaceMergeTechnicalError("integration-target", `Cannot plan workspace integration for ${repoRel}: ${getErrorMessage(error)}`);
+    }
+  }
+  if (!publishToRemote && repoKeys.length > 0) {
+    await log('AI merge (workspace): "Push to remote after merge" is disabled — landing every repository on its local integration ref only; no remote refs are written.');
+  }
+
   const repos: WorkspaceRepoLandResult[] = [];
   let allLanded = true;
 
   await setStatus("merging");
+  /* FNXC:WorkspaceMergeAbort 2026-08-23-08:32: The status writer can synchronously abort this generation; never let a post-abort setup probe turn cancellation into a Git error. */
+  throwIfAborted(options.signal, taskId);
+  try {
+
+  let workspaceDispatchFence: { fenceRefName: string; fenceRefSha: string } | undefined;
+  const hasRemoteWorkspaceTarget = [...workspaceTargets.values()].some(({ target }) => target.kind === "remote");
+  const recordDispatchFence = (store as Partial<TaskStore>).recordWorkspaceLeaseFenceRef;
+  if (hasRemoteWorkspaceTarget && options.workspaceDispatchFence && typeof recordDispatchFence === "function") {
+    /*
+    FNXC:WorkspaceMergeDispatch 2026-08-15-10:18:
+    A successor must publish its dispatch pin to EVERY workspace target remote before any land
+    sequence begins. Publishing only when each repository reaches its loop leaves a later remote
+    writable by a resumed predecessor; renewal callbacks are liveness-only, never correctness.
+    */
+    try {
+      for (const repoRel of repoKeys) {
+        const target = workspaceTargets.get(repoRel)?.target;
+        if (!target || target.kind === "local") continue;
+        const ensuredDispatchFence = await ensureTenancyFenceRef({
+          store,
+          handle: options.workspaceDispatchFence,
+          claimOutcome: "reentrant",
+          remote: target.remote,
+          cwd: join(workspaceRootDir, repoRel),
+          fenceRefName: mergeDispatchFenceRef(taskId),
+        });
+        options.workspaceDispatchFence = ensuredDispatchFence;
+      }
+      if (!options.workspaceDispatchFence.fenceRefName || !options.workspaceDispatchFence.fenceRefSha) {
+        throw new WorkspaceFenceRefError(`Workspace merge dispatch lease ${options.workspaceDispatchFence.leaseKey} has no fence pin`, "transport");
+      }
+      workspaceDispatchFence = {
+        fenceRefName: options.workspaceDispatchFence.fenceRefName,
+        fenceRefSha: options.workspaceDispatchFence.fenceRefSha,
+      };
+    } catch (error) {
+      if (error instanceof WorkspaceFenceRefError) {
+        const failedTarget = [...workspaceTargets.entries()].find(([, value]) => value.target.kind === "remote");
+        if (error.kind === "transport" && failedTarget?.[1].target.kind === "remote") {
+          throw new WorkspaceEnvironmentError(
+            failedTarget[0], `remote '${failedTarget[1].target.remote}'`,
+            `restore access to remote '${failedTarget[1].target.remote}' and choose Retry`, error.message,
+          );
+        }
+        throw new WorkspaceMergeTechnicalError("dispatch-fence-publication", `Workspace merge dispatch fence publication failed for ${taskId}: ${error.message}`);
+      }
+      throw error;
+    }
+  }
+
   /*
   FNXC:Workspace 2026-06-22-04:10 (Phase C review A3 — status 'merging' must never leak):
   The busy-throw (WorkspaceRepoLandBusyError) and the persist-failure throw
@@ -1958,39 +2763,38 @@ export async function landWorkspaceTask(
   first is safe — finalize overwrites it. This finally only clears the transient merge status;
   it does not move the task.
   */
-  try {
   for (const repoRel of repoKeys) {
     throwIfAborted(options.signal, taskId);
     const entry = workspaceWorktrees[repoRel];
     const repoRootDir = join(workspaceRootDir, repoRel);
 
-    // Re-resolve THIS sub-repo's integration branch with the shared overrides
-    // stripped (KTD1) so each sub-repo lands on its OWN origin/HEAD, not a shared
-    // workspace branch.
-    let integrationBranch: string;
-    try {
-      integrationBranch = await resolveIntegrationBranch(
-        repoRootDir,
-        { ...settings, integrationBranch: undefined, baseBranch: undefined },
-      );
-    } catch (err: unknown) {
-      const message = getErrorMessage(err);
-      await log(`AI merge (workspace): failed to resolve integration branch for sub-repo ${repoRel}: ${message}`);
-      repos.push({ repo: repoRel, repoRootDir, integrationBranch: "", branch: entry.branch, status: "failed", error: message });
-      allLanded = false;
-      break;
-    }
+    /*
+    FNXC:Workspace 2026-08-20-00:56:
+    Recorded acquisition state is the only workspace landing target. A worktree forked from
+    release/x lands on release/x, while a legacy or acquisition-fallback entry remains on its
+    own integration branch even if task.baseBranch has since changed.
+    */
+    const workspaceTarget = workspaceTargets.get(repoRel);
+    if (!workspaceTarget) throw new WorkspaceMergeTechnicalError("integration-target", `Workspace integration plan is missing for ${repoRel}`);
+    const integrationBranch = workspaceTarget.integrationBranch;
 
     // U2 landed predicate + skip (KTD3): a repo whose recorded `landedSha` is an
     // ancestor of (or equals) its CURRENT integration tip is already landed — SKIP
     // it so a retry never re-advances the ref. This makes a re-run after a partial
     // land idempotent for the already-landed repos.
+    /*
+    FNXC:Workspace 2026-08-15-07:05:
+    Supply task creation time so a missing workspace branch cannot let a recycled historical
+    trailer prove this repo landed and skip its current work.
+    */
     const provenLandedSha = await findProvenLandedCommit(
       repoRootDir,
       integrationBranch,
       entry.landedSha,
       taskId,
       entry.branch,
+      entry.revertBoundarySha,
+      task.createdAt,
     );
     if (provenLandedSha) {
       /*
@@ -2009,6 +2813,7 @@ export async function landWorkspaceTask(
       repos.push({
         repo: repoRel, repoRootDir, integrationBranch, branch: entry.branch,
         status: "landed", landedSha: provenLandedSha, alreadyLanded: true,
+        dependencySyncDecision: "not-run-already-landed",
       });
       continue;
     }
@@ -2037,25 +2842,138 @@ export async function landWorkspaceTask(
     if (landLeaseHolder && landLeaseHolder.taskId !== taskId) {
       throw new WorkspaceRepoLandBusyError(repoRel, landLeaseHolder.taskId, taskId);
     }
-    activeSessionRegistry.registerPath(repoRootDir, {
-      taskId,
-      kind: "workspace-repo-land",
-      ownerKey: WORKSPACE_REPO_LAND_OWNER_KEY,
-    });
+
+    /*
+    FNXC:Workspace 2026-08-15-08:36:
+    A process-local registry cannot serialize workspace landers on separate engine nodes. Claim the
+    repository's durable lease before registering locally, pin its fence ref once, and retain the
+    resulting handle through land-intent resolution. The remote push checks that same pin atomically
+    with the integration ref, so a superseded tenant cannot advance shared history after its TTL.
+    */
+    let durableLandLease: WorkspaceLeaseHandle | undefined;
+    try {
+      const acquireWorkspaceLease = (store as Partial<TaskStore>).acquireWorkspaceLease;
+      /*
+      FNXC:Workspace 2026-08-15-08:47:
+      The optional branch is solely for legacy structural in-memory stores used
+      by single-process tests. A real TaskStore has this API, and any error from
+      it remains a fail-closed land contention rather than a registry fallback.
+      */
+      if (typeof acquireWorkspaceLease === "function") {
+        const claim = await acquireWorkspaceLease.call(store, {
+          leaseKey: `repo:${repoRel}`,
+          kind: "land",
+          owner: { taskId, nodeId: resolveEngineNodeId(), incarnationId: resolveEngineIncarnationId() },
+          leaseMs: 5 * 60_000,
+        });
+        if (claim.outcome === "conflict") {
+          throw new WorkspaceRepoLandBusyError(repoRel, claim.conflict.taskId, taskId);
+        }
+        durableLandLease = claim.handle;
+        if (workspaceTarget.target.kind === "remote") {
+          durableLandLease = await ensureTenancyFenceRef({
+            store,
+            handle: durableLandLease,
+            claimOutcome: claim.outcome,
+            remote: workspaceTarget.target.remote,
+            cwd: repoRootDir,
+            fenceRefName: workspaceLandFenceRef(repoRel),
+          });
+        }
+      }
+    } catch (error) {
+      if (durableLandLease) await store.releaseWorkspaceLease(durableLandLease).catch(() => undefined);
+      if (error instanceof WorkspaceRepoLandBusyError) throw error;
+      /*
+      FNXC:WorkspaceIntegration 2026-08-21-22:20:
+      A repository fence transport failure means the selected remote cannot be reached, not that
+      its durable lease is defective. Preserve the environment classification here because this
+      catch surrounds fence publication before the normal per-repository land body; ProjectEngine
+      can then park it for Retry without consuming the technical retry budget.
+      */
+      if (error instanceof WorkspaceFenceRefError && error.kind === "transport" && workspaceTarget.target.kind === "remote") {
+        const action = `restore access to remote '${workspaceTarget.target.remote}' and choose Retry`;
+        const operatorMessage = `Workspace repository ${repoRel} needs remote '${workspaceTarget.target.remote}': ${action}.`;
+        await persistWorkspaceRepoLandFailure(store, taskId, repoRel, {
+          category: "environment", message: operatorMessage, at: new Date().toISOString(), branch: entry.branch,
+          repository: repoRel, resource: `remote '${workspaceTarget.target.remote}'`, action,
+          technicalDetail: error.message.slice(0, 2_000),
+        }).catch(() => undefined);
+        throw new WorkspaceEnvironmentError(repoRel, `remote '${workspaceTarget.target.remote}'`, action, error.message);
+      }
+      throw new WorkspaceMergeTechnicalError("durable-lease", `Workspace repository lease unavailable for ${repoRel}: ${getErrorMessage(error)}`);
+    }
+    try {
+      activeSessionRegistry.registerPath(repoRootDir, {
+        taskId,
+        kind: "workspace-repo-land",
+        ownerKey: WORKSPACE_REPO_LAND_OWNER_KEY,
+      });
+    } catch (error) {
+      if (durableLandLease) await store.releaseWorkspaceLease(durableLandLease).catch(() => undefined);
+      throw error;
+    }
+
+    /*
+    FNXC:Workspace 2026-08-20-19:45:
+    A repository land can legitimately outlive the five-minute durable TTL while dependency sync and
+    AI review run. Renew its current owner/fence handle during the complete land body, but keep every
+    intent and push fenced by the durable handle: a failed renewal aborts before the next commit point.
+    */
+    let leaseLost = false;
+    const leaseAbort = new AbortController();
+    let renewalInFlight: Promise<void> | undefined;
+    const renewWorkspaceLease = (store as Partial<TaskStore>).renewWorkspaceLease;
+    const renewLease = async (): Promise<void> => {
+      if (!durableLandLease || typeof renewWorkspaceLease !== "function" || leaseLost) return;
+      try {
+        const renewed = await renewWorkspaceLease.call(store, durableLandLease, 5 * 60_000);
+        if (!renewed) throw new Error("Workspace lease renewal was refused");
+        durableLandLease = renewed;
+      } catch {
+        leaseLost = true;
+        leaseAbort.abort("workspace-repo-land-lease-lost");
+      }
+    };
+    const renewalTimer = durableLandLease && typeof renewWorkspaceLease === "function"
+      ? setInterval(() => {
+        if (!renewalInFlight) {
+          renewalInFlight = renewLease().finally(() => { renewalInFlight = undefined; });
+        }
+      }, 60_000)
+      : undefined;
+    renewalTimer?.unref?.();
+    const landSignal = options.signal ? AbortSignal.any([options.signal, leaseAbort.signal]) : leaseAbort.signal;
+    const assertLeaseLive = () => {
+      if (leaseLost || leaseAbort.signal.aborted) throw new WorkspaceMergeTechnicalError("durable-lease", `Workspace repository lease renewal was lost for ${repoRel}`);
+    };
 
     try {
       const landResult = await landOneRepo(repoRootDir, entry.branch, integrationBranch, {
         taskId, settings, audit, log, setStatus, maxPasses,
         mergeAgent, reviewAgent, stashResolveAgent,
-        includeTaskId, trailers, taskTitle, signal: options.signal,
+        includeTaskId, trailers, taskTitle, signal: landSignal,
         allowDirtyLocalCheckoutSync,
         // FNXC:Workspace 2026-06-24-23:50: one sub-repo's dependency-sync failure must not block
         // landing the others — degrade verification for that repo, still land the git squash.
         nonFatalDependencySync: true,
         // FNXC:MergeNoCommits 2026-07-17-12:00: no-commits tasks skip dependency sync in the clean room
         noCommitsExpected: task.noCommitsExpected === true,
+        repoRel,
+        repoKeys,
+        ...(durableLandLease && workspaceTarget.target.kind === "remote" ? { workspaceLand: { getHandle: () => { assertLeaseLive(); return durableLandLease!; }, repoRelPath: repoRel, remote: workspaceTarget.target.remote, assertLive: assertLeaseLive } } : {}),
+        ...(workspaceDispatchFence ? { workspaceDispatchFence } : {}),
+        mergeContent: {
+          kind: "workspace",
+          repositories: {
+            state: "captured",
+            fingerprints: mergeBoundaryFingerprints,
+            inScopeModified: [...mergeBoundaryModifiedRepositories].sort(),
+          },
+        },
         store,
       });
+      assertLeaseLive();
       if (landResult.outcome === "landed") {
         /*
         FNXC:Workspace 2026-06-22-04:10 (Phase C review A1 — persist-after-advance is a HARD failure):
@@ -2067,13 +2985,39 @@ export async function landWorkspaceTask(
         recorded as `landed` in the in-memory result first so the error payload is accurate.
         */
         try {
-          await persistRepoLandedSha(store, taskId, repoRel, landResult.squashSha);
+          /*
+          FNXC:Workspace 2026-08-23-22:15:
+          Resolve the write-ahead land intent ONLY when one was written. `landOneRepo` records an
+          intent solely for a REMOTE target (it needs the tenancy fence pin and the remote URL), so a
+          local-only workspace land — the FN-122 contract: no remote, no fence, no intent — reached
+          this resolver with nothing to resolve, got `missing`, and hard-failed a fully landed repo as
+          a partial land after its integration ref had already advanced. Gate both sides on the same
+          condition so the intent lifecycle cannot be half-applied.
+          */
+          if (durableLandLease && workspaceTarget.target.kind === "remote") {
+            assertLeaseLive();
+            const resolved = await store.resolveWorkspaceLandIntent({
+              handle: durableLandLease,
+              taskId,
+              repoRelPath: repoRel,
+              expectedIntentFenceToken: durableLandLease.fenceToken,
+              resolution: "landed",
+              resolvedSha: landResult.squashSha,
+              persistLandedSha: () => persistRepoLandedSha(store, taskId, repoRel, landResult.squashSha),
+            });
+            if (resolved.outcome !== "resolved") {
+              throw new Error(`Workspace land intent for ${repoRel} was not resolved (${resolved.outcome})`);
+            }
+          } else {
+            await persistRepoLandedSha(store, taskId, repoRel, landResult.squashSha);
+          }
         } catch (persistErr: unknown) {
           const pmsg = getErrorMessage(persistErr);
           await log(`AI merge (workspace): sub-repo ${repoRel} landed (${short(landResult.squashSha)}) but persisting landedSha FAILED: ${pmsg} — escalating to partial land so a retry can recover (ref already advanced; retry will skip via trailer ancestor-check)`);
           repos.push({
             repo: repoRel, repoRootDir, integrationBranch, branch: entry.branch,
             status: "landed", landedSha: landResult.squashSha, localSync: landResult.localSync,
+            dependencySyncDecision: landResult.dependencySyncDecision,
           });
           allLanded = false;
           const landedCount = repos.filter((r) => r.status === "landed").length;
@@ -2086,25 +3030,75 @@ export async function landWorkspaceTask(
         repos.push({
           repo: repoRel, repoRootDir, integrationBranch, branch: entry.branch,
           status: "landed", landedSha: landResult.squashSha, localSync: landResult.localSync,
+          dependencySyncDecision: landResult.dependencySyncDecision,
         });
       } else {
-        repos.push({ repo: repoRel, repoRootDir, integrationBranch, branch: entry.branch, status: "empty" });
+        repos.push({
+          repo: repoRel, repoRootDir, integrationBranch, branch: entry.branch, status: "empty",
+          dependencySyncDecision: landResult.dependencySyncDecision,
+        });
       }
     } catch (err: unknown) {
+      /*
+      FNXC:Workspace 2026-08-20-19:58:
+      A lost repository tenancy is not a repository land failure: writing landFailure here would
+      let a stale owner mutate workspace state after its durable lease was revoked.
+      */
+      if (leaseLost) throw new WorkspaceMergeTechnicalError("durable-lease", `Workspace repository lease renewal was lost for ${repoRel}`);
       if (isMergeAbortedError(err)) throw err;
       // A WorkspacePartialLandError from the persist-failure window above must PROPAGATE
       // (the engine parks/retries). The outer try/finally below resets status first (A3).
       if (err instanceof WorkspacePartialLandError) throw err;
+      // A dispatch-fence publication failure is contention/transport at the resource boundary,
+      // not a sub-repo merge failure. This body never reached its fenced push.
+      if (err instanceof WorkspaceFenceRefError) {
+        const target = workspaceTargets.get(repoRel)?.target;
+        if (err.kind === "target-diverged" && target?.kind === "remote") {
+          const resource = `remote '${target.remote}' branch '${integrationBranch}'`;
+          const action = "reconcile the diverged remote branch and choose Retry";
+          const operatorMessage = `Workspace repository ${repoRel} needs ${resource}: ${action}.`;
+          await persistWorkspaceRepoLandFailure(store, taskId, repoRel, {
+            category: "environment", message: operatorMessage, at: new Date().toISOString(), branch: entry.branch,
+            repository: repoRel, resource, action, technicalDetail: err.message.slice(0, 2_000),
+          }).catch(() => undefined);
+          throw new WorkspaceEnvironmentError(repoRel, resource, action, err.message);
+        }
+        if (err.kind === "transport" && target?.kind === "remote") {
+          const operatorMessage = `Workspace repository ${repoRel} needs remote '${target.remote}': restore access to remote '${target.remote}' and choose Retry.`;
+          await persistWorkspaceRepoLandFailure(store, taskId, repoRel, {
+            category: "environment", message: operatorMessage, at: new Date().toISOString(), branch: entry.branch,
+            repository: repoRel, resource: `remote '${target.remote}'`,
+            action: `restore access to remote '${target.remote}' and choose Retry`, technicalDetail: err.message.slice(0, 2_000),
+          }).catch(() => undefined);
+          throw new WorkspaceEnvironmentError(repoRel, `remote '${target.remote}'`, `restore access to remote '${target.remote}' and choose Retry`, err.message);
+        }
+        throw new WorkspaceMergeTechnicalError("repository-fence-publication", `Workspace repository fence publication failed for ${repoRel}: ${err.message}`);
+      }
       const message = getErrorMessage(err);
       await log(`AI merge (workspace): sub-repo ${repoRel} land failed: ${message}`);
       await audit.git({ type: "merge:ai-no-branch", target: entry.branch, metadata: { taskId, kind: "workspace-repo-land-failed", repo: repoRel, error: message } }).catch(() => undefined);
-      repos.push({ repo: repoRel, repoRootDir, integrationBranch, branch: entry.branch, status: "failed", error: message });
+      const operatorMessage = `Workspace repository ${repoRel} could not land. Retry after resolving the repository environment or conflict.`;
+      await persistWorkspaceRepoLandFailure(store, taskId, repoRel, {
+        category: /conflict/i.test(message) ? "content-conflict" : "internal-technical",
+        message: operatorMessage,
+        at: new Date().toISOString(),
+        branch: entry.branch,
+        repository: repoRel,
+        action: "Retry after resolving the reported repository issue",
+        technicalDetail: message.slice(0, 2_000),
+      }).catch(() => undefined);
+      repos.push({
+        repo: repoRel, repoRootDir, integrationBranch, branch: entry.branch, status: "failed",
+        dependencySyncDecision: "failed-before-decision", error: operatorMessage,
+      });
       allLanded = false;
       // Stop on first failure and return a partial result. The already-landed repos'
       // `landedSha` is persisted, so the engine dispatch's auto-retry re-runs this
       // loop and the landed predicate above skips them (only the failed repo retries).
       break;
     } finally {
+      if (renewalTimer) clearInterval(renewalTimer);
+      await renewalInFlight?.catch(() => undefined);
       /*
       FNXC:Workspace 2026-06-22-02:10 (Phase C U3, KTD4):
       Release the land lease — on land SUCCESS or land FAILURE — but ONLY when WE hold
@@ -2115,6 +3109,11 @@ export async function landWorkspaceTask(
       const held = activeSessionRegistry.lookupByPath(repoRootDir);
       if (held && held.taskId === taskId && held.ownerKey === WORKSPACE_REPO_LAND_OWNER_KEY) {
         activeSessionRegistry.unregisterPath(repoRootDir);
+      }
+      if (durableLandLease) {
+        await store.releaseWorkspaceLease(durableLandLease).catch((releaseError: unknown) => {
+          aiMergeLog.warn(`${taskId}: durable workspace land lease release refused for ${repoRel}: ${getErrorMessage(releaseError)}`);
+        });
       }
     }
   }
@@ -2160,11 +3159,11 @@ export async function landWorkspaceTask(
       const reason =
         "branch had no net changes vs main — work may have been reverted or lost; operator review required";
       await fence.write("lifecycle", () => store.updateTask(taskId, { error: reason }));
-      if (fence.isOrphaned()) return { taskId, repos, allLanded, finalized: false };
+      if (fence.isOrphaned()) return { taskId, repos, allLanded, finalized: false, finalizeBlockedReason: reason };
       const reboundColumn = await resolveFinalizeReboundColumn(store, taskId);
       await fence.write("log", () => store.logEntry(
         taskId,
-        `Finalize blocked (empty-merge no-landed-proof guard, workspace): ${reason} — moving back to ${reboundColumn} with progress preserved`,
+        `Finalize blocked (empty-merge no-landed-proof guard, workspace): ${reason} — contained recovery target ${reboundColumn} with progress preserved`,
         JSON.stringify({ lane: "ai-empty-merge-workspace", repoCount: repos.length, landedCount, repos: repos.map((r) => r.repo) }, null, 2),
       ).catch(() => undefined));
       await audit.database({
@@ -2172,10 +3171,41 @@ export async function landWorkspaceTask(
         target: taskId,
         metadata: { reason, lane: "ai-empty-merge-workspace", repoCount: repos.length, landedCount, hadPriorNoOpProof: false },
       }).catch(() => undefined);
-      await fence.write("lifecycle", () => store.moveTask(taskId, reboundColumn, { preserveProgress: true, moveSource: "engine" } as Parameters<TaskStore["moveTask"]>[2]));
-      return { taskId, repos, allLanded, finalized: false };
+      await fence.write("lifecycle", () => reboundAiMergeTask(store, taskId));
+      return { taskId, repos, allLanded, finalized: false, finalizeBlockedReason: reason };
     }
-    const finalized = await finalizeWorkspaceTask(store, taskId, task, repos, fence);
+    /*
+    FNXC:WorkspaceMergeDispatch 2026-08-15-09:37:
+    Dispatch admission is not a licence to finalize. The sub-repo pushes may have completed while
+    this tenancy's renewal callback was stalled, so hold the owner+fence transaction lock over the
+    terminal merge-details write and move-to-done sequence. A reclaimed lease never invokes this
+    callback: its already-pushed commits remain recoverable through landedSha/intent evidence, but
+    this stale generation must not write the task outcome. Renewal only improves liveness.
+    */
+    const finalize = () => finalizeWorkspaceTask(store, taskId, task, repos, workspaceRootDir, fence);
+    const withValidDispatchLease = (store as Partial<TaskStore>).withValidWorkspaceLease;
+    if (options.workspaceDispatchFence && typeof withValidDispatchLease === "function") {
+      try {
+        const finalized = await (withValidDispatchLease.call(
+          store,
+          options.workspaceDispatchFence,
+          async () => finalize(),
+        ) as Promise<boolean>);
+        return { taskId, repos, allLanded, finalized };
+      } catch (error) {
+        if (error instanceof Error && error.message === "Workspace lease is no longer valid") {
+          await audit.database({
+            type: "workspace-lease:merge-completed-unrecorded" as Parameters<typeof audit.database>[0]["type"],
+            target: taskId,
+            metadata: { taskId, outcome: "superseded-after-push", landedRepoCount: repos.filter((repo) => repo.status === "landed").length },
+          }).catch(() => undefined);
+          await log("AI merge (workspace): dispatch lease was superseded after landing; left pushed refs intact for durable recovery");
+          throw new WorkspaceMergeDispatchSupersededError(taskId);
+        }
+        throw error;
+      }
+    }
+    const finalized = await finalize();
     return { taskId, repos, allLanded, finalized };
   }
   return { taskId, repos, allLanded, finalized: false };
@@ -2188,9 +3218,8 @@ export { isRepoLanded };
 
 /**
  * FNXC:Workspace 2026-06-22-00:30 (Phase C U2, KTD3):
- * Persist one sub-repo's `landedSha` with a FRESH-read-then-merge so a concurrent
- * sibling-entry write is not clobbered (Phase A/B per-repo `workspaceWorktrees`
- * pattern). Re-read the latest task, merge only this repo's entry, write the whole map.
+ * Persist one sub-repo's `landedSha` through the store's advisory-locked per-key merge,
+ * so a concurrent sibling-entry acquisition or landing cannot be clobbered.
  *
  * FNXC:Workspace 2026-06-22-04:10 (Phase C review A1 — do NOT swallow the DB write):
  * Previously the `store.updateTask(...)` was `.catch(() => undefined)`. That swallow is the
@@ -2202,6 +3231,10 @@ export { isRepoLanded };
  * trailer ancestor-fallback (A1) recognises the actually-landed repo and skips it (no double
  * squash). We DELIBERATELY do not swallow the `getTask` read either-way: a failed read leaves
  * `landedSha` unrecorded for the same reason, so it must also escalate.
+ *
+ * FNXC:Workspace 2026-08-15-07:51: requireExistingEntry preserves the vanished-entry no-op,
+ * while mergeWorkspaceWorktreeEntry owns the cross-process atomic map merge. Do not substitute
+ * updateTask with a reconstructed workspaceWorktrees map here.
  */
 async function persistRepoLandedSha(
   store: TaskStore,
@@ -2209,12 +3242,36 @@ async function persistRepoLandedSha(
   repoRel: string,
   landedSha: string,
 ): Promise<void> {
-  const latest = await store.getTask(taskId);
-  const current = latest?.workspaceWorktrees ?? {};
-  const entry = current[repoRel];
-  if (!entry) return; // entry vanished — nothing to merge into
-  const next = { ...current, [repoRel]: { ...entry, landedSha } };
-  await store.updateTask(taskId, { workspaceWorktrees: next });
+  // FNXC:Workspace 2026-08-15-06:45: a new landing is strictly after its revert boundary,
+  // so clear that invalidation marker while retaining the fresh landedSha as normal proof.
+  const mergeWorkspaceEntry = (store as Partial<TaskStore>).mergeWorkspaceWorktreeEntry;
+  if (typeof mergeWorkspaceEntry === "function") {
+    await mergeWorkspaceEntry.call(
+      store,
+      taskId,
+      repoRel,
+      { landedSha, landFailure: undefined, revertBoundarySha: undefined },
+      { requireExistingEntry: true },
+    );
+    return;
+  }
+
+  /*
+  FNXC:Workspace 2026-08-15-09:08:
+  Production stores use the advisory-locked per-repository merge above. Retain the
+  read/merge/write fallback only for structural single-process test stores that
+  intentionally predate that API; routing a real durable store through it would
+  reintroduce sibling-map clobbering.
+  */
+  const task = await store.getTask(taskId);
+  const current = task.workspaceWorktrees?.[repoRel];
+  if (!current) return;
+  await store.updateTask(taskId, {
+    workspaceWorktrees: {
+      ...task.workspaceWorktrees,
+      [repoRel]: { ...current, landedSha, landFailure: undefined, revertBoundarySha: undefined },
+    },
+  });
 }
 
 /**
@@ -2225,11 +3282,30 @@ async function persistRepoLandedSha(
  * `task:merged` consumer); the full per-repo map is carried in `mergeDetails.workspaceLandedShas`.
  * Returns true iff the task was moved to done.
  */
+/*
+FNXC:WorkspaceMergeLogs 2026-08-29-07:28:
+The terminal workspace log is one durable write at the established finalization ordinal. Summarize
+all repository outcomes, SHAs, and dependency decisions together so a task card has one unambiguous
+landing recap rather than an unlabeled aggregate count.
+*/
+export function formatRepositoryMergeLog(repoRelPath: string, message: string): string {
+  return `[${repoRelPath}] ${message}`;
+}
+
+export function formatWorkspaceLandingSummary(repos: WorkspaceRepoLandResult[]): string {
+  const aggregate = repos.some((repo) => repo.status === "failed") ? "partial-failed" : "all-landed";
+  const repositoryResults = repos
+    .map((repo) => `${repo.repo} {status=${repo.status}; sha=${repo.landedSha ?? "none"}; dependency-sync=${repo.dependencySyncDecision ?? "not-recorded"}}`)
+    .join("; ");
+  return `AI merge (workspace): aggregate=${aggregate}; task → done; ${repositoryResults}`;
+}
+
 async function finalizeWorkspaceTask(
   store: TaskStore,
   taskId: string,
   task: Task,
   repos: WorkspaceRepoLandResult[],
+  workspaceRootDir: string,
   fence?: MergeWriteFence,
 ): Promise<boolean> {
   const landed = repos.filter((r) => r.status === "landed" && r.landedSha);
@@ -2263,6 +3339,40 @@ async function finalizeWorkspaceTask(
   await store.updateTask(taskId, { mergeDetails });
   task.mergeDetails = mergeDetails;
 
+  let worktreeRemoved = false;
+  try {
+    fence?.assertOwned("finalization");
+    const cleanup = await cleanupLandedWorkspaceTaskWorktrees({
+      store,
+      task: fresh ?? task,
+      workspaceRootDir,
+      landedShas: workspaceLandedShas,
+      source: "workspace-ai-merge-finalize",
+      fence,
+      log: async (message) => {
+        if (fence) {
+          await fence.write("log", () => store.logEntry(taskId, message, "AiMerge").catch(() => undefined));
+        } else {
+          await store.logEntry(taskId, message, "AiMerge").catch(() => undefined);
+        }
+      },
+    });
+    worktreeRemoved = cleanup.removed;
+  } catch (error) {
+    const message = `Workspace post-landing worktree cleanup failed non-fatally: ${error instanceof Error ? error.message : String(error)}`;
+    if (fence) {
+      await fence.write("log", () => store.logEntry(taskId, message, "AiMerge").catch(() => undefined));
+    } else {
+      await store.logEntry(taskId, message, "AiMerge").catch(() => undefined);
+    }
+  }
+
+  /*
+  FNXC:MergeExecutionExclusion 2026-08-30-15:06:
+  Workspace finalization now uses the singular lane's proof-gated cleanup before moving done.
+  A preserved or unexpectedly failed cleanup is recorded but never converts a proven landing into
+  a merge failure, because the durable landed refs remain authoritative for later convergence.
+  */
   const result: MergeResult = {
     task,
     branch: task.branch ?? "",
@@ -2272,110 +3382,207 @@ async function finalizeWorkspaceTask(
     reason: anyLanded ? undefined : "no-net-changes",
     commitSha: representative,
     mergeConfirmed: anyLanded,
-    worktreeRemoved: false,
+    worktreeRemoved,
     branchDeleted: false,
   };
-  await fence?.write("log", () => store.logEntry(taskId, `AI merge (workspace): all ${repos.length} sub-repo(s) landed — task → done`, "AiMerge").catch(() => undefined));
+  if (fence) {
+    await fence.write("log", () => store.logEntry(taskId, formatWorkspaceLandingSummary(repos), "AiMerge").catch(() => undefined));
+  } else {
+    await store.logEntry(taskId, formatWorkspaceLandingSummary(repos), "AiMerge").catch(() => undefined);
+  }
   fence?.assertOwned("finalization");
   await finalizeTask(store, taskId, result, undefined, undefined, undefined, fence);
   return true;
 }
 
 async function mergeAndReview(input: {
-  mergeRoot: string;
-  branch: string;
-  integrationBranch: string;
-  tipSha: string;
-  taskTitle?: string;
-  includeTaskId: boolean;
-  trailers: string[];
-  taskId: string;
-  maxPasses: number;
-  mergeAgent: (cwd: string, prompt: string) => Promise<void>;
-  reviewAgent: (cwd: string, prompt: string) => Promise<string>;
-  audit: RunAuditor;
-  log: (message: string) => Promise<void>;
-  setStatus: (status: string | null) => Promise<unknown>;
-  store: TaskStore;
-  signal?: AbortSignal;
-  initialPriorReasons?: string[];
+  mergeRoot: string; branch: string; integrationBranch: string; tipSha: string; taskTitle?: string;
+  includeTaskId: boolean; trailers: string[]; taskId: string; maxPasses: number;
+  mergeAgent: (cwd: string, prompt: string) => Promise<void>; reviewAgent: (cwd: string, prompt: string) => Promise<string>;
+  audit: RunAuditor; log: (message: string) => Promise<void>; setStatus: (status: string | null) => Promise<unknown>; store: TaskStore;
+  signal?: AbortSignal; initialPriorReasons?: string[];
 }): Promise<{ squashSha: string | null; priorReasons: string[] }> {
   const { mergeRoot, branch, integrationBranch, tipSha, taskTitle, includeTaskId, trailers, taskId, maxPasses, mergeAgent, reviewAgent, audit, log, setStatus, store, signal } = input;
-  let priorReasons = [...(input.initialPriorReasons ?? [])];
-
-  for (let attempt = 0; ; attempt++) {
-    throwIfAborted(signal, taskId);
-    // Reset the clean room to the tip before each (re)merge so corrective passes
-    // start from a known-good base, not a half-resolved tree.
-    await git(["reset", "--hard", tipSha], mergeRoot);
-    await git(["clean", "-fd"], mergeRoot);
-
-    if (attempt > 0) {
-      await setStatus("merging");
-      await log(`AI merge: corrective re-merge (pass ${attempt}/${maxPasses}) addressing: ${priorReasons.join("; ")}`);
-    }
-    const latestTaskForMergePrompt = await store.getTask(taskId);
-    const mergeUserComments = selectUserCommentsForAgentContext(latestTaskForMergePrompt);
-    await mergeAgent(mergeRoot, buildMergePrompt({
-      taskId, branch, integrationBranch, tipSha, taskTitle, includeTaskId, trailers,
-      correctiveReasons: priorReasons.length ? priorReasons : undefined,
-      userComments: mergeUserComments,
-    }));
-
-    let head = await git(["rev-parse", "HEAD"], mergeRoot);
-    const emptyMerge = head === tipSha;
-    if (emptyMerge && priorReasons.length === 0) return { squashSha: null, priorReasons }; // empty initial merge — nothing landed
-
-    // Guarantee the squash's task metadata (task-id subject prefix + board
-    // association trailers) even if the agent omitted it — this amends HEAD, so
-    // re-read the sha afterwards.
-    if (!emptyMerge) {
-      await ensureCommitTaskMetadata(mergeRoot, taskId, includeTaskId, trailers);
-      head = await git(["rev-parse", "HEAD"], mergeRoot);
-    }
-
-    await setStatus("reviewing");
-    const diffStat = await git(["diff", "--stat", `${tipSha}..${head}`], mergeRoot);
-    const latestTaskForReviewPrompt = await store.getTask(taskId);
-    const reviewUserComments = selectUserCommentsForAgentContext(latestTaskForReviewPrompt);
-    const verdict = parseReviewVerdict(await reviewAgent(mergeRoot, buildReviewPrompt({
-      taskId, branch, integrationBranch, tipSha, squashSha: head, diffStat, priorReasons,
-      userComments: reviewUserComments,
-    })));
-    await audit.git({
-      type: "merge:ai-review-verdict",
-      target: integrationBranch,
-      metadata: { taskId, attempt, verdict: verdict.verdict, severity: verdict.severity, reasons: verdict.reasons, squashSha: head },
+  const current = await store.getTask(taskId);
+  const sourceSha = await git(["rev-parse", "--verify", branch], mergeRoot);
+  let state: NonNullable<Task["aiMergeReviewReconciliation"]> | undefined = current?.aiMergeReviewReconciliation;
+  if (!state || state.sourceSha !== sourceSha || state.integrationTipSha !== tipSha) {
+    const legacy = boundBlockingReviewReasons(input.initialPriorReasons ?? []);
+    state = { sourceSha, integrationTipSha: tipSha, findings: legacy.map((text, index) => ({ id: `legacy-${index + 1}`, text, disposition: "pending" as const })), consecutiveCleanApprovals: 0, correctivePasses: 0 };
+  }
+  let needsMerge = !state.candidateSha;
+  let persistedState = current?.aiMergeReviewReconciliation;
+  const sameState = (left: Task["aiMergeReviewReconciliation"], right: Task["aiMergeReviewReconciliation"]): boolean => JSON.stringify(left) === JSON.stringify(right);
+  const persistState = async (expected: Task["aiMergeReviewReconciliation"], next: NonNullable<Task["aiMergeReviewReconciliation"]>): Promise<void> => {
+    await store.updateTaskAtomic(taskId, (live) => {
+      if (!sameState(live.aiMergeReviewReconciliation, expected)) throw new AiMergeReviewReconciliationInvalidatedError();
+      return { aiMergeReviewReconciliation: next };
     });
-
-    if (verdict.verdict === "approve") {
-      await log(`AI merge review (pass ${attempt + 1}): approved squash ${head}`);
-      return { squashSha: emptyMerge ? null : head, priorReasons };
+    persistedState = next;
+  };
+  const assertCurrentEpisodeIdentity = async (): Promise<void> => {
+    const expectedState = state;
+    if (!expectedState) throw new AiMergeReviewReconciliationInvalidatedError();
+    const liveTask = await store.getTask(taskId);
+    const liveBranch = liveTask?.branch ?? branch;
+    const liveSourceSha = await git(["rev-parse", "--verify", liveBranch], mergeRoot);
+    const liveTipSha = await git(["rev-parse", "--verify", `refs/heads/${integrationBranch}`], mergeRoot);
+    if (
+      liveBranch !== branch
+      || liveSourceSha !== expectedState.sourceSha
+      || liveTipSha !== expectedState.integrationTipSha
+      || !sameState(liveTask?.aiMergeReviewReconciliation, expectedState)
+    ) {
+      await store.updateTaskAtomic(taskId, (currentTask) => {
+        if (!sameState(currentTask.aiMergeReviewReconciliation, expectedState)) return undefined;
+        return { aiMergeReviewReconciliation: null, mergeRetries: undefined };
+      });
+      throw new AiMergeReviewReconciliationInvalidatedError();
     }
-
-    /*
-    FNXC:MergeReviewBlockers 2026-07-21-21:30:
-    Every rejected blocker remains part of the corrective contract until a reviewer approves the complete result. Review an empty corrective rebuild instead of treating it as an unreviewed no-op, and accumulate newly discovered blockers so a later pass cannot regress an earlier concern.
-
-    FNXC:MergeReviewBlockers 2026-07-21-21:45:
-    Persist the accumulated set in every rejection log so crash recovery restores all outstanding concerns rather than only the latest pass.
-    */
-    const unresolvedReasons = [...new Set([...priorReasons, ...verdict.reasons])];
-    const budgetExhausted = attempt >= maxPasses;
-    if (budgetExhausted) {
-      if (verdict.severity === "blocking") {
-        await audit.git({ type: "merge:ai-review-blocked", target: integrationBranch, metadata: { taskId, attempt, reasons: unresolvedReasons } });
-        await log(`AI merge BLOCKED after ${attempt} corrective pass(es) — unresolved correctness concern: ${unresolvedReasons.join("; ")}`);
-        throw new AiMergeBlockedError(taskId, unresolvedReasons);
+  };
+  while (true) {
+    throwIfAborted(signal, taskId);
+    const actionable = state.findings.filter((finding) => finding.disposition === "still-present");
+    if (needsMerge) {
+      if (state.correctivePasses > 0 && actionable.length === 0) {
+        throw new AiMergeBlockedError(taskId, ["review reconciliation has no actionable finding"]);
       }
-      // Advisory: land the squash with the concern logged.
-      await audit.git({ type: "merge:ai-review-landed-with-concerns", target: integrationBranch, metadata: { taskId, attempt, reasons: unresolvedReasons, squashSha: head } });
-      await log(`AI merge: landing with unresolved advisory concern(s): ${unresolvedReasons.join("; ")}`);
-      return { squashSha: emptyMerge ? null : head, priorReasons: unresolvedReasons };
+      await git(["reset", "--hard", tipSha], mergeRoot); await git(["clean", "-fd"], mergeRoot);
+      if (state.correctivePasses > 0) {
+        await setStatus("merging");
+        await log(`AI merge: corrective re-merge (pass ${state.correctivePasses}/${maxPasses}) addressing findings: ${actionable.map((finding) => finding.text).join("; ")}`);
+      }
+      const task = await store.getTask(taskId);
+      await mergeAgent(mergeRoot, buildMergePrompt({ taskId, branch, integrationBranch, tipSha, taskTitle, includeTaskId, trailers, correctiveReasons: actionable.map((finding) => `[${finding.id}] ${finding.text}`), userComments: selectUserCommentsForAgentContext(task) }));
+      let candidateSha = await git(["rev-parse", "HEAD"], mergeRoot);
+      if (candidateSha === tipSha && state.findings.length === 0) return { squashSha: null, priorReasons: [] };
+      if (candidateSha !== tipSha) { await ensureCommitTaskMetadata(mergeRoot, taskId, includeTaskId, trailers); candidateSha = await git(["rev-parse", "HEAD"], mergeRoot); }
+      state = { ...state, candidateSha, candidateTreeSha: await git(["rev-parse", `${candidateSha}^{tree}`], mergeRoot), consecutiveCleanApprovals: 0 };
+      await persistState(persistedState, state);
+      needsMerge = false;
     }
-
-    priorReasons = unresolvedReasons;
-    await log(`AI merge review (pass ${attempt + 1}): rejected (${verdict.severity}) — ${unresolvedReasons.join("; ")}`);
+    const candidateSha: string = state.candidateSha!;
+    await assertCurrentEpisodeIdentity();
+    await setStatus("reviewing");
+    const diffStat = await git(["diff", "--stat", `${tipSha}..${candidateSha}`], mergeRoot);
+    const task = await store.getTask(taskId);
+    const activePriorFindings = state.findings.filter((finding) => finding.disposition === "pending" || finding.disposition === "still-present");
+    const verdict = parseReviewVerdict(await reviewAgent(mergeRoot, buildReviewPrompt({ taskId, branch, integrationBranch, tipSha, squashSha: candidateSha, diffStat, priorReasons: activePriorFindings.map((finding) => finding.text), priorFindings: activePriorFindings.map((finding) => ({ id: finding.id, text: finding.text })), userComments: selectUserCommentsForAgentContext(task) })));
+    // A review response can arrive after an operator dismisses its finding or pushes a new source.
+    await assertCurrentEpisodeIdentity();
+    const ids = new Set(state.findings.map((finding) => finding.id));
+    const dispositionCounts = new Map<string, number>();
+    for (const { id } of verdict.priorFindingDispositions ?? []) {
+      dispositionCounts.set(id, (dispositionCounts.get(id) ?? 0) + 1);
+    }
+    const invalidAcknowledgement = [...dispositionCounts].some(([id, count]) => !ids.has(id) || count > 1);
+    /* FNXC:MergerAiReview 2026-08-22-22:26: Unknown and duplicate acknowledgements are unusable; a contradictory duplicate must never clear a real blocker. */
+    const dispositions = new Map((verdict.priorFindingDispositions ?? [])
+      .filter((entry) => ids.has(entry.id) && dispositionCounts.get(entry.id) === 1)
+      .map((entry) => [entry.id, entry.disposition]));
+    let findings: NonNullable<Task["aiMergeReviewReconciliation"]>["findings"] = state.findings.map((finding) => {
+      const disposition = dispositions.get(finding.id);
+      return disposition === "corrected" || disposition === "absent-from-squash" ? { ...finding, disposition } : disposition === "still-present" ? { ...finding, disposition } : finding;
+    });
+    /*
+    FNXC:MergerAiReview 2026-08-22-22:04:
+    FN-159 filters protocol at durable finding construction as defence in depth: R1 recognizes
+    today's markers, while this independent boundary prevents a future marker from polluting the
+    reconciliation corpus as FN-090 did after FN-062.
+    */
+    const recoveredReasons = boundBlockingReviewReasons(verdict.reasons);
+    const newFindings = verdict.verdict === "reject" && verdict.severity !== "advisory"
+      ? (recoveredReasons.length ? recoveredReasons : ["reviewer rejected the merge without a stated reason"])
+        .map((text, index) => ({ id: `finding-${state!.correctivePasses + 1}-${index + 1}`, text, disposition: "still-present" as const }))
+      : [];
+    if (verdict.verdict === "approve") {
+      /* FNXC:MergerAiReview 2026-08-22-22:26: A malformed duplicate that says still-present still retains the real blocker. */
+      const reConfirmed = new Set((verdict.priorFindingDispositions ?? [])
+        .filter((entry) => ids.has(entry.id) && entry.disposition === "still-present")
+        .map((entry) => entry.id));
+      const released = findings.filter((finding) => finding.disposition === "still-present" && !reConfirmed.has(finding.id));
+      if (released.length) {
+        const at = new Date().toISOString();
+        findings = findings.map((finding) => released.some(({ id }) => id === finding.id)
+          ? { ...finding, disposition: "absent-from-squash", audit: [...(finding.audit ?? []), { at, actor: "ai-merge-review", disposition: "absent-from-squash", reason: `not re-confirmed on approved candidate ${candidateSha}` }] }
+          : finding);
+        await log(`AI merge review: approved; released unreconfirmed finding(s): ${released.map(({ id }) => id).join(", ")}`);
+      }
+    }
+    state = { ...state, findings: [...findings, ...newFindings] };
+    const stillPresent: NonNullable<Task["aiMergeReviewReconciliation"]>["findings"] = state.findings.filter((finding) => finding.disposition === "still-present");
+    const repeatedInvalidAcknowledgement: boolean = invalidAcknowledgement && state.invalidAcknowledgementCandidateSha === candidateSha;
+    const unusableAcknowledgement: boolean = invalidAcknowledgement && !repeatedInvalidAcknowledgement;
+    const clean: boolean = verdict.verdict === "approve" && !unusableAcknowledgement && stillPresent.length === 0;
+    await audit.git({ type: "merge:ai-review-verdict", target: integrationBranch, metadata: { taskId, verdict: verdict.verdict, severity: verdict.severity, squashSha: candidateSha } });
+    if (verdict.verdict === "approve") {
+      const unconfirmed = state.findings.filter((finding) => finding.disposition === "pending").length;
+      state = {
+        ...state,
+        consecutiveCleanApprovals: clean ? state.consecutiveCleanApprovals + 1 : 0,
+        ...(unusableAcknowledgement ? { invalidAcknowledgementCandidateSha: candidateSha } : {}),
+      };
+      await persistState(persistedState, state);
+      if (clean) {
+        /*
+        FNXC:MergeReviewConfirmation 2026-08-26-10:11:
+        Landing requires TWO consecutive clean approvals of the same candidate (see the
+        `consecutiveCleanApprovals >= 2` gate below), so this line is written twice per squash — by
+        design, and previously WORD FOR WORD. An operator reading the task journal saw the same
+        sentence repeated with the same SHA and had no way to tell a confirmation from a duplicated
+        invocation; it was reported as an anomaly precisely because the log made a safety feature
+        look like a bug. Number the approval so the second one reads as what it is.
+        */
+        const approvalNumber = state.consecutiveCleanApprovals;
+        /*
+        The SHA sits immediately after `approved`, and the pass number inside `(pass N)`, because
+        `SelfHealingManager.getApprovedAiMergeReviewShas` PARSES this line with
+        `/AI merge review \(pass \d+\): approved(?:\s+(?:squash|commit)\s+([0-9a-f]{7,40}))?/`.
+        That parser has never matched anything: no emitter ever wrote the parenthetical, so
+        `hasApprovedAiMergeReview` always answered false and the recovery it guards could not run.
+        Two sides, each individually reasonable, coupled through a log line nobody compared — the
+        same shape as every other defect in this series. Keep the suffixes AFTER the SHA so the
+        capture group cannot be pushed out of reach by an optional clause.
+        */
+        const suffixes = [
+          unconfirmed ? `${unconfirmed} prior finding(s) unconfirmed` : "",
+          approvalNumber >= 2 ? "confirmation pass" : "",
+        ].filter(Boolean);
+        await log(repeatedInvalidAcknowledgement
+          ? "AI merge review: approved; ignoring repeated unusable prior-finding acknowledgement"
+          : `AI merge review (pass ${approvalNumber}): approved squash ${candidateSha}${suffixes.length ? ` — ${suffixes.join("; ")}` : ""}`);
+        if (state.consecutiveCleanApprovals >= 2) {
+          await assertCurrentEpisodeIdentity();
+          return { squashSha: candidateSha === tipSha ? null : candidateSha, priorReasons: [] };
+        }
+        continue; // Direct confirmation review of exactly the same candidate; no merge agent and no budget spend.
+      }
+      if (unusableAcknowledgement && stillPresent.length === 0) {
+        await log("AI merge review: approved; prior-finding acknowledgement unusable (unknown or duplicated id) — re-asking on the same candidate");
+        continue;
+      }
+      if (repeatedInvalidAcknowledgement && stillPresent.length === 0) {
+        await log("AI merge review: approved; ignoring repeated unusable prior-finding acknowledgement");
+        continue;
+      }
+      if (stillPresent.length) await log(`AI merge review: approved but ${stillPresent.length} finding(s) re-confirmed still-present — corrective pass`);
+    }
+    if (verdict.verdict === "reject" && verdict.severity === "advisory" && stillPresent.length === 0) {
+      await log(`AI merge: landing with unresolved advisory concern(s): ${verdict.reasons.join("; ")}`);
+      return { squashSha: candidateSha === tipSha ? null : candidateSha, priorReasons: [] };
+    }
+    if (stillPresent.length === 0) {
+      state = { ...state, terminal: true }; await persistState(persistedState, state);
+      throw new AiMergeBlockedError(taskId, ["reviewer rejected the merge without a stated reason"]);
+    }
+    if (state.correctivePasses >= maxPasses) {
+      state = { ...state, terminal: true }; await persistState(persistedState, state);
+      await log(`AI merge BLOCKED after ${state.correctivePasses} corrective pass(es) — candidate ${candidateSha}: ${stillPresent.map((finding) => finding.text).join("; ")}`);
+      throw new AiMergeBlockedError(taskId, stillPresent.map((finding) => finding.text));
+    }
+    state = { ...state, correctivePasses: state.correctivePasses + 1, consecutiveCleanApprovals: 0 };
+    await persistState(persistedState, state);
+    needsMerge = true;
   }
 }
 
@@ -2440,9 +3647,23 @@ export async function pushAfterMergeToRemote(input: {
   throwIfAborted(signal, taskId);
   let fastPathError: string;
   try {
-    await git(["push", remote, `${localRef}:refs/heads/${targetBranch}`], projectRootDir, { timeout: 120_000 });
+    // FNXC:MergePush 2026-08-16-02:55: Retry transient fast-path transport failures with
+    // bounded, cancellation-aware backoff; merge aborts must escape to the aborted-push audit path.
+    await pushWithTransientRetries(
+      () => git(["push", remote, `${localRef}:refs/heads/${targetBranch}`], projectRootDir, { timeout: 120_000 }),
+      {
+        taskId,
+        signal,
+        onRetry: async ({ attempt, maxRetries, delayMs, error }) => {
+          const message = `Push after merge: temporary Git transport failure; retrying in ${delayMs}ms (${attempt}/${maxRetries}): ${error}`;
+          aiMergeLog.warn(`${taskId}: ${message}`);
+          await log(message);
+        },
+      },
+    );
     return { pushed: true, remote, targetBranch };
   } catch (err: unknown) {
+    if (isMergeAbortedError(err)) throw err;
     fastPathError = getErrorMessage(err);
   }
   if (!isNonFastForwardPushError(fastPathError)) {
@@ -2619,7 +3840,7 @@ async function finalizeMerged(
   landedSha: string,
   audit: RunAuditor,
   log: (message: string) => Promise<void>,
-  opts: { empty: boolean },
+  opts: { empty: boolean; expectedBranchTipSha?: string },
   mergeTarget?: MergeTargetResolution,
   groupRouting?: BranchGroupMergeRouting | null,
   syncGroupPr?: SyncGroupPrFn,
@@ -2638,14 +3859,18 @@ async function finalizeMerged(
   let mergeDetails: MergeDetails | undefined;
   let modifiedFiles: string[] | undefined;
   if (!opts.empty && landedSha) {
-    const [{ landedFiles: capturedLandedFiles, filesChanged, insertions, deletions }, mergeCommitMessage] = await Promise.all([
+    const [{ landedFiles: capturedLandedFiles, filesChanged, insertions, deletions }, mergeCommitMessage, landedBranchTipSha] = await Promise.all([
       captureSingleCommitLandedMetadata(projectRootDir, landedSha),
       git(["log", "-1", "--format=%s", landedSha], projectRootDir).catch(() => ""),
+      opts.expectedBranchTipSha
+        ? Promise.resolve(opts.expectedBranchTipSha)
+        : git(["rev-parse", "--verify", `refs/heads/${branch}`], projectRootDir).catch(() => ""),
     ]);
     const landedFiles = capturedLandedFiles ?? [];
-    const mergedAt = new Date().toISOString();
+    const mergedAt = task.mergeDetails?.mergedAt ?? new Date().toISOString();
     mergeDetails = {
       commitSha: landedSha,
+      ...(landedBranchTipSha ? { landedBranchTipSha } : {}),
       landedFiles,
       filesChanged,
       insertions,
@@ -2682,21 +3907,58 @@ async function finalizeMerged(
     task.mergeDetails = mergeDetails;
   }
   let branchDeleted = false;
-  // NEVER delete the integration branch itself — a task whose branch name
-  // coincides with the target (or merges into its own branch) must not have the
-  // just-advanced integration ref force-deleted out from under it.
-  fence?.assertOwned("finalization");
-  if (branch !== integrationBranch && await gitOk(["branch", "-D", branch], projectRootDir)) {
+  const deleteBranchNormally = async (): Promise<void> => {
+    /*
+    FNXC:WorktreeCleanup 2026-08-29-00:59:
+    FN-251 fixes deletion ordering for Fusion-managed task branches only. An operator-supplied branch
+    remains operator-owned even after its now-safe worktree cleanup, while the integration branch is
+    never a deletion target.
+    */
+    fence?.assertOwned("finalization");
+    if (branch !== integrationBranch && isFusionDeletableBranch(task, branch) && await gitOk(["branch", "-D", branch], projectRootDir)) {
+      branchDeleted = true;
+      await audit.git({ type: "branch:delete", target: branch, metadata: { taskId, force: true } }).catch(() => undefined);
+    }
+  };
+  /*
+  FNXC:MergeExecutionExclusion 2026-08-29-00:59:
+  FN-251 requires a proven landing to attempt non-fatal worktree cleanup before branch deletion.
+  Re-reporting a durable landing as a merge failure caused duplicate merge attempts and graph-backstop
+  completion; a preserved checkout therefore records its reason and never stops finalization. Git
+  cannot delete a branch checked out by a worktree, so cleanup must resolve before the branch delete.
+  */
+  const cleanup = await cleanupLandedTaskWorktree({
+    store,
+    taskId,
+    worktreePath: task.worktree,
+    rootDir: projectRootDir,
+    landedSha,
+    source: "ai-merge-finalize",
+    audit,
+    log,
+    fence,
+  });
+  const worktreeRemoved = cleanup.removed;
+
+  if (!opts.expectedBranchTipSha) await deleteBranchNormally();
+
+  if (opts.expectedBranchTipSha && branch !== integrationBranch && isFusionDeletableBranch(task, branch)) {
+    fence?.assertOwned("finalization");
+    const deletedAtExpectedTip = await gitOk([
+      "update-ref",
+      "-d",
+      `refs/heads/${branch}`,
+      opts.expectedBranchTipSha,
+    ], projectRootDir);
+    if (!deletedAtExpectedTip) {
+      throw new RecordedMergeBranchTipChangedError(branch, opts.expectedBranchTipSha);
+    }
     branchDeleted = true;
-    await audit.git({ type: "branch:delete", target: branch, metadata: { taskId, force: true } }).catch(() => undefined);
-  }
-  // Remove the task's own worktree if it still exists.
-  let worktreeRemoved = false;
-  if (task.worktree) {
-    fence?.assertOwned("finalization");
-    worktreeRemoved = await gitOk(["worktree", "remove", "--force", task.worktree], projectRootDir);
-    fence?.assertOwned("finalization");
-    await store.updateTask(taskId, { worktree: null }).catch(() => undefined);
+    await audit.git({
+      type: "branch:delete",
+      target: branch,
+      metadata: { taskId, force: true, source: "recorded-landing-tip-cas" },
+    }).catch(() => undefined);
   }
 
   const result: MergeResult = {
@@ -2745,18 +4007,10 @@ async function finalizeMerged(
           syncGroupPr,
         });
       } catch (err) {
-        if (isMergeAbortedError(err)) throw err;
         try {
-          store.recordRunAuditEvent?.({
-            taskId,
-            agentId: "merger",
-            runId: `merge-${taskId}`,
-            domain: "git",
-            mutationType: "merge:branch-group-pr-sync-failed",
-            target: groupRouting.branchGroup.id,
-            metadata: { groupId: groupRouting.branchGroup.id, error: err instanceof Error ? err.message : String(err) },
-          });
-        } catch {
+          recordBranchGroupPrSyncFailureAudit(store, taskId, groupRouting.branchGroup.id, err);
+        } catch (auditError) {
+          if (isMergeAbortedError(auditError)) throw auditError;
           // best-effort audit
         }
       }

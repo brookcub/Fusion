@@ -46,6 +46,94 @@ describe("useAppSettings", () => {
     mockUpdateSettings.mockResolvedValue({} as never);
   });
 
+  it.each([
+    ["full-width", "full-width"],
+    [undefined, "bubbles"],
+    ["legacy-value", "bubbles"],
+  ] as const)("normalizes persisted chat message layout %s to %s", async (storedLayout, expectedLayout) => {
+    mockFetchSettings.mockResolvedValueOnce({ chatMessageLayout: storedLayout } as never);
+    const { result } = renderHook(() => useAppSettings("proj_123"));
+
+    await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
+    expect(result.current.chatMessageLayout).toBe(expectedLayout);
+  });
+
+  it("updates every mounted Appearance consumer synchronously without fetching", async () => {
+    const { result } = renderHook(() => useAppSettings("proj_123"));
+
+    await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
+    const settingsFetchesBefore = mockFetchSettings.mock.calls.length;
+    const configFetchesBefore = mockFetchConfig.mock.calls.length;
+
+    act(() => {
+      result.current.setChatMessageLayoutImmediate("full-width");
+      result.current.setOpenTasksInRightSidebarImmediate(true);
+      result.current.setOpenMobileTasksInPopupImmediate(true);
+      result.current.setTaskPopupsBoardListOnlyImmediate(false);
+      result.current.setShowCostBadgeOnCardsImmediate(true);
+      result.current.setTaskDetailChatFirstImmediate(true);
+    });
+
+    expect(result.current.chatMessageLayout).toBe("full-width");
+    expect(result.current.openTasksInRightSidebar).toBe(true);
+    expect(result.current.openMobileTasksInPopup).toBe(true);
+    expect(result.current.taskPopupsBoardListOnly).toBe(false);
+    expect(result.current.showCostBadgeOnCards).toBe(true);
+    expect(result.current.taskDetailChatFirst).toBe(true);
+    expect(mockFetchSettings).toHaveBeenCalledTimes(settingsFetchesBefore);
+    expect(mockFetchConfig).toHaveBeenCalledTimes(configFetchesBefore);
+
+    act(() => {
+      result.current.setChatMessageLayoutImmediate("bubbles");
+      result.current.setOpenTasksInRightSidebarImmediate(false);
+      result.current.setOpenMobileTasksInPopupImmediate(false);
+      result.current.setTaskPopupsBoardListOnlyImmediate(true);
+      result.current.setShowCostBadgeOnCardsImmediate(false);
+      result.current.setTaskDetailChatFirstImmediate(false);
+    });
+
+    expect(result.current.chatMessageLayout).toBe("bubbles");
+    expect(result.current.openTasksInRightSidebar).toBe(false);
+    expect(result.current.openMobileTasksInPopup).toBe(false);
+    expect(result.current.taskPopupsBoardListOnly).toBe(true);
+    expect(result.current.showCostBadgeOnCards).toBe(false);
+    expect(result.current.taskDetailChatFirst).toBe(false);
+    expect(mockFetchSettings).toHaveBeenCalledTimes(settingsFetchesBefore);
+    expect(mockFetchConfig).toHaveBeenCalledTimes(configFetchesBefore);
+  });
+
+  it("resets chat message layout to bubbles while a new project hydrates", async () => {
+    mockFetchSettings
+      .mockResolvedValueOnce({ chatMessageLayout: "full-width" } as never)
+      .mockResolvedValueOnce({ chatMessageLayout: undefined } as never);
+    const { result, rerender } = renderHook(({ projectId }) => useAppSettings(projectId), { initialProps: { projectId: "project-a" } });
+
+    await waitFor(() => expect(result.current.chatMessageLayout).toBe("full-width"));
+    rerender({ projectId: "project-b" });
+    expect(result.current.chatMessageLayout).toBe("bubbles");
+    await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
+    expect(result.current.chatMessageLayout).toBe("bubbles");
+  });
+
+  it("does not apply a previous project's late layout response", async () => {
+    let resolvePreviousProjectSettings!: (value: never) => void;
+    mockFetchSettings
+      .mockImplementationOnce(() => new Promise((resolve) => { resolvePreviousProjectSettings = resolve as (value: never) => void; }))
+      .mockResolvedValueOnce({ chatMessageLayout: "bubbles" } as never);
+
+    const { result, rerender } = renderHook(({ projectId }) => useAppSettings(projectId), { initialProps: { projectId: "project-a" } });
+    rerender({ projectId: "project-b" });
+
+    await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
+    expect(result.current.chatMessageLayout).toBe("bubbles");
+
+    await act(async () => {
+      resolvePreviousProjectSettings({ chatMessageLayout: "full-width" } as never);
+    });
+
+    expect(result.current.chatMessageLayout).toBe("bubbles");
+  });
+
   it("defaults omitted task popup scoping to enabled during hydration", async () => {
     const { result } = renderHook(() => useAppSettings("proj_123"));
 
@@ -523,7 +611,14 @@ describe("useAppSettings", () => {
     });
   });
 
-  it("derives todosEnabled from experimentalFeatures.todoView", async () => {
+  /*
+  FNXC:Navigation 2026-08-15-22:15:
+  FN-8762 (5b2b31d2c9) extracted Todo Lists into the bundled `fusion-plugin-todos`
+  plugin and removed the host `todosEnabled` derivation from useAppSettings; the
+  `experimentalFeatures.todoView` gate no longer exists. Regression-pin that the
+  removed field never reappears on the hook result.
+  */
+  it("no longer derives a host todosEnabled flag (Todos is the fusion-plugin-todos plugin, FN-8762)", async () => {
     mockFetchSettings.mockResolvedValueOnce({
       autoMerge: false,
       globalPause: false,
@@ -539,8 +634,9 @@ describe("useAppSettings", () => {
     const { result } = renderHook(() => useAppSettings("proj_123"));
 
     await waitFor(() => {
-      expect(result.current.todosEnabled).toBe(true);
+      expect(result.current.taskStuckTimeoutMs).toBe(600000);
     });
+    expect("todosEnabled" in result.current).toBe(false);
   });
 
   it("derives goalsEnabled from experimentalFeatures.goalsView", async () => {

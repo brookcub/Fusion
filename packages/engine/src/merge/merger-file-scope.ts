@@ -141,6 +141,18 @@ export class FileScopeViolationError extends Error {
 
 export type StagedFilesReader = (cwd: string) => Promise<string[]>;
 
+/**
+ * FNXC:AIMerge 2026-08-15-22:55:
+ * Unified AI merges approve a committed clean-room squash, so their file list
+ * must be read from the approved commit range rather than the empty index.
+ */
+export function createCommitRangeFilesReader(fromSha: string, toSha: string): StagedFilesReader {
+  return async (cwd) => {
+    const { stdout } = await execAsync(`git diff --name-only ${fromSha}..${toSha}`, { cwd, encoding: "utf-8" });
+    return stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+  };
+}
+
 async function readStagedFileNames(cwd: string): Promise<string[]> {
   const { stdout } = await execAsync("git diff --cached --name-only", {
     cwd,
@@ -162,6 +174,15 @@ export async function assertSquashOverlapsFileScope(params: {
    *  declared scope. `scopeOverride` is a documented no-op only under
    *  `fileScope: "off"` (handled by the caller, which skips this assert). */
   customScopeRules?: string[];
+  /** Optional production transform for workspace repo-local scope evaluation. */
+  scopeTransform?: (scope: string[]) => string[];
+  /**
+   * FNXC:AIMerge 2026-08-15-05:50:
+   * A workspace repo with declarations owned only by sibling repos must fail even
+   * when a local file repeats a sibling-prefixed name. Preserve the original
+   * declared scope in the violation so operators can correct the task contract.
+   */
+  forceViolation?: (resolvedScope: string[]) => boolean;
 }): Promise<void> {
   const { store, taskId, rootDir, task, customScopeRules, stagedFilesReader = readStagedFileNames } = params;
   const hasCustomRules = Array.isArray(customScopeRules) && customScopeRules.length > 0;
@@ -190,14 +211,18 @@ export async function assertSquashOverlapsFileScope(params: {
     }
     declaredScope = await store.parseFileScopeFromPrompt(taskId);
   }
-  if (declaredScope.length === 0) {
+  // Apply only after the override/custom-scope resolution preserves legacy semantics.
+  const resolvedScope = declaredScope;
+  declaredScope = params.scopeTransform ? params.scopeTransform(resolvedScope) : resolvedScope;
+  const forcedViolation = params.forceViolation?.(resolvedScope) === true;
+  if (declaredScope.length === 0 && !forcedViolation) {
     return;
   }
 
   const stagedFiles = await stagedFilesReader(rootDir);
   const hasOverlap = stagedFiles.some((file) => matchesScope(file, declaredScope));
-  if (!hasOverlap) {
-    throw new FileScopeViolationError(taskId, stagedFiles, declaredScope);
+  if (forcedViolation || !hasOverlap) {
+    throw new FileScopeViolationError(taskId, stagedFiles, forcedViolation ? resolvedScope : declaredScope);
   }
 }
 
@@ -220,6 +245,8 @@ export async function enforceSquashFileScopeInvariant(params: {
   resetLabel: string;
   stagedFilesReader?: StagedFilesReader;
   auditor?: RunAuditor;
+  scopeTransform?: (scope: string[]) => string[];
+  forceViolation?: (resolvedScope: string[]) => boolean;
 }): Promise<void> {
   // U7 (R10): resolve the file-scope enforcement mode from the merge trait
   // (flag ON) or settings (back-compat). The lost-work guard trio is NOT gated

@@ -3,12 +3,14 @@ import {
   applyReviewSeverityGate,
   formatFindingsByPriority,
   formatResolvedFindings,
+  isActionableReviewFinding,
   isBlockingFinding,
   resolveReviewBlockingSeverity,
   DEFAULT_CODE_REVIEW_BLOCKING_SEVERITY,
   DEFAULT_PLAN_REVIEW_BLOCKING_SEVERITY,
 } from "../workflows/review-severity-gate.js";
 import type { WorkflowReviewFinding } from "../types.js";
+import { isOpenWorkflowReviewFinding } from "../workflows/workflow-step-results.js";
 
 function finding(overrides: Partial<WorkflowReviewFinding> = {}): WorkflowReviewFinding {
   return { id: "f1", title: "t", body: "b", ...overrides };
@@ -68,10 +70,18 @@ describe("isBlockingFinding", () => {
   });
 
   it("never blocks review receipts or superseded findings", () => {
-    for (const resolution of ["resolved-in-review", "superseded"] as const) {
+    for (const resolution of ["resolved-in-review", "superseded", "dispute-upheld"] as const) {
       expect(isBlockingFinding(finding({ severity: "critical", resolution }), "critical")).toBe(false);
       expect(isBlockingFinding(finding({ severity: "critical", resolution }), "any")).toBe(false);
     }
+  });
+
+  it("keeps a disputed finding open and blocking until a reviewer adjudicates it", () => {
+    const disputed = finding({ severity: "critical", disputedAt: "2026-08-22T06:41:00.000Z", disputeRationale: "The transaction is atomic." });
+    expect(isOpenWorkflowReviewFinding(disputed)).toBe(true);
+    expect(isBlockingFinding(disputed, "critical")).toBe(true);
+    expect(formatFindingsByPriority([disputed])).toContain("must fix");
+    expect(formatResolvedFindings([disputed])).toBe("");
   });
 });
 
@@ -108,16 +118,14 @@ describe("applyReviewSeverityGate", () => {
       .toBe("APPROVE_WITH_NOTES");
   });
 
-  /*
-   * The fail-closed contract is the reason this gate is safe to enable by default: every reviewer that
-   * does not opt into the structured findings schema keeps its full blocking power.
-   */
-  it("never downgrades a REVISE with no findings at all (prose-only reviewer)", () => {
-    for (const findings of [undefined, []]) {
-      const result = applyReviewSeverityGate({ verdict: "REVISE", findings, threshold: "critical" });
-      expect(result.verdict).toBe("REVISE");
-      expect(result.downgraded).toBe(false);
-    }
+  it("downgrades a prose-only REVISE with undefined findings", () => {
+    const result = applyReviewSeverityGate({ verdict: "REVISE", findings: undefined, threshold: "critical" });
+    expect(result).toMatchObject({ verdict: "APPROVE_WITH_NOTES", downgraded: true, blocking: [], advisory: [] });
+  });
+
+  it("downgrades a REVISE with an empty findings array", () => {
+    const result = applyReviewSeverityGate({ verdict: "REVISE", findings: [], threshold: "critical" });
+    expect(result).toMatchObject({ verdict: "APPROVE_WITH_NOTES", downgraded: true, blocking: [], advisory: [] });
   });
 
   it("never downgrades when any finding is unclassified", () => {
@@ -141,13 +149,11 @@ describe("applyReviewSeverityGate", () => {
     expect(result.downgraded).toBe(false);
   });
 
-  it("keeps an all-resolved REVISE fail-closed while exposing only audit receipts", () => {
-    const result = applyReviewSeverityGate({
-      verdict: "REVISE",
-      findings: [finding({ id: "receipt", severity: "critical", resolution: "resolved-in-review" })],
-      threshold: "any",
-    });
-    expect(result).toMatchObject({ verdict: "REVISE", downgraded: false, blocking: [], advisory: [] });
+  it("downgrades an all-resolved REVISE while exposing only audit receipts", () => {
+    const receipt = finding({ id: "receipt", severity: "critical", resolution: "resolved-in-review" });
+    expect(isActionableReviewFinding(receipt)).toBe(false);
+    const result = applyReviewSeverityGate({ verdict: "REVISE", findings: [receipt], threshold: "any" });
+    expect(result).toMatchObject({ verdict: "APPROVE_WITH_NOTES", downgraded: true, blocking: [], advisory: [] });
     expect(result.resolved.map((item) => item.id)).toEqual(["receipt"]);
   });
 
@@ -196,5 +202,12 @@ describe("formatFindingsByPriority", () => {
     expect(formatFindingsByPriority([receipt])).toBe("");
     expect(formatResolvedFindings([receipt])).toContain("Already resolved during this review pass — do NOT redo");
     expect(formatResolvedFindings([receipt])).toContain("[resolved-in-review]");
+  });
+
+  it("renders an adjudicated dispute as a resolved receipt, never an actionable obligation", () => {
+    const upheld = finding({ id: "upheld", title: "Reviewer upheld", body: "The dispute was not accepted", resolution: "dispute-upheld" });
+    expect(isOpenWorkflowReviewFinding(upheld)).toBe(false);
+    expect(formatFindingsByPriority([upheld])).toBe("");
+    expect(formatResolvedFindings([upheld])).toContain("[dispute-upheld]");
   });
 });

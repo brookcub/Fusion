@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import "../executor-test-helpers.js";
 import { TaskExecutor } from "../../executor.js";
+import { runWorkflowMergeAttemptNode } from "../../workflows/workflow-merge-nodes.js";
 import { createMockStore, resetExecutorMocks } from "../executor-test-helpers.js";
 import type { TaskDetail } from "@fusion/core";
 
@@ -75,6 +76,28 @@ function logText(store: ReturnType<typeof createMockStore>): string {
   return store.logEntry.mock.calls.map((call: unknown[]) => call[1]).join("\n");
 }
 
+async function produceImplementationIncompleteMergeNodeValue(task: TaskDetail): Promise<string> {
+  const requestMerge = vi.fn().mockResolvedValue({
+    outcome: "failure",
+    value: "implementation-incomplete",
+    data: { status: "failed", reason: "implementation-incomplete" },
+  });
+  const result = await runWorkflowMergeAttemptNode({
+    primitives: { requestMerge, audit: vi.fn() },
+  }, {
+    run: { runId: "run-implementation-incomplete", taskId: task.id, workflowId: "builtin:coding" },
+    node: { node: { id: "merge-attempt", kind: "merge-attempt" } },
+  }, task);
+
+  expect(requestMerge).toHaveBeenCalledTimes(1);
+  expect(result).toMatchObject({
+    outcome: "failure",
+    value: "implementation-incomplete",
+    contextPatch: { "workflow:merge-status": "implementation-incomplete" },
+  });
+  return result.value!;
+}
+
 describe("merge-node paused-abort retry classification (FN-6735)", () => {
   beforeEach(() => {
     resetExecutorMocks();
@@ -116,8 +139,12 @@ describe("merge-node paused-abort retry classification (FN-6735)", () => {
   });
 
   it("allows shared-branch-group local integration to retry even when global autoMerge is off", async () => {
+    // FN-8823 (3dd824d04e): under project auto-merge Off, a shared-branch member is HELD unless its
+    // task explicitly opts in with autoMerge: true (see AGENTS.md "autoMerge: false callout"). The
+    // invariant this test guards — shared local integration retries under global Off — now requires
+    // that explicit member opt-in; an undefined member autoMerge is fenced by design.
     const { store, task, executor, mergeRequester } = makeHarness({
-      autoMerge: undefined,
+      autoMerge: true,
       branchContext: { groupId: "BG-6735", source: "mission", assignmentMode: "shared" },
     }, { autoMerge: false });
 
@@ -316,6 +343,59 @@ describe("merge-node paused-abort retry classification (FN-6735)", () => {
     "merge-retry",
   ] as const;
 
+  it.each(["merge-attempt", "merge"] as const)("routes primitive-produced implementation-incomplete no-proof failure at node %s without requesting no-op merge", async (nodeId) => {
+    const { store, task, executor, mergeRequester } = makeHarness({
+      steps: [],
+      currentStep: 0,
+      branch: null,
+      worktree: null,
+      modifiedFiles: undefined,
+      workflowStepResults: undefined,
+      paused: false,
+    } as Partial<TaskDetail>);
+    (executor as any).addActiveWorktree(task.id, "/tmp/fusion-fn-9166-fail-closed");
+
+    const value = await produceImplementationIncompleteMergeNodeValue(task);
+    await invokeGraphFailure(executor, task, nodeId, value);
+
+    expect(mergeRequester).not.toHaveBeenCalled();
+    expect(store.updateTask).toHaveBeenCalledWith(
+      task.id,
+      expect.objectContaining({
+        status: "failed",
+        error: expect.stringContaining("implementation incomplete with no executable proof to resume"),
+      }),
+      undefined,
+    );
+    expect(logText(store)).toContain(`Workflow graph merge blocked at node '${nodeId}': implementation incomplete with no executable proof to resume — failing instead of retrying merge`);
+    expect((executor as any).activeWorktrees.has(task.id)).toBe(false);
+  });
+
+  it.each(["merge-attempt", "merge"] as const)("routes primitive-produced implementation-incomplete resumable failure at node %s without requesting merge", async (nodeId) => {
+    const worktreePath = "/tmp/fusion-fn-9166-resumable";
+    const { store, task, executor, mergeRequester } = makeHarness({
+      steps: [
+        { name: "Preflight", status: "done" },
+        { name: "Implement", status: "pending" },
+      ],
+      currentStep: 1,
+      branch: "fusion/fn-9166-resumable",
+      worktree: worktreePath,
+      modifiedFiles: undefined,
+      workflowStepResults: undefined,
+      paused: false,
+    } as Partial<TaskDetail>);
+    (executor as any).addActiveWorktree(task.id, worktreePath);
+
+    const value = await produceImplementationIncompleteMergeNodeValue(task);
+    await invokeGraphFailure(executor, task, nodeId, value);
+
+    expect(mergeRequester).not.toHaveBeenCalled();
+    expect(store.moveTask).toHaveBeenCalledWith(task.id, "in-progress", expect.objectContaining({ preserveProgress: true }));
+    expect(logText(store)).toContain(`Workflow graph failed at node '${nodeId}' (implementation-incomplete) with incomplete steps — resuming execution in 'in-progress'`);
+    expect((executor as any).getActiveWorktreePaths(task.id)).toEqual([worktreePath]);
+  });
+
   it.each(implementationIncompleteMergeNodes)("fails implementation-incomplete no-proof merge pause abort at node %s without requesting no-op merge", async (nodeId) => {
     const { store, task, executor, mergeRequester } = makeHarness({
       steps: [],
@@ -389,14 +469,14 @@ describe("merge-node paused-abort retry classification (FN-6735)", () => {
 
     expect(mergeRequester).not.toHaveBeenCalled();
     expect(store.updateTask).toHaveBeenCalledWith(task.id, { status: null, error: null }, undefined);
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo", expect.objectContaining({
+    expect(store.moveTask).toHaveBeenCalledWith(task.id, "in-progress", expect.objectContaining({
       preserveProgress: true,
       moveSource: "engine",
       recoveryRehome: true,
     }));
     expect(store.moveTask).not.toHaveBeenCalledWith(task.id, "done", expect.anything());
     const messages = logText(store);
-    expect(messages).toContain(`Workflow graph failed at node '${nodeId}' (implementation-incomplete) with incomplete steps — moved back to todo for execution resume`);
+    expect(messages).toContain(`Workflow graph failed at node '${nodeId}' (implementation-incomplete) with incomplete steps — resuming execution in 'in-progress'`);
     expect(messages).not.toContain("routed to bounded auto-merge retry after benign pause/resume abort");
   });
 
@@ -466,13 +546,13 @@ describe("merge-node paused-abort retry classification (FN-6735)", () => {
       expect.objectContaining({ paused: false, pausedReason: null }),
       undefined,
     );
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo", expect.objectContaining({
+    expect(store.moveTask).toHaveBeenCalledWith(task.id, "in-progress", expect.objectContaining({
       preserveProgress: true,
       moveSource: "engine",
       recoveryRehome: true,
     }));
     const messages = logText(store);
-    expect(messages).toContain("Workflow graph failed at node 'merge' (implementation-incomplete) with incomplete steps — moved back to todo for execution resume");
+    expect(messages).toContain("Workflow graph failed at node 'merge' (implementation-incomplete) with incomplete steps — resuming execution in 'in-progress'");
     expect(messages).not.toContain("operator action required");
     // Resumable path keeps active registration so the preserved worktree stays counted.
     expect((executor as any).activeWorktrees.has(task.id)).toBe(true);
@@ -498,7 +578,7 @@ describe("merge-node paused-abort retry classification (FN-6735)", () => {
     await invokeGraphFailure(executor, task, "merge-gate", "implementation-incomplete");
 
     expect(mergeRequester).not.toHaveBeenCalled();
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo", expect.objectContaining({ preserveProgress: true }));
+    expect(store.moveTask).toHaveBeenCalledWith(task.id, "in-progress", expect.objectContaining({ preserveProgress: true }));
     expect((executor as any).activeWorktrees.has(task.id)).toBe(true);
     expect((executor as any).getActiveWorktreePaths(task.id)).toEqual([worktreePath]);
   });

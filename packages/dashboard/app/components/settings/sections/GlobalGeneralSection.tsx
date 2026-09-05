@@ -49,12 +49,22 @@ export function GlobalGeneralSection({ form, setForm }: GlobalGeneralSectionProp
       />
       <SettingsToggleRow
         descriptor={{
-          key: "persistAgentToolOutput",
-          label: t("settings.globalGeneral.saveToolOutputInAgentLogs", " Save tool output in agent logs "),
-          help: t("settings.globalGeneral.whenDisabledToolRowsAreStillLoggedBut", " When disabled, tool rows are still logged but detailed tool payloads are omitted. Very large tool payloads may still be clipped even when this stays enabled. Default: disabled. "),
+          key: "quickAddSubmitOnEnter",
+          label: t("settings.globalGeneral.quickAddSubmitOnEnter", " Press Enter to save a task in Quick Add "),
+          help: t("settings.globalGeneral.quickAddSubmitOnEnterHint", " Default: enabled. When disabled, Enter inserts a newline and Cmd/Ctrl+Enter saves. "),
           scope: "global",
         }}
-        value={form.persistAgentToolOutput === true}
+        value={form.quickAddSubmitOnEnter !== false}
+        onChange={(v) => setForm((f) => ({ ...f, quickAddSubmitOnEnter: v === true }))}
+      />
+      <SettingsToggleRow
+        descriptor={{
+          key: "persistAgentToolOutput",
+          label: t("settings.globalGeneral.saveToolOutputInAgentLogs", " Save tool output in agent logs "),
+          help: t("settings.globalGeneral.whenDisabledToolRowsAreStillLoggedBut", " When disabled, tool rows are still logged but detailed tool payloads are omitted. Very large tool payloads may still be clipped even when this stays enabled. Default: enabled. "),
+          scope: "global",
+        }}
+        value={form.persistAgentToolOutput !== false}
         onChange={(v) => setForm((f) => ({ ...f, persistAgentToolOutput: v === true }))}
       />
       <SettingsToggleRow
@@ -174,32 +184,35 @@ export function GlobalGeneralSection({ form, setForm }: GlobalGeneralSectionProp
         }))}
       />
       {/*
-        FNXC:AutoUpdate 2026-07-25-10:05:
-        Operator opt-in for unattended updates, placed directly under the release channel it
-        follows. Default OFF: Fusion must not replace its own install and bounce the process
-        without being told to. Only effective on a supervised host (`fn dashboard`), which is
-        the default launch path; the server-side watcher logs and skips otherwise.
+        FNXC:UpdateAutomation 2026-08-21-02:17:
+        The dashboard exposes independent install and restart choices directly
+        below the channel. The old combined preference remains persisted only as
+        a compatibility fallback and must not create a third visible control.
       */}
       <SettingsToggleRow
         descriptor={{
-          key: "autoUpdateAndRestart",
-          label: t("settings.globalGeneral.autoUpdateAndRestart", " Auto-update and restart "),
-          help: t("settings.globalGeneral.autoUpdateAndRestartHelp", " When enabled, Fusion installs available updates on the selected release channel by itself and then restarts to apply them — the same install + restart the \"Update now\" button performs, without asking. Requires a supervising parent (the default for `fn dashboard`); hosts started with --no-supervise skip the install. Default: disabled. "),
+          key: "autoUpdateEnabled",
+          label: t("settings.globalGeneral.autoUpdateEnabled", " Automatically install updates "),
+          help: t("settings.globalGeneral.autoUpdateEnabledHelp", " Installs updates from the selected release channel during the background update check. Unset: disabled. "),
           scope: "global",
         }}
-        value={form.autoUpdateAndRestart === true}
-        onChange={(v) => setForm((f) => ({ ...f, autoUpdateAndRestart: v === true }))}
+        value={form.autoUpdateEnabled === true || (form.autoUpdateEnabled === undefined && form.autoUpdateAndRestart === true)}
+        onChange={(v) => setForm((f) => ({ ...f, autoUpdateEnabled: v === true }))}
       />
       <SettingsToggleRow
         descriptor={{
-          key: "autoReloadOnVersionChange",
-          label: t("settings.globalGeneral.autoReloadDashboardOnVersionChange", " Auto-reload dashboard on version change "),
-          help: t("settings.globalGeneral.whenEnabledDefaultTheDashboardAutomaticallyReloadsWhen", " When enabled (default), the dashboard automatically reloads when it detects a new build version \u2014 either from server rebuilds or service worker updates. Disable this to stay on the current version until you manually refresh. Default: enabled. "),
+          key: "autoRestartAfterUpdate",
+          label: t("settings.globalGeneral.autoRestartAfterUpdate", " Automatically restart after an update "),
+          help: t("settings.globalGeneral.autoRestartAfterUpdateHelp", " After a dashboard update installs, requests a supervised restart. Without a supervisor, Fusion keeps the manual restart path. Unset: disabled. "),
           scope: "global",
         }}
-        value={form.autoReloadOnVersionChange !== false}
-        onChange={(v) => setForm((f) => ({ ...f, autoReloadOnVersionChange: v === true }))}
+        value={form.autoRestartAfterUpdate === true || (form.autoRestartAfterUpdate === undefined && form.autoUpdateAndRestart === true)}
+        onChange={(v) => setForm((f) => ({ ...f, autoRestartAfterUpdate: v === true }))}
       />
+      {/*
+        FNXC:VersionAutoReload 2026-08-23-04:03:
+        Reloading after a detected build-version change is mandatory to prevent tabs from running deleted bundles. It deliberately has no Settings control.
+      */}
     </>);
 }
 export default GlobalGeneralSection;

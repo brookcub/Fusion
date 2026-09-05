@@ -25,10 +25,11 @@ const openModelPortal = async () => {
 };
 
 describe("ChatThinkingLevelControl with the real CustomModelDropdown portal", () => {
-  it("keeps the brain popup open for pointerdown inside the portaled model menu, then selects the model normally", async () => {
+  it("keeps the brain popup open for pointerdown inside the readable portaled model menu, then selects the model normally", async () => {
     const onChangeModel = vi.fn();
     const portal = await openModelPortalWithRender({ onChangeModel });
 
+    expect(portal).toHaveAttribute("data-menu-width", "readable");
     fireEvent.pointerDown(portal);
 
     expect(screen.getByTestId("chat-thinking-popover")).toBeInTheDocument();
@@ -37,7 +38,16 @@ describe("ChatThinkingLevelControl with the real CustomModelDropdown portal", ()
     fireEvent.click(within(portal).getByText("GPT-4o"));
 
     expect(onChangeModel).toHaveBeenCalledWith({ modelProvider: "openai", modelId: "gpt-4o" });
-    await waitFor(() => expect(screen.queryByTestId("chat-thinking-popover")).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("chat-thinking-popover")).toBeInTheDocument());
+  });
+
+  it("keeps the brain popup open for touchstart inside the portaled model menu", async () => {
+    const portal = await openModelPortalWithRender({ onChangeModel: vi.fn() });
+
+    fireEvent.touchStart(portal);
+
+    expect(screen.getByTestId("chat-thinking-popover")).toBeInTheDocument();
+    expect(screen.getByTestId("model-combobox-portal")).toBeInTheDocument();
   });
 
   it("still closes the brain popup for a genuine outside pointerdown", async () => {
@@ -59,9 +69,8 @@ describe("ChatThinkingLevelControl with the real CustomModelDropdown portal", ()
     fireEvent.click(screen.getByTestId("chat-thinking-mode-agent"));
     fireEvent.click(screen.getByTestId("chat-thinking-agent-agent-002"));
     expect(onChangeModel).toHaveBeenCalledWith({ agentId: "agent-002" });
-    expect(screen.queryByTestId("chat-thinking-popover")).not.toBeInTheDocument();
+    expect(screen.getByTestId("chat-thinking-popover")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByTestId("chat-thinking-btn"));
     fireEvent.click(screen.getByTestId("chat-thinking-option-high"));
     expect(onChange).toHaveBeenCalledWith("high");
     expect(screen.queryByTestId("chat-thinking-popover")).not.toBeInTheDocument();

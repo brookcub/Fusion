@@ -1,5 +1,119 @@
 # @fusion/i18n
 
+## 0.39.37-beta.2
+
+### Patch Changes
+
+- @fusion/core@0.78.0-beta.2
+
+## 0.39.37-beta.1
+
+### Patch Changes
+
+- @fusion/core@0.78.0-beta.1
+
+## 0.39.37-beta.0
+
+### Patch Changes
+
+- @fusion/core@0.78.0-beta.0
+
+## 0.39.36
+
+### Patch Changes
+
+- @fusion/core@0.77.0
+
+## 0.39.36-beta.14
+
+### Patch Changes
+
+- @fusion/core@0.77.0-beta.14
+
+## 0.39.36-beta.13
+
+### Patch Changes
+
+- @fusion/core@0.77.0-beta.13
+
+## 0.39.36-beta.12
+
+### Patch Changes
+
+- @fusion/core@0.77.0-beta.12
+
+## 0.39.36-beta.11
+
+### Patch Changes
+
+- @fusion/core@0.77.0-beta.11
+
+## 0.39.36-beta.10
+
+### Patch Changes
+
+- @fusion/core@0.77.0-beta.10
+
+## 0.39.36-beta.9
+
+### Patch Changes
+
+- @fusion/core@0.77.0-beta.9
+
+## 0.39.36-beta.8
+
+### Patch Changes
+
+- @fusion/core@0.77.0-beta.8
+
+## 0.39.36-beta.7
+
+### Patch Changes
+
+- @fusion/core@0.77.0-beta.7
+
+## 0.39.36-beta.6
+
+### Patch Changes
+
+- @fusion/core@0.77.0-beta.6
+
+## 0.39.36-beta.5
+
+### Patch Changes
+
+- @fusion/core@0.77.0-beta.5
+
+## 0.39.36-beta.4
+
+### Patch Changes
+
+- @fusion/core@0.77.0-beta.4
+
+## 0.39.36-beta.3
+
+### Patch Changes
+
+- @fusion/core@0.77.0-beta.3
+
+## 0.39.36-beta.2
+
+### Patch Changes
+
+- @fusion/core@0.77.0-beta.2
+
+## 0.39.36-beta.1
+
+### Patch Changes
+
+- @fusion/core@0.77.0-beta.1
+
+## 0.39.36-beta.0
+
+### Patch Changes
+
+- @fusion/core@0.77.0-beta.0
+
 ## 0.39.35
 
 ### Patch Changes

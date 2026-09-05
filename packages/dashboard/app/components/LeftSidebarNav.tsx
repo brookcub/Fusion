@@ -14,6 +14,7 @@ import {
   Clock,
   FileText,
   Gauge,
+  History,
   Lightbulb,
   LayoutGrid,
   List,
@@ -105,7 +106,7 @@ function persistCollapsed(collapsed: boolean): void {
 export interface LeftSidebarNavProps {
   view: TaskView;
   onChangeView: (view: TaskView) => void;
-  onNewTask?: () => void;
+  onNewTask?: (workflowId?: string | null) => void;
   onOpenSettings?: () => void;
   mailboxUnreadCount?: number;
   mailboxPendingApprovalCount?: number;
@@ -282,7 +283,7 @@ export function LeftSidebarNav({
 
   /*
   FNXC:Navigation 2026-06-22-12:00:
-  Single explicit sidebar order (top to bottom): board, list, graph, agents, chat, mailbox, planning, missions, goals, compound, automation, import, workflows, insight, research, ideation, command-center, documents (Artifacts), skills, memory, evals, then any remaining plugin views in their sorted order.
+  Single explicit sidebar order (top to bottom): dashboard, board, list, History, graph, planning, missions, agents, chat, mailbox, goals, compound, automation, import, workflows, insight, research, ideation, documents (Artifacts), skills, memory, evals, then any remaining plugin views in their sorted order.
 
   Dev Server is intentionally absent: it moved to the right dock. Secrets and Todos remain omitted (they live in the right dock / mobile More-sheet / Header overflow).
 
@@ -320,6 +321,15 @@ export function LeftSidebarNav({
       icon: List,
       testId: "sidebar-nav-list",
       onSelect: () => onChangeView("list"),
+    },
+    {
+      id: "patchnode",
+      label: t("nav.patchnode", getDashboardViewLabel("patchnode")),
+      view: "patchnode",
+      isActive: view === "patchnode",
+      icon: History,
+      testId: "sidebar-nav-patchnode",
+      onSelect: () => onChangeView("patchnode"),
     },
     ...(graphPluginEntry ? [mapPluginEntry(graphPluginEntry)] : []),
     /*
@@ -504,7 +514,7 @@ export function LeftSidebarNav({
             aria-label={newTaskLabel}
             title={newTaskLabel}
             data-testid="sidebar-nav-new-task"
-            onClick={onNewTask}
+            onClick={() => onNewTask()}
           >
             <Plus size={16} />
             <span className="left-sidebar-nav__label">{newTaskLabel}</span>

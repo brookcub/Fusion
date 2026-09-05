@@ -1,3 +1,5 @@
+import { emitBoundedRunAudit } from "../run-audit/emit-bounded-run-audit.js";
+/* FNXC:RunAudit 2026-08-20-05:49: FN-9177 bounds optional audit telemetry so a hostile sink cannot alter this lifecycle path. */
 import { createLogger } from "../process/logger.js";
 import { resolveLegacyStampReviewColumns } from "./task-store-helpers.js";
 
@@ -19,7 +21,9 @@ import {randomUUID} from "node:crypto";
 import {mkdir, readFile, writeFile, rename, unlink} from "node:fs/promises";
 import {join} from "node:path";
 import {existsSync} from "node:fs";
-import type {Task, TaskCreateInput, TaskAttachment, BoardConfig, ActivityLogEntry, ActivityEventType, Artifact, ArtifactCreateInput, RunMutationContext, MergeQueueEntry, BranchGroup, BranchGroupUpdate, CompletionHandoffMarker, WorkflowWorkItem, WorkflowWorkItemKind, PrEntity, PrEntityUpdate, TaskRecommendation} from "../types.js";
+import { getTaskActivityLogEntryLimit } from "./comments.js";
+import type { TaskLogEntry } from "../types.js";
+import type {Task, TaskCreateInput, TaskAttachment, BoardConfig, ActivityLogEntry, ActivityEventType, Artifact, ArtifactCreateInput, RunMutationContext, MergeQueueEntry, BranchGroup, BranchGroupUpdate, CompletionHandoffMarker, WorkflowWorkItem, WorkflowWorkItemKind, PrEntity, PrEntityUpdate, TaskRecommendation, WorkspaceWorktreeEntry, TaskRepositoryScope} from "../types.js";
 import { CONFIG_CHANGED_BY_SYSTEM } from "../types.js";
 import {validateSettingValuePatch, WorkflowSettingRejectionError} from "../workflows/workflow-settings.js";
 import "../builtin-traits.js";
@@ -28,8 +32,12 @@ import {resolveSameAgentDuplicateIntake} from "./task-creation.js";
 import {type TaskRow, TASK_COLUMN_DESCRIPTORS} from "../task-store/persistence.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
 import {assertSafeGitBranchName} from "../task-store/shell-safety.js";
+import {isFusionDeletableBranch} from "../branch/branch-assignment.js";
 import {readTaskRow as readTaskRowAsync, readTaskRowInTransaction, resolveActiveTaskWedgeEpisodeRow} from "../task-store/async/async-persistence.js";
-import {upsertArchivedTaskEntry} from "./async/async-archive-lineage.js";
+import {findArchivedTaskEntry, upsertArchivedTaskEntry} from "./async/async-archive-lineage.js";
+import { appendPatchnodeEntry } from "./async/async-patchnode.js";
+import { buildPatchnodeEntryInput } from "../board/patchnode.js";
+import { resolveProjectColumnsForRoles } from "../project-lane-vocabulary.js";
 import {purgeTaskWorkflowSelectionRowsAsyncImpl} from "./workflow-definitions.js";
 import * as schema from "../postgres/schema/index.js";
 import {and, asc, eq, inArray, isNotNull, isNull, sql} from "drizzle-orm";
@@ -43,10 +51,12 @@ import {insertArtifactRow as insertArtifactRowAsync} from "../task-store/async/a
 import {appendConfigurationRevision, createConfigurationRevision, getConfigurationRevision, rollbackConfiguration} from "../async-stores/async-configuration-revision-store.js";
 import {readProjectConfig, writeProjectConfig} from "./async/async-settings.js";
 import {publishSettingsUpdated} from "./settings-ops.js";
+import {loadWorkspaceConfig} from "../git/git-repository.js";
 import { mergeRestoredProjectSettings } from "../config/settings-schema.js";
 import type {ConfigChangedBy, ConfigurationRevision} from "../types.js";
 import { resolveArchivedLanes } from "../project-lane-vocabulary.js";
 import { acquireTaskAdvisoryXactLock } from "./task-advisory-lock.js";
+import { invalidateSupersededRepositoryScopeReviews } from "../tasks/repository-scope.js";
 
 export function getTaskSelectClauseWithActivityLogLimitImpl(store: TaskStore, limit: number): string {
     const columns = [
@@ -55,7 +65,7 @@ export function getTaskSelectClauseWithActivityLogLimitImpl(store: TaskStore, li
       "modelPresetId", "modelProvider", "credentialInstanceId", "modelId",
       "validatorModelProvider", "validatorCredentialInstanceId", "validatorModelId",
       "planningModelProvider", "planningCredentialInstanceId", "planningModelId", "mergerModelProvider", "mergerCredentialInstanceId", "mergerModelId",
-      "mergeRetries", "workflowStepRetries", "stuckKillCount", "resumeLimboCount", "executeRequeueLoopCount", "graphResumeRetryCount", "consecutiveToolFailureRetryCount", "executorEscalationAttempted", "toolFailureDetectorLogCursor", "toolFailureRetryExhaustedAuditEmitted", "resumeLimboTipSha", "resumeLimboStepSignature", "executeRequeueLoopSignature", "postReviewFixCount", "planReviewReplanCount", "recoveryRetryCount", "taskDoneRetryCount", "bulkCompletionRefusalAt", "worktreeSessionRetryCount", "completionHandoffLimboRecoveryCount", "verificationFailureCount", "mergeConflictBounceCount", "mergeAuditBounceCount", "mergeTransientRetryCount", "branchConflictRecoveryCount", "reviewerContextRetryCount", "reviewerFallbackRetryCount", "nextRecoveryAt",
+      "mergeRetries", "aiMergeReviewReconciliation", "workflowStepRetries", "stuckKillCount", "resumeLimboCount", "executeRequeueLoopCount", "graphResumeRetryCount", "consecutiveToolFailureRetryCount", "executorEscalationAttempted", "toolFailureDetectorLogCursor", "toolFailureRetryExhaustedAuditEmitted", "resumeLimboTipSha", "resumeLimboStepSignature", "executeRequeueLoopSignature", "postReviewFixCount", "planReviewReplanCount", "recoveryRetryCount", "sessionContentionHoldCount", "sessionContentionWaitReason", "taskDoneRetryCount", "bulkCompletionRefusalAt", "worktreeSessionRetryCount", "completionHandoffLimboRecoveryCount", "verificationFailureCount", "mergeConflictBounceCount", "mergeAuditBounceCount", "mergeTransientRetryCount", "branchConflictRecoveryCount", "reviewerContextRetryCount", "reviewerFallbackRetryCount", "reviewConvergenceStage", "reviewConvergenceEscalationCount", "nextRecoveryAt",
       // FNXC:WorkflowIrPin 2026-07-19-03:10 (U9b / KTD-3 + KTD-8): this projection is a SECOND
       // copy of the slim column list (see getTaskSelectClauseImpl2). The IR pin, its node entry,
       // and the adoption stamp must appear in BOTH or a task read through this path reads as
@@ -65,8 +75,8 @@ export function getTaskSelectClauseWithActivityLogLimitImpl(store: TaskStore, li
       "tokenUsageInputTokens", "tokenUsageOutputTokens", "tokenUsageCachedTokens", "tokenUsageCacheWriteTokens", "tokenUsageTotalTokens", "tokenUsageFirstUsedAt", "tokenUsageLastUsedAt", "tokenUsageModelProvider", "tokenUsageModelId", "tokenUsagePerModel", "tokenBudgetSoftAlertedAt", "tokenBudgetHardAlertedAt", "tokenBudgetOverride",
       "createdAt", "updatedAt", "columnMovedAt", "firstExecutionAt", "cumulativeActiveMs", "cumulativePlanningMs", "planningStartedAt", "executionStartedAt", "executionCompletedAt",
       "dependencies", "steps", "customFields", "attachments", "steeringComments",
-      "comments", "review", "reviewState", "workflowStepResults", "prInfo", "prInfos", "issueInfo", "githubTracking", "sourceIssueProvider", "sourceIssueRepository", "sourceIssueExternalIssueId", "sourceIssueNumber", "sourceIssueUrl", "sourceIssueClosedAt", "mergeDetails", "workspaceWorktrees",
-      "breakIntoSubtasks", "noCommitsExpected", "enabledWorkflowSteps", "modifiedFiles", "declaredSymbols",
+      "comments", "review", "reviewState", "workflowStepResults", "prInfo", "prInfos", "issueInfo", "githubTracking", "sourceIssueProvider", "sourceIssueRepository", "sourceIssueExternalIssueId", "sourceIssueNumber", "sourceIssueUrl", "sourceIssueClosedAt", "mergeDetails", "workspaceWorktrees", "repositoryScope", "externalBlock",
+      "noCommitsExpected", "enabledWorkflowSteps", "modifiedFiles", "declaredSymbols",
       "missionId", "sliceId", "scopeOverride", "scopeOverrideReason", "scopeAutoWiden", "assignedAgentId", "pausedByAgentId", "assigneeUserId", "nodeId", "effectiveNodeId", "effectiveNodeSource",
       "sourceType", "sourceAgentId", "sourceRunId", "sourceSessionId", "sourceMessageId", "sourceParentTaskId", "sourceMetadata",
       "checkedOutBy", "checkedOutAt", "checkoutNodeId", "checkoutRunId", "checkoutLeaseRenewedAt", "checkoutLeaseEpoch", "deletedAt", "allowResurrection",
@@ -378,6 +388,155 @@ export async function updateTaskAtomicImpl(store: TaskStore, id: string, updater
     });
   }
 
+export type FencedWorkflowStepResultsPatch = Pick<
+  Task,
+  "workflowStepResults"
+  | "approvedPlanFingerprint"
+  | "reviewConvergenceStage"
+  | "reviewConvergenceEscalationCount"
+>;
+
+export type WorkflowStepResultsFencedCompute = (
+  current: Task,
+) => FencedWorkflowStepResultsPatch | null;
+
+export type WorkflowStepResultsFencedUpdateResult =
+  | { applied: true; task: Task }
+  | {
+    applied: false;
+    reason: "refused" | "no-op" | "unavailable" | "task-missing" | "task-deleted";
+  };
+
+/*
+FNXC:WorkflowStepResults 2026-08-29-02:04:
+FN-249 makes durable graph step-result writes contend with resetTaskPublicationImpl's exact
+transaction-scoped task advisory lock. withTaskLock and updateTaskAtomic are in-process promise
+chains and do not order against Reset; the planning lifecycle lock is also disjoint because Reset
+never takes it. Acquire the advisory lock before reading or writing the task row, then compute the
+field-bounded patch from that in-transaction row. This primitive deliberately does not take
+withTaskWorkflowSerialization because it touches no workflow-work-item rows.
+
+The compute callback is synchronous and pure. It executes while the task lock and PostgreSQL
+transaction are open, so awaiting a store method can deadlock on the non-reentrant task lock or
+starve the connection pool. The engine supplies the abort re-check and startedAt attempt CAS in
+this closure, after Reset's transaction has either committed or released its lock.
+*/
+export async function updateWorkflowStepResultsFencedImpl(
+  store: TaskStore,
+  id: string,
+  compute: WorkflowStepResultsFencedCompute,
+): Promise<WorkflowStepResultsFencedUpdateResult> {
+  const layer = store.asyncLayer;
+  if (!layer) return { applied: false, reason: "unavailable" };
+
+  return store.withTaskLock(id, async () => {
+    const outcome = await layer.transactionImmediate(async (tx): Promise<WorkflowStepResultsFencedUpdateResult> => {
+      await acquireTaskAdvisoryXactLock(tx, layer.projectId, id);
+      const row = await readTaskRowInTransaction(tx, id, { includeDeleted: true }, layer.projectId);
+      if (!row) return { applied: false, reason: "task-missing" };
+      if (row.deletedAt) return { applied: false, reason: "task-deleted" };
+
+      const current = store.rowToTask(store.pgRowToTaskRow(row));
+      const patch = compute(current);
+      if (patch === null) return { applied: false, reason: "refused" };
+      const patchKeys = Object.keys(patch) as Array<keyof FencedWorkflowStepResultsPatch>;
+      if (patchKeys.length === 0) return { applied: false, reason: "no-op" };
+
+      const values: {
+        workflowStepResults?: Task["workflowStepResults"];
+        approvedPlanFingerprint?: string | null;
+        reviewConvergenceStage?: number | null;
+        reviewConvergenceEscalationCount?: number | null;
+        updatedAt: string;
+      } = { updatedAt: new Date().toISOString() };
+      if (Object.prototype.hasOwnProperty.call(patch, "workflowStepResults")) {
+        values.workflowStepResults = patch.workflowStepResults ?? [];
+      }
+      if (Object.prototype.hasOwnProperty.call(patch, "approvedPlanFingerprint")) {
+        values.approvedPlanFingerprint = patch.approvedPlanFingerprint ?? null;
+      }
+      if (Object.prototype.hasOwnProperty.call(patch, "reviewConvergenceStage")) {
+        values.reviewConvergenceStage = patch.reviewConvergenceStage ?? null;
+      }
+      if (Object.prototype.hasOwnProperty.call(patch, "reviewConvergenceEscalationCount")) {
+        values.reviewConvergenceEscalationCount = patch.reviewConvergenceEscalationCount ?? null;
+      }
+
+      const [updatedRow] = await tx.update(schema.project.tasks).set(values).where(and(
+        eq(schema.project.tasks.id, id),
+        taskProjectScope(layer),
+        isNull(schema.project.tasks.deletedAt),
+      )).returning();
+      if (!updatedRow) return { applied: false, reason: "task-missing" };
+      return { applied: true, task: store.rowToTask(store.pgRowToTaskRow(updatedRow)) };
+    });
+
+    if (outcome.applied) {
+      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
+      store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
+    }
+    return outcome;
+  });
+}
+
+/**
+ * FNXC:LifecycleContainment 2026-08-30-13:36:
+ * FN-267: a review-remediation refusal has two durable effects that must not separate — the marker
+ * that stops the card being re-attempted, and the entry that explains it to an operator. Writing
+ * them through two calls leaves a cross-process window in which a newer review round replaces the
+ * result, so an overtaken engine persists both for a round it no longer owns.
+ *
+ * This is deliberately a SEPARATE primitive rather than a `log` field on
+ * {@link updateWorkflowStepResultsFencedImpl}: that writer is the workflow graph's durable
+ * step-result path, and widening it would put a high-blast-radius seam inside this change. Both
+ * take the same advisory transaction lock, so they serialize against each other across processes.
+ */
+export async function updateWorkflowStepResultsWithLogFencedImpl(
+  store: TaskStore,
+  id: string,
+  compute: (current: Task) => { workflowStepResults: Task["workflowStepResults"]; logEntry: TaskLogEntry } | null,
+): Promise<WorkflowStepResultsFencedUpdateResult> {
+  const layer = store.asyncLayer;
+  if (!layer) return { applied: false, reason: "unavailable" };
+
+  return store.withTaskLock(id, async () => {
+    const outcome = await layer.transactionImmediate(async (tx): Promise<WorkflowStepResultsFencedUpdateResult> => {
+      await acquireTaskAdvisoryXactLock(tx, layer.projectId, id);
+      const row = await readTaskRowInTransaction(tx, id, { includeDeleted: true }, layer.projectId);
+      if (!row) return { applied: false, reason: "task-missing" };
+      if (row.deletedAt) return { applied: false, reason: "task-deleted" };
+
+      const current = store.rowToTask(store.pgRowToTaskRow(row));
+      const patch = compute(current);
+      if (patch === null) return { applied: false, reason: "refused" };
+
+      const log = [...(current.log ?? []), patch.logEntry];
+      const entryLimit = getTaskActivityLogEntryLimit();
+      if (log.length > entryLimit) log.splice(0, log.length - entryLimit);
+
+      const [updatedRow] = await tx.update(schema.project.tasks).set({
+        workflowStepResults: patch.workflowStepResults ?? [],
+        log,
+        updatedAt: new Date().toISOString(),
+      }).where(and(
+        eq(schema.project.tasks.id, id),
+        taskProjectScope(layer),
+        isNull(schema.project.tasks.deletedAt),
+      )).returning();
+      if (!updatedRow) return { applied: false, reason: "task-missing" };
+      return { applied: true, task: store.rowToTask(store.pgRowToTaskRow(updatedRow)) };
+    });
+
+    if (outcome.applied) {
+      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
+      store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
+    }
+    return outcome;
+  });
+}
+
 /**
  * FNXC:TaskRecommendations 2026-08-08-06:52:
  * A recommendation link is a read-modify-write of one JSONB parent field. Dashboard processes
@@ -451,12 +610,340 @@ export async function linkTaskRecommendationImpl(
   });
 }
 
+export async function normalizeWorkspaceTaskWorktreeMetadataImpl(
+  store: TaskStore,
+  id: string,
+): Promise<Task> {
+  return store.withTaskLock(id, async () => {
+    const layer = store.asyncLayer!;
+    const outcome = await layer.transactionImmediate(async (tx) => {
+      /*
+      FNXC:WorkspaceRootRouting 2026-08-19-12:15:
+      A populated workspace configuration makes the singular task checkout fields stale routing
+      metadata. Clear those fields under the same project/task advisory transaction used by per-repo
+      merges, while leaving the JSON map untouched so concurrent acquisition or landing cannot lose a
+      sibling repository. The operation never inspects or mutates the filesystem.
+      */
+      await acquireTaskAdvisoryXactLock(tx, layer.projectId, id);
+      const row = await readTaskRowInTransaction(tx, id, { includeDeleted: true }, layer.projectId);
+      if (!row) throw new TaskNotFoundError(id);
+      if (row.deletedAt) throw new TaskDeletedError(id, row.deletedAt as string);
+
+      const current = store.rowToTask(store.pgRowToTaskRow(row));
+      const hasStaleSingularRouting = Boolean(
+        current.worktree
+        || current.branch
+        || current.executionStartBranch
+        || current.baseCommitSha,
+      );
+      if (!hasStaleSingularRouting) return { task: current, mutated: false };
+
+      const updatedAt = new Date().toISOString();
+      const [updatedRow] = await tx
+        .update(schema.project.tasks)
+        .set({
+          worktree: null,
+          branch: null,
+          executionStartBranch: null,
+          baseCommitSha: null,
+          updatedAt,
+        })
+        .where(and(eq(schema.project.tasks.id, id), taskProjectScope(layer)))
+        .returning();
+      if (!updatedRow) throw new TaskNotFoundError(id);
+      return { task: store.rowToTask(store.pgRowToTaskRow(updatedRow)), mutated: true };
+    });
+
+    if (outcome.mutated) {
+      /* FNXC:WorkspaceRootRouting 2026-08-19-12:15: sessionFile is a task.json-only resumable
+      handle. Reproject the row after the atomic singular-field clear so a root-bound legacy session
+      cannot be reopened on the next run. */
+      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
+      store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
+    }
+    return outcome.task;
+  });
+}
+
 /*
 FNXC:TaskWedgeNotifications 2026-08-01-15:35:
 Resolution changes only the active episode status. The PostgreSQL compare-and-set
 merges that field into the existing JSON, preserving per-reason cooldown stamps so
 resolving X or notifying Y cannot reopen X's live spam window.
 */
+/*
+FNXC:Workspace 2026-08-15-07:51:
+Per-repository workspace worktree updates must serialize across Fusion processes, not merely one
+TaskStore instance. The advisory transaction lock is acquired before reading the composite
+(project_id, id)-scoped row, then this method replaces only the requested key. Reintroducing an
+engine-side wholesale workspaceWorktrees update would reopen the Phase-B sibling-clobber race.
+*/
+export async function mergeWorkspaceWorktreeEntryImpl(
+  store: TaskStore,
+  id: string,
+  repoRelPath: string,
+  patch: Partial<WorkspaceWorktreeEntry> | ((current: Task) => Promise<Partial<WorkspaceWorktreeEntry>>),
+  options: {
+    requireExistingEntry?: boolean;
+    clearSingularWorktree?: boolean;
+    validateBeforePersist?: (current: Task) => Promise<void>;
+  } = {},
+): Promise<Task> {
+  let resolvedPatch: Partial<WorkspaceWorktreeEntry>;
+  if (typeof patch === "function") {
+    const callbackTask = await store.getTask(id, { includeDeleted: true });
+    if (!callbackTask) throw new TaskNotFoundError(id);
+    if (callbackTask.deletedAt) throw new TaskDeletedError(id, callbackTask.deletedAt);
+    const callbackExisting = callbackTask.workspaceWorktrees?.[repoRelPath];
+    if (options.requireExistingEntry && !callbackExisting) return callbackTask;
+    /*
+    FNXC:WorkspaceWorktree 2026-08-23-06:25:
+    Filesystem creation, init commands, hydration, and secrets materialization run before the
+    in-process task mutex. A planning-lock holder may wait on that mutex, so holding it during
+    long preparation pins the cross-process advisory lock and makes other takers time out. The
+    durable repository lease, sequential acquisition loop, and transaction revalidation below
+    still serialize and fence publication of the prepared result.
+    */
+    resolvedPatch = await patch(callbackTask);
+  } else {
+    resolvedPatch = patch;
+  }
+
+  return store.withTaskLock(id, async () => {
+    const layer = store.asyncLayer!;
+    const outcome = await layer.transactionImmediate(async (tx) => {
+      await acquireTaskAdvisoryXactLock(tx, layer.projectId, id);
+      const row = await readTaskRowInTransaction(tx, id, { includeDeleted: true }, layer.projectId);
+      if (!row) throw new TaskNotFoundError(id);
+      if (row.deletedAt) throw new TaskDeletedError(id, row.deletedAt as string);
+
+      const current = store.rowToTask(store.pgRowToTaskRow(row));
+      const workspaceWorktrees = current.workspaceWorktrees ?? {};
+      const existing = workspaceWorktrees[repoRelPath];
+      if (options.requireExistingEntry && !existing) return { task: current, mutated: false };
+      await options.validateBeforePersist?.(current);
+      /*
+      FNXC:WorkspaceWorktree 2026-08-20-07:08: Persist the prepared entry only after the authoritative
+      task row passes lifecycle revalidation under the database advisory lock. A cross-process move
+      that wins during filesystem preparation therefore blocks the row update instead of attaching a
+      late worktree to review, complete, or archived state.
+      */
+      const updatedAt = new Date().toISOString();
+      const [updatedRow] = await tx
+        .update(schema.project.tasks)
+        .set({
+          workspaceWorktrees: { ...workspaceWorktrees, [repoRelPath]: { ...existing, ...resolvedPatch } },
+          ...(options.clearSingularWorktree
+            ? {
+                worktree: null,
+                branch: null,
+                branchWriteOrigin: "engine" as const,
+                executionStartBranch: null,
+                baseCommitSha: null,
+              }
+            : {}),
+          updatedAt,
+        })
+        .where(and(eq(schema.project.tasks.id, id), taskProjectScope(layer)))
+        .returning();
+      if (!updatedRow) throw new TaskNotFoundError(id);
+      return { task: store.rowToTask(store.pgRowToTaskRow(updatedRow)), mutated: true };
+    });
+
+    if (outcome.mutated) {
+      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
+      store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
+    }
+    return outcome.task;
+  });
+}
+
+/*
+FNXC:RepositoryScope 2026-08-29-08:50:
+FN-258 removes per-task repository selection. This engine-only replacement writer re-synchronizes
+scope from workspace.json under the existing planning and advisory locks, preserving the review fence
+only when the complete configured set is unchanged.
+*/
+export async function updateTaskRepositoryScopeImpl(
+  store: TaskStore,
+  id: string,
+  requestedScope: TaskRepositoryScope | undefined,
+): Promise<Task> {
+  const configuredRepositories = [...new Set(((await loadWorkspaceConfig(store.getRootDir()))?.repos ?? [])
+    .map((repository) => repository.trim())
+    .filter(Boolean))].sort();
+  return store.withPlanningLifecycleLock(id, () => store.withTaskLock(id, async () => {
+    const layer = store.asyncLayer!;
+    const outcome = await layer.transactionImmediate(async (tx) => {
+      await acquireTaskAdvisoryXactLock(tx, layer.projectId, id);
+      const row = await readTaskRowInTransaction(tx, id, { includeDeleted: true }, layer.projectId);
+      if (!row) throw new TaskNotFoundError(id);
+      if (row.deletedAt) throw new TaskDeletedError(id, row.deletedAt as string);
+      const current = store.rowToTask(store.pgRowToTaskRow(row));
+      const hasLandedRepository = Object.values(current.workspaceWorktrees ?? {}).some((entry) => Boolean(entry.landedSha));
+      const [pendingIntent] = await tx.select({ taskId: schema.project.workspaceLandIntents.taskId })
+        .from(schema.project.workspaceLandIntents)
+        .where(and(
+          eq(schema.project.workspaceLandIntents.projectId, layer.projectId?.trim() || "__legacy_unscoped__"),
+          eq(schema.project.workspaceLandIntents.taskId, id),
+          eq(schema.project.workspaceLandIntents.status, "pending"),
+        ))
+        .limit(1);
+      const currentRepositories = current.repositoryScope?.repositories ?? [];
+      const repositoriesChanged = JSON.stringify([...currentRepositories].sort())
+        !== JSON.stringify(configuredRepositories);
+      if ((pendingIntent || hasLandedRepository) && repositoriesChanged) {
+        throw new Error(`Repository scope for ${id} cannot change after workspace landing has started`);
+      }
+      const replacement = configuredRepositories.length === 0
+        ? undefined
+        : {
+            ...requestedScope,
+            repositories: configuredRepositories,
+            state: "confirmed" as const,
+            confirmedBy: "workspace" as const,
+            confirmedAt: current.repositoryScope?.confirmedAt ?? new Date().toISOString(),
+          };
+      const stateChanged = (current.repositoryScope?.state ?? "proposed") !== (replacement?.state ?? "proposed");
+      const scopeChanged = repositoriesChanged || stateChanged;
+      const normalized = replacement && {
+        ...replacement,
+        revision: scopeChanged
+          ? Math.max((current.repositoryScope?.revision ?? 0) + 1, replacement.revision ?? 0)
+          : (current.repositoryScope?.revision ?? replacement.revision ?? 1),
+        ...(scopeChanged
+          ? { reviewEvidence: undefined, reviewRemediation: undefined }
+          : { reviewEvidence: current.repositoryScope?.reviewEvidence, reviewRemediation: current.repositoryScope?.reviewRemediation }),
+      };
+      const [updatedRow] = await tx
+        .update(schema.project.tasks)
+        .set({
+          repositoryScope: normalized ?? null,
+          workflowStepResults: scopeChanged
+            ? invalidateSupersededRepositoryScopeReviews(current.workflowStepResults, normalized?.revision)
+            : current.workflowStepResults,
+          updatedAt: new Date().toISOString(),
+        })
+        .where(and(eq(schema.project.tasks.id, id), taskProjectScope(layer)))
+        .returning();
+      if (!updatedRow) throw new TaskNotFoundError(id);
+      return store.rowToTask(store.pgRowToTaskRow(updatedRow));
+    });
+    await store.writeTaskJsonFile(store.taskDir(id), outcome);
+    if (store.isWatching) store.taskCache.set(id, { ...outcome });
+    store.emitTaskLifecycleEventSafely("task:updated", [outcome]);
+    return outcome;
+  }));
+}
+
+/*
+FNXC:WorkspaceFinalization 2026-08-21-09:09:
+Workspace Code Review remediation is task-owned state guarded by the current repository-scope
+revision. The CAS prevents a late reviewer from restoring a stale repository target after an
+operator changes scope; it updates only repository_scope and cannot clobber worktree land state.
+*/
+export async function updateWorkspaceReviewStateImpl(
+  store: TaskStore,
+  id: string,
+  expectedScopeRevision: number,
+  reviewRemediation: TaskRepositoryScope["reviewRemediation"] | null,
+): Promise<{ task: Task; updated: boolean }> {
+  return store.withTaskLock(id, async () => {
+    const layer = store.asyncLayer!;
+    const outcome = await layer.transactionImmediate(async (tx) => {
+      await acquireTaskAdvisoryXactLock(tx, layer.projectId, id);
+      const row = await readTaskRowInTransaction(tx, id, { includeDeleted: true }, layer.projectId);
+      if (!row) throw new TaskNotFoundError(id);
+      if (row.deletedAt) throw new TaskDeletedError(id, row.deletedAt as string);
+      const current = store.rowToTask(store.pgRowToTaskRow(row));
+      if (current.repositoryScope?.revision !== expectedScopeRevision) return { task: current, updated: false };
+      const repositoryScope = {
+        ...current.repositoryScope,
+        ...(reviewRemediation ? { reviewRemediation } : { reviewRemediation: undefined }),
+      };
+      const [updatedRow] = await tx.update(schema.project.tasks).set({
+        repositoryScope,
+        updatedAt: new Date().toISOString(),
+      }).where(and(eq(schema.project.tasks.id, id), taskProjectScope(layer))).returning();
+      if (!updatedRow) throw new TaskNotFoundError(id);
+      return { task: store.rowToTask(store.pgRowToTaskRow(updatedRow)), updated: true };
+    });
+    if (outcome.updated) {
+      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
+      store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
+    }
+    return outcome;
+  });
+}
+
+export type PublishWorkspaceCodeReviewEvidenceInput = {
+  expectedScopeRevision: number;
+  reviewEvidence: NonNullable<TaskRepositoryScope["reviewEvidence"]>;
+  clearReviewRemediation: boolean;
+  modifiedFiles?: Task["modifiedFiles"];
+};
+
+export type PublishWorkspaceCodeReviewEvidenceResult = {
+  task: Task;
+  published: boolean;
+  reason?: "scope-superseded" | "scope-absent";
+};
+
+/*
+FNXC:WorkspaceReviewEvidence 2026-08-29-12:11:
+FN-259 requires workspace Code Review approval evidence to bypass updateTask. FN-258 deliberately
+removed repositoryScope from that generic path, so updateTaskAtomic silently discarded a valid
+approval while persisting only its modified-files companion. This writer commits both values through
+one project-scoped, revision-fenced transaction before publishing the normal task projection.
+*/
+export async function publishWorkspaceCodeReviewEvidenceImpl(
+  store: TaskStore,
+  id: string,
+  input: PublishWorkspaceCodeReviewEvidenceInput,
+): Promise<PublishWorkspaceCodeReviewEvidenceResult> {
+  return store.withTaskLock(id, async () => {
+    const layer = store.asyncLayer!;
+    const outcome = await layer.transactionImmediate(async (tx): Promise<PublishWorkspaceCodeReviewEvidenceResult> => {
+      await acquireTaskAdvisoryXactLock(tx, layer.projectId, id);
+      const row = await readTaskRowInTransaction(tx, id, { includeDeleted: true }, layer.projectId);
+      if (!row) throw new TaskNotFoundError(id);
+      if (row.deletedAt) throw new TaskDeletedError(id, row.deletedAt as string);
+
+      const current = store.rowToTask(store.pgRowToTaskRow(row));
+      const currentScope = current.repositoryScope;
+      if (!currentScope) return { task: current, published: false, reason: "scope-absent" };
+      if (currentScope.revision !== input.expectedScopeRevision) {
+        return { task: current, published: false, reason: "scope-superseded" };
+      }
+
+      const repositoryScope: TaskRepositoryScope = {
+        ...currentScope,
+        reviewEvidence: input.reviewEvidence,
+        ...(input.clearReviewRemediation && currentScope.reviewRemediation?.scopeRevision === input.expectedScopeRevision
+          ? { reviewRemediation: undefined }
+          : {}),
+      };
+      const [updatedRow] = await tx.update(schema.project.tasks).set({
+        repositoryScope,
+        ...(input.modifiedFiles !== undefined ? { modifiedFiles: input.modifiedFiles } : {}),
+        updatedAt: new Date().toISOString(),
+      }).where(and(eq(schema.project.tasks.id, id), taskProjectScope(layer))).returning();
+      if (!updatedRow) throw new TaskNotFoundError(id);
+      return { task: store.rowToTask(store.pgRowToTaskRow(updatedRow)), published: true };
+    });
+
+    if (outcome.published) {
+      await store.writeTaskJsonFile(store.taskDir(id), outcome.task);
+      if (store.isWatching) store.taskCache.set(id, { ...outcome.task });
+      store.emitTaskLifecycleEventSafely("task:updated", [outcome.task]);
+    }
+    return outcome;
+  });
+}
+
 export async function resolveTaskWedgeNotificationEpisodeImpl(
   store: TaskStore,
   id: string,
@@ -728,7 +1215,7 @@ export async function setCompletionHandoffAcceptedMarkerImpl(store: TaskStore, t
     await recordCompletionHandoffAsync(layer.db, taskId, opts.source, opts.acceptedAt);
     const marker = await getCompletionHandoffMarkerAsync(layer.db, taskId);
     if (!marker) throw new Error(`Failed to set completion handoff marker for ${taskId}`);
-    void store.recordRunAuditEvent({
+    void emitBoundedRunAudit(store, {
       taskId,
       agentId: "system",
       runId: `completion-handoff:${taskId}:${Date.now()}`,
@@ -736,12 +1223,7 @@ export async function setCompletionHandoffAcceptedMarkerImpl(store: TaskStore, t
       mutationType: "task:completion-handoff-accepted",
       target: taskId,
       metadata: { taskId, acceptedAt: marker.acceptedAt, source: marker.source },
-    }).catch((err) => {
-      storeLog.warn("completion-handoff audit write failed", {
-        taskId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
+    }, { log: { warn: (detail) => storeLog.warn("completion-handoff audit write failed", { taskId, detail }) } });
     return marker as CompletionHandoffMarker;
 }
 
@@ -777,7 +1259,7 @@ export async function reconcileLegacyAutoMergeStampsImpl(store: TaskStore, optio
       if (store.isWatching) store.taskCache.set(current.id, { ...current });
       store.emitTaskLifecycleEventSafely("task:updated", [current]);
 
-      void store.recordRunAuditEvent({
+      void emitBoundedRunAudit(store, {
         taskId: current.id,
         agentId: "system",
         runId: `legacy-auto-merge-stamp-clear-${current.id}-${Date.now()}`,
@@ -864,6 +1346,15 @@ export async function cleanupBranchForTaskImpl(store: TaskStore, task: Task): Pr
       } catch {
         // Skip branches whose names would be unsafe to pass through a shell.
         // A malformed stored value should not become a command-injection vector.
+        continue;
+      }
+      /*
+      FNXC:BranchDeletionProvenance 2026-08-20-03:39:
+      A task branch written by an operator remains operator data even when its spelling
+      resembles Fusion's namespace. Keep the generated fallback only when the shared
+      provenance classifier proves this candidate is Fusion-owned.
+      */
+      if (!isFusionDeletableBranch(task, branch)) {
         continue;
       }
       const verify = await store.runGitCommand(`git rev-parse --verify "${branch}"`);
@@ -1188,10 +1679,31 @@ export async function cleanupArchivedTasksImpl(store: TaskStore): Promise<string
       .where(and(eq(schema.project.tasks.projectId, projectId), eq(schema.project.tasks.column, "archived")));
     const cleanedUpIds: string[] = [];
     const { rm } = await import("node:fs/promises");
+    const patchnodeCompleteColumns = await resolveProjectColumnsForRoles(store, ["complete"])
+      .catch(() => new Set<string>());
 
     for (const row of archivedRows) {
       const task = store.rowToTask(store.pgRowToTaskRow(row));
       const dir = store.taskDir(task.id);
+      /*
+      FNXC:PatchnodeLedger 2026-08-28-12:16:
+      A pre-Patchnode archived row reaches its last surviving summary here. Consult the existing cold snapshot before rewriting it, and leave the row intact when capture fails so a later cleanup can retry instead of hard-deleting the only evidence.
+      */
+      const existingEntry = await findArchivedTaskEntry(layer.db, task.id, layer.projectId);
+      if (
+        patchnodeCompleteColumns.has(existingEntry?.preArchiveColumn ?? "")
+        && task.columnMovedAt
+        && Number.isFinite(Date.parse(task.columnMovedAt))
+      ) {
+        try {
+          await appendPatchnodeEntry(layer, buildPatchnodeEntryInput(task, "completed", task.columnMovedAt));
+        } catch (error) {
+          storeLog.warn(`[patchnode] skipping archived cleanup after capture failure for ${task.id}`, {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          continue;
+        }
+      }
       // Guarantee a cold-storage snapshot before the destructive delete.
       const entry = await store.taskToArchiveEntry(task, task.deletedAt ?? new Date().toISOString());
       await upsertArchivedTaskEntry(layer.db, entry, layer.projectId);

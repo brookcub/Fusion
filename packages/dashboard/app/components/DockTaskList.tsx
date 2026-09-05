@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { isArchivedColumnRole, isCompleteColumnRole } from "../utils/columnRoles";
-import { partitionRevertedTasks } from "../utils/taskRevert";
+import { isTaskReverted } from "../utils/taskRevert";
 import type { GithubIssueAction, Task, TaskDetail } from "@fusion/core";
 import type { ToastType } from "../hooks/useToast";
 import { TaskCard } from "./TaskCard";
@@ -13,7 +14,9 @@ export interface DockTaskListProps {
   projectId?: string;
   onOpenTask?: (task: Task | TaskDetail) => void;
   onReviseTask?: (task: Task) => void;
+  onUpdateTask?: (id: string, updates: { title?: string; description?: string; dependencies?: string[]; dismissNearDuplicate?: boolean; githubTracking?: { enabled?: boolean } }) => Promise<Task>;
   onDeleteTask?: (id: string, options?: { removeDependencyReferences?: boolean; removeLineageReferences?: boolean; githubIssueAction?: GithubIssueAction; allowResurrection?: boolean }) => Promise<Task>;
+  onOpenChatWithPrefill?: (prefillText: string) => void;
   addToast?: (message: string, type?: ToastType) => void;
   prAuthAvailable?: boolean;
   autoMergeEnabled?: boolean;
@@ -44,10 +47,17 @@ export function DockTaskList({ columnFlagsByTaskId,
   onOpenTask,
   onDeleteTask,
   onReviseTask,
+  onUpdateTask,
+  onOpenChatWithPrefill,
   addToast = () => {},
   prAuthAvailable = false,
   autoMergeEnabled = false,
 }: DockTaskListProps) {
+  /*
+  FNXC:NearDuplicateDetection 2026-08-23-04:10:
+  A host that renders a duplicate tag must also pass its clear action, otherwise a triage hold has no UI release.
+  */
+  const { t } = useTranslation("app");
   const [showDone, setShowDone] = useState(false);
 
   const handleOpenTask = useCallback((task: Task | TaskDetail) => {
@@ -70,29 +80,35 @@ export function DockTaskList({ columnFlagsByTaskId,
     return { complete: isCompleteColumnRole(flags, task.column), archived: isArchivedColumnRole(flags, task.column) };
   }, [columnFlagsByTaskId]);
   /*
-  FNXC:TaskRevert 2026-08-01-20:06:
-  Resolution cards must receive the task's resolved traits, not legacy column names.
-  A custom complete column otherwise hides the reverted treatment and its Delete and
-  Revise actions in the dock even though the same task is correctly partitioned here.
+  FNXC:TaskRevert 2026-08-27-02:34:
+  Reverted cards now follow normal dock visibility rather than a separate deduplicated section.
+  Collapse only duplicate reverted ids so refetch overlap cannot render the same resolution card twice.
   */
-  const revertedTasks = useMemo(() => partitionRevertedTasks(tasks as Task[]).reverted, [tasks]);
-  const doneTasks = useMemo(() => tasks.filter((task) => isTerminal(task).complete && !revertedTasks.some((reverted) => reverted.id === task.id)), [tasks, isTerminal, revertedTasks]);
-  const visibleTasks = useMemo(() => tasks.filter((task) => {
+  const displayTasks = useMemo(() => {
+    const seenRevertedTaskIds = new Set<string>();
+    return tasks.filter((task) => {
+      if (!isTaskReverted(task.sourceMetadata)) return true;
+      if (seenRevertedTaskIds.has(task.id)) return false;
+      seenRevertedTaskIds.add(task.id);
+      return true;
+    });
+  }, [tasks]);
+  const doneTasks = useMemo(() => displayTasks.filter((task) => isTerminal(task).complete), [displayTasks, isTerminal]);
+  const visibleTasks = useMemo(() => displayTasks.filter((task) => {
     const roles = isTerminal(task);
     if (roles.archived) return false;
-    if (revertedTasks.some((reverted) => reverted.id === task.id)) return false;
     if (roles.complete) return showDone;
     return true;
-  }), [showDone, tasks, isTerminal, revertedTasks]);
+  }), [displayTasks, showDone, isTerminal]);
   const hasDoneTasks = doneTasks.length > 0;
   const isEmpty = visibleTasks.length === 0;
-  const emptyTitle = tasks.length === 0 ? "No tasks yet" : "No active tasks";
+  const emptyTitle = tasks.length === 0 ? t("rightDock.noTasksYet", "No tasks yet") : t("rightDock.noActiveTasks", "No active tasks");
   const emptyCopy = tasks.length === 0
-    ? "Tasks you create or import will appear here for quick right-sidebar review."
+    ? t("rightDock.emptyCopy", "Tasks you create or import will appear here for quick right-sidebar review.")
     : hasDoneTasks
-      ? "Completed tasks are hidden until you choose Show Done. Archived tasks stay out of this compact sidebar."
-      : "Archived tasks stay out of this compact sidebar. Active tasks will appear here when work is available.";
-  const toggleLabel = showDone ? "Hide Done" : "Show Done";
+      ? t("rightDock.doneHiddenCopy", "Completed tasks are hidden until you choose Show Done. Archived tasks stay out of this compact sidebar.")
+      : t("rightDock.archivedCopy", "Archived tasks stay out of this compact sidebar. Active tasks will appear here when work is available.");
+  const toggleLabel = showDone ? t("rightDock.hideDone", "Hide Done") : t("rightDock.showDone", "Show Done");
 
   return (
     <div className={`dock-task-list${isEmpty ? " dock-task-list--empty" : ""}`} data-testid="dock-task-list">
@@ -108,12 +124,6 @@ export function DockTaskList({ columnFlagsByTaskId,
           </button>
         </div>
       ) : null}
-      {revertedTasks.length > 0 && (
-        <section className="dock-task-list__reverted" aria-label="Reverted Tasks" data-testid="dock-reverted-tasks">
-          <h3>Reverted Tasks</h3>
-          {revertedTasks.map((task) => <TaskCard key={`reverted-${task.id}`} task={task} taskColumnFlags={columnFlagsByTaskId?.get(task.id)} projectId={projectId} onOpenDetail={handleOpenTask} onDeleteTask={onDeleteTask} onReviseTask={onReviseTask} addToast={addToast} disableDrag />)}
-        </section>
-      )}
       {isEmpty ? (
         <div className="dock-task-list__empty" data-testid="dock-task-list-empty">
           <p className="dock-task-list__empty-title">{emptyTitle}</p>
@@ -129,6 +139,7 @@ export function DockTaskList({ columnFlagsByTaskId,
         <div key={dockRowKey(task.id, index, list)} className="dock-task-list__row" data-testid={`dock-task-list-row-${task.id}`}>
           <TaskCard
             task={task as Task}
+            taskColumnFlags={columnFlagsByTaskId?.get(task.id)}
             projectId={projectId}
             onOpenDetail={handleOpenTask}
             /*
@@ -136,8 +147,10 @@ export function DockTaskList({ columnFlagsByTaskId,
             Every task Delete affordance must reach the shared confirm→delete flow. The right-dock Tasks list is a TaskCard host, so it must pass onDeleteTask instead of rendering cards that silently lack/delete-disable the destructive path.
             */
             onDeleteTask={onDeleteTask}
+            onReviseTask={onReviseTask}
+            onUpdateTask={onUpdateTask}
+            onOpenChatWithPrefill={onOpenChatWithPrefill}
             addToast={addToast}
-            disableDrag={true}
             prAuthAvailable={prAuthAvailable}
             autoMergeEnabled={autoMergeEnabled}
           />

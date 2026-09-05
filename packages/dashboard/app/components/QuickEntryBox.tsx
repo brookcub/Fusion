@@ -8,10 +8,10 @@ import type { Task, Settings, TaskPriority, ResolvedWorkflowOptionalStep, Thinki
 import type { ModelInfo, Agent, CreateTaskInput, DuplicateMatch, BoardWorkflowDefinition, NodeInfo } from "../api";
 import { checkDuplicateTasks, fetchModels, fetchSettings, updateGlobalSettings, fetchAgents, uploadAttachment, fetchWorkflowOptionalSteps } from "../api";
 import { DuplicateWarningModal } from "./DuplicateWarningModal";
-import { Link, Paperclip, Brain, Lightbulb, ListTree, Sparkles, Save, ChevronDown, ChevronUp, ChevronRight, Bot, Server, Zap, Eye, EyeOff, Play } from "lucide-react";
+import { Link, Paperclip, Brain, Lightbulb, Sparkles, Save, ChevronDown, ChevronUp, ChevronRight, Bot, Server, Zap, Eye, EyeOff, Play } from "lucide-react";
 import { CustomModelDropdown } from "./CustomModelDropdown";
 import { LoadingSpinner } from "./LoadingSpinner";
-import { getScopedItem, removeScopedItem, setScopedItem } from "../utils/projectStorage";
+import { getScopedItem, MAX_PERSISTED_DRAFT_BYTES, removeScopedItem, setScopedItem } from "../utils/projectStorage";
 import { useNodes } from "../hooks/useNodes";
 import { useComposerDictation } from "../hooks/useComposerDictation";
 import { MicButton } from "./MicButton";
@@ -21,8 +21,11 @@ import { WorkflowOptionalStepsDropdown } from "./WorkflowOptionalStepsDropdown";
 import { WorkflowIcon } from "./WorkflowIcon";
 import { PendingAttachmentPreviews } from "./PendingAttachmentPreviews";
 import { getPriorityColorVar, getPriorityIcon, getPriorityLabel } from "../utils/priorityIndicator";
-import { validateQuickAddStartWorkflow, workflowSupportsQuickAddStart, resolveQuickAddStartInitialColumn, resolveQuickAddStartTargetColumn, type ValidatedQuickAddWorkflow } from "../utils/quickAddStart";
+import { validateQuickAddStartWorkflow, workflowSupportsQuickAddStart, resolveQuickAddStartInitialColumn, resolveQuickAddStartWorkflowTarget, resolveQuickAddStartTargetColumn, type ValidatedQuickAddWorkflow } from "../utils/quickAddStart";
 import { computeFixedMenuPosition, getLayoutViewportSize } from "../utils/fixedMenuPosition";
+import { isInsidePortaledModelMenu } from "../utils/portalSurfaces";
+import { restoreOptionalStepsOnFastExit } from "../utils/fastModeOptionalSteps";
+import { useQuickAddSubmitOnEnter } from "../hooks/useQuickAddSubmitOnEnter";
 
 const STORAGE_KEY = "kb-quick-entry-text";
 const ALLOWED_TASK_ATTACHMENT_TYPES = new Set([
@@ -60,10 +63,6 @@ interface QuickEntryBoxProps {
    * QuickEntryBox intentionally does not render a quick-add Plan button.
    */
   onPlanningMode?: (initialPlan: string, workflowId?: string | null) => void;
-  /**
-   * Called when the user clicks the "Subtask" button to trigger subtask breakdown.
-   */
-  onSubtaskBreakdown?: (description: string, workflowId?: string | null) => void;
   /** Selected workflow lane for AI-assisted create actions. Omit in legacy board mode to preserve project-default inheritance. */
   workflowId?: string | null;
   /** Real workflows available to the quick-add workflow selector. Board-only aggregate sentinels must be filtered before rendering/submission. */
@@ -88,6 +87,8 @@ interface QuickEntryBoxProps {
   List view renders quick-add as a COMPACT single-line input so the box isn't tall. When true, the textarea stays one line: isExpanded initializes false, focus does NOT auto-expand it, and auto-resize-to-scrollHeight is short-circuited (capped to the one-line min-height). Board/columns omit singleLine, preserving the tall 80px + auto-grow behavior. singleLine governs only textarea height, not the disclosure/controls panel (which List already collapses via defaultExpanded={false}).
   */
   singleLine?: boolean;
+  /** Explicit override of the global Enter-submit preference. */
+  submitOnEnter?: boolean;
   /**
    * Favorited provider IDs from shared app-level state.
    * When provided (alongside availableModels), the component uses these
@@ -157,8 +158,10 @@ function hasMeaningfulNodeChoice(nodes: NodeInfo[]): boolean {
   return nodes.length > 1 || nodes.some((node) => node.type !== "local");
 }
 
-export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], availableModels, onSubtaskBreakdown, workflowId, workflowOptions, defaultWorkflowId, projectId, autoExpand = true, defaultExpanded = true, singleLine = false, favoriteProviders: parentFavoriteProviders, favoriteModels: parentFavoriteModels, onToggleFavorite: parentToggleFavorite, onToggleModelFavorite: parentToggleModelFavorite, onOpenTask }: QuickEntryBoxProps) {
+export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], availableModels, workflowId, workflowOptions, defaultWorkflowId, projectId, autoExpand = true, defaultExpanded = true, singleLine = false, submitOnEnter, favoriteProviders: parentFavoriteProviders, favoriteModels: parentFavoriteModels, onToggleFavorite: parentToggleFavorite, onToggleModelFavorite: parentToggleModelFavorite, onOpenTask }: QuickEntryBoxProps) {
   const { t } = useTranslation("app");
+  const contextSubmitOnEnter = useQuickAddSubmitOnEnter();
+  const enterSubmits = submitOnEnter ?? contextSubmitOnEnter;
   const [description, setDescription] = useState(() => {
     if (typeof window !== "undefined") {
       return getScopedItem(STORAGE_KEY, projectId) || "";
@@ -178,6 +181,7 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
   const touchButtonRef = useRef<HTMLButtonElement | null>(null);
   const startIntentRef = useRef<ValidatedQuickAddWorkflow | null>(null);
   const justResetRef = useRef(false);
+  const draftPersistenceWarningShownRef = useRef(false);
   const previousProjectIdRef = useRef(projectId);
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
@@ -251,7 +255,7 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
   const [showWorkflowPicker, setShowWorkflowPicker] = useState(false);
   /*
   FNXC:QuickAddWorkflow 2026-06-30-00:00:
-  Quick-add needs an independent real workflow target because the main Board selector can be on the aggregate "All workflows" read view. Resolve only against real workflow ids and keep the aggregate sentinel out of task create, Plan, Subtask, and optional-step requests.
+  Quick-add needs an independent real workflow target because the main Board selector can be on the aggregate "All workflows" read view. Resolve only against real workflow ids and keep the aggregate sentinel out of task create, Plan, and optional-step requests.
   */
   const [quickEntryWorkflowId, setQuickEntryWorkflowId] = useState<string | null | undefined>(() => (
     resolveQuickAddWorkflowId(workflowId, defaultWorkflowId, getRealWorkflowOptions(workflowOptions))
@@ -267,6 +271,11 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
   const [enabledOptionalStepIds, setEnabledOptionalStepIds] = useState<string[]>([]);
   const [isFastMode, setIsFastMode] = useState(false);
   const isFastModeRef = useRef(isFastMode);
+  const preFastOptionalStepIdsRef = useRef<string[] | null>(null);
+  const defaultOnOptionalStepIds = useMemo(
+    () => optionalSteps.filter((step) => step.defaultOn).map((step) => step.templateId),
+    [optionalSteps],
+  );
   useEffect(() => {
     isFastModeRef.current = isFastMode;
   }, [isFastMode]);
@@ -381,6 +390,7 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
   const selectedWorkflowForCreate = workflowId === undefined ? undefined : quickEntryWorkflowId;
   const validatedStartWorkflow = useMemo(() => validateQuickAddStartWorkflow(selectedQuickEntryWorkflow), [selectedQuickEntryWorkflow]);
   const startInitialColumn = validatedStartWorkflow ? resolveQuickAddStartInitialColumn(validatedStartWorkflow) : null;
+  const startWorkflowTarget = validatedStartWorkflow ? resolveQuickAddStartWorkflowTarget(validatedStartWorkflow) : null;
   /*
   FNXC:QuickAddStart 2026-07-31-23:51:
   Start is a VISIBLE button in the quick-add action row for eligible workflows only, replacing the hidden
@@ -390,7 +400,7 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
   for the follow-up move). Workflows without a waiting lane render no Start button at all — Save stays the single
   create affordance there.
   */
-  const canQuickAddStart = Boolean(validatedStartWorkflow && workflowSupportsQuickAddStart(validatedStartWorkflow) && (startInitialColumn || onMoveTask));
+  const canQuickAddStart = Boolean(validatedStartWorkflow && workflowSupportsQuickAddStart(validatedStartWorkflow) && startWorkflowTarget && (startInitialColumn || onMoveTask));
   const canQuickAddStartNow = canQuickAddStart && Boolean(description.trim()) && !isSubmitting;
 
   useEffect(() => {
@@ -416,6 +426,7 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
     let cancelled = false;
     setOptionalSteps([]);
     setEnabledOptionalStepIds([]);
+    preFastOptionalStepIdsRef.current = null;
 
     if (!effectiveOptionalWorkflowId) {
       return () => {
@@ -427,6 +438,7 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
       .then((steps) => {
         if (cancelled) return;
         setOptionalSteps(steps);
+        preFastOptionalStepIdsRef.current = null;
         /*
         FNXC:FastOptionalSteps 2026-06-30-10:24:
         Optional-step metadata can resolve after the operator has already selected Fast. Seed `[]` in that race so async defaultOn loading cannot undo Fast's speed-first opt-out; later dropdown clicks still add explicit selections normally.
@@ -437,6 +449,7 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
         if (cancelled) return;
         setOptionalSteps([]);
         setEnabledOptionalStepIds([]);
+        preFastOptionalStepIdsRef.current = null;
       });
 
     return () => {
@@ -458,14 +471,28 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
 
   FNXC:FastOptionalSteps 2026-06-30-10:41:
   A Fast create must submit explicit `[]` even if optional-step metadata has not loaded yet; otherwise the store/engine see `enabledWorkflowSteps` as omitted and re-seed default-on gates.
+
+  FNXC:FastOptionalSteps 2026-08-29-12:08:
+  FN-260 makes Fast reversible: leaving it restores the pre-Fast selection plus any steps explicitly enabled while Fast was active. Invalidate that baseline whenever non-user metadata seeding or reset replaces the enabled set, so stale workflow selections fall back to the current defaultOn seed.
   */
+
   const toggleFastMode = useCallback(() => {
-    setIsFastMode((prev) => {
-      const next = !prev;
-      if (next) setEnabledOptionalStepIds([]);
-      return next;
-    });
-  }, []);
+    const next = !isFastMode;
+    if (next) {
+      preFastOptionalStepIdsRef.current = enabledOptionalStepIds;
+      setEnabledOptionalStepIds([]);
+    } else {
+      setEnabledOptionalStepIds(
+        restoreOptionalStepsOnFastExit(
+          preFastOptionalStepIdsRef.current,
+          enabledOptionalStepIds,
+          defaultOnOptionalStepIds,
+        ),
+      );
+      preFastOptionalStepIdsRef.current = null;
+    }
+    setIsFastMode(next);
+  }, [defaultOnOptionalStepIds, enabledOptionalStepIds, isFastMode]);
 
   const executorSelectionValue = getModelSelectionValue(executorProvider, executorModelId);
   const validatorSelectionValue = getModelSelectionValue(validatorProvider, validatorModelId);
@@ -496,12 +523,26 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
     setDescription(getScopedItem(STORAGE_KEY, projectId) || "");
   }, [projectId]);
 
-  // Persist description to localStorage whenever it changes
+  /*
+  FNXC:QuickAddDraftPersistence 2026-08-20-00:43:
+  Quick Add's in-memory draft remains authoritative for task creation. Browser restoration is best-effort and capped so a pasted description cannot exhaust localStorage or interrupt typing (Runfusion/Fusion#3477).
+  */
   useEffect(() => {
-    if (typeof window !== "undefined") {
-      setScopedItem(STORAGE_KEY, description, projectId);
+    if (description.length === 0) {
+      removeScopedItem(STORAGE_KEY, projectId);
+      return;
     }
-  }, [description, projectId]);
+
+    const persisted = setScopedItem(STORAGE_KEY, description, projectId, {
+      maxBytes: MAX_PERSISTED_DRAFT_BYTES,
+    });
+    if (persisted) {
+      draftPersistenceWarningShownRef.current = false;
+    } else if (!draftPersistenceWarningShownRef.current) {
+      draftPersistenceWarningShownRef.current = true;
+      addToast(t("tasks.draftTooLargeToSave", "Draft is too large to save in this browser — it will not be restored after a reload."), "warning");
+    }
+  }, [addToast, description, projectId, t]);
 
   // Clear agents cache when projectId changes to prevent stale agents from leaking across projects
   useEffect(() => {
@@ -584,7 +625,7 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
       const clickedInsideTrigger = modelTriggerRef.current?.contains(target);
       const clickedInsidePortal = modelMenuPortalRef.current?.contains(target);
       // Also check for clicks inside CustomModelDropdown's portaled dropdown
-      const clickedInsideCombobox = (target instanceof Element) && (target.closest?.(".model-combobox-dropdown--portal") != null);
+      const clickedInsideCombobox = isInsidePortaledModelMenu(target);
 
       if (!clickedInsideTrigger && !clickedInsidePortal && !clickedInsideCombobox) {
         setIsModelMenuOpen(false);
@@ -700,7 +741,8 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
     setPlanningThinkingLevel("");
     setMergerThinkingLevel("");
     setSelectedPresetId(undefined);
-    setEnabledOptionalStepIds(optionalSteps.filter((step) => step.defaultOn).map((step) => step.templateId));
+    setEnabledOptionalStepIds(defaultOnOptionalStepIds);
+    preFastOptionalStepIdsRef.current = null;
     setIsFastMode(false);
     setGithubTrackingOverride(null);
     setSessionAdvisorOverride(null);
@@ -718,7 +760,7 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
     if (typeof window !== "undefined") {
       removeScopedItem(STORAGE_KEY, projectId);
     }
-  }, [pendingAttachments, projectId, optionalSteps]);
+  }, [defaultOnOptionalStepIds, pendingAttachments, projectId]);
 
   const handleAttachmentFiles = useCallback((files: FileList | File[] | null | undefined) => {
     if (!files || files.length === 0) return;
@@ -1024,11 +1066,23 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
           }
           return;
         }
-        // Enter without Shift submits
-        e.preventDefault();
         if (duplicateMatches || submitInFlightRef.current) {
+          e.preventDefault();
           return;
         }
+        /*
+        FNXC:QuickEntry 2026-08-16-03:15:
+        The global Quick Add option defaults on to preserve historical Enter submission. When disabled, plain Enter remains a browser newline while Cmd/Ctrl+Enter stays the explicit save accelerator.
+        */
+        if (e.metaKey || e.ctrlKey) {
+          e.preventDefault();
+          handleSubmit();
+          return;
+        }
+        if (!enterSubmits) {
+          return;
+        }
+        e.preventDefault();
         handleSubmit();
       } else if (e.key === "Escape") {
         e.preventDefault();
@@ -1099,6 +1153,7 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
       projectId,
       setIsDisclosureExpanded,
       duplicateMatches,
+      enterSubmits,
       singleLine,
     ],
   );
@@ -1555,21 +1610,6 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
   FNXC:QuickEntry 2026-06-30-00:00:
   Quick-add intentionally exposes no Plan button, disabled Plan state, tooltip, test id, or click target. Keep non-quick-add planning entry points such as the New Task dialog and model-menu planning lane intact.
   */
-  const handleSubtaskClick = useCallback(() => {
-    const trimmed = description.trim();
-    if (!trimmed) {
-      addToast(t("tasks.enterDescriptionFirst", "Enter a description first"), "error");
-      return;
-    }
-    if (selectedWorkflowForCreate !== undefined) {
-      onSubtaskBreakdown?.(trimmed, selectedWorkflowForCreate);
-    } else {
-      onSubtaskBreakdown?.(trimmed);
-    }
-    // Clear the form after triggering subtask breakdown
-    resetForm();
-  }, [description, onSubtaskBreakdown, selectedWorkflowForCreate, addToast, resetForm]);
-
   /*
   FNXC:QuickAddStart 2026-07-24-11:20:
   Start stashes the workflow snapshot validated at click time in `startIntentRef` and then runs the SAME submit
@@ -1766,7 +1806,7 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
             FNXC:BoardComposer 2026-07-10-12:00:
             First-run review flagged the quick-add composer as disorganized: chips wrapped into four
             arbitrary-looking rows with Save buried mid-row. Reorganize into two logical clusters inside
-            the single wrapping action row: an options group (workflow, optional steps, subtask, deps,
+            the single wrapping action row: an options group (workflow, optional steps, deps,
             models, node, agent) and a right-aligned primary group (attach, GitHub tracking, Priority,
             Fast, Save) so status controls sit beside attach and Save still reads last/right.
 
@@ -1885,22 +1925,6 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
               disabled={isSubmitting || isDisabled}
               triggerTestId="quick-entry-optional-steps-trigger"
             />
-
-            {/* FNXC:QuickAddSubtaskFlag 2026-06-21-00:00: Render no Subtask button or click target unless App wires the default-off `subtaskBreakdown` experiment callback. */}
-            {onSubtaskBreakdown && (
-              <button
-                type="button"
-                className="btn btn-sm"
-                onClick={handleSubtaskClick}
-                onMouseDown={(e) => e.preventDefault()}
-                disabled={!description.trim()}
-                data-testid="subtask-button"
-                title={t("tasks.subtaskButtonTitle", "Break down into AI-generated subtasks")}
-              >
-                <ListTree size={12} style={{ verticalAlign: "middle", marginRight: 4 }} />
-                {t("tasks.subtask", "Subtask")}
-              </button>
-            )}
             {/*
               FNXC:QuickAddRefine 2026-06-30-00:00:
               Quick Add intentionally omits AI Refine so the compact create row has no refine button, menu, loading state, or /ai/refine-text path. New Task and TaskForm keep their dedicated refine affordance for richer task drafting.
@@ -2410,7 +2434,7 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
                 focus for its filter input. Plain menu chrome still preserves the quick-entry focus.
                 */
                 const target = e.target as Element;
-                if (target.closest("input, textarea, select, [contenteditable], .model-combobox-dropdown--portal")) {
+                if (target.closest("input, textarea, select, [contenteditable]") || isInsidePortaledModelMenu(target)) {
                   return;
                 }
                 e.preventDefault();

@@ -1,8 +1,11 @@
 import {
   AiServiceError,
-  MIN_DESCRIPTION_LENGTH,
+  columnsWithFlag,
+  declaresAnyLifecycleTrait,
   parseRepoSlug,
   resolveTaskGithubTracking,
+  resolveTaskOutputLanguage,
+  resolveWorkflowIrForTask,
   summarizeTitle,
   type GlobalSettings,
   type ProjectSettings,
@@ -257,6 +260,64 @@ export type MaybeCreateTrackingIssueReason =
   | "auth_gh_not_authenticated"
   | "auth_invalid_mode";
 
+/*
+FNXC:GithubTracking 2026-08-15-22:27:
+A tracking issue created AFTER the Fusion task is already done/archived has no later
+task:moved event, so GitHubTrackingStateService never closes it. Observed on FN-9046 /
+FN-9054 / FN-9061: executionCompletedAt preceded issue.createdAt by 4–15 minutes, and
+the issues stayed OPEN. After create or dedup-link, close immediately when the task is
+already in a complete or archived lane. Failures are logged and never undo the link.
+*/
+async function closeTrackingIssueIfTaskAlreadyTerminal(
+  task: Task,
+  store: TaskStore,
+  client: GitHubClient,
+  issue: { owner: string; repo: string; number: number },
+): Promise<void> {
+  const latest = typeof store.getTask === "function"
+    ? ((await store.getTask(task.id).catch(() => task)) ?? task)
+    : task;
+  const ir = await resolveWorkflowIrForTask(store, latest.id).catch(() => undefined);
+  const traitsExpressed = ir !== undefined && declaresAnyLifecycleTrait(ir);
+  const completeLanes = ir === undefined || !traitsExpressed ? ["done"] : columnsWithFlag(ir, "complete");
+  const archivedLanes = ir === undefined || !traitsExpressed ? ["archived"] : columnsWithFlag(ir, "archived");
+  const isComplete = completeLanes.includes(latest.column);
+  const isArchived = archivedLanes.includes(latest.column);
+  if (!isComplete && !isArchived) {
+    return;
+  }
+
+  try {
+    const existing = await client.getIssue(issue.owner, issue.repo, issue.number);
+    if (!existing || existing.state === "closed") {
+      return;
+    }
+    const stateReason = isArchived && !latest.executionCompletedAt ? "not_planned" : "completed";
+    await client.setIssueState(issue.owner, issue.repo, issue.number, "closed", stateReason);
+    if (typeof store.logEntry === "function") {
+      await store.logEntry(latest.id, "Closed linked GitHub tracking issue", `${issue.owner}/${issue.repo}#${issue.number}`);
+    }
+    if (typeof store.recordActivity === "function") {
+      await store.recordActivity({
+        type: "task:updated",
+        taskId: latest.id,
+        taskTitle: latest.title,
+        details: `Closed linked GitHub tracking issue ${issue.owner}/${issue.repo}#${issue.number} because the task is already ${latest.column}`,
+        metadata: {
+          type: "github-issue-closed-already-terminal",
+          repo: `${issue.owner}/${issue.repo}`,
+          number: issue.number,
+        },
+      });
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (typeof store.logEntry === "function") {
+      await store.logEntry(latest.id, "Failed to close GitHub tracking issue", message);
+    }
+  }
+}
+
 function resolveTrackingTitleSummarizerModel(
   projectSettings: ProjectSettings,
   globalSettings: GlobalSettings,
@@ -371,18 +432,26 @@ export async function maybeCreateTrackingIssue(
 
   const titleMissing = collapseWhitespace(latestTask.title ?? "").length === 0;
   const resolvedSummarizer = resolveTrackingTitleSummarizerModel(deps.projectSettings, deps.globalSettings);
+  /*
+  FNXC:TitleSummarization 2026-08-19-13:43:
+  Tracking title generation uses the shared summarizer for every non-empty titleless task.
+  The project setting controls ordinary create-time automation; this configured tracking lane
+  retains its existing explicit integration behavior without a hidden length threshold.
+  */
   const canSummarizeTitle = titleMissing
     && typeof latestTask.description === "string"
-    && latestTask.description.length >= MIN_DESCRIPTION_LENGTH
+    && latestTask.description.trim().length > 0
     && Boolean(resolvedSummarizer.provider && resolvedSummarizer.modelId);
 
   if (canSummarizeTitle) {
     try {
+      /* FNXC:TaskOutputLanguage 2026-08-19-15:36: GitHub tracking snapshots task prose language before its asynchronous title call. */
       const generatedTitle = await summarizeTitle(
         latestTask.description,
         deps.rootDir,
         resolvedSummarizer.provider,
         resolvedSummarizer.modelId,
+        resolveTaskOutputLanguage({ ...deps.globalSettings, ...deps.projectSettings }, latestTask.description),
       );
 
       if (generatedTitle) {
@@ -517,6 +586,11 @@ export async function maybeCreateTrackingIssue(
               },
             });
 
+            await closeTrackingIssueIfTaskAlreadyTerminal(latestTask, deps.taskStore, githubClient, {
+              owner: repo.owner,
+              repo: repo.repo,
+              number: bestMatch.candidate.number,
+            });
             return { created: false, reason: "existing_issue_found" };
           }
         }
@@ -551,6 +625,11 @@ export async function maybeCreateTrackingIssue(
       },
     });
 
+    await closeTrackingIssueIfTaskAlreadyTerminal(latestTask, deps.taskStore, githubClient, {
+      owner: repo.owner,
+      repo: repo.repo,
+      number: issue.number,
+    });
     return { created: true, issue };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

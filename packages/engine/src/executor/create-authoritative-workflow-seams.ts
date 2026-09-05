@@ -5,8 +5,8 @@
  * FNXC:WorkflowExecutionOwnership 2026-07-27-16:25 / 2026-07-28-20:25:
  * Seam return vocabulary is the ownership boundary; exit events announce without changing outcomes.
  */
-import type { AgentStore, Settings, TaskStore, ThinkingLevel, WorkspaceConfig } from "@fusion/core";
-import { emitWorkflowLifecycleEvent, THINKING_LEVELS } from "@fusion/core";
+import type { AgentStore, ResolvedTaskOutputLanguage, Settings, TaskStore, ThinkingLevel, WorkspaceConfig } from "@fusion/core";
+import { emitWorkflowLifecycleEvent, resolveTaskOutputLanguage, THINKING_LEVELS } from "@fusion/core";
 import type { ImplementationExit } from "./implementation-exit.js";
 import type { WorkflowLegacySeams } from "../workflows/workflow-node-handlers.js";
 import type { AgentSemaphore } from "../concurrency/concurrency.js";
@@ -20,6 +20,9 @@ import {
 } from "../workflows/workflow-node-handlers.js";
 import { graphActiveContextKey } from "./task-predicates.js";
 import { WorkflowReviewService } from "../workflows/workflow-review-service.js";
+import { MERGE_BOUNDARY_UNPROVEN_VALUE } from "../workflows/workflow-merge-nodes.js";
+import { SESSION_CONTENTION_HOLD_VALUE } from "../workflows/workflow-graph-executor.js";
+import { isSessionContentionError } from "../errors/transient-error-patterns.js";
 import { mergeEffectiveSettings } from "../project/effective-settings.js";
 import { resolveReviewCheckoutCwd } from "../execution/review-checkout.js";
 import { logReviewCheckoutRouting } from "./review-checkout-routing.js";
@@ -28,7 +31,7 @@ import {
   resolveValidatorThinkingLevel,
   resolveValidatorFallbackThinkingLevel,
 } from "../agents/agent-session-helpers.js";
-import type { ReviewVerdict } from "../execution/reviewer.js";
+import type { ReviewResult } from "../execution/reviewer.js";
 import {
   buildReviewUnavailableMessage,
   buildPlanVerifiedMessage,
@@ -38,11 +41,75 @@ import {
 } from "../project/proactive-status.js";
 import type { EngineRunContext } from "../util/run-audit.js";
 import { executorLog, reviewerLog } from "../logger.js";
+import { normalizeWorkspaceTaskRouting } from "./workspace-config-resolver.js";
+import { isApprovalFamilyVerdict } from "./workspace-review-per-repo.js";
 
 const WORKFLOW_THINKING_LEVEL_SET: ReadonlySet<string> = new Set(THINKING_LEVELS);
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mirror TaskExecutor method surface
 type AnyFn = (...args: any[]) => any;
+
+export type WorkspaceCodeReviewApprovalPublication = {
+  expected: boolean;
+  published: boolean;
+  superseded: boolean;
+  emptyApprovalFingerprints: boolean;
+  reason?: "scope-superseded" | "scope-absent" | "writer-unavailable" | "writer-failed" | "not-published";
+};
+
+/*
+FNXC:WorkspaceReviewEvidence 2026-08-29-12:17:
+FN-259 gives both workspace Code Review producers one durable primitive. FN-258 removed
+repositoryScope from updateTask, so an approval that only reaches updateTaskAtomic is silently
+lost; a writer failure now returns an explicit failed publication so callers cannot record APPROVE.
+*/
+export async function persistWorkspaceCodeReviewApproval(
+  store: TaskStore,
+  taskId: string,
+  review: Pick<ReviewResult, "verdict" | "repositoryScopeRevision" | "repositoryDiffFingerprints" | "repositoryModifiedFiles">,
+): Promise<WorkspaceCodeReviewApprovalPublication> {
+  const repositoryScopeRevision = review.repositoryScopeRevision;
+  const fingerprintEntries = Object.entries(review.repositoryDiffFingerprints ?? {});
+  const emptyApprovalFingerprints = repositoryScopeRevision !== undefined
+    && isApprovalFamilyVerdict(review.verdict)
+    && review.repositoryDiffFingerprints !== undefined
+    && fingerprintEntries.length === 0;
+  if (repositoryScopeRevision === undefined || !isApprovalFamilyVerdict(review.verdict) || fingerprintEntries.length === 0) {
+    if (repositoryScopeRevision !== undefined) {
+      const current = await store.getTask(taskId);
+      if (current.repositoryScope?.revision !== repositoryScopeRevision) {
+        return { expected: false, published: false, superseded: true, emptyApprovalFingerprints };
+      }
+    }
+    return { expected: false, published: false, superseded: false, emptyApprovalFingerprints };
+  }
+
+  const publish = (store as Partial<Pick<TaskStore, "publishWorkspaceCodeReviewEvidence">>).publishWorkspaceCodeReviewEvidence;
+  if (typeof publish !== "function") {
+    return { expected: true, published: false, superseded: false, emptyApprovalFingerprints: false, reason: "writer-unavailable" };
+  }
+
+  try {
+    const published = await publish.call(store, taskId, {
+      expectedScopeRevision: repositoryScopeRevision,
+      reviewEvidence: Object.fromEntries(fingerprintEntries.map(([repository, fingerprint]) => [
+        repository,
+        { fingerprint, approvedAt: new Date().toISOString() },
+      ])),
+      clearReviewRemediation: true,
+      ...(review.repositoryModifiedFiles !== undefined ? { modifiedFiles: review.repositoryModifiedFiles } : {}),
+    });
+    return {
+      expected: true,
+      published: published.published,
+      superseded: published.reason === "scope-superseded",
+      emptyApprovalFingerprints: false,
+      ...(published.published ? {} : { reason: published.reason ?? "not-published" }),
+    };
+  } catch {
+    return { expected: true, published: false, superseded: false, emptyApprovalFingerprints: false, reason: "writer-failed" };
+  }
+}
 
 export type CreateAuthoritativeWorkflowSeamsDeps = {
   store: TaskStore;
@@ -55,6 +122,7 @@ export type CreateAuthoritativeWorkflowSeamsDeps = {
     [k: string]: unknown;
   };
   workspaceConfig: WorkspaceConfig | null | undefined;
+  ensureWorkspaceConfig?: () => Promise<WorkspaceConfig | null>;
   activeWorkflowPrincipals: Map<string, { agentId: string; nodeInstanceId: string; agent?: import("@fusion/core").Agent }>;
   graphSeamGoverningNodeId: Map<string, string>;
   graphSeamThinkingLevel: Map<string, ThinkingLevel>;
@@ -78,7 +146,8 @@ export type CreateAuthoritativeWorkflowSeamsDeps = {
 
 export function createAuthoritativeWorkflowSeams(
   deps: CreateAuthoritativeWorkflowSeamsDeps,
-  _settings: Settings,
+  settings: Settings,
+  outputLanguage?: ResolvedTaskOutputLanguage,
 ): WorkflowLegacySeams {
     return {
       // Built-in triage/spec generation runs upstream of the interpreter today,
@@ -180,7 +249,12 @@ export function createAuthoritativeWorkflowSeams(
         // the staging state the merge queue consumes.
         const live = await deps.store.getTask(seamTask.id);
         await deps.persistTokenUsage(seamTask.id);
-        await deps.handoffTaskToReview(live, "workflow-graph-review");
+        /*
+        FNXC:TaskOutputLanguage 2026-08-19-16:25:
+        Legacy graph seams receive the invocation's resolved target rather than re-detecting a
+        mutable live description. Direct seam callers retain the compatibility fallback.
+        */
+        await deps.handoffTaskToReview(live, "workflow-graph-review", undefined, outputLanguage ?? resolveTaskOutputLanguage(settings, live.description));
         return { outcome: "success", value: "in-review" };
       },
       "review-handoff": async (seamTask) => {
@@ -190,7 +264,8 @@ export function createAuthoritativeWorkflowSeams(
          */
         const live = await deps.store.getTask(seamTask.id);
         await deps.persistTokenUsage(seamTask.id);
-        await deps.handoffTaskToReview(live, "workflow-graph-review-handoff");
+        /* FNXC:TaskOutputLanguage 2026-08-19-16:25: Manual handoff uses the same invocation snapshot as the review seam. */
+        await deps.handoffTaskToReview(live, "workflow-graph-review-handoff", undefined, outputLanguage ?? resolveTaskOutputLanguage(settings, live.description));
         return { outcome: "success", value: "in-review" };
       },
       merge: async (seamTask, _context, signal) => {
@@ -201,12 +276,15 @@ export function createAuthoritativeWorkflowSeams(
         if (signal?.aborted) {
           return { outcome: "failure", value: "merge-cancelled" };
         }
-        const mergeTask = await deps.ensureWorkflowMergeBoundaryTask(seamTask, {
+        const mergeBoundary = await deps.ensureWorkflowMergeBoundaryTask(seamTask, {
           reason: "workflow-merge-boundary",
           nodeId: "legacy-merge-seam",
           workflowId: "legacy-seams",
           runId: deps.getRunContextFor(seamTask.id)?.runId ?? "legacy-seam",
         });
+        /* FNXC:WorkflowMerge 2026-08-20-00:50: FN-9157 keeps the legacy seam terminal too; a retry cannot create missing boundary proof. */
+        if (mergeBoundary.blocked) return { outcome: "failure", value: MERGE_BOUNDARY_UNPROVEN_VALUE };
+        const mergeTask = mergeBoundary.task;
         const missingImplementationProof = await deps.getWorkflowMergeImplementationProofFailure(mergeTask);
         if (missingImplementationProof) {
           await deps.store.logEntry(
@@ -309,9 +387,17 @@ export function createAuthoritativeWorkflowSeams(
         (the step genuinely did not complete) while the VALUE names the ending, which is what the
         foreach propagates upward — `runForeach` returns a failing instance's value as its own —
         so the `steps` node can carry an `outcome:review-pending` edge to the park node.
-        Every other ending keeps `step-failed` exactly as before.
+
+        FNXC:WorkspaceContention 2026-08-23-00:00:
+        A step-session acquisition contention is also a scheduling wait. Preserve its typed graph
+        value so the foreach reaches `holdForSessionContention`; flattening it to `step-failed`
+        sends this path through ordinary graph failure and recreates the worktree-churn incident.
         */
-        const failureValue = result.exit === "review-handoff-pending-review" ? "review-pending" : "step-failed";
+        const failureValue = result.exit === "review-handoff-pending-review"
+          ? "review-pending"
+          : isSessionContentionError(result.error ?? "")
+            ? SESSION_CONTENTION_HOLD_VALUE
+            : "step-failed";
         return {
           outcome: result.outcome,
           value: result.outcome === "success" ? "step-done" : failureValue,
@@ -336,13 +422,30 @@ export function createAuthoritativeWorkflowSeams(
           return { verdict: "UNAVAILABLE", review: "no active step instance" };
         }
         const stepIndex = active.stepIndex;
-        const detail = await deps.store.getTask(seamTask.id);
-        // Worktree isolation (KTD-11): review the instance's OWN worktree when set.
+        let detail = await deps.store.getTask(seamTask.id);
+        const workspaceConfig = deps.ensureWorkspaceConfig
+          ? await deps.ensureWorkspaceConfig()
+          : deps.workspaceConfig;
+        if (workspaceConfig) {
+          /*
+          FNXC:WorkspaceRootRouting 2026-08-19-12:15:
+          A code review must not interpret historical singular root metadata as its checkout. Repair
+          that metadata before selecting a cwd, then let reviewWorkspacePerRepo consume only the
+          durable declared-repository entries; an empty map remains a real unavailable review.
+          */
+          detail = await normalizeWorkspaceTaskRouting(deps.store, seamTask.id) as typeof detail;
+        }
+        // Workspace Code Review fans out over durable repository entries. Plan Review
+        // reads the workspace under its declared read-only boundary; only single-repo
+        // review resolves a checkout here.
         const worktreePath = active.worktreePath || detail.worktree || deps.rootDir;
-        const reviewCwd = resolveReviewCheckoutCwd(detail, worktreePath);
-        logReviewCheckoutRouting(seamTask.id, detail, reviewCwd, worktreePath);
+        const reviewCwd = workspaceConfig ? deps.rootDir : resolveReviewCheckoutCwd(detail, worktreePath);
+        if (reviewCwd) logReviewCheckoutRouting(seamTask.id, detail, reviewCwd, worktreePath);
         const stepName = detail.steps[stepIndex]?.name ?? `Step ${stepIndex}`;
         const promptContent = detail.prompt ?? "";
+        const planScopeContext = workspaceConfig && config.type === "plan"
+          ? `\n\nRepository scope (task-level; review this plan once): ${detail.repositoryScope?.repositories.join(", ") || "unconfirmed"}.`
+          : "";
         const userComments = selectUserCommentsForAgentContext(detail, { limit: null });
         // Merge per-task effective workflow settings (U3, KTD-3) so the validator
         // model-lane reads below pick up workflow values. Behavior-inert by default.
@@ -369,7 +472,7 @@ export function createAuthoritativeWorkflowSeams(
             stepIndex,
             stepName,
             type: config.type,
-            promptContent,
+            promptContent: `${promptContent}${planScopeContext}`,
             // Code reviews diff against the per-step baseline captured at
             // step-execute; plan reviews pass no baseline (advisory).
             baselineSha: config.type === "code" ? active.baselineSha : undefined,
@@ -419,16 +522,44 @@ export function createAuthoritativeWorkflowSeams(
               onSessionEnded: (s) => deps.unregisterSubagentSession(seamTask.id, s),
             },
           });
-        const runForCwd = (cwd: string): Promise<{ verdict: ReviewVerdict; review: string; summary: string }> => {
+        const runForCwd = (cwd: string): Promise<ReviewResult> => {
           const invoke = () => invokeReviewerForCwd(cwd);
           return sem ? sem.runNested(invoke) : invoke();
         };
+        /*
+        FNXC:RepositoryScope 2026-08-20-23:40:
+        Plan Review is one task-document session even in a workspace. Code Review alone aggregates
+        modified scoped repositories. This prevents a clean acquired checkout from producing either
+        an extra plan session or an unavailable verdict before implementation starts.
+        */
         const invokeReviewer = () =>
-          deps.workspaceConfig && reviewCwd === worktreePath
-            ? deps.reviewWorkspacePerRepo(detail, (cwd: string) => runForCwd(cwd))
-            : runForCwd(reviewCwd);
+          workspaceConfig && config.type === "code" && detail.repositoryScope?.state !== "confirmed"
+            ? Promise.resolve({
+                verdict: "UNAVAILABLE" as const,
+                retryable: false,
+                review: "Workspace Code Review requires a confirmed repository scope.",
+                summary: "Unavailable: repository scope is not confirmed",
+              })
+            : workspaceConfig && config.type === "code"
+            ? deps.reviewWorkspacePerRepo(detail, (cwd: string) => runForCwd(cwd), {
+                workspaceRepos: workspaceConfig.repos,
+                workspaceRootDir: deps.rootDir,
+                settings,
+                /*
+                FNXC:Workspace 2026-08-15-04:49:
+                fn_task_done persists an accepted no-op sentinel as noCommitsExpected
+                before scheduling this review handoff. Carry that durable provenance
+                into the shared classifier so workspace review agrees with completion
+                even when the task acquired no sub-repo worktree.
+                */
+                noOpCompletion: detail.noCommitsExpected === true,
+                noOpCompletionReason: "verified no-op completion persisted by fn_task_done",
+              })
+            : workspaceConfig && !reviewCwd
+              ? Promise.resolve({ verdict: "UNAVAILABLE" as const, retryable: false, review: "Workspace Plan Review requires a confirmed scoped repository checkout.", summary: "Unavailable: no scoped repository checkout" })
+              : runForCwd(reviewCwd);
 
-        let review: { verdict: ReviewVerdict; review: string; summary: string };
+        let review: ReviewResult;
         try {
           review = await invokeReviewer();
         } catch (err) {
@@ -437,6 +568,51 @@ export function createAuthoritativeWorkflowSeams(
           const narration = buildReviewUnavailableMessage(err);
           void emitProactiveStatus(deps.store, seamTask.id, narration, "reviewer", sanitizeFailureReason(err));
           return { verdict: "UNAVAILABLE", review: `reviewer error: ${message}` };
+        }
+
+        /*
+        FNXC:RepositoryScope 2026-08-21-02:35:
+        A workspace Code Review callback belongs to the scope generation used to capture its
+        per-repository diff evidence. Check that generation under the task lock before persisting
+        approval or advancing the graph: an operator scope change supersedes the whole callback.
+        */
+        const workspaceApprovalPublication = workspaceConfig && config.type === "code"
+          ? await persistWorkspaceCodeReviewApproval(deps.store, seamTask.id, review)
+          : undefined;
+        if (workspaceApprovalPublication?.superseded) {
+          review = {
+            verdict: "UNAVAILABLE",
+            retryable: false,
+            review: "Workspace Code Review result superseded by a repository scope change.",
+            summary: "Unavailable: repository scope changed during review",
+            repositoryReviewOutcomes: review.repositoryReviewOutcomes,
+            repositoryScopeRevision: review.repositoryScopeRevision,
+          };
+        } else if (workspaceApprovalPublication?.expected && !workspaceApprovalPublication.published) {
+          const repositories = Object.keys(review.repositoryDiffFingerprints ?? {}).sort();
+          const reason = workspaceApprovalPublication.reason ?? "not-published";
+          await deps.store.logEntry(
+            seamTask.id,
+            `Workspace Code Review approval unavailable for ${seamTask.id}: ${repositories.join(", ")}`,
+            `Durable workspace review evidence was not published: ${reason}`,
+          );
+          review = {
+            verdict: "UNAVAILABLE",
+            retryable: true,
+            review: `Workspace Code Review approval could not be persisted for ${repositories.join(", ")}: ${reason}.`,
+            summary: `Unavailable: workspace review approval could not be persisted (${reason})`,
+            repositoryReviewOutcomes: review.repositoryReviewOutcomes,
+            repositoryScopeRevision: review.repositoryScopeRevision,
+          };
+        } else if (workspaceApprovalPublication?.emptyApprovalFingerprints) {
+          review = {
+            verdict: "UNAVAILABLE",
+            retryable: false,
+            review: "Workspace Code Review returned approval without repository diff fingerprints.",
+            summary: "Unavailable: no workspace review fingerprints were published",
+            repositoryReviewOutcomes: review.repositoryReviewOutcomes,
+            repositoryScopeRevision: review.repositoryScopeRevision,
+          };
         }
 
         await deps.store.logEntry(
@@ -462,6 +638,24 @@ export function createAuthoritativeWorkflowSeams(
         if (review.verdict === "APPROVE" && !config.advisory) {
           try {
             const cur = await deps.store.getTask(seamTask.id);
+            /*
+            FNXC:RepositoryScope 2026-08-21-02:48:
+            The step-inversion path has its own graph-advance projection. Re-read
+            the scope generation after evidence persistence and before marking the
+            step done, so an intervening scope mutation routes this callback as
+            unavailable instead of allowing its old APPROVE edge to advance.
+            */
+            if (workspaceConfig && config.type === "code" && review.repositoryScopeRevision !== undefined
+              && cur.repositoryScope?.revision !== review.repositoryScopeRevision) {
+              return {
+                verdict: "UNAVAILABLE",
+                retryable: false,
+                review: "Workspace Code Review result superseded by a repository scope change.",
+                summary: "Unavailable: repository scope changed during review before graph advancement",
+                repositoryReviewOutcomes: review.repositoryReviewOutcomes,
+                repositoryScopeRevision: review.repositoryScopeRevision,
+              };
+            }
             const status = cur.steps[stepIndex]?.status;
             if (stepIndex >= 0 && stepIndex < cur.steps.length && status !== "done" && status !== "skipped") {
               await deps.updateStepGraph(seamTask.id, stepIndex, "done");
@@ -477,7 +671,16 @@ export function createAuthoritativeWorkflowSeams(
           }
         }
 
-        return { verdict: review.verdict, review: review.review, summary: review.summary };
+        return {
+          verdict: review.verdict,
+          review: review.review,
+          summary: review.summary,
+          retryable: review.retryable,
+          repositoryDiffFingerprints: review.repositoryDiffFingerprints,
+          repositoryModifiedFiles: review.repositoryModifiedFiles,
+          repositoryReviewOutcomes: review.repositoryReviewOutcomes,
+          repositoryScopeRevision: review.repositoryScopeRevision,
+        };
       },
     };
 }

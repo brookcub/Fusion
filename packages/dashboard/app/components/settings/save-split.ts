@@ -66,6 +66,7 @@ export const MODEL_LANE_KEYS = [
   "mergerFallbackProvider", "mergerFallbackModelId", "mergerFallbackThinkingLevel",
   "githubImportAutoTranslate", "importTranslateTargetLocale",
   "importTranslateProvider", "importTranslateModelId", "importTranslateThinkingLevel",
+  "fastCheapProvider", "fastCheapModelId", "fastCheapCredentialInstanceId", "fastCheapThinkingLevel",
 ] as const;
 
 const MODEL_LANE_KEY_SET = new Set<string>(MODEL_LANE_KEYS);
@@ -81,7 +82,7 @@ global value before) let a project override's effective value silently stand in
 for "no change", so a genuine global edit that happened to match the merged value
 was dropped from the global patch. These scoped-only keys never fall back to `initialValues`.
 */
-const GLOBAL_GITLAB_SCOPED_ONLY_KEYS = new Set<string>([
+export const GLOBAL_SOURCE_CONTROL_SCOPED_ONLY_KEYS = new Set<string>([
   "gitlabEnabled",
   "gitlabInstanceUrl",
   "gitlabApiBaseUrl",
@@ -90,6 +91,44 @@ const GLOBAL_GITLAB_SCOPED_ONLY_KEYS = new Set<string>([
   "reportRoadmapDedupeEnabled",
   "reportRoadmapLabel",
   "reportRoadmapRepo",
+  "jiraEnabled",
+  "jiraBaseUrl",
+  "jiraApiBaseUrl",
+  "jiraAuthEmail",
+  "jiraAuthTokenSecretKey",
+  "jiraAuthTokenSecretScope",
+  "jiraBranchNameTemplate",
+]);
+
+/*
+FNXC:JiraBranchNaming 2026-08-20-05:18:
+GitLab and JIRA are dual-scope source-control settings. Keep their shared membership in
+one exported set so the global-section and project-override routing guards cannot drift.
+Roadmap keys deliberately remain project-only in the project guard below.
+*/
+export const DUAL_SCOPE_SOURCE_CONTROL_KEYS = new Set<string>([
+  "gitlabEnabled",
+  "gitlabInstanceUrl",
+  "gitlabApiBaseUrl",
+  "gitlabAuthToken",
+  "gitlabAuthTokenType",
+  "jiraEnabled",
+  "jiraBaseUrl",
+  "jiraApiBaseUrl",
+  "jiraAuthEmail",
+  "jiraAuthTokenSecretKey",
+  "jiraAuthTokenSecretScope",
+  "jiraBranchNameTemplate",
+]);
+
+const JIRA_SOURCE_CONTROL_KEYS = new Set<string>([
+  "jiraEnabled",
+  "jiraBaseUrl",
+  "jiraApiBaseUrl",
+  "jiraAuthEmail",
+  "jiraAuthTokenSecretKey",
+  "jiraAuthTokenSecretScope",
+  "jiraBranchNameTemplate",
 ]);
 
 type RemoteAccessProvider = "tailscale" | "cloudflare";
@@ -144,11 +183,19 @@ export const GLOBAL_SECTION_KEYS: Record<string, ReadonlySet<string>> = {
     "reportRoadmapDedupeEnabled",
     "reportRoadmapLabel",
     "reportRoadmapRepo",
+  "jiraEnabled",
+  "jiraBaseUrl",
+  "jiraApiBaseUrl",
+  "jiraAuthEmail",
+  "jiraAuthTokenSecretKey",
+  "jiraAuthTokenSecretScope",
+  "jiraBranchNameTemplate",
   ]),
   "global-general": new Set([
     "language",
     "dismissModalsOnOutsideClick",
     "skipConfirmationDialogs",
+    "quickAddSubmitOnEnter",
     "persistAgentToolOutput",
     "agentToolOutputMaxChars",
     "proactiveTaskChatEnabled",
@@ -158,9 +205,9 @@ export const GLOBAL_SECTION_KEYS: Record<string, ReadonlySet<string>> = {
     "updateCheckEnabled",
     "updateCheckFrequency",
     "updateChannel",
-    // FNXC:AutoUpdate 2026-07-25-10:05: global-general owns save/reset for the unattended-update opt-in.
-    "autoUpdateAndRestart",
-    "autoReloadOnVersionChange",
+    // FNXC:UpdateAutomation 2026-08-21-02:48: only visible controls can enter global save patches; legacy compatibility remains read-only.
+    "autoUpdateEnabled",
+    "autoRestartAfterUpdate",
   ]),
   /*
   FNXC:DashboardShortcuts 2026-07-04-00:00:
@@ -178,11 +225,16 @@ export const GLOBAL_SECTION_KEYS: Record<string, ReadonlySet<string>> = {
     "modelRouterEnabled",
     "modelRouterCheapProvider",
     "modelRouterCheapModelId",
+    "fastCheapGlobalProvider",
+    "fastCheapGlobalModelId",
+    "fastCheapGlobalCredentialInstanceId",
+    "fastCheapGlobalThinkingLevel",
     "opencodeGoModelSync",
     "openrouterAppAttribution",
     "openrouterModelFilters",
     "openrouterModelSync",
     "openrouterProviderPreferences",
+    "orcarouterModelSync",
     "executionGlobalProvider",
     "executionGlobalModelId",
     "planningGlobalProvider",
@@ -214,11 +266,16 @@ export const GLOBAL_SECTION_KEYS: Record<string, ReadonlySet<string>> = {
     "modelRouterEnabled",
     "modelRouterCheapProvider",
     "modelRouterCheapModelId",
+    "fastCheapGlobalProvider",
+    "fastCheapGlobalModelId",
+    "fastCheapGlobalCredentialInstanceId",
+    "fastCheapGlobalThinkingLevel",
     "opencodeGoModelSync",
     "openrouterAppAttribution",
     "openrouterModelFilters",
     "openrouterModelSync",
     "openrouterProviderPreferences",
+    "orcarouterModelSync",
     "executionGlobalProvider",
     "executionGlobalModelId",
     "planningGlobalProvider",
@@ -448,7 +505,7 @@ export function splitSettingsSave({
     if (key === "githubTrackingDefaultRepo" && activeSection !== "source-control-global") {
       continue;
     }
-    if ((key === "gitlabEnabled" || key === "gitlabInstanceUrl" || key === "gitlabApiBaseUrl" || key === "gitlabAuthToken" || key === "gitlabAuthTokenType") && activeSection !== "source-control-global") {
+    if (DUAL_SCOPE_SOURCE_CONTROL_KEYS.has(key) && activeSection !== "source-control-global") {
       continue;
     }
     if (key === "mcpServers" && scopedMcpValues) {
@@ -485,7 +542,7 @@ export function splitSettingsSave({
         continue;
       }
 
-      const scopedOnly = GLOBAL_GITLAB_SCOPED_ONLY_KEYS.has(key);
+      const scopedOnly = GLOBAL_SOURCE_CONTROL_SCOPED_ONLY_KEYS.has(key);
       const hasScopedInitial = hasOwn(initialScopedValues?.global, key);
       const hasMergedInitial = !scopedOnly && hasOwn(initialValues, key);
       const initialValue = hasScopedInitial
@@ -516,12 +573,23 @@ export function splitSettingsSave({
     // section is active these source-control keys are the GLOBAL fallbacks, so they must not
     // also be written as project overrides. See the FNXC note in the global branch.
     if (key === "githubTrackingDefaultRepo" && activeSection === "source-control-global") continue;
-    if ((key === "gitlabEnabled" || key === "gitlabInstanceUrl" || key === "gitlabApiBaseUrl" || key === "gitlabAuthToken" || key === "gitlabAuthTokenType" || key === "reportRoadmapDedupeEnabled" || key === "reportRoadmapLabel" || key === "reportRoadmapRepo") && activeSection === "source-control-global") continue;
+    if ((DUAL_SCOPE_SOURCE_CONTROL_KEYS.has(key) || ["reportRoadmapDedupeEnabled", "reportRoadmapLabel", "reportRoadmapRepo"].includes(key)) && activeSection === "source-control-global") continue;
     if (key === "mcpServers" && scopedMcpValues) continue;
     if (key === "mcpServers" && activeSection === "global-mcp") continue;
     if (!isProjectSettingsKey(key)) continue;
 
     const initialProjectValue = initialScopedValues?.project?.[key as keyof Settings];
+    const hasProjectOverride = hasOwn(initialScopedValues?.project, key);
+
+    /*
+    FNXC:JiraBranchNaming 2026-08-20-05:18:
+    The project form displays effective global JIRA values. When no raw project override exists,
+    an unchanged effective value must not be materialized as a project setting, or later global
+    edits stop propagating to that project. Explicit edits and clears still use normal diffing.
+    */
+    if (JIRA_SOURCE_CONTROL_KEYS.has(key) && !hasProjectOverride && settingsValueEquals(value, initialValues?.[key as keyof Settings])) {
+      continue;
+    }
 
     if (MODEL_LANE_KEY_SET.has(key)) {
       if (!settingsValueEquals(value, initialProjectValue)) {

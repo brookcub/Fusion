@@ -4,22 +4,12 @@ import { join } from "node:path";
 import type { TaskStore } from "@fusion/core";
 
 /*
-FNXC:PlanArtifactPersistence 2026-07-26-03:55:
-Planning sessions run in the TASK's own worktree (see FNXC:NodeWorktreeIsolation in triage.ts), and they
-carry the full coding tool surface. The system prompt tells the planner to persist through
-`fn_task_prompt_write`, but that is a soft instruction: a planner that reaches for the generic write tool
-writes the relative spec path (`.fusion/tasks/<id>/PROMPT.md`) against its own cwd, so the spec lands
-INSIDE the worktree. Triage then finalizes by reading `<rootDir>/<promptPath>`, sees nothing, and fails
-deterministic validation — and the worktree copy is destroyed with the worktree.
-
-Two durability requirements follow, and this module owns both:
-1. A plan written inside a worktree is copied back into the main project `.fusion/` folder. The copy goes
-   through `store.updateTask({ prompt })`, which is the single validated persistence path (File Scope
-   validation, root PROMPT.md write, and task.json sync stay together and stay atomic).
-2. The authoritative plan is mirrored into the project database. `project.tasks` has no `prompt` column —
-   PROMPT.md is filesystem-only and is hydrated on read — so losing the project checkout loses every spec.
-   The mirror uses the existing `task_documents` store under the `plan` key, which triage already reads as
-   a planning-draft fallback (`readNonEmptyPlanningDraft`), so recovery has a DB-backed source of truth.
+FNXC:PlanArtifactPersistence 2026-09-01-14:49:
+Fresh planning runs at the project root under a boundary that permits generic writes only inside `.fusion/`,
+so normal plans publish directly to the authoritative task artifact. This worktree-recovery path remains for
+replan cards that already retained an execution checkout or legacy attempts interrupted before FN-282.
+Recovered content still passes through `store.updateTask({ prompt })`, and the authoritative plan is mirrored
+under the `plan` task-document key so filesystem and project-database durability remain aligned.
 */
 
 /** Relative, cwd-anchored path handed to the planning agent for a task's spec. */
@@ -43,6 +33,13 @@ export interface ReconcileWorktreePlanArtifactOptions {
   /** cwd the planning session ran in. Equal to `rootDir` when planning did not get a worktree. */
   planningCwd: string;
   logger?: PlanWritebackLogger;
+  /**
+   * Optional caller-owned authoritative writer. Triage uses this to serialize a recovered
+   * worktree artifact with its reset-generation fence before it can recreate PROMPT.md.
+   */
+  writeAuthoritativePrompt?: (content: string) => Promise<boolean>;
+  /** Optional caller-owned plan-document writer subject to the same publication fence. */
+  mirrorAuthoritativePlan?: (content: string, author?: string) => Promise<boolean>;
 }
 
 export type PlanWritebackOutcome =
@@ -57,7 +54,9 @@ export type PlanWritebackOutcome =
   /** Worktree copy was copied back into the project `.fusion/` folder. */
   | "recovered"
   /** A worktree copy existed but persisting it failed; the root copy is untouched. */
-  | "recovery-failed";
+  | "recovery-failed"
+  /** A reset fenced this planning attempt before its worktree copy could be published. */
+  | "recovery-fenced";
 
 export interface ReconcileWorktreePlanArtifactResult {
   outcome: PlanWritebackOutcome;
@@ -109,7 +108,10 @@ export async function reconcileWorktreePlanArtifact(
 
   try {
     // The single validated persistence path: File Scope validation + root PROMPT.md write + task.json sync.
-    await store.updateTask(taskId, { prompt: worktreeContent });
+    const persisted = options.writeAuthoritativePrompt
+      ? await options.writeAuthoritativePrompt(worktreeContent)
+      : (await store.updateTask(taskId, { prompt: worktreeContent }), true);
+    if (!persisted) return { outcome: "recovery-fenced", content: rootContent ?? undefined };
     logger?.log?.(
       `${taskId}: recovered a worktree-local PROMPT.md into the project .fusion folder (${planningCwd})`,
     );
@@ -171,11 +173,14 @@ export async function persistPlanArtifact(
   options: ReconcileWorktreePlanArtifactOptions & { author?: string },
 ): Promise<ReconcileWorktreePlanArtifactResult & { mirrored: boolean }> {
   const result = await reconcileWorktreePlanArtifact(options);
+  if (result.outcome === "recovery-fenced") return { ...result, mirrored: false };
   const mirrored = result.content
-    ? await mirrorPlanToProjectDb(options.store, options.taskId, result.content, {
-      author: options.author,
-      logger: options.logger,
-    })
+    ? options.mirrorAuthoritativePlan
+      ? await options.mirrorAuthoritativePlan(result.content, options.author)
+      : await mirrorPlanToProjectDb(options.store, options.taskId, result.content, {
+        author: options.author,
+        logger: options.logger,
+      })
     : false;
   return { ...result, mirrored };
 }

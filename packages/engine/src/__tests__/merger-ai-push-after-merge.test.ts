@@ -92,6 +92,11 @@ function advanceOrigin(originDir: string, fileName: string): void {
 
 function makeStore(settingsOverrides: Record<string, unknown> = {}) {
   const task: Record<string, unknown> = {
+    /* FNXC:RequiredPreMergeSteps 2026-08-23-00:20: merge-mechanics fixture, not a review-gating one.
+       The door refuses a card whose enabled optional pre-merge groups produced no result, and the
+       built-in workflow enables Plan and Code Review by default, so an unspecified list failed the
+       door before the behaviour under test ran. An explicit empty list states the intent. */
+    enabledWorkflowSteps: [],
     id: "FN-1",
     column: "in-review",
     status: null,
@@ -109,6 +114,14 @@ function makeStore(settingsOverrides: Record<string, unknown> = {}) {
       ...settingsOverrides,
     })),
     updateTask: vi.fn(async (_id: string, patch: Record<string, unknown>) => { Object.assign(task, patch); return task; }),
+    /* FNXC:MergeMockDrift 2026-08-23-00:20: `updateTaskAtomic` is a production write seam the merge
+       path uses; a fake store that omits it throws TypeError before the behaviour under test runs.
+       Same read-modify-write shape as the sibling fake in `merger-ai.test.ts`. */
+    updateTaskAtomic: vi.fn(async (_id: string, updater: (current: typeof task) => Record<string, unknown> | undefined) => {
+      const patch = await updater(task);
+      if (patch) Object.assign(task, patch);
+      return task;
+    }),
     moveTask: vi.fn(async (_id: string, column: string) => { task.column = column; return task; }),
     emit: vi.fn(),
     logEntry: vi.fn(async (_id: string, message: string, action?: string) => { logs.push({ message, action }); }),
@@ -148,6 +161,60 @@ describe("runAiMerge push-after-merge", () => {
     expect(storeMocks.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
       mutationType: "push:origin",
       metadata: expect.objectContaining({ outcome: "success" }),
+    }));
+  });
+
+  it("retries a temporary transport failure on the unified fast path", async () => {
+    const { dir, originDir } = initRepoWithRemote();
+    const hookPath = join(originDir, "hooks", "pre-receive");
+    writeFileSync(hookPath, `#!/bin/sh
+marker="$(dirname "$0")/../transient-push-once"
+if [ ! -f "$marker" ]; then
+  touch "$marker"
+  echo "fatal: unable to access remote: Connection reset by peer" >&2
+  exit 1
+fi
+`, { mode: 0o755 });
+    const { store, logs } = makeStore();
+
+    const result = await runAiMerge(store, dir, "FN-1", { manual: true }, {
+      mergeAgent: realMergeAgent("fusion/fn-1"),
+      reviewAgent: approveReviewer(),
+    });
+
+    expect(result.pushedToRemote).toBe(true);
+    expect(git(originDir, "rev-parse main")).toBe(git(dir, "rev-parse main"));
+    expect(logs.some((entry) => entry.message.includes("temporary Git transport failure"))).toBe(true);
+  });
+
+  it("records an aborted outcome when cancellation interrupts the unified retry backoff", async () => {
+    const { dir, originDir } = initRepoWithRemote();
+    const hookPath = join(originDir, "hooks", "pre-receive");
+    writeFileSync(hookPath, `#!/bin/sh
+echo "fatal: unable to access remote: Connection reset by peer" >&2
+exit 1
+`, { mode: 0o755 });
+    const controller = new AbortController();
+    const { store, storeMocks, logs } = makeStore();
+    storeMocks.logEntry.mockImplementation(async (_id: string, message: string, action?: string) => {
+      logs.push({ message, action });
+      if (message.includes("temporary Git transport failure")) controller.abort();
+    });
+
+    const result = await runAiMerge(store, dir, "FN-1", { manual: true, signal: controller.signal }, {
+      mergeAgent: realMergeAgent("fusion/fn-1"),
+      reviewAgent: approveReviewer(),
+    });
+
+    expect(result.pushedToRemote).toBe(false);
+    expect(result.pushError).toContain("aborted by shutdown signal");
+    expect(storeMocks.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+      mutationType: "push:origin",
+      metadata: expect.objectContaining({ outcome: "aborted" }),
+    }));
+    expect(storeMocks.recordRunAuditEvent).not.toHaveBeenCalledWith(expect.objectContaining({
+      mutationType: "push:origin",
+      metadata: expect.objectContaining({ outcome: "failed" }),
     }));
   });
 

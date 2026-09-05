@@ -75,11 +75,19 @@ const SETTING_DESCRIPTION_KEYS: Record<string, string> = {
   githubTrackingDefaultRepo: "globalGeneral.projectsInheritThisValueWhenTheyDoNot",
   gitlabEnabled: "merge.gitLabAuthDetails",
   gitlabInstanceUrl: "globalGeneral.gitLabInstanceUrlHint",
+  jiraEnabled: "jira.enabledHelp",
+  jiraBaseUrl: "jira.baseUrlHelp",
+  jiraApiBaseUrl: "jira.apiBaseUrlHelp",
+  jiraAuthEmail: "jira.emailHelp",
+  jiraAuthTokenSecretKey: "jira.secretHelp",
+  jiraAuthTokenSecretScope: "jira.scopeHelp",
+  jiraBranchNameTemplate: "jira.templateHelp",
   gitlabApiBaseUrl: "globalGeneral.gitLabApiBaseUrlHint",
   gitlabAuthTokenType: "globalGeneral.gitLabTokenTypeHint",
   gitlabAuthToken: "globalGeneral.gitLabAuthTokenHint",
   dismissModalsOnOutsideClick: "globalGeneral.dismissModalsByClickingOutsideHint",
   skipConfirmationDialogs: "globalGeneral.skipConfirmationDialogsHint",
+  quickAddSubmitOnEnter: "globalGeneral.quickAddSubmitOnEnterHint",
   persistAgentToolOutput: "globalGeneral.whenDisabledToolRowsAreStillLoggedBut",
   agentToolOutputMaxChars: "globalGeneral.agentToolOutputLimitHint",
   proactiveTaskChatEnabled: "globalGeneral.enableProactiveTaskChatHint",
@@ -88,10 +96,12 @@ const SETTING_DESCRIPTION_KEYS: Record<string, string> = {
   fnBinaryCheckEnabled: "globalGeneral.disableThisIfYourLocalDevProcessIs",
   updateCheckEnabled: "globalGeneral.andShowsUpdateNoticesInTheCLIAnd",
   updateCheckFrequency: "globalGeneral.controlsHowOftenTheDashboardReFetchesThe",
-  autoReloadOnVersionChange: "globalGeneral.whenEnabledDefaultTheDashboardAutomaticallyReloadsWhen",
   updateChannel: "globalGeneral.releaseChannelHelp",
   autoUpdateAndRestart: "globalGeneral.autoUpdateAndRestartHelp",
+  autoUpdateEnabled: "globalGeneral.autoUpdateEnabledHelp",
+  autoRestartAfterUpdate: "globalGeneral.autoRestartAfterUpdateHelp",
   // AppearanceSection
+  chatMessageLayout: "appearance.chatMessageLayoutHelp",
   openTasksInRightSidebar: "appearance.openTasksInRightSidebarHelp",
   openMobileTasksInPopup: "appearance.openMobileTasksInPopupHelp",
   taskPopupsBoardListOnly: "appearance.taskPopupsBoardListOnlyHelp",
@@ -108,6 +118,8 @@ const SETTING_DESCRIPTION_KEYS: Record<string, string> = {
   defaultThinkingLevel: "globalModels.controlsHowMuchReasoningEffortTheAIModel",
   openrouterModelSync: "globalModels.whenEnabledStartupFetchesTheLatestAvailableModels",
   opencodeGoModelSync: "globalModels.flowAndPublishesThemUnderTheOpencodeGo",
+  /* FNXC:SettingsHelp 2026-08-23-20:45: OrcaRouter catalog sync ships its own SettingsToggleRow help in GlobalModelsSection. */
+  orcarouterModelSync: "globalModels.whenEnabledStartupFetchesTheLatestOrcaRouterModels",
   openrouterAppAttribution: "globalModels.leaveEmptyToOmitThisHeaderDefaultHttps",
   openrouterModelFilters: "globalModels.commaSeparatedValuesSentToOpenRouterModelSync",
   openrouterProviderPreferences: "globalModels.openRouterRoutingOrderHint",
@@ -187,6 +199,13 @@ const SETTING_DESCRIPTION_KEYS: Record<string, string> = {
   memoryDreamsEnabled: "memory.turnsDailyNotesIntoDREAMSMdAndPromotes",
   memoryDreamsSchedule: "memory.cronExpressionForDreamProcessing",
   memoryBackendType: "memory.agentsGetMemorySearchMemoryGetAndMemory",
+  stashUrl: "memory.stashUrlHelp",
+  /*
+  FNXC:StashSessionCapture 2026-08-19-05:09:
+  (RUFU-122) Task-terminal transcript upload controls (Stash backend only).
+  */
+  executorSessionCaptureEnabled: "memory.uploadTaskAgentLogTranscriptToStash",
+  executorSessionCaptureMaxEvents: "memory.capOnTranscriptEventsUploadedPerTask",
   // MergeSection
   autoMerge: "merge.whenEnabledTasksThatPassReviewAreAutomatically",
   // FN-7557: planApprovalMode defaults to auto-approve-all; the "(default)" marker moved to the auto-approve option.
@@ -244,11 +263,9 @@ const SETTING_DESCRIPTION_KEYS: Record<string, string> = {
   maxWorktrees: "worktrees.limitsTotalGitWorktreesIncludingInReviewTasks",
   worktreeLimitEnabled: "worktrees.worktreeLimitEnabledHelp",
   worktreeInitCommand: "worktrees.shellCommandToRunInEachNewWorktree",
-  recycleWorktrees: "worktrees.offByDefaultOptInWhenEnabledCompleted",
   showWorktreeGrouping: "worktrees.showWorktreeGroupingHelp",
   worktreeCopyFiles: "worktrees.copyFilesHelp",
   executorAllowSiblingBranchRename: "worktrees.andCanHidePriorCommitsFromTheDefault",
-  worktreeNaming: "worktrees.howToNameFreshWorktreeDirectories",
   worktreesDir: "worktrees.whenUnsetOnlyAffectsNewlyCreatedWorktrees",
   worktreeRebaseBeforeMerge: "worktrees.whenEnabledTheMergerFetchesFromTheConfigured",
   worktreeRebaseRemote: "worktrees.whichRemoteToFetchForThePreMerge",
@@ -294,6 +311,7 @@ const SETTING_DESCRIPTION_KEYS: Record<string, string> = {
   showTaskChatsInCommonFeed: "general.showTaskChatsInCommonFeedHint",
   taskPrefix: "general.prefixForNewTaskIDsEGKB",
   maxRecommendationsPerTask: "general.maxRecommendationsPerTaskHelp",
+  requireTaskRecommendations: "general.requireTaskRecommendationsHelp",
   recommendationMailboxNoticeEnabled: "general.recommendationMailboxNoticeEnabledHelp",
   workspaceMode: "general.workspaceModeHint",
   defaultWorkflowId: "general.newTasksInheritThisCustomWorkflowsStepsOverridable",
@@ -305,7 +323,7 @@ const SETTING_DESCRIPTION_KEYS: Record<string, string> = {
   // ProjectModelsSection
   autoSelectModelPreset: "projectModels.autoSelectModelPresetHint",
   autoSummarizeTitles: "projectModels.whenEnabledTasksCreatedWithoutATitleBut",
-  taskDefinitionInInputLanguage: "projectModels.taskDefinitionInInputLanguageHelp",
+  taskOutputLanguage: "projectModels.taskOutputLanguageHelp",
   defaultPresetBySize: "projectModels.autoSelectModelPresetHint",
   modelPresets: "projectModels.autoSelectModelPresetHint",
   prDescriptionPromptInstructions: "projectModels.prDescriptionPromptInstructionsHelp",
@@ -322,6 +340,10 @@ const SETTING_DESCRIPTION_KEYS: Record<string, string> = {
 
 /** Setting keys intentionally not surfaced as a plain Settings UI description field, with reasons. */
 const NOT_SURFACED_ALLOWLIST: Record<string, string> = {
+  // FNXC:TaskOutputLanguage 2026-08-19-14:56: Legacy compatibility remains persisted but hidden behind the three-mode selector.
+  taskDefinitionInInputLanguage: "legacy task-output-language compatibility flag, not a rendered Settings field",
+  // FNXC:GitHubStarPrompt 2026-08-24-00:34: Internal dismissal timestamp written by useGitHubStarPrompt when the operator dismisses the star ask; runtime bookkeeping state, not a user-editable Settings field.
+  githubStarPromptDismissedAt: "internal star-prompt dismissal timestamp written by useGitHubStarPrompt; not a rendered Settings field",
   /*
   FNXC:OriginWorkflowSelection 2026-07-26-19:40:
   Server-side mirror of the operator's Board workflow lane, written by the dashboard
@@ -341,6 +363,27 @@ const NOT_SURFACED_ALLOWLIST: Record<string, string> = {
   nested enabled flag rather than a top-level plain description field.
   */
   voiceInput: "nested Voice Input section object; enable toggle owns Default: off for voiceInput.enabled",
+  /*
+  FNXC:StashVectorSearch 2026-08-21-13:35:
+  RUFU-146 review (PRRT_kwDOSA-8Y86a7RZs): the duplicate earlier stashApiKey
+  allowlist entry was removed — NOT_SURFACED_ALLOWLIST carried the key twice
+  (the second entry silently overrode the first); the single remaining entry
+  below is the more complete one.
+  */
+  // FNXC:StashVectorSearch 2026-08-20-16:32:
+  // (RUFU-126) schema-only vector search toggle with no Settings UI row
+  // (same treatment as stashApiKey below): config-file-managed knob for the
+  // Stash backend, which is inert without a stashUrl anyway. Registered here
+  // so the FN-7505 guard does not flag the RUFU-126 schema addition.
+  stashVectorSearch: "RUFU-126 schema-only Stash vector search toggle; no Settings UI row",
+  /*
+  FNXC:StashSessionCapture 2026-08-19-05:09:
+  (RUFU-122) Schema-only transcript flag: when enabled, status entries are
+  included in the uploaded agent-log transcript. Deliberately rendered as NO
+  Settings row (operator-managed via the config file), so there is no
+  user-editable description field to document.
+  */
+  executorSessionCaptureIncludeStatus: "schema-only transcript flag (status-entry inclusion); deliberately not rendered as a Settings row",
   // Moved to workflow settings (U4) — see MOVED_SETTINGS_KEYS in `packages/core/src/config/settings-schema.ts`.
   workflowStepTimeoutMs: "moved to workflow settings (U4)",
   workflowStepScopeEnforcement: "moved to workflow settings (U4)",
@@ -381,6 +424,14 @@ const NOT_SURFACED_ALLOWLIST: Record<string, string> = {
   titleSummarizerGlobalCredentialInstanceId: "inline companion for the global title-summarizer model picker; unset inherits the provider default",
   mergerGlobalCredentialInstanceId: "inline companion for the global merger model picker; unset inherits the provider default",
   importTranslateGlobalCredentialInstanceId: "inline companion for the global import-translate model picker; unset inherits the provider default",
+  fastCheapGlobalProvider: "configured by the global Fast & Cheap Model picker for the no-plan/no-review Fast mode lane",
+  fastCheapGlobalModelId: "configured by the global Fast & Cheap Model picker for the no-plan/no-review Fast mode lane",
+  fastCheapGlobalCredentialInstanceId: "inline companion for the global Fast & Cheap Model picker; unset inherits the provider default",
+  fastCheapGlobalThinkingLevel: "inline thinking companion for the global Fast & Cheap Model picker",
+  fastCheapProvider: "configured by the project Fast & Cheap Model picker for the no-plan/no-review Fast mode lane",
+  fastCheapModelId: "configured by the project Fast & Cheap Model picker for the no-plan/no-review Fast mode lane",
+  fastCheapCredentialInstanceId: "inline companion for the project Fast & Cheap Model picker; unset inherits the provider default",
+  fastCheapThinkingLevel: "inline thinking companion for the project Fast & Cheap Model picker",
   defaultCredentialInstanceIdOverride: "inline companion for the project default model picker; unset inherits the provider default",
   titleSummarizerCredentialInstanceId: "inline companion for the project title-summarizer model picker; unset inherits the provider default",
   titleSummarizerFallbackCredentialInstanceId: "inline companion for the project title-summarizer fallback model picker; unset inherits the provider default",
@@ -500,9 +551,6 @@ const NOT_SURFACED_ALLOWLIST: Record<string, string> = {
   commitMsgHookEnabled: "not yet exposed as a distinct Settings field",
   autoResolveReviewComments: "not yet exposed as a distinct Settings field",
   mergeRequestContractShadowEnabled: "internal shadow-diagnostic flag, not a Settings field",
-  mergeDiffVolumeMinLines: "not yet exposed as a distinct Settings field",
-  mergeDiffVolumeThreshold: "not yet exposed as a distinct Settings field",
-  mergeDiffVolumeAllowlist: "not yet exposed as a distinct Settings field",
   mergeAuditAutoRecovery: "not yet exposed as a distinct Settings field",
   autoRecovery: "not yet exposed as a distinct Settings field",
   buildTimeoutMs: "not yet exposed as a distinct Settings field",
@@ -613,15 +661,58 @@ const NOT_SURFACED_ALLOWLIST: Record<string, string> = {
   prerebaseAutoEnabled: "internal pre-rebase tuning constant, no UI field",
   prerebaseHotFiles: "internal pre-rebase tuning constant, no UI field",
   prerebaseDivergenceThreshold: "internal pre-rebase tuning constant, no UI field",
-  // FNXC:Round10 2026-07-13: FN-7907/FN-7908 added chat default model/agent/session settings.
-  // These are configured via the chat New Session defaults picker, not plain description fields.
-  chatNewSessionMode: "chat new-session default mode, configured via the chat defaults picker, not a plain description field",
-  chatDefaultKind: "chat default agent kind, configured via the chat defaults picker, not a plain description field",
-  chatDefaultAgentId: "chat default agent id, configured via the chat defaults picker, not a plain description field",
-  chatDefaultModelProvider: "chat default model provider, configured via the chat defaults picker, not a plain description field",
-  chatDefaultModelId: "chat default model id, configured via the chat defaults picker, not a plain description field",
-  chatDefaultThinkingLevel: "chat default thinking level, configured via the chat defaults picker, not a plain description field",
+  /*
+   * FNXC:SettingsDefaults 2026-09-01-14:52:
+   * Chat defaults are rendered by ProjectModelsSection's Chat group, where help is
+   * attached to the shared SettingsHelpTip "?" affordance instead of a plain
+   * description field. chatNewSessionMode is retained schema-parity state with no
+   * rendered control.
+   */
+  chatNewSessionMode: "retired create-time mode flag with no rendered control, retained in DEFAULT_SETTINGS for settings parity",
+  chatDefaultKind: "configured by ProjectModelsSection's Chat group with SettingsHelpTip help, not a plain description field",
+  chatDefaultAgentId: "configured by ProjectModelsSection's Chat group with SettingsHelpTip help, not a plain description field",
+  chatDefaultModelProvider: "configured by ProjectModelsSection's Chat group with SettingsHelpTip help, not a plain description field",
+  chatDefaultModelId: "configured by ProjectModelsSection's Chat group with SettingsHelpTip help, not a plain description field",
+  chatDefaultThinkingLevel: "configured by ProjectModelsSection's Chat group with SettingsHelpTip help, not a plain description field",
+  /*
+   * FNXC:Rufu043MemoryBackends 2026-08-08-17:38:
+   * RUFU-040 foundation commit 8c595f5cd added three project-scoped Stash/TencentDB
+   * memory-backend settings keys to DEFAULT_PROJECT_SETTINGS without registering them
+   * here, breaking this guard's "every DEFAULT_SETTINGS key is either mapped to a
+   * description or explicitly allowlisted" assertion on any base carrying the
+   * foundation. They are allowlisted (not mapped) because their canonical schema
+   * default is the empty string `""` (meaning "use the runtime localhost constant"),
+   * so a description-field `Default:` claim would be a fabricated-default defect that
+   * the guard's canonical-default assertion rejects; their concrete defaults are the
+   * http://127.0.0.1 runtime fallbacks conveyed by each row's placeholder/help, not a
+   * description-field claim.
+   *
+   * FNXC:StashSessionCapture 2026-08-19-05:09:
+   * (RUFU-122) stashUrl left this allowlist: it is now a genuinely rendered
+   * Settings row whose help copy accurately states its empty-string canonical
+   * default ("Default: empty (uses the built-in default Stash URL)"), so it is
+   * mapped in SETTING_DESCRIPTION_KEYS instead — a key in BOTH maps fails the
+   * overlap assertion below.
+   */
+  memoryBackendUrl: "project-scoped TencentDB gateway URL row (rendered in MemorySection only for the tencentdb backend); canonical schema default is empty (`''`) = use the runtime DEFAULT_GATEWAY_URL (http://127.0.0.1:8420), conveyed by the row's placeholder/help, not a description-field claim",
+  stashApiKey: "Stash API-key secret override, not rendered as a settings field (the primary key lives in the global secrets store `stash-api-key` per MemorySection help, never in settings); canonical schema default is empty (`''`) = use the resolved global secret",
 };
+
+const CHAT_DEFAULT_ALLOWLIST_KEYS = [
+  "chatNewSessionMode",
+  "chatDefaultKind",
+  "chatDefaultAgentId",
+  "chatDefaultModelProvider",
+  "chatDefaultModelId",
+  "chatDefaultThinkingLevel",
+] as const;
+
+const RETIRED_CHAT_FLOW_PHRASES = [
+  "New Chat dialog",
+  "New Chat picker",
+  "chat defaults picker",
+  "New Session defaults picker",
+] as const;
 
 describe("FN-7505 settings default-value description guard", () => {
   it("uses the active English catalog's first-error tool retry default", () => {
@@ -691,6 +782,27 @@ describe("FN-7505 settings default-value description guard", () => {
       SETTING_DESCRIPTION_KEYS,
       "FN-8993 requires knowledgeGraphDir to stay out of SETTING_DESCRIPTION_KEYS",
     ).not.toHaveProperty("knowledgeGraphDir");
+  });
+
+  it("chat default allowlist reasons name their real host and carry no retired-flow claim", () => {
+    for (const settingKey of CHAT_DEFAULT_ALLOWLIST_KEYS) {
+      expect(DEFAULT_SETTINGS).toHaveProperty(settingKey);
+
+      const reason = NOT_SURFACED_ALLOWLIST[settingKey];
+      expect(reason).toEqual(expect.any(String));
+      expect(reason).not.toBe("");
+
+      for (const retiredPhrase of RETIRED_CHAT_FLOW_PHRASES) {
+        expect(reason).not.toMatch(new RegExp(retiredPhrase, "i"));
+      }
+
+      if (settingKey === "chatNewSessionMode") {
+        expect(reason).toMatch(/\b(retired|inert)\b/i);
+        expect(reason).toMatch(/no rendered control/i);
+      } else {
+        expect(reason).toContain("ProjectModelsSection");
+      }
+    }
   });
 
   it("does not allowlist a key that is also mapped to a description (would mask real coverage gaps)", () => {

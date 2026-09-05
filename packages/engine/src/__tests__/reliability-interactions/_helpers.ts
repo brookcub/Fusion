@@ -1,7 +1,8 @@
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { execSync, spawnSync, exec } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
+import postgres from "postgres";
 import { Worker } from "node:worker_threads";
 import {
   AgentStore, DEFAULT_SETTINGS, TaskStore, type Settings, type Task,
@@ -10,6 +11,7 @@ import {
   drizzleEq, postgresSchema,
 } from "@fusion/core";
 import { aiMergeTask } from "../../merger.js";
+import { decoratePgProvisioningError } from "../../../../core/src/__test-utils__/pg-provisioning-diagnostics.js";
 import { SelfHealingManager } from "../../self-healing.js";
 
 export const hasGit = spawnSync("git", ["--version"], { stdio: "pipe" }).status === 0;
@@ -39,8 +41,8 @@ FNXC:SqliteRemoval 2026-07-14-00:00:
 The SQLite Database class was removed (VAL-REMOVAL-005). Reliability fixtures
 now require a PG-backed TaskStore. The engine-slow CI job and test-shards both
 provision a PG service container. Tests skip locally when PG is not reachable.
-The TCP probe is duplicated from packages/core/src/__test-utils__/pg-test-harness.ts
-because that module is not exported from @fusion/core's public API.
+The TCP probe remains duplicated because pg-test-harness is not exported from @fusion/core's
+public API, while provisioning diagnostics are shared from its test-only sibling module.
 */
 const PG_TEST_URL_BASE = process.env.FUSION_PG_TEST_URL_BASE ?? "postgresql://localhost:5432";
 
@@ -94,40 +96,52 @@ function probeTcpReachable(host: string, port: number, timeoutMs = 1500): boolea
 }
 
 /*
-FNXC:PgTestGuard 2026-07-14-07:10:
-hasPg must verify BOTH that the PostgreSQL server is TCP-reachable AND that the
-psql CLI binary is installed. adminExecAsync() shells out to psql for DDL
-(CREATE/DROP DATABASE). Without this check, a runner with Postgres reachable
-but psql missing would pass the gate and fail inside fixture creation with
-spawn ENOENT instead of skipping cleanly.
-*/
-const hasPsql = spawnSync("psql", ["--version"], { stdio: "pipe" }).status === 0;
+FNXC:ReliabilityFixtures 2026-08-16-22:30:
+FN-9133 aligns reliability-fixture DDL with the core harness after its documented
+2026-07-18 orphaned `psql -f -` subprocess-guard incident. PostgreSQL reachability
+is sufficient now that an owned postgres.js maintenance connection runs DDL; never
+reintroduce a psql binary requirement or shell child for CREATE/DROP DATABASE.
 
-export const hasPg = process.env.FUSION_PG_TEST_SKIP !== "1" && hasPsql && (() => {
+FN-9133 deliberately does not copy an advisory admission gate or deferred drain.
+FN-9130 measured those in-hook designs as regressions, and FN-9134 owns the open
+contention alternative.
+*/
+export const hasPg = process.env.FUSION_PG_TEST_SKIP !== "1" && (() => {
   if (!PG_TEST_URL_BASE) return false;
   const { host, port } = parseProbeTarget(PG_TEST_URL_BASE);
   return probeTcpReachable(host, port);
 })();
 
-function adminExecAsync(statement: string, timeoutMs = 15_000): Promise<void> {
-  const { promise, resolve, reject } = Promise.withResolvers<void>();
-  const maintUrl = new URL(PG_TEST_URL_BASE);
-  maintUrl.pathname = "/postgres";
-  const child = exec(
-    `psql "${maintUrl.toString()}" -v ON_ERROR_STOP=1 -f -`,
-    { stdio: ["pipe", "pipe", "pipe"], env: process.env, timeout: timeoutMs },
-    (error, _stdout, stderr) => {
-      if (error) {
-        reject(new Error(`adminExec psql failed: ${error.message}\nstderr: ${stderr}`));
-        return;
-      }
-      resolve();
-    },
-  );
-  if (child.stdin) {
-    child.stdin.end(statement);
+async function adminExecAsync(statement: string, timeoutMs = 15_000): Promise<void> {
+  let timedOut = false;
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  let client: ReturnType<typeof postgres> | undefined;
+  try {
+    await Promise.race([
+      (async () => {
+        const maintUrl = new URL(PG_TEST_URL_BASE);
+        maintUrl.pathname = "/postgres";
+        client = postgres(maintUrl.toString(), { max: 1, prepare: false, onnotice: () => {} });
+        // Cancel on the server before the JS deadline and own the socket for force-close.
+        await client.unsafe(`SET statement_timeout = ${Math.max(1_000, timeoutMs - 500)}`);
+        await client.unsafe(statement);
+      })(),
+      new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          timedOut = true;
+          void client?.end({ timeout: 0 }).catch(() => {});
+          reject(new Error(`adminExec timed out after ${timeoutMs}ms: ${statement}`));
+        }, timeoutMs);
+      }),
+    ]);
+  } catch (error) {
+    if (timedOut) throw error;
+    const diagnosed = decoratePgProvisioningError(error, PG_TEST_URL_BASE);
+    throw new Error(`adminExec failed: ${diagnosed instanceof Error ? diagnosed.message : String(diagnosed)}\nstatement: ${statement}`);
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    await client?.end({ timeout: 5 }).catch(() => {});
   }
-  return promise;
 }
 
 let relDbCounter = 0;
@@ -140,17 +154,13 @@ export type PgLayerFixture = {
 
 /**
  * Create one isolated PostgreSQL schema layer for a reliability test.
- * Callers must use {@link hasPg} before invoking this helper because DDL uses
- * the `psql` binary as well as a TCP-reachable PostgreSQL server.
+ * Callers must use {@link hasPg} before invoking this helper because DDL needs
+ * a TCP-reachable PostgreSQL maintenance database.
  */
 export async function createPgLayer(): Promise<PgLayerFixture> {
   relDbCounter += 1;
   const dbName = `fusion_rel_${process.pid}_${relDbCounter}_${Math.random().toString(36).slice(2, 8)}`;
-  try {
-    await adminExecAsync(`DROP DATABASE IF EXISTS "${dbName}"`);
-  } catch {
-    // may not exist — safe to ignore
-  }
+  // The pid/counter/random name is new for every fixture; a pre-create DROP only adds contention.
   await adminExecAsync(`CREATE DATABASE "${dbName}"`);
   const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
   const backend: ResolvedBackend = {
@@ -158,25 +168,55 @@ export async function createPgLayer(): Promise<PgLayerFixture> {
     runtimeUrl: testUrl,
     migrationUrl: testUrl,
     migrationUrlOverridden: false,
+    /*
+    This helper creates its own local postmaster endpoint, making it the test equivalent of a
+    lifecycle-proven direct session transport (mirrors core pg-test-harness, FNXC:PlanningDependencyReseed
+    2026-08-04-00:54). Without it, every hold-column task mutation that routes through the planning
+    lifecycle advisory lock throws `Planning lifecycle lock transport unavailable: direct-session-unavailable`
+    and the self-healing sweeps under test silently recover 0 rows.
+    */
+    directSessionUrl: testUrl,
+    directSessionProvenance: "migration-override",
   };
   const schemaConn = await createConnectionSetFromUrl(backend, { poolMax: 1, connectTimeoutSeconds: 5 });
-  await applySchemaBaseline(schemaConn.migration);
-  await schemaConn.close();
-  const connections = await createConnectionSetFromUrl(backend, { poolMax: 5, connectTimeoutSeconds: 5 });
-  const layer = createAsyncDataLayer(connections);
+  try {
+    await applySchemaBaseline(schemaConn.migration);
+  } catch (error) {
+    throw decoratePgProvisioningError(error, PG_TEST_URL_BASE);
+  } finally {
+    await schemaConn.close();
+  }
+  /*
+  FN-8764 built-in workflow-owner provisioning during AgentStore.init() requires a bound
+  asyncLayer.projectId (the project-scoped advisory lock hashes it), so the reliability layer
+  binds one explicitly — mirroring the CLI extension harness rather than the project-agnostic
+  core default.
+  */
+  const projectId = dbName;
+  const connections = await createConnectionSetFromUrl(backend, { poolMax: 5, connectTimeoutSeconds: 5, projectId });
+  const layer = createAsyncDataLayer(connections, { projectId });
   return {
     layer,
     dbName,
     cleanup: async () => {
-      try { await layer.close(); } catch { /* best-effort */ }
-      try { await adminExecAsync(`DROP DATABASE IF EXISTS "${dbName}"`); } catch { /* best-effort */ }
+      try {
+        await layer.close();
+      } catch (error) {
+        console.warn(`[reliability-fixtures] failed to close ${dbName}`, error);
+      }
+      try {
+        await adminExecAsync(`DROP DATABASE IF EXISTS "${dbName}" WITH (FORCE)`);
+      } catch (error) {
+        // Preserve best-effort teardown without concealing a persistent database leak.
+        console.warn(`[reliability-fixtures] failed to drop ${dbName}`, error);
+      }
     },
   };
 }
 
 /*
 FNXC:PgMigrationQuarantine 2026-07-16-10:30:
-VAL-REMOVAL-005 removed AgentStore's SQLite runtime path, so multi-node claim and handoff tests must construct TaskStore and every sibling AgentStore with one shared AsyncDataLayer. Reliability callers gate with hasGit && hasPg; integration callers compose hasPg ? pgDescribe : describe.skip because DDL requires both reachable PostgreSQL and psql, but integration tests do not require Git.
+VAL-REMOVAL-005 removed AgentStore's SQLite runtime path, so multi-node claim and handoff tests must construct TaskStore and every sibling AgentStore with one shared AsyncDataLayer. Reliability callers gate with hasGit && hasPg; integration callers compose hasPg ? pgDescribe : describe.skip because DDL requires reachable PostgreSQL, but integration tests do not require Git.
 */
 export async function makePgTaskStore(): Promise<{
   rootDir: string;
@@ -285,6 +325,14 @@ export async function makeReliabilityFixture(input: {
     description: "reliability fixture task",
     column: "in-review",
     branch: `fusion/${id.toLowerCase()}`,
+    /*
+    FNXC:BranchNaming 2026-08-23-00:40:
+    Creation is a branch-write boundary (`normalizeCreateBranchProvenance`): supplying `branch`
+    without an explicit origin throws `BranchWriteProvenanceError`. This fixture stands in for a
+    card whose branch the ENGINE created, which is what every reliability scenario built on it
+    assumes. Without this the fixture threw before any scenario ran.
+    */
+    branchWriteOrigin: "engine",
     baseBranch: "main",
     prompt: `## File Scope\n- packages/engine/src/__tests__/reliability-interactions/**/*.ts\n`,
     steps: [],

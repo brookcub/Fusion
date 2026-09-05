@@ -16,6 +16,7 @@ import type {
   WorkflowSettingType,
 } from "./workflow-ir-types.js";
 import { classifyWorkflowAgentNode } from "./workflow-ir-types.js";
+import { MERGE_REGION_ENTRY_NODE_KINDS } from "./workflow-merge-region.js";
 import { getWorkflowExtensionRegistry } from "./workflow-extension-registry.js";
 import type { WorkflowExtensionConfigField } from "./workflow-extension-types.js";
 import { THINKING_LEVELS } from "../types.js";
@@ -317,18 +318,9 @@ function reachableFrom(
   return seen;
 }
 
-const INTERPRETER_ENTRY_NODE_KINDS: ReadonlySet<WorkflowIrNodeKind> = new Set([
-  "merge-gate",
-  "merge-attempt",
-  "manual-merge-hold",
-  "retry-backoff",
-  "recovery-router",
-  "branch-group-member-integration",
-  "branch-group-promotion",
-  "pr-create",
-  "pr-respond",
-  "pr-merge",
-]);
+/* FNXC:MergeAuthority 2026-08-23-18:05: same membership as the canonical merge-region set — one
+   spelling, so interpreter entry and merge-sweep admission can never drift apart. */
+const INTERPRETER_ENTRY_NODE_KINDS: ReadonlySet<WorkflowIrNodeKind> = MERGE_REGION_ENTRY_NODE_KINDS;
 
 /*
 FNXC:WorkflowValidation 2026-07-18-22:10:
@@ -975,6 +967,23 @@ function validateReviewerAgentOverrides(nodes: WorkflowIrNode[]): void {
     }
     const templateNodes = (node.config as { template?: { nodes?: unknown } } | undefined)?.template?.nodes;
     if (Array.isArray(templateNodes)) validateReviewerAgentOverrides(templateNodes as WorkflowIrNode[]);
+  }
+}
+
+/*
+ * FNXC:McpConfig 2026-09-01-06:06:
+ * Read-only MCP server names are authorable wherever coding toolMode is authorable and can only
+ * reference operator-configured servers. Validate their shape recursively but do not treat them as
+ * an approval bypass flag, because coding mode already grants strictly broader capabilities.
+ */
+function validateReadonlyMcpServersConfig(nodes: WorkflowIrNode[]): void {
+  for (const node of nodes) {
+    const value = node.config?.readonlyMcpServers;
+    if (value !== undefined && (!Array.isArray(value) || value.some((name) => typeof name !== "string" || !name.trim()))) {
+      throw new WorkflowIrError(`Workflow node '${node.id}' readonlyMcpServers must be an array of non-empty strings when present`);
+    }
+    const templateNodes = (node.config as { template?: { nodes?: unknown } } | undefined)?.template?.nodes;
+    if (Array.isArray(templateNodes)) validateReadonlyMcpServersConfig(templateNodes as WorkflowIrNode[]);
   }
 }
 
@@ -1760,6 +1769,7 @@ function validateV2(ir: WorkflowIrV2): void {
   const topLevelIds = new Set(ir.nodes.map((n) => n.id));
   validateStepExecutePlacement(ir.nodes);
   validateThinkingLevelConfig(ir.nodes);
+  validateReadonlyMcpServersConfig(ir.nodes);
   validateCredentialInstanceIdConfig(ir.nodes);
   validateReviewerAgentOverrides(ir.nodes);
   for (const node of ir.nodes) {

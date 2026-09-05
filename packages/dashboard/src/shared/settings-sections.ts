@@ -27,7 +27,6 @@ const ADVANCED_SECTION_IDS = new Set([
   "global-mcp",
   "cli-agents",
   "research-global",
-  "remote",
   "experimental",
   "hermes-runtime",
   "openclaw-runtime",
@@ -84,7 +83,8 @@ const SETTINGS_SECTION_DEFINITIONS: readonly SettingsSectionDefinition[] = [
   FN-8130 changes the Settings landing surface from Authentication to Appearance. Authentication remains first within its own AI & Models group, but the always-visible global Preferences section is the default instead.
   */
   { id: "authentication", label: "Authentication", labelKey: "settings.nav.authentication", scope: undefined, searchableText: ["login", "OAuth", "API key", "custom providers", "Anthropic", "OpenAI", "provider credentials"] },
-  { id: "global-models", label: "Models · Global", labelKey: "settings.nav.globalModels", scope: "global", searchableText: ["global models", "model presets", "favorite providers", "model pricing overrides", "LiteLLM pricing", "token pricing", "translate", "translation model", "import translation model", "import auto-translation model"] },
+  // FNXC:FastModeModel 2026-08-29-02:43: Fast & Cheap is a dedicated global lane, so Settings search must route cost-oriented queries to its selector.
+  { id: "global-models", label: "Models · Global", labelKey: "settings.nav.globalModels", scope: "global", searchableText: ["global models", "model overrides", "model lanes", "planning model", "reviewer model", "fast mode", "fast and cheap", "cheap model", "inexpensive model", "model presets", "favorite providers", "model pricing overrides", "LiteLLM pricing", "token pricing", "translate", "translation model", "import translation model", "import auto-translation model"] },
   /**
    * FNXC:SettingsNavigation 2026-07-13-00:00:
    * Project Models owns the FN-7907 Direct-chat default settings. Its shared Settings search index must advertise chat-default terms and i18n labels so desktop nav, the mobile section picker, and filtered search all surface this section when operators search for Chat defaults.
@@ -103,8 +103,16 @@ const SETTINGS_SECTION_DEFINITIONS: readonly SettingsSectionDefinition[] = [
     searchableText: [
       "default provider",
       "default model",
+      "model overrides",
+      "model lanes",
       "workflow model lanes",
+      "planning model",
+      "reviewer model",
       "executor escalation model",
+      "fast mode",
+      "fast and cheap",
+      "cheap model",
+      "inexpensive model",
       "escalation model",
       "alternate model",
       "tool-failure retry model",
@@ -121,7 +129,7 @@ const SETTINGS_SECTION_DEFINITIONS: readonly SettingsSectionDefinition[] = [
       "autoSummarizeTitles",
       "task definition language",
       "task definitions input language",
-      "taskDefinitionInInputLanguage",
+      "taskOutputLanguage",
       "localized task prose",
       "title summarization",
       "title summarizer",
@@ -149,9 +157,6 @@ const SETTINGS_SECTION_DEFINITIONS: readonly SettingsSectionDefinition[] = [
     searchableKeys: [
       "settings.projectModels.chatHeading",
       "settings.projectModels.chatDescription",
-      "settings.projectModels.chatNewSessionMode",
-      "settings.projectModels.chatNewSessionModePrompt",
-      "settings.projectModels.chatNewSessionModeAlwaysDefault",
       "settings.projectModels.chatDefaultKind",
       "settings.projectModels.chatDefaultModel",
       "settings.projectModels.chatDefaultAgent",
@@ -239,6 +244,9 @@ const SETTINGS_SECTION_DEFINITIONS: readonly SettingsSectionDefinition[] = [
   /*
   FNXC:SettingsNavigation 2026-06-26-09:20:
   FN-7062 requires the remote settings nav entry to read "Remote Access" only. The stale "& Node Sync" suffix belongs to the separate Node Sync settings section, while this section body already uses the Remote Access heading.
+
+  FNXC:SettingsNavigation 2026-08-18-05:53:
+  FN-002 requires Remote Access in Basic Settings. Its shared registry entry governs both rendered Settings navigation and served metadata, so it must not be classified as advanced by a consumer-specific override.
   */
   { id: "remote", label: "Remote Access", labelKey: "settings.nav.remote", scope: "global", searchableText: ["cloudflared", "tunnel", "QR", "persistent token", "remote URL"] },
   { id: "backups-global", label: "Database Backups", labelKey: "settings.backups.databaseBackups", scope: "global", searchableText: ["database backup", "restore", "shared cluster"] },

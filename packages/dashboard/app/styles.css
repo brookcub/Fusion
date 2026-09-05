@@ -137,8 +137,20 @@ html {
   --font-size-md: 1.125rem;
   --font-size-lg: 1.25rem;
   --line-height-tight: 1.25;
+  /* FNXC:DashboardStyling 2026-08-21-13:35: normal-body line-height token (was a raw 1.4 literal in ChatFocusSelector.css). */
+  --line-height-normal: 1.4;
+  /*
+  FNXC:DashboardStyling 2026-09-01-08:39:
+  Ten declarations across nine component stylesheets named these weight rungs without definitions, making each declaration invalid so text inherited its weight. Define the complete scale here, matching the earlier font-size repair above, rather than adding component literals.
+  */
+  --font-weight-regular: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
 
   /* Spacing Scale */
+  /* FNXC:DashboardStyling 2026-08-23-16:00: FN-9198 uses this 2px token for chat title-switcher focus-ring widths and offsets. */
+  --space-3xs: 2px;
   --space-xs: 4px;
   --space-sm: 8px;
   --space-md: 12px;
@@ -180,6 +192,10 @@ html {
 
   /* Component-specific tokens */
   --btn-padding: var(--space-sm) var(--space-lg);
+  /*
+  FNXC:DashboardStyling 2026-09-01-08:39:
+  Border shorthands must use this existing theme-aware width token, not an alias such as --border-width. Its 29 theme overrides, including Cozy Cartoon's thicker borders, keep all component outlines consistent.
+  */
   --btn-border-width: 1px;
   --card-padding: 10px 12px;
   --modal-padding: var(--space-lg) 20px;
@@ -234,6 +250,15 @@ html {
   previously referenced undefined tokens, silently resolving z-index to auto
   and letting dashboard scroll owners clip or cover guided report actions.
   */
+  /*
+  FNXC:DashboardStyling 2026-08-23-22:35:
+  FN-9202's shared `.banner--chrome` shell referenced `--z-sticky`, which nothing defined — the same
+  undefined-token defect FN-8406 records above, silently resolving z-index to auto so a sticky
+  top banner no longer sat in the documented stacking order. 30 restores the value the per-banner
+  shells carried before the unification, staying below the popover/modal scale and the 100
+  `.modal-overlay` floor that must cover it.
+  */
+  --z-sticky: 30;
   --z-popover: 60;
   --z-dropdown: 1000;
   --z-modal: 1100;
@@ -397,6 +422,7 @@ svg.spinning {
   --provider-openai: #10a37f;
   --provider-gemini: #4285f4;
   --provider-openrouter: #6f4cff;
+  --provider-orcarouter: #0e7c86;
   --provider-brave: #fb542b;
   --provider-tavily: #4f46e5;
   --provider-minimax: #e73562;
@@ -705,15 +731,6 @@ html *::after {
     color var(--transition-normal),
     border-color var(--transition-normal),
     box-shadow var(--transition-normal);
-}
-
-html .card.dragging,
-html .card.dragging *,
-html .list-row.dragging,
-html .list-row.dragging *,
-html .column.drag-over,
-html .column.drag-over * {
-  transition: none !important;
 }
 
 [data-theme="light"] .agent-dialog-overlay,
@@ -1188,11 +1205,6 @@ rather than relying on the absence of a declaration.
   scroll-snap-align: center;
 }
 
-.column.drag-over {
-  border-color: var(--todo);
-  box-shadow: inset 0 0 0 1px var(--todo);
-}
-
 .column-header {
   display: flex;
   align-items: center;
@@ -1327,6 +1339,31 @@ Modal and dock pop-out surfaces should not darken or blur the app behind them. K
   display: flex;
 }
 
+/*
+FNXC:DashboardTheming 2026-08-20-00:49:
+Operator feedback requires one readable pixel face for ordinary prose, links, dates, and native or role-based controls. Scope the override to those UI semantics rather than every descendant, so direct mono contracts for paths, identifiers, logs, code, editors, and terminals continue to describe machine-readable content.
+*/
+[data-color-theme="medieval"] {
+  font-family: var(--font-primary);
+}
+
+[data-color-theme="medieval"] :where(a, time, button, label, input, textarea, select, option, [role="button"], [role="link"], [role="textbox"], [role="option"]) {
+  font-family: var(--font-primary);
+}
+
+[data-color-theme="medieval"] :is(pre, pre *, code, code *, kbd, kbd *, samp, samp *, .cm-editor, .cm-editor *, .xterm, .xterm *, .terminal, .terminal *, .session-terminal, .session-terminal *) {
+  font-family: var(--font-mono) !important;
+}
+
+/*
+FNXC:DashboardTheming 2026-08-28-07:45:
+The shared .btn rule hardcodes its font size, so Cozy Cartoon needs this single token-backed typography override to make ordinary buttons visibly larger. The compact exclusions preserve every .btn-sm/.btn--sm control, including the height-pinned Quick Add action row, while omitting height and min-height lets the desktop ViewHeader clamp keep trimming enlarged button padding without stretching headers.
+*/
+[data-color-theme="cozy-cartoon"] .btn:not(.btn-sm):not(.btn--sm) {
+  font-size: var(--cozy-cartoon-btn-font-size);
+  font-weight: var(--cozy-cartoon-btn-font-weight);
+}
+
 .modal {
   position: relative;
   background: var(--surface);
@@ -1337,6 +1374,22 @@ Modal and dock pop-out surfaces should not darken or blur the app behind them. K
   box-shadow: var(--shadow-lg);
   display: flex;
   flex-direction: column;
+}
+
+/*
+FNXC:DashboardTheming 2026-08-20-00:29:
+Medieval modal chrome must follow the generic modal shorthand reset so its border-box grain remains visible. Paint-only layers keep sizing, dismissal, focus, touch, and mobile behavior owned by the existing modal contract.
+*/
+[data-color-theme="medieval"] .modal {
+  border-color: transparent;
+  border-width: var(--btn-border-width);
+  background-color: var(--surface);
+  background-image:
+    linear-gradient(var(--surface), var(--surface)),
+    repeating-linear-gradient(90deg, var(--medieval-wood-dark) 0, var(--medieval-wood-light) var(--space-xs), var(--medieval-wood-dark) var(--space-sm), var(--medieval-wood-light) var(--space-md));
+  background-origin: border-box;
+  background-clip: padding-box, border-box;
+  box-shadow: var(--shadow-lg);
 }
 
 .modal-resize-grip {
@@ -2840,6 +2893,13 @@ Task cards reuse the compact badge chip dimensions for GitLab links, but stale G
   gap: 2px;
 }
 
+.detail-log-timestamps {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-xs);
+}
+
 .detail-log-timestamp {
   font-size: 11px;
   color: var(--text-muted);
@@ -3805,6 +3865,28 @@ Toast text must contrast its status background across every dashboard theme and 
     display: none;
   }
 
+  /*
+  FNXC:DashboardTheming 2026-08-19-19:52:
+  Mobile's generic modal reset removes all borders, which would erase Medieval's shared wood frame at the
+  actual narrow viewport. Restore only tokenized border paint here; sizing, touch, dismissal, and the
+  fullscreen mobile modal contract remain owned by the generic rule above.
+  */
+  [data-color-theme="medieval"] .modal:not(.confirm-dialog),
+  [data-color-theme="medieval"] .modal-lg,
+  [data-color-theme="medieval"] .modal-md,
+  [data-color-theme="medieval"] .gm-modal {
+    border-color: transparent;
+    border-width: var(--btn-border-width);
+    border-style: solid;
+    background-color: var(--surface);
+    background-image:
+      linear-gradient(var(--surface), var(--surface)),
+      repeating-linear-gradient(90deg, var(--medieval-wood-dark) 0, var(--medieval-wood-light) var(--space-xs), var(--medieval-wood-dark) var(--space-sm), var(--medieval-wood-light) var(--space-md));
+    background-origin: border-box;
+    background-clip: padding-box, border-box;
+    box-shadow: var(--shadow-lg);
+  }
+
   /* Settings modal: use the section picker as the only mobile navigation */
   .settings-layout {
     flex-direction: column;
@@ -3973,7 +4055,7 @@ Toast text must contrast its status background across every dashboard theme and 
 .text-secondary { color: var(--text-muted); }
 .text-dim { color: var(--text-dim, var(--text-muted)); }
 
-/* === Column header dropdown menu (todo column "Respecify All", etc.) ====== */
+/* === Column header dropdown menu actions ================================ */
 .column-menu {
   position: relative;
   display: inline-flex;

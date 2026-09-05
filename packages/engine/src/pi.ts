@@ -11,6 +11,7 @@ import { exec, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 import { basename, dirname, join, relative, isAbsolute, resolve } from "node:path";
 
 const execAsync = promisify(exec);
@@ -49,6 +50,8 @@ import {
   mergeBuiltInZaiProviderModels,
   mergeSupplementalAnthropicModels,
   mergeSupplementalOpenAiCodexModels,
+  buildAnthropicClaudeCodeIdentityHeaders,
+  toExecutionModelProviderId,
   registerBuiltInGrokProvider,
   registerBuiltInZaiProvider,
   registerFusionSessionIdentity,
@@ -86,16 +89,28 @@ import { resolvePermanentAgentToolDecision } from "./agents/permanent-agent-gati
 import type { SystemPromptLayers } from "./execution/prompt-layers.js";
 import { READONLY_ALLOWLIST, filterCustomToolsForReadonly, isReadonlyAllowed } from "./workflows/workflow-step-tool-policy.js";
 import { createStreamingDeltaNormalizer } from "./execution/streaming-delta.js";
+import {
+  applyReasoningSummaryToPayload,
+  isReasoningSummaryUnsupportedError,
+  type ReasoningSummaryDetail,
+} from "./execution/reasoning-summary-payload.js";
 import { isModelAuthTierIncompatibilityError, isProviderModelNotFoundError, isUnsupportedMessageRoleError } from "./errors/transient-error-detector.js";
 import { logMcpForwardingSkipped, runtimeSupportsMcp } from "./mcp/mcp-runtime-support.js";
 import { connectMcpSessionTools, type McpClientFactory, type McpSessionToolset } from "./mcp/mcp-session-tools.js";
 export { isModelAuthTierIncompatibilityError } from "./errors/transient-error-detector.js";
 import { buildBashContainmentDenialMessage, evaluateBashContainment } from "./bash-containment.js";
+import type { SessionBoundaryDescriptor } from "./agents/agent-runtime.js";
+import { resolveSandboxBackend, type SandboxBackend, type SandboxPolicy } from "./sandbox/index.js";
 
 const RTK_ACCEPTED_REWRITE_EXIT_CODES = new Set([0, 3]);
 const RTK_EXPECTED_PASSTHROUGH_EXIT_CODES = new Set([1, 2]);
 const RTK_EXPECTED_FAIL_OPEN_ERROR_CODES = new Set(["ABORT_ERR", "ENOENT", "ETIMEDOUT"]);
 const RTK_REWRITE_MAX_BUFFER_BYTES = 64 * 1024;
+
+/** Quote a backend argv for pi's string-shaped bash spawn hook. */
+function shellEscapeCommand(command: string, args: readonly string[]): string {
+  return [command, ...args].map((part) => `'${part.replace(/'/g, `'\\''`)}'`).join(" ");
+}
 
 export type RtkRewriteMode = "off" | "rewrite";
 
@@ -222,12 +237,14 @@ interface ToolHookResult {
 type AgentToolHookSession = AgentSession & {
   agent?: {
     afterToolCall?: (payload: ToolHookPayload) => Promise<ToolHookResult | undefined>;
+    onPayload?: (payload: unknown, model: { api?: unknown }) => unknown | undefined | Promise<unknown | undefined>;
     state?: {
       messages?: Array<Record<string, unknown>>;
     };
   };
   __fusionToolResultGuardInstalled?: boolean;
   __fusionMessageContentGuardInstalled?: boolean;
+  __fusionReasoningSummaryPayloadHookInstalled?: boolean;
 };
 const FN_MEMORY_APPEND_TOOL_NAME = "fn_memory_append";
 const FUSION_SHUTDOWN_WRAP_FLAG = "__fusionSessionShutdownDisposeWrapped";
@@ -1037,6 +1054,10 @@ export type BuiltinWebToolName = "WebSearch" | "WebFetch";
 
 export interface AgentOptions {
   cwd: string;
+  /** Explicit task boundary; undeclared callers retain legacy path inference. */
+  sessionBoundary?: SessionBoundaryDescriptor;
+  sandboxBackendId?: import("./sandbox/types.js").SandboxCapabilities["id"];
+  sandboxPolicy?: SandboxPolicy;
   systemPrompt: string;
   /** Structured prompt layers for cross-session caching. When provided,
    *  the stable layer is used as systemPromptOverride and the dynamic
@@ -1086,6 +1107,8 @@ export interface AgentOptions {
   fallbackThinkingLevel?: string;
   /** Default thinking effort level (e.g. "medium", "high"). When provided, sets the session's thinking level after creation. */
   defaultThinkingLevel?: string;
+  /** Detail requested for already-enabled Responses reasoning summaries; defaults to detailed. */
+  reasoningSummaryDetail?: ReasoningSummaryDetail;
   /** Optional pre-configured SessionManager. When provided, the agent session
    *  uses this instead of creating an in-memory session. Pass a file-based
    *  SessionManager to enable session persistence and pause/resume. */
@@ -1099,6 +1122,8 @@ export interface AgentOptions {
    *  (and `skillSelection` is not), auto-constructs a SkillSelectionContext
    *  from the cwd and these names. Ignored when `skillSelection` is set. */
   skills?: string[];
+  /** Reports the one resolved session-skill summary to task-bound callers. */
+  onSkillSummary?: (summary: { availableCount: number; forcedSkillNames: string[]; unresolvedForcedSkills: Array<{ requestedName: string; reason: string }> }) => void | Promise<void>;
   /** Extra directories to scan for skills (each holding `<id>/SKILL.md`), in
    *  addition to the default cwd/agent-dir roots. Forwarded to the resource
    *  loader so callers (e.g. plugins that install skills to a private dir) can
@@ -1114,6 +1139,11 @@ export interface AgentOptions {
    * Defaults to false so validators/read-only helpers do not inherit arbitrary external tools.
    */
   allowMcpToolsInReadonly?: boolean;
+  /**
+   * Configured MCP server names a read-only session may use. This only narrows an explicit
+   * `allowMcpToolsInReadonly` opt-in; omit it to preserve the reviewed planning-lane behavior.
+   */
+  readonlyMcpServerAllowlist?: string[];
   /** Test seam for MCP session tools; production uses the SDK client/transport factories. */
   mcpClientFactory?: McpClientFactory;
   /** Test seam for MCP retry timing. */
@@ -1127,6 +1157,8 @@ export interface AgentOptions {
   onFallbackModelUsed?: (payload: FallbackModelUsedPayload) => Promise<void> | void;
   /** Optional task context for fallback notifications. */
   taskId?: string;
+  /** True only for sessions actively executing a board task (FN-125). */
+  taskExecutionSession?: boolean;
   taskTitle?: string;
   actionGateContext?: AgentActionGateContext;
   /** Permanent-agent action gating context forwarded by runtime/session helpers. */
@@ -1144,15 +1176,22 @@ export interface AgentOptions {
  * provider register but threw "No API provider registered for api: anthropic"
  * the moment a task tried to stream.
  *
+ * FNXC:CustomProviders 2026-08-19-15:28:
+ * Google-compatible custom providers keep the registered Google dialect. This path and dashboard
+ * registration must agree so pi performs the same thinking-level translation for every custom model.
+ *
  * @param apiType - the custom provider's declared compatibility type.
  * @returns the registered pi-ai api key to stream against.
  */
-function resolveCustomProviderApiType(apiType: string): "anthropic-messages" | "openai-responses" | "openai-completions" {
+function resolveCustomProviderApiType(apiType: string): "anthropic-messages" | "openai-responses" | "google-generative-ai" | "openai-completions" {
   if (apiType === "anthropic-compatible") {
     return "anthropic-messages";
   }
   if (apiType === "openai-responses") {
     return "openai-responses";
+  }
+  if (apiType === "google-generative-ai") {
+    return "google-generative-ai";
   }
   return "openai-completions";
 }
@@ -1167,7 +1206,12 @@ function resolveConfiguredModel(
     return undefined;
   }
 
-  const model = modelRegistry.find(provider, modelId);
+  /*
+  FNXC:ProviderAuth 2026-08-15-20:57:
+  Persisted model settings from the split Anthropic authentication cards may name an auth id. pi-ai only knows the direct execution provider, so normalize before registry lookup and template fallback; never register the auth id as a provider.
+  */
+  const executionProvider = toExecutionModelProviderId(provider);
+  const model = modelRegistry.find(executionProvider, modelId);
   if (model) {
     return model;
   }
@@ -1176,15 +1220,15 @@ function resolveConfiguredModel(
   // This mirrors the pi CLI's buildFallbackModel behaviour, which accepts any
   // model ID for a configured provider (e.g. any OpenRouter model string) even
   // when it isn't in the built-in or custom model list.
-  const providerModels = modelRegistry.getAll().filter((m) => m.provider === provider);
+  const providerModels = modelRegistry.getAll().filter((m) => m.provider === executionProvider);
   if (providerModels.length > 0) {
     const baseModel = providerModels[0]!;
-    piLog.warn(`${kind} model ${provider}/${modelId} not in registry; using provider base model as template`);
+    piLog.warn(`${kind} model ${executionProvider}/${modelId} not in registry; using provider base model as template`);
     return { ...baseModel, id: modelId, name: modelId };
   }
 
   throw new Error(
-    `Configured model ${provider}/${modelId} (${kind} selection) was not found in the pi model registry. `
+    `Configured model ${executionProvider}/${modelId} (${kind} selection) was not found in the pi model registry. `
     + "If this model comes from a custom provider, verify Settings → Custom Providers (stored in ~/.fusion/settings.json) includes this provider/model, "
     + "or choose an available model from /api/models.",
   );
@@ -1632,6 +1676,22 @@ function normalizeExistingPathForGitComparison(path: string): string {
   }
 }
 
+function normalizePathThroughExistingAncestor(path: string): string {
+  const resolvedPath = resolve(path);
+  let existingAncestor = resolvedPath;
+
+  while (true) {
+    try {
+      const canonicalAncestor = realpathSync.native(existingAncestor);
+      return resolve(canonicalAncestor, relative(existingAncestor, resolvedPath));
+    } catch {
+      const parent = dirname(existingAncestor);
+      if (parent === existingAncestor) return resolvedPath;
+      existingAncestor = parent;
+    }
+  }
+}
+
 /**
  * FNXC:SkillReadBoundary 2026-07-21-12:00:
  * GitHub #2384 / FN-8466 requires the exact host-advertised additional skill
@@ -1685,6 +1745,57 @@ async function assertValidWorktreeSession(cwd: string, projectRoot: string): Pro
 }
 
 /**
+ * FNXC:WorkspaceBoundary 2026-08-22-21:58:
+ * FN-158 declares task boundaries at the executor because grouped configured
+ * worktree paths cannot safely be inferred. A workspace task directory is not a
+ * Git checkout: each child is validated against its own repository root instead.
+ */
+export async function resolveSessionBoundaryRoot(
+  cwd: string,
+  descriptor?: SessionBoundaryDescriptor,
+): Promise<{ worktreePath: string | null; worktreeProjectRoot: string | null }> {
+  if (!descriptor) {
+    const worktreeProjectRoot = getProjectRootFromWorktree(cwd);
+    if (worktreeProjectRoot) await assertValidWorktreeSession(cwd, worktreeProjectRoot);
+    return { worktreePath: cwd, worktreeProjectRoot };
+  }
+
+  const root = descriptor.writableRoot ?? cwd;
+  if (!existsSync(root) || !existsSync(descriptor.projectRoot)) {
+    throw new Error(`Refusing to start declared ${descriptor.kind} session: boundary root is missing`);
+  }
+  if (!isSameOrInsidePath(resolve(root), resolve(cwd))) {
+    throw new Error(`Refusing to start declared ${descriptor.kind} session outside its boundary root`);
+  }
+  if (descriptor.kind === "read-only-root") {
+    if (descriptor.writableRoot !== null) {
+      throw new Error("Refusing read-only-root session with a writable root");
+    }
+    return { worktreePath: root, worktreeProjectRoot: descriptor.projectRoot };
+  }
+  if (descriptor.kind === "task-worktree") {
+    await assertValidWorktreeSession(root, descriptor.projectRoot);
+    return { worktreePath: root, worktreeProjectRoot: descriptor.projectRoot };
+  }
+
+  const repoRoots = descriptor.repoRoots ?? [];
+  if (repoRoots.length === 0) {
+    throw new Error("Refusing workspace-task-dir session without declared repository roots");
+  }
+  let validatedChildren = 0;
+  for (const repo of repoRoots) {
+    const child = resolve(root, repo.repoRelPath);
+    if (!isSameOrInsidePath(resolve(root), child) || !existsSync(child)) continue;
+    await assertValidWorktreeSession(child, repo.repoRootDir);
+    validatedChildren += 1;
+  }
+  if (validatedChildren === 0) {
+    throw new Error("Refusing workspace-task-dir session without a valid repository worktree child");
+  }
+  return { worktreePath: root, worktreeProjectRoot: descriptor.projectRoot };
+}
+
+/**
  * Check if a path is allowed to be accessed from a worktree session.
  * Rules:
  * - Paths inside the worktree are always allowed
@@ -1692,6 +1803,7 @@ async function assertValidWorktreeSession(cwd: string, projectRoot: string): Pro
  * - Task attachments under .fusion/tasks/N/attachments/ are allowed (for reading context files)
  * - Sibling task specs (.fusion/tasks/N/PROMPT.md and task.json) are allowed for
  *   read-only tools (read/glob/grep) so agents can consult dependency specs.
+ * - User skills under ~/.agents/skills are allowed for read-only tools only.
  * - Host-advertised additional skill roots are allowed for read-only tools only.
  * - All other paths outside the worktree are rejected
  *
@@ -1715,32 +1827,29 @@ function isWorktreeAllowedPath(
   const requestedResolved = isAbsolute(requestedPath) ? resolve(requestedPath) : resolve(worktreeResolved, requestedPath);
   const worktreeCanonical = normalizeExistingPathForGitComparison(worktreeResolved);
   const projectRootCanonical = normalizeExistingPathForGitComparison(projectRootResolved);
-  const requestedCanonical = normalizeExistingPathForGitComparison(requestedResolved);
+  const requestedCanonical = normalizePathThroughExistingAncestor(requestedResolved);
 
+  /*
+  FNXC:WorktreeBoundary 2026-08-22-02:52:
+  Every worktree and project exception must use canonical containment only. A lexical path beneath an allowed root can cross a symlink to host files, including when the final glob/write target does not exist yet; normalize through the deepest existing ancestor before deciding.
+  */
   // Check if path is inside the worktree
-  if (
-    isSameOrInsidePath(worktreeResolved, requestedResolved) ||
-    isSameOrInsidePath(worktreeCanonical, requestedCanonical)
-  ) {
+  if (isSameOrInsidePath(worktreeCanonical, requestedCanonical)) {
     return true; // Path is inside the worktree
   }
 
   // Exception: project root `.fusion/memory/` files for durable project learnings
-  const relToProjectRoot = relative(projectRootResolved, requestedResolved).replace(/\\/g, "/");
   const relToCanonicalProjectRoot = relative(projectRootCanonical, requestedCanonical).replace(/\\/g, "/");
-  const projectRelativePaths = [relToProjectRoot, relToCanonicalProjectRoot];
   if (
-    projectRelativePaths.some((relPath) =>
-      relPath === ".fusion/memory" ||
-      relPath === ".fusion/memory/" ||
-      relPath.startsWith(".fusion/memory/")
-    )
+    relToCanonicalProjectRoot === ".fusion/memory" ||
+    relToCanonicalProjectRoot === ".fusion/memory/" ||
+    relToCanonicalProjectRoot.startsWith(".fusion/memory/")
   ) {
     return true;
   }
 
   // Exception: task attachments under `.fusion/tasks/*/attachments/*`
-  if (projectRelativePaths.some((relPath) => relPath.match(/^\.fusion\/tasks\/[^/]+\/attachments\//))) {
+  if (relToCanonicalProjectRoot.match(/^\.fusion\/tasks\/[^/]+\/attachments\//)) {
     return true;
   }
 
@@ -1748,9 +1857,9 @@ function isWorktreeAllowedPath(
   // PROMPT.md / task.json of dependency tasks without needing them copied
   // into the worktree. `glob`/`grep` are narrow enough to allow as well so
   // the agent can discover them; writes and bash remain restricted.
-  const readOnlyTools = new Set(["read", "glob", "grep"]);
+  const readOnlyTools = new Set(["read", "glob", "grep", "find", "ls"]);
   if (toolName && readOnlyTools.has(toolName)) {
-    if (projectRelativePaths.some((relPath) => /^\.fusion\/tasks\/[^/]+\/(PROMPT\.md|task\.json)$/.test(relPath))) {
+    if (/^\.fusion\/tasks\/[^/]+\/(PROMPT\.md|task\.json)$/.test(relToCanonicalProjectRoot)) {
       return true;
     }
 
@@ -1759,12 +1868,17 @@ function isWorktreeAllowedPath(
     GitHub #2384 / FN-8466 lets agents Read only the specific additional skill
     roots advertised by this session. Do not extend this exception to write,
     edit, or bash: plugin skill bodies remain host-owned read-only context.
+
+    FNXC:SkillReadBoundary 2026-08-22-09:37:
+    Skill-root containment must compare canonical paths only. A lexical path
+    beneath an allowed root can traverse a symlink whose real target is outside
+    that root; canonicalizing the deepest existing ancestor also closes this
+    escape for glob paths and nonexistent descendants.
     */
     if (readOnlyExtraRoots.some((root) => {
       const rootResolved = resolve(root);
-      const rootCanonical = normalizeExistingPathForGitComparison(rootResolved);
-      return isSameOrInsidePath(rootResolved, requestedResolved)
-        || isSameOrInsidePath(rootCanonical, requestedCanonical);
+      const rootCanonical = normalizePathThroughExistingAncestor(rootResolved);
+      return isSameOrInsidePath(rootCanonical, requestedCanonical);
     })) {
       return true;
     }
@@ -1791,6 +1905,30 @@ function isWorktreeAllowedPath(
  * message with `content: undefined`, which pi's downstream handling later
  * crashes on with "Cannot read properties of undefined (reading 'filter')".
  */
+/*
+FNXC:WorkspaceBoundary 2026-08-22-23:17:
+FN-158 keeps this deliberately limited shell-text inspection as portable defence
+in depth. Shell parsing is not sound; the kernel sandbox is the hard control.
+This catches the known `cd ../../repo && touch` bypass and makes it visible with
+exactly the same boundary rejection as file tools.
+*/
+function bashCommandTargetsOutsideBoundary(
+  command: string,
+  cwd: string,
+  worktreePath: string,
+  projectRoot: string,
+  readOnlyExtraRoots: readonly string[],
+): boolean {
+  const targets = command.matchAll(/(?:\b(?:cd|pushd)\s+|(?<!\S))(\/[^\s;&|]+|\.\.\/[^\s;&|]+)/g);
+  for (const match of targets) {
+    const target = match[1]?.replace(/["']/g, "");
+    if (!target) continue;
+    const resolvedTarget = isAbsolute(target) ? target : resolve(cwd, target);
+    if (!isWorktreeAllowedPath(worktreePath, projectRoot, resolvedTarget, "bash", readOnlyExtraRoots)) return true;
+  }
+  return false;
+}
+
 function boundaryRejection(message: string, details?: Record<string, unknown>) {
   return {
     content: [{ type: "text", text: message }],
@@ -1835,16 +1973,43 @@ export function wrapToolsWithBoundary(
   worktreePath: string | null,
   projectRoot: string | null,
   readOnlyExtraRoots: readonly string[] = [],
+  readOnlyBoundary = false,
+  writableAllowlist: readonly string[] = [],
 ): ToolDefinition[] {
   if (!worktreePath || !projectRoot) {
     return tools; // Not a worktree session, no wrapping needed
   }
 
-  const normalizedReadOnlyExtraRoots = normalizeAdditionalSkillPaths(readOnlyExtraRoots);
+  /*
+  FNXC:SkillReadBoundary 2026-08-22-09:20:
+  Agent Skills installs reusable user skills under ~/.agents/skills. Worktree
+  sessions must be able to read those skill bodies and references, but the
+  exception must not expose sibling ~/.agents configuration or permit writes,
+  edits, or Bash outside the worktree.
+  */
+  const normalizedReadOnlyExtraRoots = normalizeAdditionalSkillPaths([
+    join(homedir(), ".agents", "skills"),
+    ...readOnlyExtraRoots,
+  ]);
+  const boundaryProjectRoot = resolve(projectRoot);
+  const canonicalBoundaryProjectRoot = normalizePathThroughExistingAncestor(boundaryProjectRoot);
+  const normalizedWritableAllowlist = writableAllowlist.flatMap((root) => {
+    const lexicalRoot = resolve(root);
+    if (!isSameOrInsidePath(boundaryProjectRoot, lexicalRoot)) return [];
+    const canonicalRoot = normalizePathThroughExistingAncestor(lexicalRoot);
+    return isSameOrInsidePath(canonicalBoundaryProjectRoot, canonicalRoot) ? [canonicalRoot] : [];
+  });
+  const isAllowlistedWritePath = (requestedPath: string): boolean => {
+    const requestedResolved = isAbsolute(requestedPath)
+      ? resolve(requestedPath)
+      : resolve(worktreePath, requestedPath);
+    const requestedCanonical = normalizePathThroughExistingAncestor(requestedResolved);
+    return normalizedWritableAllowlist.some((root) => isSameOrInsidePath(root, requestedCanonical));
+  };
 
   return tools.map((tool) => {
     // Only wrap tools that access the filesystem
-    const fileToolNames = new Set(["read", "write", "edit", "glob", "grep", "bash"]);
+    const fileToolNames = new Set(["read", "write", "edit", "glob", "grep", "find", "ls", "bash", "fn_run_verification"]);
     if (!fileToolNames.has(tool.name)) {
       return tool;
     }
@@ -1863,23 +2028,46 @@ export function wrapToolsWithBoundary(
 
         // Check path argument for file operations
         const pathArg = params.path as string | undefined;
+        if (readOnlyBoundary && (tool.name === "bash" || tool.name === "fn_run_verification")) {
+          return boundaryRejection("This session has a read-only workspace boundary and cannot run shell or verification commands.");
+        }
+        if (
+          readOnlyBoundary
+          && (tool.name === "write" || tool.name === "edit")
+          && (!pathArg || !isAllowlistedWritePath(pathArg))
+        ) {
+          /*
+          FNXC:PlanningBoundary 2026-09-01-14:49:
+          Checkout-free planning reads the dependency-installed project root but may write only inside
+          `.fusion/`. Canonical ancestor containment closes symlink escapes for both existing and new
+          targets; durable plan and document writers remain the supported publication surfaces.
+          */
+          return boundaryRejection(
+            "This planning session may write only inside its declared .fusion allowlist. "
+            + "Use fn_task_prompt_write for PROMPT.md and fn_task_document_write for durable task documents.",
+          );
+        }
+
+
         if (pathArg && !isWorktreeAllowedPath(worktreePath, projectRoot, pathArg, tool.name, normalizedReadOnlyExtraRoots)) {
           const relToProject = relative(projectRoot, pathArg);
           return boundaryRejection(
             `Path "${relToProject}" is outside the worktree boundary. ` +
-              `Coding agents can only modify files inside the current worktree. ` +
+              `Coding agents can only access files inside the current worktree. ` +
               `Existing exceptions include .fusion/memory/ and task attachments; ` +
-              `read-only tools may also access sibling task specs and host-advertised skill roots.`,
+              `read-only tools may also access sibling task specs, ~/.agents/skills, and host-advertised skill roots.`,
           );
         }
 
-        // For bash, also check the working directory if specified
+        // Bash and bounded verification commands must share the same cwd fence.
         const cwdArg = params.cwd as string | undefined;
-        if (tool.name === "bash" && cwdArg && !isWorktreeAllowedPath(worktreePath, projectRoot, cwdArg, tool.name)) {
-          return boundaryRejection(
-            `Working directory is outside the worktree boundary. ` +
-              `Commands must run inside the worktree.`,
-          );
+        if ((tool.name === "bash" || tool.name === "fn_run_verification") && cwdArg
+          && !isWorktreeAllowedPath(worktreePath, projectRoot, cwdArg, tool.name, normalizedReadOnlyExtraRoots)) {
+          return boundaryRejection("Working directory is outside the worktree boundary. Commands must run inside the worktree.");
+        }
+        if (tool.name === "bash" && typeof params.command === "string"
+          && bashCommandTargetsOutsideBoundary(params.command, cwdArg ?? worktreePath, worktreePath, projectRoot, normalizedReadOnlyExtraRoots)) {
+          return boundaryRejection("Command targets a path outside the worktree boundary. Commands must run inside the worktree.");
         }
 
         // Call the original tool implementation with all arguments passed through
@@ -2290,6 +2478,33 @@ export function attachSessionRoutingHeaders(modelRuntime: ModelRuntime, sessionI
   }) as ModelRuntime["getAuth"];
 }
 
+/*
+FNXC:ProviderAuth 2026-09-03-05:30:
+Bundled pi-ai freezes its subscription OAuth identity at claude-cli/2.1.75. Its OAuth client merges caller options headers last, so decorating ModelRuntime.getAuth is the supported override point: Fusion can supply its maintained identity without patching a dependency.
+*/
+export function attachAnthropicClaudeCodeIdentityHeaders(modelRuntime: ModelRuntime): void {
+  const runtimeWithAuth = modelRuntime as unknown as { getAuth?: ModelRuntime["getAuth"] };
+  if (typeof runtimeWithAuth.getAuth !== "function") {
+    piLog.warn("attachAnthropicClaudeCodeIdentityHeaders: modelRuntime.getAuth missing; skipping Claude Code identity header wiring");
+    return;
+  }
+  const resolveAuth = modelRuntime.getAuth.bind(modelRuntime) as ModelRuntime["getAuth"];
+  (modelRuntime as unknown as { getAuth: ModelRuntime["getAuth"] }).getAuth = (async (providerOrModel: Parameters<ModelRuntime["getAuth"]>[0], overrides?: Parameters<ModelRuntime["getAuth"]>[1]) => {
+    const result = await resolveAuth(providerOrModel as never, overrides);
+    if (!result) return undefined;
+    const providerId = typeof providerOrModel === "string" ? providerOrModel : providerOrModel?.provider;
+    const identityHeaders = buildAnthropicClaudeCodeIdentityHeaders({
+      providerId,
+      apiKey: result.auth.apiKey,
+      onWarn: (message) => piLog.warn(message),
+    });
+    return {
+      ...result,
+      auth: { ...result.auth, headers: { ...result.auth.headers, ...identityHeaders } },
+    };
+  }) as ModelRuntime["getAuth"];
+}
+
 /**
  * Create a pi agent session configured for fn.
  * Reuses the user's existing pi auth and model configuration.
@@ -2305,7 +2520,112 @@ function withMcpPromptOptions(promptOptions: unknown, mcpServers: ResolvedMcpSer
   return { mcpServers };
 }
 
+/*
+FNXC:CliRuntimeRouting 2026-08-16-14:37:
+`createFnAgent` is now a ROUTED entry point: it delegates to the shared
+`createResolvedAgentSession` seam (registered below via
+`registerRoutedAgentSessionFactory` to avoid a static import cycle) so every
+caller — not just chat/executor/planning — gets CLI runtime routing
+(cursor-cli/claude-cli/hermes/omp-cli/no-key grok-cli), mock/test-mode forcing,
+and `session:runtime-resolved` visibility. Bare `createFnAgent` calls used to
+pin sessions to the default pi runtime, so a CLI-runtime model selection died
+with "not found in the pi model registry" in any lane that had not been
+individually migrated to the seam (mission interview was the third such
+incident after planning's 401 and this cursor one).
+
+The raw pi implementation lives on as `createPiAgentSessionRaw`, which is what
+`DefaultPiRuntime` (execution/runtime-resolution.ts) must call — the seam
+resolves to that runtime, so routing the runtime's own bridge through the seam
+again would recurse forever. When no routed factory is registered (isolated
+unit tests importing only pi.ts), `createFnAgent` falls back to the raw path,
+preserving pre-existing test behavior.
+
+Callers without an explicit `pluginRunner` resolve one from the host-registered
+default registry (`registerDefaultAgentPluginRunner`, populated by
+InProcessRuntime at plugin-system init), keyed by project root and matched by
+session cwd prefix so multi-project hosts route each session against its own
+project's plugin set.
+*/
+type RoutedAgentSessionFactory = (options: Record<string, unknown>) => Promise<AgentResult>;
+/*
+FNXC:CliRuntimeRouting 2026-08-16-14:37:
+`var` + lazy-init on purpose: agent-session-helpers registers the factory at
+its own module load, and under the pi.ts <-> helpers import cycle that call can
+run while pi.ts is still mid-evaluation. A `let`/`const` here sits in its
+temporal dead zone during that window and made every hoisted createFnAgent
+call throw "Cannot access before initialization"; `var` is hoisted-initialized
+and the Map is created on first touch.
+*/
+// eslint-disable-next-line no-var
+var routedAgentSessionFactory: RoutedAgentSessionFactory | undefined;
+// eslint-disable-next-line no-var
+var defaultAgentPluginRunners: Map<string, unknown> | undefined;
+
+function agentPluginRunnerRegistry(): Map<string, unknown> {
+  return (defaultAgentPluginRunners ??= new Map());
+}
+
+/** Late-binding registration seam (mirrors core's `setCreateFnAgent`): agent-session-helpers registers `createResolvedAgentSession` at module load. */
+export function registerRoutedAgentSessionFactory(factory: RoutedAgentSessionFactory): void {
+  routedAgentSessionFactory = factory;
+}
+
+/** Register a host PluginRunner as the ambient default for bare `createFnAgent` callers in the project rooted at `rootDir`. */
+export function registerDefaultAgentPluginRunner(rootDir: string, pluginRunner: unknown): void {
+  agentPluginRunnerRegistry().set(rootDir, pluginRunner);
+}
+
+export function unregisterDefaultAgentPluginRunner(rootDir: string): void {
+  agentPluginRunnerRegistry().delete(rootDir);
+}
+
+/** Resolve the ambient PluginRunner for a session cwd: longest registered project-root prefix wins; a sole registered runner matches any cwd. */
+function resolveDefaultAgentPluginRunner(cwd: string | undefined): unknown {
+  const registry = agentPluginRunnerRegistry();
+  if (registry.size === 0) return undefined;
+  if (cwd) {
+    let best: { rootDir: string; runner: unknown } | undefined;
+    for (const [rootDir, runner] of registry) {
+      if ((cwd === rootDir || cwd.startsWith(`${rootDir}/`)) && (!best || rootDir.length > best.rootDir.length)) {
+        best = { rootDir, runner };
+      }
+    }
+    if (best) return best.runner;
+  }
+  if (registry.size === 1) {
+    return registry.values().next().value;
+  }
+  return undefined;
+}
+
 export async function createFnAgent(options: AgentOptions): Promise<AgentResult> {
+  /*
+  FNXC:CliRuntimeRouting 2026-08-16-14:37:
+  `__rawPiSession` is DefaultPiRuntime's re-entry marker: the seam resolves to
+  that runtime, whose bridge calls back into createFnAgent (kept as the bridge
+  target so existing tests that mock createFnAgent still intercept pi-session
+  construction). The marker short-circuits to the raw constructor instead of
+  routing again, which would recurse forever.
+  */
+  const { __rawPiSession, ...routableOptions } = options as AgentOptions & { __rawPiSession?: boolean };
+  if (!__rawPiSession && routedAgentSessionFactory) {
+    const optionsWithRouting = routableOptions as AgentOptions & { pluginRunner?: unknown; runtimeHint?: string };
+    const pluginRunner = optionsWithRouting.pluginRunner ?? resolveDefaultAgentPluginRunner(routableOptions.cwd);
+    return routedAgentSessionFactory({
+      ...routableOptions,
+      sessionPurpose: routableOptions.sessionPurpose ?? "executor",
+      ...(pluginRunner ? { pluginRunner } : {}),
+    });
+  }
+  return createPiAgentSessionRaw(routableOptions as AgentOptions);
+}
+
+/**
+ * Raw pi-runtime session construction. Internal to the runtime layer: only
+ * `DefaultPiRuntime` (and the unregistered-factory fallback above) may call
+ * this — every product lane goes through `createFnAgent`'s routed path.
+ */
+export async function createPiAgentSessionRaw(options: AgentOptions): Promise<AgentResult> {
   /*
   FNXC:EngineDiagnostics 2026-07-26-09:55:
   createFnAgent is invoked on every agent/session start (executor, triage, chat, heartbeat, etc.). The entry log is steady-state bookkeeping — debug-only (FUSION_DEBUG=pi). Failures and auth issues stay on warn/error.
@@ -2370,16 +2690,28 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   // Grep→grep). When a coding session ran via Claude CLI tried `Glob`, pi
   // returned "Tool find not found" and the agent looped. Compose explicitly
   // so every tool referenced by tool-mapping.ts is registered.
-  const bashToolOptions = options.taskEnv
+  /*
+  FNXC:WorkspaceSandbox 2026-08-22-22:15:
+  A task session prepares its explicitly selected backend before exposing bash.
+  Native returns no wrapper, preserving the historical command invocation.
+  */
+  const sessionSandbox: SandboxBackend | undefined = options.sessionBoundary
+    ? resolveSandboxBackend({ backendId: options.sandboxBackendId })
+    : undefined;
+  if (sessionSandbox && options.sandboxPolicy) await sessionSandbox.prepare(options.sandboxPolicy);
+  const bashToolOptions = (options.taskEnv || sessionSandbox)
     ? {
-        spawnHook: ({ command, cwd, env }: { command: string; cwd: string; env: NodeJS.ProcessEnv }) => ({
-          command,
-          cwd,
-          env: {
-            ...env,
-            ...options.taskEnv,
-          },
-        }),
+        spawnHook: ({ command, cwd, env }: { command: string; cwd: string; env: NodeJS.ProcessEnv }) => {
+          const wrapped = sessionSandbox?.wrapCommand?.(command, { cwd, env });
+          return {
+            command: wrapped ? shellEscapeCommand(wrapped.command, wrapped.args) : command,
+            cwd,
+            env: {
+              ...env,
+              ...options.taskEnv,
+            },
+          };
+        },
       }
     : undefined;
 
@@ -2405,13 +2737,9 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   void createCodingTools;
   void createReadOnlyTools;
 
-  // Detect if this is a worktree session and apply path boundaries
-  const worktreePath = options.cwd;
-  const worktreeProjectRoot = getProjectRootFromWorktree(worktreePath);
-  if (worktreeProjectRoot) {
-    await assertValidWorktreeSession(worktreePath, worktreeProjectRoot);
-  }
-  const boundaryContext = { worktreePath, worktreeProjectRoot };
+  // Declared task boundaries fail closed; only ordinary undeclared sessions retain
+  // legacy inference so durable-agent heartbeats at the project root stay unchanged.
+  const boundaryContext = await resolveSessionBoundaryRoot(options.cwd, options.sessionBoundary);
 
   // resolvedProjectRoot was computed above (before registerExtensionProviders)
   // and is reused here for resource loader and skill discovery.
@@ -2475,8 +2803,10 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     };
   }
 
-  // Resolve skill selection if provided
+  // Resolve skill selection if provided. The override is also the only point
+  // that knows which forced requests survived discovery and project exclusions.
   let skillsOverrideFn: ReturnType<typeof createSkillsOverrideFromSelection> | undefined;
+  let skillSummary: { availableCount: number; forcedSkillNames: string[]; unresolvedForcedSkills: Array<{ requestedName: string; reason: string }> } | undefined;
   if (effectiveSkillSelection) {
     const selectionResult = resolveSessionSkills(effectiveSkillSelection);
     if (selectionResult.diagnostics.length > 0) {
@@ -2499,8 +2829,19 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     }
     skillsOverrideFn = createSkillsOverrideFromSelection(selectionResult, {
       requestedSkillNames: effectiveSkillSelection.requestedSkillNames,
+      forcedSkillNames: effectiveSkillSelection.forcedSkillNames,
       sessionPurpose: effectiveSkillSelection.sessionPurpose,
     });
+    const rawOverride = skillsOverrideFn;
+    skillsOverrideFn = (base) => {
+      const result = rawOverride(base);
+      skillSummary = {
+        availableCount: result.skills.length,
+        forcedSkillNames: result.resolvedForcedSkills.map((entry) => entry.skillName),
+        unresolvedForcedSkills: result.unresolvedForcedSkills,
+      };
+      return result;
+    };
   }
 
   /*
@@ -2542,10 +2883,12 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     agentDir: getFusionAgentDir(),
     settingsManager,
     systemPromptOverride: () => options.systemPromptLayers?.stable ?? options.systemPrompt,
-    appendSystemPromptOverride: () =>
-      options.systemPromptLayers?.dynamic
-        ? [options.systemPromptLayers.dynamic]
-        : [],
+    appendSystemPromptOverride: () => {
+      const dynamic = options.systemPromptLayers?.dynamic ? [options.systemPromptLayers.dynamic] : [];
+      const forced = skillSummary?.forcedSkillNames ?? [];
+      if (forced.length === 0) return dynamic;
+      return [...dynamic, `Before starting work, you are REQUIRED to read these available skills: ${forced.join(", ")}. All other available skills may be consulted on demand when relevant.`];
+    },
     ...(effectiveExtensionPaths.length > 0 ? { additionalExtensionPaths: [...effectiveExtensionPaths] } : {}),
     ...(normalizedAdditionalSkillPaths.length > 0
       ? { additionalSkillPaths: normalizedAdditionalSkillPaths }
@@ -2553,6 +2896,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     ...(skillsOverrideFn ? { skillsOverride: skillsOverrideFn } : {}),
   });
   await resourceLoader.reload();
+  if (skillSummary) await options.onSkillSummary?.(skillSummary);
 
   const sessionManager = options.sessionManager ?? SessionManager.inMemory();
   normalizeSessionHistoryEntries(sessionManager as unknown as SessionManagerLike);
@@ -2570,6 +2914,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   if (sessionRoutingId) {
     attachSessionRoutingHeaders(modelRuntime, sessionRoutingId);
   }
+  attachAnthropicClaudeCodeIdentityHeaders(modelRuntime);
 
   const createSessionWithModel = async (modelOverride?: typeof selectedModel) => {
     // pi-coding-agent 0.68+: `tools` is a string[] allowlist of tool names, not
@@ -2579,7 +2924,19 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     // names (`read`, `bash`, ...) as the built-ins they replace.
     let mcpToolset: McpSessionToolset | undefined;
     const allowReadonlyMcpTools = options.allowMcpToolsInReadonly === true;
-    if (forwardedMcpServers.length > 0 && (!isReadonly || allowReadonlyMcpTools)) {
+    const readonlyMcpServerAllowlist = options.readonlyMcpServerAllowlist === undefined
+      ? undefined
+      : new Set(options.readonlyMcpServerAllowlist.map((name) => name.trim()).filter(Boolean));
+    const mcpServersToConnect = isReadonly && allowReadonlyMcpTools && readonlyMcpServerAllowlist !== undefined
+      ? forwardedMcpServers.filter((server) => readonlyMcpServerAllowlist.has(server.name))
+      : forwardedMcpServers;
+    /*
+     * FNXC:McpConfig 2026-09-01-06:06:
+     * Read-only workflow lanes may receive MCP only from explicitly named servers. Narrow before
+     * connection so excluded servers never start, then re-check each tool by recorded origin;
+     * the dashboard's reviewed blanket opt-in remains unchanged when no allowlist is supplied.
+     */
+    if (mcpServersToConnect.length > 0 && (!isReadonly || allowReadonlyMcpTools)) {
       /*
        * FNXC:McpConfig 2026-06-27-14:06:
        * pi-coding-agent does not have a createAgentSession `mcpServers` option, so passing resolved servers is silently ignored. Connect MCP servers here and merge namespaced tools into the same customTools filtering/gating/boundary pipeline as engine tools before the session sees them.
@@ -2587,7 +2944,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
        * FNXC:McpConfig 2026-06-29-00:00:
        * Planning and mission interviews are read-only lanes that still need operator-configured documentation/context MCP tools. They must opt in explicitly; other read-only sessions continue to skip MCP connection so unknown external tools do not bypass the read-only allowlist by default.
        */
-      mcpToolset = await connectMcpSessionTools(forwardedMcpServers, {
+      mcpToolset = await connectMcpSessionTools(mcpServersToConnect, {
         cwd: options.cwd,
         clientFactory: options.mcpClientFactory,
         logger: piLog,
@@ -2604,7 +2961,10 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
         piLog.warn(`MCP session continuing with unavailable servers: count=${bootstrapFailures.length}`);
       }
     } else if (forwardedMcpServers.length > 0 && isReadonly) {
-      piLog.debug(`readonly session — MCP servers (${forwardedMcpServers.length}) skipped`);
+      const reason = !allowReadonlyMcpTools
+        ? "no-readonly-opt-in"
+        : "readonly-allowlist-no-match";
+      piLog.log(`readonly session — MCP servers (${forwardedMcpServers.length}) skipped: reason=${reason}`);
     }
 
     const mcpReadonlyTools = new Set(mcpToolset?.tools ?? []);
@@ -2615,7 +2975,13 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     const readonlyFilteredCustomTools = isReadonly
       ? filterCustomToolsForReadonly(
           candidateCustomTools,
-          allowReadonlyMcpTools ? { allowTool: (tool) => mcpReadonlyTools.has(tool) } : {},
+          allowReadonlyMcpTools
+            ? {
+                allowTool: (tool) => readonlyMcpServerAllowlist === undefined
+                  ? mcpReadonlyTools.has(tool)
+                  : readonlyMcpServerAllowlist.has(mcpToolset?.serverByToolName?.get(tool.name) ?? ""),
+              }
+            : {},
         )
       : { allowed: candidateCustomTools, denied: [] };
     const allowlistFilteredCustomTools = {
@@ -2657,6 +3023,8 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       boundaryContext.worktreePath,
       boundaryContext.worktreeProjectRoot,
       normalizedAdditionalSkillPaths,
+      options.sessionBoundary?.kind === "read-only-root",
+      options.sessionBoundary?.writableAllowlist ?? [],
     );
     // FNXC:ToolOutputBudget 2026-08-03-16:00:
     // Keep this outermost so policy-gate and boundary rejection text is bounded too;
@@ -2710,6 +3078,11 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     FN-9007 advances the exact matched Pi runtime closure from 0.82.1 to 0.84.1.
     Keep constructing sessions through ModelRuntime so Fusion inherits the updated provider
     catalog and SDK behavior without duplicating upstream runtime policy.
+
+    FNXC:ModelCatalog 2026-09-02-22:06:
+    FN-9244 advances the exact matched Pi runtime closure from 0.84.1 to 0.84.4. Continue
+    constructing sessions through ModelRuntime with `noTools: "builtin"`; this upgrade's
+    optional PowerShell builtin remains disabled unless Fusion explicitly allowlists it.
     */
     const createSessionOptions: NonNullable<Parameters<typeof createAgentSession>[0]> = {
       cwd: options.cwd,
@@ -2865,10 +3238,37 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     piLog.debug("Fallback session created successfully");
   }
 
+  const reasoningSummaryDetail = options.reasoningSummaryDetail ?? "detailed";
+  let reasoningSummaryCompatibilityDisabled = reasoningSummaryDetail === "off";
+  /*
+  FNXC:ThinkingTrace 2026-08-27-10:45:
+  Pi may already own an onPayload hook for extension request processing. Chain it so a replacement payload remains authoritative, then upgrade only its existing Responses reasoning; fallback-swapped sessions install the same hook so recovery cannot revert to titles-only summaries.
+  */
+  const installReasoningSummaryPayloadHook = (session: AgentToolHookSession): void => {
+    if (session.__fusionReasoningSummaryPayloadHookInstalled || !session.agent) {
+      return;
+    }
+
+    const agent = session.agent;
+    const previousOnPayload = agent.onPayload;
+    agent.onPayload = async (payload, model) => {
+      const previousResult = previousOnPayload ? await previousOnPayload(payload, model) : undefined;
+      const effectivePayload = previousResult ?? payload;
+      const replacement = applyReasoningSummaryToPayload(
+        effectivePayload,
+        model,
+        reasoningSummaryCompatibilityDisabled ? "off" : reasoningSummaryDetail,
+      );
+      return replacement ?? previousResult;
+    };
+    session.__fusionReasoningSummaryPayloadHookInstalled = true;
+  };
+
   let activeSession = sessionResult.session;
   wrapSessionDisposeWithShutdown(activeSession);
   installToolResultContentGuard(activeSession as AgentToolHookSession);
   installMessageContentGuard(activeSession as AgentToolHookSession, sessionManager as unknown as SessionManagerLike);
+  installReasoningSummaryPayloadHook(activeSession as AgentToolHookSession);
   (activeSession as any).__fusionMemoryAppendAvailable = options.customTools?.some((tool) => tool.name === FN_MEMORY_APPEND_TOOL_NAME) === true;
   const promptableSession = activeSession as PromptableSession;
 
@@ -2902,6 +3302,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       targetSession as unknown as AgentToolHookSession,
       sessionManager as unknown as SessionManagerLike,
     );
+    installReasoningSummaryPayloadHook(targetSession as unknown as AgentToolHookSession);
     (targetSession as any).__fusionMemoryAppendAvailable = options.customTools?.some((tool) => tool.name === FN_MEMORY_APPEND_TOOL_NAME) === true;
     const deltaNormalizer = createStreamingDeltaNormalizer();
     targetSession.subscribe((event) => {
@@ -2956,11 +3357,22 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       ...(principalAgentName ? { agentName: principalAgentName } : {}),
       ...(options.taskId ? { taskId: options.taskId } : {}),
       ...(options.sessionPurpose ? { purpose: options.sessionPurpose } : {}),
+      ...(options.taskExecutionSession ? { taskExecutionSession: true } : {}),
     };
   })();
   const sessionIdentityKeys = [...new Set([options.cwd, resolvedProjectRoot].filter((key): key is string => Boolean(key)))];
   const attachSessionIdentity = (session: PromptableSession & { dispose?: () => void | Promise<void> }): void => {
-    const identityDisposers = sessionIdentityKeys.map((key) => registerFusionSessionIdentity(key, sessionIdentity));
+    /*
+    FNXC:TaskExecutionTaskCreation 2026-08-21-23:16:
+    Task-execution markers must not occupy the shared project-root registry key:
+    concurrent heartbeat or triage lookup would become ambiguous and fail closed.
+    ALS retains the marker during this session's own invocation.
+    */
+    const identityDisposers = sessionIdentityKeys.map((key) => {
+      if (key === options.cwd || !options.taskExecutionSession) return registerFusionSessionIdentity(key, sessionIdentity);
+      const { taskExecutionSession: _marker, ...projectRootIdentity } = sessionIdentity;
+      return registerFusionSessionIdentity(key, projectRootIdentity);
+    });
     const sessionInvocations = session as unknown as Partial<Record<"prompt" | "promptWithFallback", (...args: unknown[]) => unknown>>;
     const wrapInvocation = (methodName: "prompt" | "promptWithFallback"): void => {
       const original = sessionInvocations[methodName];
@@ -3074,6 +3486,17 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
         piLog.warn(`Prompt failed with thinking/reasoning conflict; retrying without explicit thinking level: ${errorMessage}`);
         const recoveredSession = await swapPromptSession(selectedModel);
         await promptSessionAndCheck(recoveredSession, prompt, effectivePromptOptions);
+        return;
+      }
+
+      /*
+      FNXC:ThinkingTrace 2026-08-27-10:45:
+      Detailed summaries improve traces but are optional request metadata. A provider that rejects the field retries once on this same session with the hook disabled, so a capability mismatch never fails the run or leaks to another session.
+      */
+      if (!reasoningSummaryCompatibilityDisabled && isReasoningSummaryUnsupportedError(errorMessage)) {
+        reasoningSummaryCompatibilityDisabled = true;
+        piLog.warn(`Provider rejected detailed reasoning summary for ${describeModel(activeSession)}; retrying without the summary upgrade`);
+        await promptSessionAndCheck(activeSession, prompt, effectivePromptOptions);
         return;
       }
 

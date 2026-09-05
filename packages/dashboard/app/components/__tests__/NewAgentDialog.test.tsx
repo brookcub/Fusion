@@ -38,6 +38,7 @@ vi.mock("../CustomModelDropdown", () => ({
         <option value="medium">Medium</option>
         <option value="high">High</option>
         <option value="xhigh">Very High</option>
+        <option value="max">Max</option>
       </select>
     </div>
   ),
@@ -61,6 +62,17 @@ describe("NewAgentDialog thinking level", () => {
     vi.clearAllMocks();
   });
 
+  it("closes for a genuine touch that begins and ends on its overlay", () => {
+    const onClose = vi.fn();
+    render(<NewAgentDialog isOpen onClose={onClose} onCreated={vi.fn()} />);
+
+    const overlay = document.querySelector(".agent-dialog-overlay") as HTMLElement;
+    fireEvent.touchStart(overlay);
+    fireEvent.touchEnd(overlay);
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
   it("uses CustomModelDropdown thinking control with concrete-only agent semantics", async () => {
     render(<NewAgentDialog isOpen onClose={vi.fn()} onCreated={vi.fn()} />);
 
@@ -74,6 +86,7 @@ describe("NewAgentDialog thinking level", () => {
       "medium",
       "high",
       "xhigh",
+      "max",
     ]);
     expect(thinkingSelect.value).toBe("off");
     expect(screen.queryByText(/Default/)).toBeNull();

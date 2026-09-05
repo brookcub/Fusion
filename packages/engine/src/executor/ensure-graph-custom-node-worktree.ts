@@ -9,21 +9,21 @@
  * Per-node worktree acquisition is expected graph plumbing once the task has a worktree.
  */
 import type { Settings, Task, TaskDetail, TaskStore } from "@fusion/core";
-import { loadWorkspaceConfig, type RunCommandResult } from "@fusion/core";
+import { type RunCommandResult, type WorkspaceConfig } from "@fusion/core";
 import { executorLog } from "../logger.js";
 import { generateSyntheticRunId, createRunAuditor, type EngineRunContext, type RunAuditor } from "../util/run-audit.js";
-import { acquireTaskWorktree } from "../worktree/worktree-acquisition.js";
+import { acquireTaskWorktree, acquireWorkspaceTaskWorktrees } from "../worktree/worktree-acquisition.js";
 import { captureBaseCommitSha } from "./worktree-git-refs.js";
 import { createConfiguredCommandAbortError } from "./task-predicates.js";
-import type { WorktreePool } from "../worktree/worktree-pool.js";
+import { resolveWorkspaceConfigOnce } from "./workspace-config-resolver.js";
 
 export type EnsureGraphCustomNodeWorktreeDeps = {
   store: TaskStore;
   rootDir: string;
-  getWorkspaceConfig: () => Awaited<ReturnType<typeof loadWorkspaceConfig>> | undefined;
-  setWorkspaceConfig: (config: Awaited<ReturnType<typeof loadWorkspaceConfig>>) => void;
+  workspaceConfigOwner: object;
+  getWorkspaceConfig: () => WorkspaceConfig | null | undefined;
+  setWorkspaceConfig: (config: WorkspaceConfig | null) => void;
   getRunContextFor: (taskId: string) => EngineRunContext | undefined;
-  pool?: WorktreePool;
   secretsStore?: Parameters<typeof acquireTaskWorktree>[0]["secretsStore"];
   createWorktree: (
     branch: string,
@@ -53,14 +53,7 @@ export async function ensureGraphCustomNodeWorktree(
   nodeId: string,
   refreshStaleBase = false,
 ): Promise<TaskDetail> {
-  let workspaceConfig = deps.getWorkspaceConfig();
-  if (workspaceConfig === undefined) {
-    workspaceConfig = await loadWorkspaceConfig(deps.rootDir);
-    deps.setWorkspaceConfig(workspaceConfig);
-  }
-  if (workspaceConfig && (workspaceConfig.repos.length ?? 0) > 0) {
-    return task;
-  }
+  const workspaceConfig = await resolveWorkspaceConfigOnce(deps);
 
   const syntheticRunId = generateSyntheticRunId("workflow-node-worktree", task.id);
   const audit = createRunAuditor(deps.store, {
@@ -72,6 +65,52 @@ export async function ensureGraphCustomNodeWorktree(
   const commandAbortController = new AbortController();
   deps.registerConfiguredCommandController(task.id, commandAbortController);
   try {
+    /*
+    FNXC:WorkspaceWorktree 2026-08-29-06:59:
+    Workspace membership is decided once by workspace.json. Planning, read-only gates, and
+    implementation all acquire the complete configured set into this task directory; the short
+    per-repository lease protects only `git worktree add`, not the task's private checkout lifetime.
+    */
+    if (workspaceConfig) {
+      await deps.store.logEntry(
+        task.id,
+        `Workflow node '${nodeId}' acquiring workspace checkouts for ${workspaceConfig.repos.length} configured repository(ies)`,
+        undefined,
+        deps.getRunContextFor(task.id),
+      );
+      const workspace = await acquireWorkspaceTaskWorktrees({
+        workspaceConfig,
+        workspaceRootDir: deps.rootDir,
+        task,
+        store: deps.store,
+        settings,
+        logger: executorLog,
+        secretsStore: deps.secretsStore,
+        audit,
+        runContext: deps.getRunContextFor(task.id),
+        runConfiguredCommand: (command, cwd, timeoutMs, env) =>
+          deps.runConfiguredCommand(
+            command,
+            cwd,
+            timeoutMs,
+            env,
+            audit,
+            commandAbortController.signal,
+          ).then((result) => {
+            if (commandAbortController.signal.aborted) {
+              throw createConfiguredCommandAbortError(task.id, command);
+            }
+            return result;
+          }),
+        taskEnv: process.env,
+        addActiveWorktree: deps.addActiveWorktree,
+        refreshStaleBase,
+      });
+      deps.onStart?.(workspace.task, workspace.taskWorktreeDir);
+      executorLog.debug(`${task.id}: workflow node '${nodeId}' using workspace task directory ${workspace.taskWorktreeDir}`);
+      return { ...task, ...workspace.task } as TaskDetail;
+    }
+
     await deps.store.logEntry(
       task.id,
       `Workflow node '${nodeId}' requires a task worktree — acquiring worktree before node execution`,
@@ -83,7 +122,6 @@ export async function ensureGraphCustomNodeWorktree(
       rootDir: deps.rootDir,
       store: deps.store,
       settings,
-      pool: deps.pool,
       logger: executorLog,
       audit,
       runContext: deps.getRunContextFor(task.id),

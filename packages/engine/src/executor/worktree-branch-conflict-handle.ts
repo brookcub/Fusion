@@ -5,7 +5,7 @@
  */
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
-import type { Settings, Task, TaskStore } from "@fusion/core";
+import { classifyTaskBranchOrigin, isFusionDeletableBranch, type Settings, type Task, type TaskStore } from "@fusion/core";
 import {
   assertCleanBranchAtBase,
   BranchConflictError,
@@ -55,7 +55,11 @@ export async function reclaimExistingWorktree(
 ): Promise<void> {
   const targetPath = preservedWorktreeTargetPathForTask(task.id, livePath, settings, deps.rootDir);
   const normalizedPath = await deps.normalizeReclaimableWorktreePath(livePath, targetPath, task.id, settings);
-  await deps.store.updateTask(task.id, { worktree: normalizedPath, branch });
+  await deps.store.updateTask(task.id, {
+    worktree: normalizedPath,
+    branch,
+    branchWriteOrigin: classifyTaskBranchOrigin(task, branch) === "operator-supplied" ? "operator" : "engine",
+  });
   const latestTask = await deps.store.getTask(task.id);
   const baseRef = await resolveDiffBaseRef(normalizedPath, latestTask.baseCommitSha);
   if (baseRef) {
@@ -96,7 +100,7 @@ export async function handleBranchConflict(
   });
 
   if (inspection.kind === "stale-resolved") {
-    await deps.store.updateTask(task.id, { worktree: null, branch: null, baseCommitSha: null });
+    await deps.store.updateTask(task.id, { worktree: null, branch: null, branchWriteOrigin: "engine" as const, baseCommitSha: null });
     const message = `[recovery] ${task.id} stage-A: pruned stale admin entry for ${error.branchName}`;
     await deps.store.logEntry(task.id, message, undefined, deps.getRunContextFor(task.id));
     await deps.store.appendAgentLog(task.id, "Branch conflict auto-recovery", "status", message, "executor");
@@ -116,7 +120,7 @@ export async function handleBranchConflict(
     } catch {
       // best-effort
     }
-    try {
+    if (isFusionDeletableBranch(task, error.branchName)) try {
       await execAsync(`git branch -D ${JSON.stringify(error.branchName)}`, {
         cwd: deps.rootDir,
         timeout: 120_000,
@@ -125,7 +129,7 @@ export async function handleBranchConflict(
     } catch {
       // best-effort
     }
-    await deps.store.updateTask(task.id, { worktree: null, branch: null, baseCommitSha: null });
+    await deps.store.updateTask(task.id, { worktree: null, branch: null, branchWriteOrigin: "engine" as const, baseCommitSha: null });
     const message = `[recovery] ${task.id} stage-A: tip-already-merged cleanup for ${error.branchName} (${inspection.tipSha.slice(0, 12)} on ${inspection.integrationRef})`;
     await deps.store.logEntry(task.id, message, undefined, deps.getRunContextFor(task.id));
     await deps.store.appendAgentLog(task.id, "Branch conflict auto-recovery", "status", message, "executor");
@@ -152,7 +156,7 @@ export async function handleBranchConflict(
       }
       try {
         const worktreeMap = await getWorktreeBranchMap(deps.rootDir);
-        if (!worktreeMap.has(error.branchName)) {
+        if (!worktreeMap.has(error.branchName) && isFusionDeletableBranch(task, error.branchName)) {
           await execAsync(`git branch -D "${error.branchName}"`, { cwd: deps.rootDir });
         }
       } catch {
@@ -189,6 +193,12 @@ export async function handleBranchConflict(
       error: conflictMessage,
       branch: error.branchName,
       worktree: error.conflictingWorktreePath,
+      /*
+       * FNXC:BranchWriteOrigin 2026-08-20-14:40: FN-9161's store validation requires an explicit write origin on every branch write.
+       * FNXC:BranchWriteOrigin 2026-08-28-10:12: the parked branch may be operator-supplied, so origin derives from the classifier
+       * like the sibling re-pin above (#3523 Greptile P1).
+       */
+      branchWriteOrigin: classifyTaskBranchOrigin(task, error.branchName) === "operator-supplied" ? "operator" : "engine",
       paused: true,
       pausedReason: "branch-conflict-unrecoverable",
     });

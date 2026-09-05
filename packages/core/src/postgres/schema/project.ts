@@ -106,6 +106,7 @@ export const tasks = projectSchema.table("tasks", {
   mergerModelId: text("merger_model_id"),
   mergerThinkingLevel: text("merger_thinking_level"),
   mergeRetries: integer("merge_retries"),
+  aiMergeReviewReconciliation: text("ai_merge_review_reconciliation"),
   workflowStepRetries: integer("workflow_step_retries"),
   resumeLimboCount: integer("resume_limbo_count").default(0),
   graphResumeRetryCount: integer("graph_resume_retry_count").default(0),
@@ -119,6 +120,8 @@ export const tasks = projectSchema.table("tasks", {
   executeRequeueLoopCount: integer("execute_requeue_loop_count").default(0),
   executeRequeueLoopSignature: text("execute_requeue_loop_signature"),
   recoveryRetryCount: integer("recovery_retry_count"),
+  sessionContentionHoldCount: integer("session_contention_hold_count").default(0),
+  sessionContentionWaitReason: text("session_contention_wait_reason"),
   taskDoneRetryCount: integer("task_done_retry_count").default(0),
   // FNXC:Lifecycle 2026-07-16-21:40: FN-8141 skip-bypass taint marker (nullable ISO timestamp).
   bulkCompletionRefusalAt: text("bulk_completion_refusal_at"),
@@ -148,6 +151,8 @@ export const tasks = projectSchema.table("tasks", {
   branchConflictRecoveryCount: integer("branch_conflict_recovery_count").default(0),
   reviewerContextRetryCount: integer("reviewer_context_retry_count").default(0),
   reviewerFallbackRetryCount: integer("reviewer_fallback_retry_count").default(0),
+  reviewConvergenceStage: integer("review_convergence_stage").default(0),
+  reviewConvergenceEscalationCount: integer("review_convergence_escalation_count").default(0),
   nextRecoveryAt: text("next_recovery_at"),
   error: text("error"),
   summary: text("summary"),
@@ -168,6 +173,12 @@ export const tasks = projectSchema.table("tasks", {
   is not enough for Gate boot-smoke before health reconciliation runs.
   */
   sessionAdvisorEnabled: integer("session_advisor_enabled"),
+  /*
+  FNXC:PlanApproval 2026-08-28-17:16:
+  FN-234 retired this task column from reads and writes. Keep it in the append-only schema because
+  migration 0070 and PostgreSQL health repair still materialize it for upgrade compatibility.
+  */
+  requirePlanApproval: integer("require_plan_approval"),
   tokenUsageInputTokens: bigint("token_usage_input_tokens", { mode: "number" }),
   tokenUsageOutputTokens: bigint("token_usage_output_tokens", { mode: "number" }),
   tokenUsageCachedTokens: bigint("token_usage_cached_tokens", { mode: "number" }),
@@ -203,6 +214,7 @@ export const tasks = projectSchema.table("tasks", {
   executionCompletedAt: text("execution_completed_at"),
   dependencies: jsonb("dependencies").default([]),
   steps: jsonb("steps").default([]),
+  stepReports: jsonb("step_reports").default([]),
   log: jsonb("log").default([]),
   attachments: jsonb("attachments").default([]),
   steeringComments: jsonb("steering_comments").default([]),
@@ -228,7 +240,10 @@ export const tasks = projectSchema.table("tasks", {
   sourceIssueClosedAt: text("source_issue_closed_at"),
   mergeDetails: jsonb("merge_details"),
   workspaceWorktrees: jsonb("workspace_worktrees"),
-  breakIntoSubtasks: integer("break_into_subtasks").default(0),
+  // FNXC:RepositoryScope 2026-08-20-23:07: explicit task intent must survive PostgreSQL reads independently of acquired worktrees.
+  repositoryScope: jsonb("repository_scope"),
+  // FNXC:ExternalBlock 2026-08-28-03:48: obstacle origin and exact resume coordinates survive process restarts.
+  externalBlock: jsonb("external_block"),
   noCommitsExpected: integer("no_commits_expected").default(0),
   enabledWorkflowSteps: jsonb("enabled_workflow_steps").default([]),
   modifiedFiles: jsonb("modified_files").default([]),
@@ -316,6 +331,9 @@ export const tasks = projectSchema.table("tasks", {
   the gate is a full tasks-table scan. Sparse: most rows have NULL parent.
   */
   index("idxTasksSourceParentTaskId").on(t.sourceParentTaskId),
+  /* FNXC:TaskRecommendations 2026-08-13-22:23: duplicate intake filters source
+   * lineage on recommendation/agent creates; this sparse index avoids a task-table scan. */
+  index("idxTasksProjectSourceAgentId").on(t.projectId, t.sourceAgentId).where(sql`${t.sourceAgentId} IS NOT NULL`),
   // FNXC:EphemeralAgentTaskCreation 2026-07-30-12:00: proposal retries share one stable key, so the database—not a read-before-create race—enforces at-most-once materialization.
   uniqueIndex("uqTasksProjectProposalClaimId").on(t.projectId, t.proposalClaimId).where(sql`${t.proposalClaimId} IS NOT NULL`),
   /*
@@ -556,6 +574,37 @@ export const distributedTaskIdReservations = projectSchema.table("distributed_ta
   index("idxDistributedTaskIdReservationsExpiry").on(t.status, t.expiresAt),
 ]);
 
+// ── Durable workspace coordination leases ────────────────────────────
+/*
+FNXC:Workspace 2026-08-15-08:23:
+Acquire and land share a repo key because either tenancy must exclude another
+writer. The owner triple prevents another node or restarted process using the
+same task id from looking reentrant. renewedAt is audit observability only;
+expiresAt is the sole liveness clock and neither is a resource fence. Tokens
+matter only when a database write or git CAS enforces them. Land and
+merge-dispatch retain their published fence pin so a reclaimed tenancy rejects
+a stalled push even with an unchanged tip; reentry preserves it, while reclaim
+clears it for the new tenancy. Acquire leases never publish a pin.
+*/
+export const workspaceCoordinationLeases = projectSchema.table("workspace_coordination_leases", {
+  projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`),
+  leaseKey: text("lease_key").notNull(), kind: text("kind").notNull(),
+  ownerTaskId: text("owner_task_id").notNull(), ownerNodeId: text("owner_node_id").notNull(),
+  ownerIncarnationId: text("owner_incarnation_id").notNull(), ownerRunId: text("owner_run_id"),
+  fenceToken: bigint("fence_token", { mode: "bigint" }).notNull().default(sql`0`),
+  fenceRefName: text("fence_ref_name"), fenceRefSha: text("fence_ref_sha"), status: text("status").notNull(),
+  acquiredAt: text("acquired_at").notNull(), renewedAt: text("renewed_at").notNull(), expiresAt: text("expires_at").notNull(), createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.leaseKey] }),
+  check("workspace_coordination_leases_kind_check", sql`${t.kind} IN ('acquire', 'land', 'merge-dispatch')`),
+  check("workspace_coordination_leases_status_check", sql`${t.status} IN ('held', 'released', 'expired')`),
+  index("idxWorkspaceCoordinationLeasesOwnerTask").on(t.projectId, t.ownerTaskId), index("idxWorkspaceCoordinationLeasesOwnerNode").on(t.projectId, t.ownerNodeId), index("idxWorkspaceCoordinationLeasesExpiry").on(t.status, t.expiresAt),
+]);
+/* FNXC:Workspace 2026-08-15-08:23: SIGKILL between push and persist leaves this self-contained, non-TTL evidence. Recovery reads remote reachability, never memory or a local object store; only holder and orphan authorities may resolve it. Reentry preserves its pin. */
+export const workspaceLandIntents = projectSchema.table("workspace_land_intents", {
+  projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`), taskId: text("task_id").notNull(), repoRelPath: text("repo_rel_path").notNull(), remoteUrl: text("remote_url").notNull(), integrationRef: text("integration_ref").notNull(), intendedSha: text("intended_sha").notNull(), expectedTip: text("expected_tip").notNull(), fenceRefName: text("fence_ref_name").notNull(), fenceRefSha: text("fence_ref_sha").notNull(), ownerTaskId: text("owner_task_id").notNull(), ownerNodeId: text("owner_node_id").notNull(), ownerIncarnationId: text("owner_incarnation_id").notNull(), fenceToken: bigint("fence_token", { mode: "bigint" }).notNull(), status: text("status").notNull(), resolvedSha: text("resolved_sha"), resolution: text("resolution"), createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(), resolvedAt: text("resolved_at"),
+}, (t) => [primaryKey({ columns: [t.projectId, t.taskId, t.repoRelPath] }), check("workspace_land_intents_status_check", sql`${t.status} IN ('pending', 'recorded', 'abandoned')`), check("workspace_land_intents_resolution_check", sql`${t.resolution} IS NULL OR ${t.resolution} IN ('landed', 'not-landed')`), index("idxWorkspaceLandIntentsStatus").on(t.projectId, t.status)]);
+
 // ── Durable symbol locks ─────────────────────────────────────────────
 /*
 FNXC:SymbolLock 2026-07-30-14:10:
@@ -632,6 +681,31 @@ export const memoryRecallRecords = projectSchema.table("memory_recall_records", 
   source: jsonb("source").notNull(), tags: jsonb("tags").notNull().default(sql`'[]'::jsonb`), graphNodeIds: jsonb("graph_node_ids").notNull().default(sql`'[]'::jsonb`),
   createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
 }, (t) => [primaryKey({ columns: [t.projectId, t.id] }), unique("memory_recall_records_project_kind_hash_key").on(t.projectId, t.kind, t.contentHash), index("idxMemoryRecallRecordsKindCreated").on(t.projectId, t.kind, t.createdAt), index("idxMemoryRecallRecordsCreated").on(t.projectId, t.createdAt)]);
+
+/*
+FNXC:PatchnodeLedger 2026-08-28-12:16:
+Patchnode deliberately does not follow this schema's task foreign-key convention. Archive cleanup hard-deletes task rows to fire sibling cascades, while this self-contained delivery ledger must remain readable after that deletion.
+*/
+export const patchnodeEntries = projectSchema.table("patchnode_entries", {
+  projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`),
+  entryId: text("entry_id").notNull(),
+  taskId: text("task_id").notNull(),
+  kind: text("kind").notNull(),
+  occurrenceKey: text("occurrence_key").notNull(),
+  day: text("day").notNull(),
+  occurredAt: text("occurred_at").notNull(),
+  title: text("title").notNull(),
+  body: text("body").notNull(),
+  revertsEntryId: text("reverts_entry_id"),
+  revertedAt: text("reverted_at"),
+  revertedCommitSha: text("reverted_commit_sha"),
+  createdAt: text("created_at").notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.entryId] }),
+  check("patchnode_entries_kind_check", sql`${t.kind} IN ('completed', 'reverted')`),
+  index("idxPatchnodeEntriesFeed").on(t.projectId, t.day, t.occurredAt),
+  index("idxPatchnodeEntriesTaskKind").on(t.projectId, t.taskId, t.kind, t.occurredAt),
+]);
 
 export const agentActivityEventSeq = projectSchema.table("agent_activity_event_seq", {
   projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`), lastSeq: bigint("last_seq", { mode: "bigint" }).notNull().default(sql`0`),
@@ -2155,6 +2229,12 @@ export const chatSessions = projectSchema.table("chat_sessions", {
   // FNXC:ChatPinned 2026-07-16-12:00: nullable timestamp persists the active
   // Direct-session pin; the ChatStore enforces the per-scope max-three invariant.
   pinnedAt: text("pinned_at"),
+  // FNXC:MemoryFocus 2026-08-13-15:57: per-conversation read-time memory FOCUS/TOPIC
+  // (migration 0059). NULL/empty ('' normalized to NULL) means the conversation
+  // inherits the whole-project scope; otherwise it scopes fn_memory_search +
+  // proactive recall to this topic. It is a read-time filter only — Stash capture
+  // stays write-anywhere across every conversation.
+  memoryFocus: text("memory_focus"),
   cliSessionFile: text("cli_session_file"),
   inFlightGeneration: jsonb("in_flight_generation"),
   cliExecutorAdapterId: text("cli_executor_adapter_id"),
@@ -2574,6 +2654,29 @@ export const projectTableNames = [
   "mission_validator_runs", "mission_validator_failures",
   "mission_fix_feature_lineage", "verification_cache", "import_translation_cache",
   "approval_requests",
-  "approval_request_audit_events", "agent_activity_events", "agent_activity_event_seq", "memory_recall_records", "chat_rooms", "chat_room_members",
+  "approval_request_audit_events", "agent_activity_events", "agent_activity_event_seq", "patchnode_entries", "memory_recall_records", "chat_rooms", "chat_room_members",
   "chat_room_messages", "chat_token_usage",
+  /*
+  FNXC:WorkspaceCoordination 2026-08-23-20:05:
+  FN-9059 (migration 0060) added these two tables to the schema without registering them here, so
+  every registry consumer under-counted them: the PostgreSQL test harness never TRUNCATEd them
+  between tests (a held `repo:<repo>` lease leaked from one case into the next and made the next
+  land report the previous test's successor as the busy holder), and health compaction skipped them.
+  */
+  "workspace_coordination_leases", "workspace_land_intents",
+  /*
+  FNXC:PgTableRegistry 2026-08-23-16:05:
+  Second occurrence of the FN-9059 omission above, found by a leaking `current_plan_evidence` row:
+  a task's plan-evidence version counter continued across tests (a fresh KB-002 started at v2), so
+  `task-dependency-mutation.pg` asserted version 2 and read 3 in a whole-file run while passing in
+  isolation. Every table declared with `projectSchema.table(...)` must be registered here — the
+  harness reset and health compaction both drive off this list, and an unregistered table is simply
+  never cleaned. `project-table-registry.test.ts` now fails when the two drift apart.
+  */
+  "chat_session_tags", "chat_tags", "configuration_revisions", "current_plan_evidence",
+  "mission_lineage_stops", "spec_drift_reports", "spec_locks", "symbol_locks",
+  "task_lifecycle_consumer_cursors", "task_lifecycle_consumer_dead_letters",
+  "task_lifecycle_consumer_receipts", "task_lifecycle_consumer_registrations",
+  "task_lifecycle_event_seq", "task_lifecycle_events", "task_verification_requests",
+  "unplanned_execution_blocks", "workflow_agent_capacity_leases",
 ] as const;

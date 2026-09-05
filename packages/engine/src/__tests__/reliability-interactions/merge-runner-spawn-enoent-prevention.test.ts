@@ -19,6 +19,7 @@ vi.mock("../../pi.js", () => ({
 import type { Settings } from "@fusion/core";
 import { activeSessionRegistry, executingTaskLock } from "../../agents/active-session-registry.js";
 import { aiMergeTask } from "../../merger.js";
+import { resolveTaskWorktreePath } from "../../worktree/worktree-paths.js";
 /*
 FNXC:PgMigrationQuarantine 2026-07-18-04:10:
 VAL-REMOVAL-005 reliability fixtures use PostgreSQL AsyncDataLayer storage. Read
@@ -45,6 +46,14 @@ async function setupReuseMergeFixture(opts: {
 }> {
   const fixture = await makeReliabilityFixture({
     taskId: opts.taskId,
+    /*
+    FNXC:MergeFixtures 2026-08-23-18:30:
+    This fixture exercises merge-runner cwd preflight mechanics, not review gating. The merge door
+    refuses a task whose ENABLED optional pre-merge groups produced no result and the built-in
+    workflow enables Plan Review + Code Review by default, so declare no enabled steps rather than
+    letting an unrelated gate mask the preflight assertions.
+    */
+    task: { enabledWorkflowSteps: [] },
     settings: {
       baseBranch: "master",
       mergeIntegrationWorktree: "reuse-task-worktree",
@@ -62,6 +71,8 @@ async function setupReuseMergeFixture(opts: {
   await store.updateTask(task.id, {
     baseBranch: "master",
     branch,
+    // FNXC:BranchWriteProvenance 2026-08-23-18:30: an engine-side fixture branch write must declare its origin.
+    branchWriteOrigin: "engine",
     steps: completedSteps,
     currentStep: completedSteps.length,
   } as any);
@@ -71,7 +82,7 @@ async function setupReuseMergeFixture(opts: {
 
   await mkdir(worktreeRoot, { recursive: true });
   git(rootDir, `git worktree add ${JSON.stringify(worktreePath)} ${JSON.stringify(branch)}`);
-  await store.updateTask(task.id, { worktree: worktreePath, branch } as any);
+  await store.updateTask(task.id, { worktree: worktreePath, branch, branchWriteOrigin: "engine" } as any);
   if (!opts.skipEnqueue) {
     await store.enqueueMergeQueue(task.id);
   }
@@ -160,7 +171,15 @@ describe("FN-6278 reliability interactions: merge runner cwd preflight", () => {
         },
       });
       const acquired = audits.find((event) => event.mutationType === "merge:reuse-handoff-acquired");
-      expect(acquired?.target).toBe(worktreePath);
+      /*
+      FNXC:WorktreeLocationUnification 2026-09-03-00:12:
+      FN-268 unified the default worktree root from the historic `<rootDir>-worktrees` sibling to
+      `<rootDir>/.fusion/worktrees`. When the reuse worktree cwd vanished, the merger re-acquires a
+      fresh checkout at the unified default layout (not the stale prior sibling path this fixture
+      registered as `priorWorktreePath`). Assert the freshly acquired handoff target resolves through
+      the canonical layout helper so this stays correct if the default relocates again.
+      */
+      expect(acquired?.target).toBe(resolveTaskWorktreePath(rootDir, fixture.settings, taskId.toLowerCase()));
       expect(git(rootDir, "git ls-files")).toContain("packages/engine/src/fn-6278-ri-vanished.ts");
     } finally {
       await cleanupFixture(fixture, worktreeRoot);
@@ -182,7 +201,7 @@ describe("FN-6278 reliability interactions: merge runner cwd preflight", () => {
       git(rootDir, `git worktree remove --force ${JSON.stringify(worktreePath)}`);
       await mkdir(unregisteredPath, { recursive: true });
       await writeFile(join(unregisteredPath, ".git"), "gitdir: /tmp/fusion-unregistered-placeholder\n", "utf-8");
-      await store.updateTask(taskId, { worktree: unregisteredPath, branch } as any);
+      await store.updateTask(taskId, { worktree: unregisteredPath, branch, branchWriteOrigin: "engine" } as any);
 
       const result = await aiMergeTask(store, rootDir, taskId);
       const taskAfter = await store.getTask(taskId);

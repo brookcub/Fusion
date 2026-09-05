@@ -12,8 +12,9 @@ import {
 } from "../terminal-service.js";
 import { runGitCommand } from "../routes/resolve-diff-base.js";
 
-const { mockStat } = vi.hoisted(() => ({
+const { mockStat, mockLoadPtyModule } = vi.hoisted(() => ({
   mockStat: vi.fn(),
+  mockLoadPtyModule: vi.fn(),
 }));
 
 // Mock node-pty
@@ -35,6 +36,11 @@ const mockPtyProcess = {
 
 vi.mock("node-pty", () => ({
   spawn: vi.fn(() => mockPtyProcess),
+}));
+
+vi.mock("@fusion/engine", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@fusion/engine")>()),
+  loadPtyModule: mockLoadPtyModule,
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -68,6 +74,7 @@ describe("TerminalService", () => {
     vi.clearAllMocks();
     service = new TerminalService(projectRoot, 10);
     vi.mocked(nodePty.spawn).mockImplementation(() => mockPtyProcess as never);
+    mockLoadPtyModule.mockResolvedValue(nodePty);
     mockPtyProcess._onDataCallback = null;
     mockPtyProcess._onExitCallback = null;
     mockStat.mockResolvedValue({ isDirectory: () => true });
@@ -95,6 +102,18 @@ describe("TerminalService", () => {
       }
       expect(result.session.id).toMatch(/^term-\d+-/);
       expect(result.session.cwd).toBe(projectRoot);
+    });
+
+    it("returns an actionable diagnostic when the PTY platform package is missing", async () => {
+      mockLoadPtyModule.mockRejectedValueOnce(new Error("native payload missing"));
+
+      const result = await service.createSession();
+
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("Expected PTY load failure");
+      expect(result.code).toBe("pty_load_failed");
+      expect(result.error.startsWith("Terminal service unavailable. The PTY module could not be loaded.")).toBe(true);
+      expect(result.error).toContain(`@lydell/node-pty-${process.platform}-${process.arch}`);
     });
 
     it("returns max_sessions error when session limit reached", async () => {
@@ -571,6 +590,86 @@ describe("TerminalService", () => {
     it("returns null for invalid session", () => {
       const scrollback = service.getScrollback("invalid-session");
       expect(scrollback).toBeNull();
+    });
+  });
+
+  /*
+  FNXC:TerminalSharing 2026-08-19-03:05:
+  Several browsers can watch one PTY, so attaching a viewer must not consume output the already
+  attached viewers have not received. getScrollbackAndClearPending() drops the queue outright, which
+  is invisible with a single viewer and silently deletes a slice of everyone else's live stream once
+  a second one connects. flushPendingOutput() is what an attach uses instead.
+  */
+  /*
+  FNXC:TerminalSharing 2026-08-19-02:45:
+  Every attach used to replay the whole scrollback. A reconnecting client (backgrounded tab, sleep,
+  heartbeat timeout) still displays that history, so the replay appended a second copy — the
+  duplicated-prompt-on-return symptom. A client reports the offset it rendered and gets only the gap.
+  */
+  describe("scrollback resume", () => {
+    it("returns only the bytes a reattaching client missed", async () => {
+      const createResult = await service.createSession();
+      if (!createResult.success) throw new Error("Expected terminal session creation to succeed");
+      const id = createResult.session.id;
+
+      mockPtyProcess._onDataCallback?.("first output\n");
+      const initial = service.getScrollbackSince(id);
+      expect(initial).toEqual({ data: "first output\n", seq: 13, reset: true });
+
+      mockPtyProcess._onDataCallback?.("second output\n");
+      const resumed = service.getScrollbackSince(id, initial!.seq);
+      // Only the delta, and no reset — the client keeps the screen it already has.
+      expect(resumed).toEqual({ data: "second output\n", seq: 27, reset: false });
+    });
+
+    it("asks the client to reset when it is caught up (nothing to append)", async () => {
+      const createResult = await service.createSession();
+      if (!createResult.success) throw new Error("Expected terminal session creation to succeed");
+      const id = createResult.session.id;
+
+      mockPtyProcess._onDataCallback?.("output\n");
+      const at = service.getScrollbackSince(id)!.seq;
+      expect(service.getScrollbackSince(id, at)).toEqual({ data: "", seq: at, reset: false });
+    });
+
+    it("falls back to a full replay with reset for a first attach or a bogus offset", async () => {
+      const createResult = await service.createSession();
+      if (!createResult.success) throw new Error("Expected terminal session creation to succeed");
+      const id = createResult.session.id;
+
+      mockPtyProcess._onDataCallback?.("output\n");
+      // First attach (no offset), an offset from the future, and a negative one all reset.
+      expect(service.getScrollbackSince(id)?.reset).toBe(true);
+      expect(service.getScrollbackSince(id, 9999)?.reset).toBe(true);
+      expect(service.getScrollbackSince(id, -5)?.reset).toBe(true);
+      expect(service.getScrollbackSince(id, Number.NaN)?.reset).toBe(true);
+    });
+
+    it("returns null for an unknown session", () => {
+      expect(service.getScrollbackSince("no-such-session", 0)).toBeNull();
+    });
+  });
+
+  describe("shared-viewer output handoff", () => {
+    it("delivers queued output to existing subscribers instead of discarding it", async () => {
+      const existingViewer = vi.fn();
+      service.onData(existingViewer);
+
+      const createResult = await service.createSession();
+      if (!createResult.success) throw new Error("Expected terminal session creation to succeed");
+      const session = createResult.session;
+
+      // Output arrives and is still queued behind the flush throttle when a second viewer attaches.
+      mockPtyProcess._onDataCallback?.("queued output");
+      service.flushPendingOutput(session.id);
+
+      expect(existingViewer).toHaveBeenCalledWith(session.id, "queued output");
+      // The newcomer reads it from scrollback, so it is delivered exactly once to each viewer.
+      expect(service.getScrollback(session.id)).toContain("queued output");
+    });
+
+    it("is a no-op for an unknown session", () => {
+      expect(() => service.flushPendingOutput("no-such-session")).not.toThrow();
     });
   });
 

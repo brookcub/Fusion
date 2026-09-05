@@ -1,4 +1,5 @@
-#!/usr/bin/env node
+// FNXC:WindowsMergeGate 2026-09-05-08:24: also imported by Vitest globalSetup;
+// a hashbang moved below Vite's injected imports is invalid JavaScript.
 /**
  * FNXC:EngineTests 2026-07-08-04:10:
  * FN-7669 prototypes the #1 lever FN-7668 ranked: the `engine-core` merge

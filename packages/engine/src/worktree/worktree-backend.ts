@@ -1,7 +1,7 @@
-import { exec } from "node:child_process";
+import { exec, execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { access, rm } from "node:fs/promises";
-import { basename, resolve } from "node:path";
+import { access, readFile, rm, writeFile } from "node:fs/promises";
+import { basename, isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { Settings } from "@fusion/core";
 import {
@@ -17,6 +17,7 @@ import { resolveIntegrationBranch } from "../merge/integration-branch.js";
 import { formatError } from "../logger.js";
 import { installTaskWorktreeIdentityGuard } from "./worktree-hooks.js";
 import { pruneWorktreeAdminEntries } from "./worktree-prune.js";
+import { isRetryableRemovalError, removeDirectoryWithRetry } from "./worktree-removal-retry.js";
 import {
   StaleWorktreeIndexLockError,
   classifyStaleLock,
@@ -26,6 +27,7 @@ import {
 import { parseStaleRegistrationPath, recoverStaleRegistration } from "./worktree-stale-registration.js";
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 const NATIVE_TIMEOUT_MS = 120_000;
 const REMOVE_TIMEOUT_MS = 60_000;
 const MAX_BUFFER = 10 * 1024 * 1024;
@@ -200,6 +202,8 @@ export interface WorktreeCreateInput {
   worktreePath: string;
   startPoint?: string;
   taskId: string;
+  /** FNXC:WorkspaceBranches 2026-08-20-03:38: provenance controls safe existing-branch attachment. */
+  branchOrigin?: "engine-canonical" | "group-derived" | "operator-supplied";
   allowSiblingBranchRename?: boolean;
 }
 
@@ -213,6 +217,7 @@ export interface WorktreeRemoveInput {
   worktreePath: string;
   branch?: string;
   taskId?: string;
+  force?: boolean;
 }
 
 export interface WorktreeSyncInput {
@@ -234,6 +239,35 @@ export interface WorktreeBackend {
   sync(input: WorktreeSyncInput): Promise<{ skipped: boolean }>;
   prune(input: WorktreePruneInput): Promise<void>;
   resolveWorktreePath(input: { rootDir: string; worktreeName: string; branch: string }): Promise<string>;
+}
+
+const WORKTREE_BACKEND_MARKER = "fusion-worktree-backend-kind";
+
+async function resolveWorktreeBackendMarkerPath(worktreePath: string): Promise<string> {
+  const { stdout } = await execAsync(`git rev-parse --git-path ${JSON.stringify(WORKTREE_BACKEND_MARKER)}`, {
+    cwd: worktreePath,
+    encoding: "utf-8",
+  });
+  const markerPath = stdout.trim();
+  return isAbsolute(markerPath) ? markerPath : resolve(worktreePath, markerPath);
+}
+
+export async function persistWorktreeBackendKind(
+  worktreePath: string,
+  backendKind: WorktreeBackend["kind"],
+): Promise<void> {
+  await writeFile(await resolveWorktreeBackendMarkerPath(worktreePath), `${backendKind}\n`, "utf-8");
+}
+
+export async function readPersistedWorktreeBackendKind(
+  worktreePath: string,
+): Promise<WorktreeBackend["kind"] | undefined> {
+  try {
+    const backendKind = (await readFile(await resolveWorktreeBackendMarkerPath(worktreePath), "utf-8")).trim();
+    return backendKind === "native" || backendKind === "worktrunk" ? backendKind : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export type WorktrunkOperationCode =
@@ -295,7 +329,7 @@ function getErrorMessageWithStderr(error: unknown): string {
 
 function isRecoverableNativeWorktreeRemoveError(error: unknown): boolean {
   const message = getErrorMessageWithStderr(error);
-  return /Directory not empty/i.test(message) || /failed to delete/i.test(message) || /contains modified or untracked files/i.test(message);
+  return isRetryableRemovalError(error) || /Directory not empty/i.test(message) || /failed to delete/i.test(message) || /contains modified or untracked files/i.test(message);
 }
 
 function findStringByKey(value: unknown, key: string): string | null {
@@ -346,11 +380,13 @@ export class NativeWorktreeBackend implements WorktreeBackend {
 
   async create(input: WorktreeCreateInput): Promise<WorktreeCreateResult> {
     const startArg = input.startPoint ? ` ${quoteShellArg(input.startPoint)}` : "";
-    const installGuardOrCleanup = async (worktreePath: string) => {
+    const installGuardOrCleanup = async (worktreePath: string, expectedBranch: string) => {
       try {
         await installTaskWorktreeIdentityGuard({
           worktreePath,
           taskId: input.taskId,
+          // The hook must follow the branch Git actually checked out: sibling collision recovery can rename it.
+          expectedBranch,
           commitMsgHookEnabled: this.deps.settings?.commitMsgHookEnabled,
           taskPrefix: this.deps.settings?.taskPrefix,
           taskAttributionTrailerName: this.deps.settings?.taskAttributionTrailerNames?.[0],
@@ -416,7 +452,7 @@ export class NativeWorktreeBackend implements WorktreeBackend {
     let staleRegistrationRecoveryAttempted = false;
     try {
       const created = await createWithBranch(input.branch);
-      await installGuardOrCleanup(created.path);
+      await installGuardOrCleanup(created.path, created.branch);
       return created;
     } catch (error) {
       const lockPath = parseIndexLockPath(`${(error as { message?: string })?.message ?? ""}\n${getErrorStderr(error) ?? ""}`);
@@ -448,7 +484,7 @@ export class NativeWorktreeBackend implements WorktreeBackend {
                 metadata: { lockPath },
               });
               const created = await createWithBranch(input.branch);
-              await installGuardOrCleanup(created.path);
+              await installGuardOrCleanup(created.path, created.branch);
               return created;
             }
             await this.deps.audit?.git({
@@ -506,7 +542,7 @@ export class NativeWorktreeBackend implements WorktreeBackend {
               target: input.worktreePath,
               metadata: { actions: recovery.actions },
             });
-            await installGuardOrCleanup(created.path);
+            await installGuardOrCleanup(created.path, created.branch);
             return created;
           } catch (retryError) {
             const actionsWithForce = [...recovery.actions, "add-force-retry"];
@@ -517,7 +553,7 @@ export class NativeWorktreeBackend implements WorktreeBackend {
                 target: input.worktreePath,
                 metadata: { actions: actionsWithForce },
               });
-              await installGuardOrCleanup(created.path);
+              await installGuardOrCleanup(created.path, created.branch);
               return created;
             } catch (forceError) {
               await this.deps.audit?.git({
@@ -541,6 +577,27 @@ export class NativeWorktreeBackend implements WorktreeBackend {
 
       const isBareBranchCollision = /(?:a\s+)?branch named ["']?.+["']? already exists|branch ["']?.+["']? already exists/i.test(combinedErrorOutput);
       if (isBareBranchCollision) {
+          /*
+           * FNXC:WorkspaceBranches 2026-08-20-03:38:
+           * FN-9161 preserves explicit operator branch ownership, including
+           * Fusion-shaped names. Attach its existing bare branch directly;
+           * Git still rejects a branch checked out by another live worktree.
+           */
+          if (input.branchOrigin === "operator-supplied") {
+            try {
+              const created = await attachExistingBranch();
+              await installGuardOrCleanup(created.path, created.branch);
+              await this.deps.audit?.git({
+                type: "worktree:branch-collision-recovery",
+                target: input.worktreePath,
+                metadata: { taskId: input.taskId, disposition: "attach-operator-branch" },
+              });
+              return created;
+            } catch (attachError) {
+              await cleanupPartialCollisionRecovery();
+              throw attachError;
+            }
+          }
           /*
            * FNXC:WorktreeAcquisition 2026-07-16-00:00:
            * FN-8132 / #2232 recovers only a bare branch-name collision after the
@@ -577,7 +634,7 @@ export class NativeWorktreeBackend implements WorktreeBackend {
           if (inspection.kind === "reclaimable") {
             try {
               const created = await attachExistingBranch();
-              await installGuardOrCleanup(created.path);
+              await installGuardOrCleanup(created.path, created.branch);
               await this.deps.audit?.git({
                 type: "worktree:branch-collision-recovery",
                 target: input.worktreePath,
@@ -598,7 +655,7 @@ export class NativeWorktreeBackend implements WorktreeBackend {
                 maxBuffer: MAX_BUFFER,
               });
               const created = await createWithBranch(input.branch);
-              await installGuardOrCleanup(created.path);
+              await installGuardOrCleanup(created.path, created.branch);
               await this.deps.audit?.git({
                 type: "worktree:branch-collision-recovery",
                 target: input.worktreePath,
@@ -620,7 +677,7 @@ export class NativeWorktreeBackend implements WorktreeBackend {
         const candidateBranch = `${input.branch}-${suffix}`;
         try {
           const created = await createWithBranch(candidateBranch);
-          await installGuardOrCleanup(created.path);
+          await installGuardOrCleanup(created.path, created.branch);
           return created;
         } catch {
           // continue probing suffixes
@@ -653,7 +710,7 @@ export class NativeWorktreeBackend implements WorktreeBackend {
 
   async remove(input: WorktreeRemoveInput): Promise<void> {
     try {
-      await execAsync(`git worktree remove --force ${quoteShellArg(input.worktreePath)}`, {
+      await execAsync(`git worktree remove${input.force === false ? "" : " --force"} ${quoteShellArg(input.worktreePath)}`, {
         cwd: input.rootDir,
         encoding: "utf-8",
         timeout: REMOVE_TIMEOUT_MS,
@@ -661,6 +718,22 @@ export class NativeWorktreeBackend implements WorktreeBackend {
       });
       return;
     } catch (error) {
+      // Defensive callers rely on Git's deletion-boundary dirty check. Never turn
+      // that refusal into the recursive filesystem fallback below.
+      if (input.force === false) {
+        const missingPathError = /is not a working tree|no such file or directory|does not exist/i.test(getErrorMessageWithStderr(error));
+        if (!existsSync(input.worktreePath) && missingPathError) {
+          await pruneWorktreeAdminEntries({
+            rootDir: input.rootDir,
+            auditor: this.deps.audit,
+            reason: "remove-missing-fallback",
+            target: input.worktreePath,
+            logger: this.deps.logger,
+          });
+          return;
+        }
+        throw error;
+      }
       if (!isRecoverableNativeWorktreeRemoveError(error)) {
         throw error;
       }
@@ -669,16 +742,26 @@ export class NativeWorktreeBackend implements WorktreeBackend {
       this.deps.logger?.warn?.(
         `[worktree-backend] git worktree remove failed for ${input.worktreePath}: ${errorMessage} — falling back to filesystem removal`,
       );
+      /*
+      FNXC:WorktreeCleanup 2026-08-20-02:04:
+      Native removal retains its non-recoverable Git-error throw contract (notably stale registrations). Once Git reports a recoverable filesystem failure, use the same bounded retry as clean rooms without changing this surface's single prune placement.
+      */
+      const removal = await removeDirectoryWithRetry({
+        path: input.worktreePath,
+        rm,
+        log: (message) => this.deps.logger?.warn?.(`[worktree-backend] ${message}`),
+      });
       await this.deps.audit?.git({
         type: "worktree:remove-fallback",
         target: input.worktreePath,
         metadata: {
           fallback: "filesystem-non-empty",
           error: errorMessage,
+          ...(removal.removed ? {} : { attempts: removal.attempts, residual: true, registrationRetained: true }),
         },
       });
+      if (!removal.removed) throw removal.lastFailure ?? new Error(removal.lastError ?? "filesystem removal failed");
 
-      await rm(input.worktreePath, { recursive: true, force: true });
       await pruneWorktreeAdminEntries({
         rootDir: input.rootDir,
         auditor: this.deps.audit,
@@ -840,6 +923,7 @@ export class WorktrunkWorktreeBackend implements WorktreeBackend {
       await installTaskWorktreeIdentityGuard({
         worktreePath: resolvedPath,
         taskId: input.taskId,
+        expectedBranch: input.branch,
         commitMsgHookEnabled: this.deps.settings?.commitMsgHookEnabled,
         taskPrefix: this.deps.settings?.taskPrefix,
         taskAttributionTrailerName: this.deps.settings?.taskAttributionTrailerNames?.[0],
@@ -914,7 +998,7 @@ export class WorktrunkWorktreeBackend implements WorktreeBackend {
   async remove(input: WorktreeRemoveInput): Promise<void> {
     const target = input.branch ?? input.worktreePath;
     try {
-      await this.runWorktrunk(["remove", "--foreground", target], {
+      await this.runWorktrunk(["remove", "--foreground", ...(input.force === true ? ["--force"] : []), target], {
         cwd: input.rootDir,
         operation: "remove",
       });
@@ -1021,6 +1105,9 @@ export const RemovalReason = {
   SelfHealingBranchConflict: "self-healing-branch-conflict",
   SelfHealingIdleSweep: "self-healing-idle-sweep",
   PoolPrune: "pool-prune",
+  TaskReset: "task-reset",
+  WorkspaceAcquireRollback: "workspace-acquire-rollback",
+  CompletionLandedCleanup: "completion-landed-cleanup",
 } as const;
 
 export type RemovalReason = typeof RemovalReason[keyof typeof RemovalReason];
@@ -1030,12 +1117,36 @@ const ALLOWED_FORCE_REASONS = new Set<RemovalReason>([
   RemovalReason.ExecutorDispose,
   RemovalReason.ExecutorTransientRetry,
   RemovalReason.ExecutorStuckKilled,
+  RemovalReason.WorkspaceAcquireRollback,
+]);
+
+const DEFENSIVE_REMOVAL_REASONS = new Set<RemovalReason>([
+  RemovalReason.MergerCleanup,
+  RemovalReason.MergerPostMerge,
+  RemovalReason.PoolPrune,
+  RemovalReason.SelfHealingBranchConflict,
+  RemovalReason.SelfHealingIdleSweep,
+  RemovalReason.SelfHealingReclaim,
+  RemovalReason.SelfHealingStaleActiveBranch,
+  RemovalReason.StepSessionCleanup,
+  RemovalReason.CompletionLandedCleanup,
+]);
+
+const POST_LANDING_PROOF_REASONS = new Set<RemovalReason>([
+  RemovalReason.CompletionLandedCleanup,
 ]);
 
 export class InvalidForceUsageError extends Error {
   constructor(reason: RemovalReason) {
     super(`force=true is not allowed for removal reason '${reason}'`);
     this.name = "InvalidForceUsageError";
+  }
+}
+
+export class InvalidPostLandingProofUsageError extends Error {
+  constructor(reason: RemovalReason) {
+    super(`postLandingProof is not allowed for removal reason '${reason}'`);
+    this.name = "InvalidPostLandingProofUsageError";
   }
 }
 
@@ -1052,9 +1163,72 @@ export class ActiveSessionWorktreeRemovalError extends Error {
   }
 }
 
+/*
+FNXC:WorktreeCleanup 2026-09-01-06:09:
+FN-9233 permits automatic cleanup of only well-known regenerable dependency and build directories.
+Ignored paths outside this narrow allowlist can contain operator-owned local content and retain FN-251's
+proof gate; quoted porcelain paths are deliberately unparseable and therefore fail closed.
+*/
+/** Directory basenames whose ignored contents are reproducible project output. */
+export const REGENERABLE_IGNORED_DIR_NAMES = new Set([
+  "node_modules", "dist", "build", "out", "target", "bin", "obj", "coverage",
+  ".next", ".nuxt", ".turbo", ".svelte-kit", ".parcel-cache", ".pytest_cache",
+  ".mypy_cache", "__pycache__", ".gradle", ".venv", "venv",
+]);
+
+export type WorktreeRemovalContentClassification = "clean" | "regenerable-ignored" | "ignored-only" | "deliverable";
+
+function isRegenerableIgnoredPorcelainEntry(entry: string): boolean {
+  const path = entry.slice(3).replace(/\/$/, "");
+  if (!path || path.startsWith('"')) return false;
+  const lastSegment = path.split("/").at(-1);
+  return lastSegment !== undefined && REGENERABLE_IGNORED_DIR_NAMES.has(lastSegment);
+}
+
+/** Classify porcelain output without allowing ignored entries to mask deliverable content. */
+export function classifyWorktreeRemovalContent(porcelain: string): WorktreeRemovalContentClassification {
+  const entries = porcelain.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  if (entries.length === 0) return "clean";
+  if (entries.some((line) => !line.startsWith("!! "))) return "deliverable";
+  return entries.every(isRegenerableIgnoredPorcelainEntry) ? "regenerable-ignored" : "ignored-only";
+}
+
+interface DefensiveRemovalContentProbe {
+  classification: WorktreeRemovalContentClassification;
+  entryCount: number;
+}
+
+/** Fail closed when an automatic sweep cannot prove the checkout is empty of user content. */
+async function assertCleanForDefensiveRemoval(worktreePath: string): Promise<DefensiveRemovalContentProbe> {
+  // Nothing on disk means nothing to preserve — stale registrations prune normally below.
+  if (!existsSync(worktreePath)) {
+    return { classification: "clean", entryCount: 0 };
+  }
+  let stdout: string;
+  try {
+    ({ stdout } = await execFileAsync("git", ["status", "--porcelain=v1", "--ignored=matching", "--untracked-files=normal"], {
+      cwd: worktreePath,
+      encoding: "utf-8",
+      timeout: 15_000,
+      maxBuffer: MAX_BUFFER,
+    }));
+  } catch (error) {
+    throw new Error(`preserving ${worktreePath}: status probe failed (${error instanceof Error ? error.message : String(error)})`);
+  }
+  const classification = classifyWorktreeRemovalContent(stdout);
+  if (classification === "deliverable") {
+    throw new Error(`preserving ${worktreePath}: uncommitted or ignored content present`);
+  }
+  return {
+    classification,
+    entryCount: stdout.split(/\r?\n/).filter((line) => line.trim().length > 0).length,
+  };
+}
+
 /**
- * Remove a worktree via configured backend.
- * Only executor-owned hard-cancel/dispose paths may use force=true.
+ * FNXC:WorkspaceWorktree 2026-08-20-07:08:
+ * Force removal is reserved for explicit executor teardown paths and workspace-acquisition rollback
+ * before the rejected checkout has been published to task state.
  */
 export async function removeWorktree(input: {
   worktreePath: string;
@@ -1063,6 +1237,8 @@ export async function removeWorktree(input: {
   reason: RemovalReason;
   taskId?: string;
   audit?: RunAuditor;
+  /** Durable landing proof permits ignored-only content, never force removal. */
+  postLandingProof?: { landedSha?: string; source: string };
   force?: boolean;
   timeout?: number;
   expectedOwnerTaskId?: string;
@@ -1078,6 +1254,88 @@ export async function removeWorktree(input: {
   if (input.force === true && !ALLOWED_FORCE_REASONS.has(input.reason)) {
     throw new InvalidForceUsageError(input.reason);
   }
+  if (input.postLandingProof && !POST_LANDING_PROOF_REASONS.has(input.reason)) {
+    throw new InvalidPostLandingProofUsageError(input.reason);
+  }
+
+  const requiresCleanWorktree = DEFENSIVE_REMOVAL_REASONS.has(input.reason);
+
+  /*
+  FNXC:WorktreeCleanup 2026-09-01-06:09:
+  FN-9233 lets all defensive sweeps discard only allowlisted regenerable ignored output, while
+  non-allowlisted ignored content retains FN-251's durable landing-proof gate. Deliverable,
+  unverifiable, and live-session content remain fail-closed for every caller.
+  */
+  let contentClassification: WorktreeRemovalContentClassification | undefined;
+  let contentEntryCount = 0;
+  if (requiresCleanWorktree) {
+    try {
+      const contentProbe = await assertCleanForDefensiveRemoval(input.worktreePath);
+      contentClassification = contentProbe.classification;
+      contentEntryCount = contentProbe.entryCount;
+    } catch (error) {
+      const classification = error instanceof Error && error.message.includes(": status probe failed (")
+        ? "unverifiable"
+        : "deliverable";
+      await input.audit?.git({
+        type: "worktree:removal-preserved",
+        target: input.worktreePath,
+        metadata: {
+          taskId: input.taskId,
+          reason: input.reason,
+          source: input.postLandingProof?.source,
+          classification,
+          hasPostLandingProof: input.postLandingProof !== undefined,
+        },
+      }).catch(() => undefined);
+      throw error;
+    }
+    if (contentClassification === "ignored-only" && !input.postLandingProof) {
+      await input.audit?.git({
+        type: "worktree:removal-preserved",
+        target: input.worktreePath,
+        metadata: {
+          taskId: input.taskId,
+          reason: input.reason,
+          source: undefined,
+          classification: "ignored-only",
+          hasPostLandingProof: false,
+        },
+      }).catch(() => undefined);
+      throw new Error(`preserving ${input.worktreePath}: uncommitted or ignored content present`);
+    }
+  }
+
+  const recordIgnoredOnlyDiscard = async (): Promise<void> => {
+    if (contentClassification !== "ignored-only" || !input.postLandingProof) return;
+    try {
+      await input.audit?.git({
+        type: "worktree:post-landing-ignored-content-discarded",
+        target: input.worktreePath,
+        metadata: {
+          taskId: input.taskId,
+          reason: input.reason,
+          source: input.postLandingProof.source,
+          landedSha: input.postLandingProof.landedSha,
+        },
+      });
+    } catch {
+      // Audit persistence must not change worktree cleanup outcomes.
+    }
+  };
+
+  const recordRegenerableDiscard = async (): Promise<void> => {
+    if (contentClassification !== "regenerable-ignored") return;
+    try {
+      await input.audit?.git({
+        type: "worktree:removal-discarded-regenerable-content",
+        target: input.worktreePath,
+        metadata: { taskId: input.taskId, reason: input.reason, entryCount: contentEntryCount },
+      });
+    } catch {
+      // Audit persistence must not change worktree cleanup outcomes.
+    }
+  };
 
   if (input.expectedOwnerTaskId && input.liveOwnerProbe) {
     const reconciled = reconcileSelfOwnedActiveSessionForRemoval(
@@ -1128,6 +1386,7 @@ export async function removeWorktree(input: {
     rootDir: input.rootDir,
     worktreePath: input.worktreePath,
     taskId: input.taskId,
+    force: requiresCleanWorktree ? false : input.force,
   };
 
   if (input.force === false || typeof input.timeout === "number") {
@@ -1137,6 +1396,8 @@ export async function removeWorktree(input: {
 
   try {
     await backend.remove(removeInput);
+    await recordIgnoredOnlyDiscard();
+    await recordRegenerableDiscard();
     if (input.audit) {
       await input.audit.git({
         type: backend.kind === "worktrunk" ? "worktree:worktrunk-remove" : "worktree:remove",
@@ -1167,6 +1428,8 @@ export async function removeWorktree(input: {
     const native = new NativeWorktreeBackend({ logger, settings: input.settings });
     try {
       await native.remove(removeInput);
+      await recordIgnoredOnlyDiscard();
+      await recordRegenerableDiscard();
       await input.audit?.git({ type: "worktree:remove", target: input.worktreePath });
       return { removed: true, classification: "removed" };
     } catch (nativeError) {

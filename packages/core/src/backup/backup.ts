@@ -1,11 +1,12 @@
 import { join } from "node:path";
+import { existsSync } from "node:fs";
 import { resolveGlobalDir } from "../config/global-settings.js";
 import { CronExpressionParser } from "cron-parser";
-import { getDefaultCentralDbPath } from "../central/central-db.js";
 import { PgBackupManager, type PgBackupPair, type PgDumpResult } from "../postgres/pg-backup.js";
 import { resolveBackend } from "../postgres/backend-resolver.js";
 import { getActiveEmbeddedRuntimeUrl } from "../postgres/active-backend-registry.js";
 import type { Settings } from "../types.js";
+import type { Routine } from "../automation/routine.js";
 
 /**
  * FNXC:SettingsBackups 2026-07-16-14:50:
@@ -33,18 +34,34 @@ export interface BackupInfo extends BackupFileInfo {
     | {
         failed: string;
       };
+  migrationsBackup?: BackupFileInfo | { skipped: "missing" };
 }
 
 export interface BackupPairInfo {
   timestamp: string;
   project?: BackupFileInfo;
   central?: BackupFileInfo;
+  migrations?: BackupFileInfo;
+}
+
+export interface BackupRestoreOptions {
+  createPreRestoreBackup?: boolean;
+  skipCentral?: boolean;
+  centralOnly?: boolean;
+}
+
+export interface BackupRestoreResult {
+  restored: Array<"project" | "central">;
+  preRestoreBackup?: BackupPairInfo;
+  projectRollback?: "succeeded";
+  centralRollback?: "succeeded";
+  migrationBookkeepingRollback?: "succeeded";
+  migrationBookkeeping: "restored" | "unavailable" | "skipped-central-only";
 }
 
 export interface BackupOptions {
   backupDir?: string;
   retention?: number;
-  centralDbPath?: string;
   includeCentralDb?: boolean;
   /**
    * FNXC:SqliteFinalRemoval 2026-06-26-00:15:
@@ -53,6 +70,11 @@ export interface BackupOptions {
    * was removed as part of the SQLite-to-PostgreSQL cutover.
    */
   connectionString?: string;
+  /** Override PostgreSQL client paths, primarily for embedders and tests. */
+  pgDumpPath?: string;
+  pgRestorePath?: string;
+  /** Override the bounded native-client timeout. Defaults to 120 seconds. */
+  clientTimeoutMs?: number;
 }
 
 /**
@@ -68,7 +90,6 @@ export class BackupManager {
   private fusionDir: string;
   private backupDir: string;
   private retention: number;
-  private centralDbPath: string;
   private includeCentralDb: boolean;
   private readonly pgManager: PgBackupManager;
 
@@ -76,7 +97,6 @@ export class BackupManager {
     this.fusionDir = fusionDir;
     this.backupDir = options?.backupDir ?? ".fusion/backups";
     this.retention = options?.retention ?? 7;
-    this.centralDbPath = options?.centralDbPath ?? join(this.fusionDir, "..", ".fusion", "fusion-central.db");
     this.includeCentralDb = options?.includeCentralDb ?? true;
     const connectionString = options?.connectionString ?? resolveBackendConnectionString();
     if (!connectionString) {
@@ -89,6 +109,9 @@ export class BackupManager {
       backupDir: this.backupDir,
       retention: this.retention,
       includeCentral: this.includeCentralDb,
+      pgDumpPath: options?.pgDumpPath,
+      pgRestorePath: options?.pgRestorePath,
+      clientTimeoutMs: options?.clientTimeoutMs,
     });
   }
 
@@ -126,27 +149,18 @@ export class BackupManager {
   }
 
   async listBackupPairs(): Promise<BackupPairInfo[]> {
-    const projects = await this.listBackups();
-    const centrals = await this.listCentralBackups();
-    const pairs = new Map<string, BackupPairInfo>();
-
-    for (const project of projects) {
-      const key = getBackupPairKey(project.filename, false);
-      if (!key) continue;
-      const existing = pairs.get(key) ?? { timestamp: key };
-      existing.project = project;
-      pairs.set(key, existing);
-    }
-
-    for (const central of centrals) {
-      const key = getBackupPairKey(central.filename, true);
-      if (!key) continue;
-      const existing = pairs.get(key) ?? { timestamp: key };
-      existing.central = central;
-      pairs.set(key, existing);
-    }
-
-    return [...pairs.values()].sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+    const pairs = await this.pgManager.listBackups();
+    return pairs.map((pair) => ({
+      timestamp: pair.timestamp,
+      project: pair.project ? pgDumpResultToBackupFileInfo(pair.project) : undefined,
+      central:
+        pair.central && "filename" in pair.central
+          ? pgDumpResultToBackupFileInfo(pair.central)
+          : undefined,
+      migrations: pair.migrations && "filename" in pair.migrations
+        ? pgDumpResultToBackupFileInfo(pair.migrations)
+        : undefined,
+    }));
   }
 
   async cleanupOldBackups(): Promise<number> {
@@ -155,15 +169,84 @@ export class BackupManager {
   }
 
   /**
-   * FNXC:SqliteFinalRemoval 2026-06-26:
-   * Restore is delegated to PgBackupManager (pg_restore). The legacy SQLite
-   * file-copy restore (cp fusion.db, pre-restore snapshots) was removed.
+   * FNXC:PostgresBackup 2026-09-04-02:58:
+   * Project/archive restores also restore captured migration bookkeeping. That
+   * write is permitted only with a complete pre-restore stem so failures can
+   * roll every committed group back to one consistent snapshot.
    */
   async restoreBackup(
     filename: string,
-    _options?: { createPreRestoreBackup?: boolean; skipCentral?: boolean; centralOnly?: boolean }
-  ): Promise<void> {
-    await this.pgManager.restoreBackup(filename);
+    options: BackupRestoreOptions = {},
+  ): Promise<BackupRestoreResult> {
+    if (options.skipCentral && options.centralOnly) {
+      throw new Error("skipCentral and centralOnly cannot be used together");
+    }
+
+    const selection = this.pgManager.resolveBackupSelection(filename);
+    if (selection.selectedKind === "central" && options.skipCentral) {
+      throw new Error("skipCentral cannot be used when a central dump is selected");
+    }
+
+    const restoreProject = selection.selectedKind === "project" && !options.centralOnly;
+    const restoreCentral = selection.selectedKind === "central"
+      || options.centralOnly === true
+      || (selection.selectedKind === "project" && !options.skipCentral);
+    const restoreBookkeeping = restoreProject && existsSync(selection.migrationsPath);
+    if (restoreBookkeeping && options.createPreRestoreBackup === false) {
+      throw new Error("createPreRestoreBackup: false is refused: migration bookkeeping restore requires a pre-restore backup for rollback.");
+    }
+    const sources: Array<{ path: string }> = [];
+    if (restoreProject) sources.push({ path: selection.projectPath });
+    if (restoreCentral) sources.push({ path: selection.centralPath });
+    if (restoreBookkeeping) sources.push({ path: selection.migrationsPath });
+    for (const source of sources) await this.pgManager.validateBackup(source.path);
+
+    let preRestorePair: PgBackupPair | undefined;
+    if (options.createPreRestoreBackup !== false) {
+      preRestorePair = await this.pgManager.createPreRestoreBackup();
+      const complete = preRestorePair.project && preRestorePair.central && "path" in preRestorePair.central
+        && (!restoreBookkeeping || (preRestorePair.migrations && "path" in preRestorePair.migrations));
+      if (!complete) throw new Error("Pre-restore backup did not produce a complete PostgreSQL dump pair including migration bookkeeping");
+      const preProject = preRestorePair.project!;
+      const preCentral = preRestorePair.central as PgDumpResult;
+      await this.pgManager.validateBackup(preProject.path);
+      await this.pgManager.validateBackup(preCentral.path);
+      if (restoreBookkeeping) await this.pgManager.validateBackup((preRestorePair.migrations as PgDumpResult).path);
+    }
+
+    const result: BackupRestoreResult = {
+      restored: [],
+      preRestoreBackup: preRestorePair ? pgBackupPairToBackupPairInfo(preRestorePair) : undefined,
+      migrationBookkeeping: restoreProject ? (restoreBookkeeping ? "restored" : "unavailable") : "skipped-central-only",
+    };
+    const rollback = async (failure: unknown): Promise<never> => {
+      if (!preRestorePair?.project) throw new Error(`Restore failed without rollback invariant: ${errorMessage(failure)}`, { cause: failure });
+      const failures: unknown[] = [failure];
+      try { await this.pgManager.restoreBackup(preRestorePair.project.path); result.projectRollback = "succeeded"; } catch (error) { failures.push(error); }
+      if (restoreCentral && preRestorePair.central && "path" in preRestorePair.central) {
+        try { await this.pgManager.restoreBackup(preRestorePair.central.path); result.centralRollback = "succeeded"; } catch (error) { failures.push(error); }
+      }
+      if (restoreBookkeeping && preRestorePair.migrations && "path" in preRestorePair.migrations) {
+        try { await this.pgManager.restoreBackup(preRestorePair.migrations.path); result.migrationBookkeepingRollback = "succeeded"; } catch (error) { failures.push(error); }
+      }
+      const names = [preRestorePair.project.filename, preRestorePair.central && "filename" in preRestorePair.central ? preRestorePair.central.filename : undefined, preRestorePair.migrations && "filename" in preRestorePair.migrations ? preRestorePair.migrations.filename : undefined].filter(Boolean).join(", ");
+      if (failures.length > 1) throw new AggregateError(failures, `Restore failed: ${errorMessage(failure)}; rollback from retained dumps ${names} also failed: ${failures.slice(1).map(errorMessage).join("; ")}`);
+      throw new Error(`Restore failed; committed groups were rolled back from retained dumps ${names}: ${errorMessage(failure)}`, { cause: failure as Error });
+    };
+    let projectCommitted = false;
+    try {
+      if (restoreProject) {
+        await this.pgManager.restoreBackup(selection.projectPath);
+        projectCommitted = true;
+        result.restored.push("project");
+      }
+      if (restoreCentral) { await this.pgManager.restoreBackup(selection.centralPath); result.restored.push("central"); }
+      if (restoreBookkeeping) await this.pgManager.restoreBackup(selection.migrationsPath);
+    } catch (error) {
+      if (!projectCommitted) throw error;
+      await rollback(error);
+    }
+    return result;
   }
 }
 
@@ -187,15 +270,6 @@ function formatTimestamp(date: Date): string {
   const minutes = String(date.getUTCMinutes()).padStart(2, "0");
   const seconds = String(date.getUTCSeconds()).padStart(2, "0");
   return `${year}-${month}-${day}-${hours}${minutes}${seconds}`;
-}
-
-function getBackupPairKey(filename: string, isCentral: boolean): string | null {
-  const pattern = isCentral
-    ? /^fusion-central(?:-pre-restore)?-(\d{4}-\d{2}-\d{2}-\d{6})(-\d+)?\.db$/
-    : /^(?:fusion|kb)(?:-pre-restore)?-(\d{4}-\d{2}-\d{2}-\d{6})(-\d+)?\.db$/;
-  const match = filename.match(pattern);
-  if (!match) return null;
-  return `${match[1]}${match[2] ?? ""}`;
 }
 
 export function validateBackupSchedule(schedule: string): boolean {
@@ -232,12 +306,13 @@ export function createBackupManager(
   settings?: Partial<Settings>,
   connectionString?: string,
 ): BackupManager {
-  let centralDbPath: string;
-  try {
-    centralDbPath = getDefaultCentralDbPath();
-  } catch {
-    centralDbPath = join(fusionDir, "..", ".fusion", "fusion-central.db");
-  }
+  /*
+  FNXC:SqliteFinalRemoval 2026-08-19-04:00:
+  The `fusion-central.db` path this used to compute and pass through was never read: PgBackupManager
+  takes only the includeCentral flag. It was a leftover of the SQLite file-copy backup that
+  VAL-REMOVAL-003 deleted, and keeping it invited the mistake that shipped elsewhere — treating that
+  file's presence as evidence about a Postgres install (see onboard-autolaunch).
+  */
 
   /*
    * FNXC:SqliteFinalRemoval 2026-06-26:
@@ -252,7 +327,6 @@ export function createBackupManager(
   return new BackupManager(fusionDir, {
     backupDir: canonicalizeBackupDir(settings?.autoBackupDir),
     retention: settings?.autoBackupRetention,
-    centralDbPath,
     includeCentralDb: true,
     connectionString: resolvedConnectionString,
   });
@@ -286,17 +360,32 @@ function pgDumpResultToBackupFileInfo(result: PgDumpResult): BackupFileInfo {
   };
 }
 
+function pgBackupPairToBackupPairInfo(pair: PgBackupPair): BackupPairInfo {
+  return {
+    timestamp: pair.timestamp,
+    project: pair.project ? pgDumpResultToBackupFileInfo(pair.project) : undefined,
+    central: pair.central && "filename" in pair.central ? pgDumpResultToBackupFileInfo(pair.central) : undefined,
+    migrations: pair.migrations && "filename" in pair.migrations ? pgDumpResultToBackupFileInfo(pair.migrations) : undefined,
+  };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function pgBackupPairToBackupInfo(pair: PgBackupPair): BackupInfo {
   const info: BackupInfo = pair.project
     ? pgDumpResultToBackupFileInfo(pair.project)
     : { filename: "", createdAt: pair.timestamp, size: 0, path: "" };
 
   if (pair.central) {
-    if ("filename" in pair.central) {
-      info.centralBackup = pgDumpResultToBackupFileInfo(pair.central);
-    } else {
-      info.centralBackup = pair.central; // { skipped: "disabled" | "missing" }
-    }
+    if ("filename" in pair.central) info.centralBackup = pgDumpResultToBackupFileInfo(pair.central);
+    else info.centralBackup = pair.central;
+  }
+  if (pair.migrations) {
+    info.migrationsBackup = "filename" in pair.migrations
+      ? pgDumpResultToBackupFileInfo(pair.migrations)
+      : pair.migrations;
   }
   return info;
 }
@@ -365,6 +454,70 @@ function formatBytes(bytes: number): string {
 
 export const BACKUP_SCHEDULE_NAME = "Database Backup";
 
+export type BackupScheduleState = "disabled" | "missing" | "inactive" | "mismatched" | "scheduled";
+
+export interface BackupScheduleStatus {
+  enabled: boolean;
+  cronExpression: string;
+  routineRegistered: boolean;
+  nextRunAt?: string;
+  lastRunAt?: string;
+  lastRunSucceeded?: boolean;
+  lastRunOutput?: string;
+  runCount?: number;
+}
+
+export type BackupRoutineSyncPlan = { action: "none" | "upsert" | "delete" };
+
+/**
+ * FNXC:SettingsBackups 2026-08-13-23:50:
+ * Global settings saves must not postpone a pending backup. Compare desired routine
+ * fields before writing so a matching central row retains its next-run cadence.
+ */
+export function planBackupRoutineSync(existing: Routine | undefined, desired: Pick<Routine, "trigger" | "command" | "enabled">): BackupRoutineSyncPlan {
+  if (!desired.enabled) return { action: existing ? "delete" : "none" };
+  if (
+    existing?.enabled
+    && existing.command === desired.command
+    && existing.trigger.type === "cron"
+    && desired.trigger.type === "cron"
+    && existing.trigger.cronExpression === desired.trigger.cronExpression
+  ) return { action: "none" };
+  return { action: "upsert" };
+}
+
+export function buildBackupScheduleStatus(
+  settings: Pick<Settings, "autoBackupEnabled" | "autoBackupSchedule">,
+  routine: Routine | undefined,
+): BackupScheduleStatus {
+  const result = routine?.lastRunResult;
+  const output = typeof result?.output === "string" ? result.output : typeof result?.error === "string" ? result.error : undefined;
+  return {
+    enabled: Boolean(settings.autoBackupEnabled),
+    cronExpression: settings.autoBackupSchedule || "0 2 * * *",
+    routineRegistered: Boolean(routine),
+    nextRunAt: routine?.nextRunAt,
+    lastRunAt: routine?.lastRunAt,
+    lastRunSucceeded: result?.success,
+    lastRunOutput: output?.slice(0, 500),
+    runCount: routine?.runCount,
+  };
+}
+
+/** @deprecated Use buildBackupScheduleStatus for the dashboard response. */
+export function getBackupScheduleStatus(
+  settings: Pick<Settings, "autoBackupEnabled" | "autoBackupSchedule">,
+  routine: Routine | undefined,
+): { status: BackupScheduleState; schedule: string; routine?: Routine } {
+  const schedule = settings.autoBackupSchedule || "0 2 * * *";
+  if (!settings.autoBackupEnabled) return { status: "disabled", schedule, routine };
+  if (!routine) return { status: "missing", schedule };
+  if (!routine.enabled) return { status: "inactive", schedule, routine };
+  return routine.trigger.type === "cron" && routine.trigger.cronExpression === schedule
+    ? { status: "scheduled", schedule, routine }
+    : { status: "mismatched", schedule, routine };
+}
+
 export async function syncBackupAutomation(
   automationStore: import("../automation/automation-store.js").AutomationStore,
   settings: Settings
@@ -422,32 +575,38 @@ export async function syncBackupRoutine(
   if (routineStore.asyncLayer) {
     const { GlobalRoutineStore } = await import("../automation/global-routine-store.js");
     const globalRoutines = new GlobalRoutineStore(routineStore.asyncLayer);
-    if (!settings.autoBackupEnabled) {
-      await globalRoutines.deleteByName(BACKUP_SCHEDULE_NAME);
-      return undefined;
-    }
-    return globalRoutines.syncBackup({
+    const input = {
       name: BACKUP_SCHEDULE_NAME,
       description: "Automatic backup of the shared global PostgreSQL cluster",
       agentId: "",
-      trigger: { type: "cron", cronExpression: schedule },
+      trigger: { type: "cron" as const, cronExpression: schedule },
       command: "fn backup --create",
-      enabled: true,
-    });
+      enabled: Boolean(settings.autoBackupEnabled),
+    };
+    const existing = await globalRoutines.getByName(BACKUP_SCHEDULE_NAME);
+    const plan = planBackupRoutineSync(existing, input);
+    if (plan.action === "none") return existing;
+    if (plan.action === "delete") {
+      await globalRoutines.deleteByName(BACKUP_SCHEDULE_NAME);
+      return undefined;
+    }
+    return globalRoutines.syncBackup(input);
   }
 
   const routines = await routineStore.listRoutines();
   const existingRoutine = routines.find((routine) => routine.name === BACKUP_SCHEDULE_NAME);
-  if (!settings.autoBackupEnabled) {
-    if (existingRoutine) await routineStore.deleteRoutine(existingRoutine.id);
-    return undefined;
-  }
   const input = {
     name: BACKUP_SCHEDULE_NAME,
     description: "Automatic backup of the shared global PostgreSQL cluster",
     agentId: "", trigger: { type: "cron" as const, cronExpression: schedule },
     command: "fn backup --create", enabled: true, scope: "project" as const,
   };
+  const plan = planBackupRoutineSync(existingRoutine, { ...input, enabled: Boolean(settings.autoBackupEnabled) });
+  if (plan.action === "none") return existingRoutine;
+  if (plan.action === "delete") {
+    await routineStore.deleteRoutine(existingRoutine!.id);
+    return undefined;
+  }
   if (existingRoutine) return routineStore.updateRoutine(existingRoutine.id, { trigger: input.trigger, command: input.command, enabled: true });
   return routineStore.createRoutine(input);
 }

@@ -1,6 +1,7 @@
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { isDefaultProviderInstance, parseProviderInstanceKey } from "../provider-instance.js";
 
 export type StoredAuthCredential = {
@@ -11,6 +12,12 @@ export type StoredAuthCredential = {
   expires?: number;
   scopes?: string[];
   accountId?: string;
+  /*
+  FNXC:ProviderAuth 2026-09-01-07:15:
+  accountFingerprint is a derived, non-reversible marker for distinguishing stored credentials.
+  It is never an authoritative provider account id and must never be emitted in an API response.
+  */
+  accountFingerprint?: string;
   [key: string]: unknown;
 };
 
@@ -22,6 +29,12 @@ function getHomeDir(): string {
 }
 
 export function getCodexCliAuthPath(home = getHomeDir()): string {
+  // FNXC:ProviderAuth 2026-09-05-08:03: opt in to one existing credential file, never a personal profile mount.
+  const explicit = process.env.FUSION_CODEX_AUTH_FILE;
+  if (explicit !== undefined) {
+    if (!isAbsolute(explicit)) throw new Error("FUSION_CODEX_AUTH_FILE must be absolute");
+    return explicit;
+  }
   return join(home, ".codex", "auth.json");
 }
 
@@ -81,6 +94,42 @@ function getLastRefreshFallbackExpiryMs(lastRefresh: unknown): number | undefine
     return undefined;
   }
   return parsed + CODEX_REFRESH_FALLBACK_WINDOW_MS;
+}
+
+/*
+FNXC:ProviderAuth 2026-09-01-07:15:
+Credential-material comparisons deliberately exclude labels, expiry, scopes, provider account ids, and
+fingerprints because those are mutable metadata rather than the secret material that identifies a login.
+*/
+export function isSameStoredCredentialMaterial(
+  left: StoredAuthCredential | undefined,
+  right: StoredAuthCredential | undefined,
+): boolean {
+  if (!left || !right || left.type !== right.type) {
+    return false;
+  }
+  return left.key === right.key && left.access === right.access && left.refresh === right.refresh;
+}
+
+export function computeStoredCredentialAccountFingerprint(
+  credential: StoredAuthCredential | undefined,
+): string | undefined {
+  if (!credential) {
+    return undefined;
+  }
+
+  const material = typeof credential.refresh === "string" && credential.refresh.length > 0
+    ? credential.refresh
+    : typeof credential.access === "string" && credential.access.length > 0
+      ? credential.access
+      : typeof credential.key === "string" && credential.key.length > 0
+        ? credential.key
+        : undefined;
+  if (!material) {
+    return undefined;
+  }
+
+  return createHash("sha256").update(`${credential.type ?? ""}\u0000${material}`).digest("hex").slice(0, 16);
 }
 
 export function isStoredAuthCredential(value: unknown): value is StoredAuthCredential {

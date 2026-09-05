@@ -59,7 +59,14 @@ function findMobileBlockContaining(needle: string): string {
 describe("mission + planning modal mobile CSS", () => {
   it("MissionManager: mission icon button touch targets are 36px", () => {
     const missionBlock = findMobileBlockContaining(".mission-manager-overlay");
-    expect(missionBlock).toMatch(/\.mission-list__item-actions \.mission-icon-btn,[\s\S]*?\.mission-feature__actions \.mission-icon-btn\s*\{[\s\S]*?min-width:\s*36px;[\s\S]*?min-height:\s*36px;/s);
+    /*
+    FNXC:Missions 2026-08-15-22:40:
+    FN-8947 (b82f1a41f3) appended `.mission-fix-feature__actions .mission-icon-btn` to this
+    touch-target selector list, so `.mission-feature__actions .mission-icon-btn` is no longer
+    the final selector before `{`. Match the selectors up to the fix-feature entry that now
+    closes the list, keeping the same 36px touch-target invariant.
+    */
+    expect(missionBlock).toMatch(/\.mission-list__item-actions \.mission-icon-btn,[\s\S]*?\.mission-feature__actions \.mission-icon-btn,[\s\S]*?\.mission-fix-feature__actions \.mission-icon-btn\s*\{[\s\S]*?min-width:\s*36px;[\s\S]*?min-height:\s*36px;/s);
   });
 
   it("MissionManager: body prevents horizontal overflow", () => {
@@ -76,21 +83,6 @@ describe("mission + planning modal mobile CSS", () => {
     const missionBlock = findMobileBlockContaining(".mission-manager-overlay");
     expect(missionBlock).toMatch(/\.mission-detail\s*\{[^}]*padding-bottom:\s*var\(--space-lg\);/s);
     expect(missionBlock).not.toMatch(/\.mission-detail\s*\{[^}]*safe-area-inset-bottom/s);
-  });
-
-  it("SubtaskBreakdown: drag handle is touch-friendly (36px)", () => {
-    const planningBlock = findMobileBlockContaining(".planning-modal");
-    expect(planningBlock).toMatch(/\.subtask-drag-handle\s*\{[^}]*min-width:\s*36px;[^}]*min-height:\s*36px;/s);
-  });
-
-  it("SubtaskBreakdown: subtask action icon buttons are 36px", () => {
-    const planningBlock = findMobileBlockContaining(".planning-modal");
-    expect(planningBlock).toMatch(/\.subtask-item-actions \.btn-icon\s*\{[^}]*min-width:\s*36px;[^}]*min-height:\s*36px;/s);
-  });
-
-  it("SubtaskBreakdown: dependency chips are touch-friendly", () => {
-    const planningBlock = findMobileBlockContaining(".planning-modal");
-    expect(planningBlock).toMatch(/\.planning-dep-chip\s*\{[^}]*min-height:\s*36px;/s);
   });
 
   it("PlanningMode: confirm buttons meet touch targets", () => {

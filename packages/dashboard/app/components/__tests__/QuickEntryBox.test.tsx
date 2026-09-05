@@ -6,7 +6,7 @@ import { expectStableTyping } from "./typingStability.test-helpers";
 import { TASK_PRIORITIES, type Task, type TaskPriority } from "@fusion/core";
 import { checkDuplicateTasks, fetchSettings, fetchAgents, uploadAttachment, fetchWorkflowOptionalSteps } from "../../api";
 import { useNodes } from "../../hooks/useNodes";
-import { scopedKey } from "../../utils/projectStorage";
+import { MAX_PERSISTED_DRAFT_BYTES, scopedKey } from "../../utils/projectStorage";
 import { getPriorityColorVar } from "../../utils/priorityIndicator";
 import { loadAllAppCss } from "../../test/cssFixture";
 import { readAppFile } from "../../test/cssFixture";
@@ -240,6 +240,7 @@ vi.mock("lucide-react", () => {
     Flag: MockIcon("lucide-flag"),
     TriangleAlert: MockIcon("lucide-triangle-alert"),
     Zap: MockIcon("lucide-zap"),
+    ShieldCheck: MockIcon("lucide-shield-check"),
     Eye: MockIcon("lucide-eye"),
     EyeOff: MockIcon("lucide-eye-off"),
     Github: MockIcon("lucide-github"),
@@ -295,6 +296,7 @@ vi.mock("../CustomModelDropdown", () => ({
           <option value="medium">Medium</option>
           <option value="high">High</option>
           <option value="xhigh">Very High</option>
+           <option value="max">Max</option>
         </select>
       ) : null}
       <button
@@ -339,7 +341,6 @@ function renderQuickEntryBox(props = {}, { startExpanded = false } = {}) {
     tasks: mockTasks,
     availableModels: MOCK_MODELS,
     projectId: TEST_PROJECT_ID,
-    onSubtaskBreakdown: vi.fn(),
   };
   const result = render(<QuickEntryBox {...defaultProps} {...props} />);
   return { ...result, props: { ...defaultProps, ...props } };
@@ -422,12 +423,11 @@ function mockMobileViewport() {
 
 /*
 FNXC:BoardComposer 2026-07-10-12:00:
-DOM order mirrors the reorganized composer action row: the options group (subtask, deps,
-models, node, agent) comes first, followed by the right-aligned primary group (attach, GitHub,
+DOM order mirrors the reorganized composer action row: the options group (deps, models,
+node, agent) comes first, followed by the right-aligned primary group (attach, GitHub,
 session advisor, Priority, Fast, Save) with Save as the LAST control.
 */
 const QUICK_ENTRY_ACTION_BUTTONS = [
-  ["Subtask", "subtask-button"],
   ["Deps", "quick-entry-deps"],
   ["Models", "quick-entry-models"],
   ["Node", "quick-entry-node-button"],
@@ -865,20 +865,6 @@ describe("QuickEntryBox", () => {
       expect(textarea.value).toBe("");
       expect(document.activeElement).not.toBe(textarea);
     });
-
-    it("does not auto-focus after Subtask handoff resets the form", async () => {
-      mockDesktopViewport();
-      const onSubtaskBreakdown = vi.fn();
-      renderQuickEntryBox({ onSubtaskBreakdown });
-      let textarea = screen.getByTestId("quick-entry-input") as HTMLTextAreaElement;
-
-      fireEvent.change(textarea, { target: { value: "Break this down" } });
-      fireEvent.click(screen.getByTestId("subtask-button"));
-      await flushPendingTimers();
-      textarea = screen.getByTestId("quick-entry-input") as HTMLTextAreaElement;
-      expect(onSubtaskBreakdown).toHaveBeenCalledWith("Break this down");
-      expect(document.activeElement).not.toBe(textarea);
-    });
   });
 
   describe("button focus preservation (FN-6122)", () => {
@@ -1263,8 +1249,7 @@ describe("QuickEntryBox", () => {
       vi.mocked(fetchSettings).mockResolvedValueOnce({
         githubTrackingEnabledByDefault: true,
       } as any);
-      const onSubtaskBreakdown = vi.fn();
-      const result = renderQuickEntryBox({ onSubtaskBreakdown });
+      const result = renderQuickEntryBox();
       expandQuickEntry();
       await waitFor(() => {
         expect(screen.getByTestId("quick-entry-github-toggle")).not.toBeDisabled();
@@ -1276,7 +1261,7 @@ describe("QuickEntryBox", () => {
       textarea.blur();
       fireEvent.blur(textarea);
       expect(document.activeElement).not.toBe(textarea);
-      return { ...result, textarea, onSubtaskBreakdown };
+      return { ...result, textarea };
     }
 
     function fireCancelableTouchStart(target: Element) {
@@ -1331,9 +1316,6 @@ describe("QuickEntryBox", () => {
           break;
         case "quick-entry-attach":
           expect(attachClickSpy).toHaveBeenCalled();
-          break;
-        case "subtask-button":
-          expect(helpers.onSubtaskBreakdown).toHaveBeenCalledWith("Adjust options without keyboard");
           break;
         case "quick-entry-save":
           await waitFor(() => {
@@ -1415,17 +1397,11 @@ describe("QuickEntryBox", () => {
     expect(inputRect.width).toBeGreaterThanOrEqual(containerRect.width * 0.8);
   });
 
-  it("starts expanded even when autoExpand is false", () => {
-    renderQuickEntryBox({ autoExpand: false });
-    const textarea = screen.getByTestId("quick-entry-input");
-
-    fireEvent.focus(textarea);
-
-    expect(textarea.classList.contains("quick-entry-input--expanded")).toBe(true);
-  });
-
-  it("starts expanded by default (backward compatible)", () => {
-    renderQuickEntryBox();
+  it.each([
+    ["autoExpand false", { autoExpand: false }],
+    ["default props (backward compatible)", {}],
+  ] as const)("starts expanded with %s", (_label, props) => {
+    renderQuickEntryBox(props);
     const textarea = screen.getByTestId("quick-entry-input");
 
     fireEvent.focus(textarea);
@@ -1453,49 +1429,22 @@ describe("QuickEntryBox", () => {
     // Now collapsed
     expect(textarea.classList.contains("quick-entry-input--expanded")).toBe(false);
     expect(screen.getByTestId("quick-entry-box").classList.contains("quick-entry-box--collapsed")).toBe(true);
+    expect(screen.getByTestId("quick-entry-box").classList.contains("quick-entry-box--expanded")).toBe(false);
     expect(toggleButton.getAttribute("aria-expanded")).toBe("false");
     expect(textarea.getAttribute("aria-expanded")).toBe("false");
     expect(controls?.hasAttribute("hidden")).toBe(true);
   });
 
-  it("toggle button collapses the view when expanded", () => {
-    renderQuickEntryBox({});
-    const textarea = screen.getByTestId("quick-entry-input");
-    const box = screen.getByTestId("quick-entry-box");
-
-    // Starts expanded
-    expect(textarea.classList.contains("quick-entry-input--expanded")).toBe(true);
-
-    // Click toggle to collapse
-    toggleQuickEntry();
-
-    // Now collapsed
-    expect(textarea.classList.contains("quick-entry-input--expanded")).toBe(false);
-    expect(box.classList.contains("quick-entry-box--collapsed")).toBe(true);
-    expect(document.getElementById("quick-entry-controls")?.hasAttribute("hidden")).toBe(true);
-  });
-
-  it("maintains the collapsed and expanded styling contract on the root container", () => {
-    renderQuickEntryBox({});
-    const box = screen.getByTestId("quick-entry-box");
-
-    expect(box.classList.contains("quick-entry-box--expanded")).toBe(true);
-    expect(box.classList.contains("quick-entry-box--collapsed")).toBe(false);
-    expect(document.getElementById("quick-entry-controls")?.hasAttribute("hidden")).toBe(false);
-
-    toggleQuickEntry();
-
-    expect(box.classList.contains("quick-entry-box--collapsed")).toBe(true);
-    expect(box.classList.contains("quick-entry-box--expanded")).toBe(false);
-    expect(document.getElementById("quick-entry-controls")?.hasAttribute("hidden")).toBe(true);
-  });
-
-  it("does NOT collapse on blur when empty", async () => {
+  it.each([
+    ["empty", ""],
+    ["has content", "Some task"],
+  ] as const)("does NOT collapse on blur when %s", async (_label, draft) => {
     renderQuickEntryBox({});
     const textarea = screen.getByTestId("quick-entry-input");
 
     // Expand manually
     expandQuickEntry();
+    if (draft) fireEvent.change(textarea, { target: { value: draft } });
     expect(textarea.classList.contains("quick-entry-input--expanded")).toBe(true);
 
     fireEvent.blur(textarea);
@@ -1503,25 +1452,6 @@ describe("QuickEntryBox", () => {
       vi.advanceTimersByTime(250);
     });
 
-    // Should NOT collapse on blur
-    await waitFor(() => {
-      expect(textarea.classList.contains("quick-entry-input--expanded")).toBe(true);
-    });
-  });
-
-  it("does NOT collapse on blur when has content", async () => {
-    renderQuickEntryBox({});
-    const textarea = screen.getByTestId("quick-entry-input");
-
-    // Expand manually and add content
-    expandQuickEntry();
-    fireEvent.change(textarea, { target: { value: "Some task" } });
-
-    fireEvent.blur(textarea);
-    await act(async () => {
-      vi.advanceTimersByTime(250);
-    });
-    
     // Should NOT collapse on blur - expanded state persists
     await waitFor(() => {
       expect(textarea.classList.contains("quick-entry-input--expanded")).toBe(true);
@@ -1732,85 +1662,12 @@ describe("QuickEntryBox", () => {
     });
   });
 
-  it("does not refocus after successful creation", async () => {
-    const { props } = renderQuickEntryBox({});
-    const textarea = screen.getByTestId("quick-entry-input") as HTMLTextAreaElement;
-    const focusSpy = vi.spyOn(textarea, "focus");
-
-    fireEvent.change(textarea, { target: { value: "Task to create" } });
-    fireEvent.keyDown(textarea, { key: "Enter" });
-
-    await waitFor(() => {
-      expect(props.onCreate).toHaveBeenCalled();
-    });
-    await waitFor(() => expect(textarea.value).toBe(""));
-    await flushPendingTimers();
-
-    expect(focusSpy).not.toHaveBeenCalled();
-    expect(document.activeElement).not.toBe(textarea);
-  });
-
-  it("does not refocus after successful creation at mobile width", async () => {
-    const innerWidthSpy = vi.spyOn(window, "innerWidth", "get").mockReturnValue(375);
-    const { props } = renderQuickEntryBox({});
-    const textarea = screen.getByTestId("quick-entry-input");
-
-    fireEvent.focus(textarea);
-    fireEvent.change(textarea, { target: { value: "Task to create" } });
-    fireEvent.keyDown(textarea, { key: "Enter" });
-
-    await waitFor(() => {
-      expect(props.onCreate).toHaveBeenCalled();
-    });
-
-    await waitFor(() => {
-      expect(document.activeElement).not.toBe(textarea);
-    });
-
-    innerWidthSpy.mockRestore();
-  });
-
-
   describe("quick-add workflow selector", () => {
     const workflowOptions = [
       { id: "wf-default", name: "Coding", columns: [] },
       { id: "wf-review", name: "Review", columns: [] },
       { id: "wf-review-copy", name: "Review", columns: [] },
     ];
-
-    it("defaults to the provided workflow, changes selection, and passes it to Save/Subtask while omitting Plan", async () => {
-      vi.mocked(fetchWorkflowOptionalSteps).mockResolvedValue([]);
-      const onCreate = vi.fn().mockResolvedValue(CREATED_TASK);
-      const onPlanningMode = vi.fn();
-      const onSubtaskBreakdown = vi.fn();
-      renderQuickEntryBox({
-        onCreate,
-        onPlanningMode,
-        onSubtaskBreakdown,
-        workflowId: "wf-review",
-        defaultWorkflowId: "wf-default",
-        workflowOptions,
-      });
-
-      expect(screen.getByTestId("quick-entry-workflow-trigger")).toHaveTextContent("Review");
-      fireEvent.click(screen.getByTestId("quick-entry-workflow-trigger"));
-      expect(screen.getByLabelText("Review (wf-review-copy)")).toBeTruthy();
-      fireEvent.click(screen.getByTestId("quick-entry-workflow-option-wf-default"));
-      expect(screen.getByTestId("quick-entry-workflow-trigger")).toHaveTextContent("Coding");
-
-      fireEvent.change(screen.getByTestId("quick-entry-input"), { target: { value: "Create in selected workflow" } });
-      clickSave();
-      await waitFor(() => expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({ workflowId: "wf-default" })));
-      // FN-7591: forwarding workflowId at create time must not carry a hard-coded column:"triage".
-      expect(vi.mocked(onCreate).mock.calls[0][0].column).toBeUndefined();
-
-      expect(screen.queryByTestId("plan-button")).not.toBeInTheDocument();
-      expect(onPlanningMode).not.toHaveBeenCalled();
-
-      fireEvent.change(screen.getByTestId("quick-entry-input"), { target: { value: "Subtask in selected workflow" } });
-      fireEvent.click(screen.getByTestId("subtask-button"));
-      expect(onSubtaskBreakdown).toHaveBeenCalledWith("Subtask in selected workflow", "wf-default");
-    });
 
     it("repairs stale parent workflow ids to the default workflow and refetches optional steps when changed", async () => {
       vi.mocked(fetchWorkflowOptionalSteps).mockResolvedValue([]);
@@ -2016,6 +1873,156 @@ describe("QuickEntryBox", () => {
       });
     });
 
+    it.each([
+      ["desktop", mockDesktopViewport],
+      ["mobile", mockMobileViewport],
+    ] as const)("restores the pre-Fast selection and standard create payload on %s", async (_viewport, setViewport) => {
+      setViewport();
+      vi.mocked(fetchWorkflowOptionalSteps).mockResolvedValue([DEFAULT_ON_STEP, MANUAL_STEP]);
+      const onCreate = vi.fn().mockResolvedValue(CREATED_TASK);
+      renderQuickEntryBox({ onCreate, workflowId: "wf-explicit" });
+
+      const trigger = await screen.findByTestId("quick-entry-optional-steps-trigger");
+      await waitFor(() => expect(trigger).toHaveTextContent("Steps: 1 selected"));
+
+      fireEvent.click(screen.getByTestId("quick-entry-fast-toggle"));
+      await waitFor(() => expect(trigger).toHaveTextContent("Steps: none"));
+      fireEvent.click(screen.getByTestId("quick-entry-fast-toggle"));
+      await waitFor(() => expect(trigger).toHaveTextContent("Steps: 1 selected"));
+
+      fireEvent.change(screen.getByTestId("quick-entry-input"), { target: { value: "Restore Fast selection" } });
+      clickSave();
+
+      await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(1));
+      const createdPayload = onCreate.mock.calls[0]?.[0];
+      expect(createdPayload?.enabledWorkflowSteps).toEqual(["browser-verification"]);
+      expect(createdPayload).not.toHaveProperty("executionMode");
+    });
+
+    it("restores an operator's non-default pre-Fast selection", async () => {
+      vi.mocked(fetchWorkflowOptionalSteps).mockResolvedValue([DEFAULT_ON_STEP, MANUAL_STEP]);
+      const onCreate = vi.fn().mockResolvedValue(CREATED_TASK);
+      renderQuickEntryBox({ onCreate, workflowId: "wf-explicit" });
+
+      const trigger = await screen.findByTestId("quick-entry-optional-steps-trigger");
+      await waitFor(() => expect(trigger).toHaveTextContent("Steps: 1 selected"));
+      fireEvent.click(trigger);
+      fireEvent.click(await screen.findByTestId("wf-optional-steps-dropdown-option-browser-verification"));
+      fireEvent.click(await screen.findByTestId("wf-optional-steps-dropdown-option-manual-smoke"));
+      await waitFor(() => expect(trigger).toHaveTextContent("Steps: 1 selected"));
+
+      fireEvent.click(screen.getByTestId("quick-entry-fast-toggle"));
+      await waitFor(() => expect(trigger).toHaveTextContent("Steps: none"));
+      fireEvent.click(screen.getByTestId("quick-entry-fast-toggle"));
+
+      await waitFor(() => expect(trigger).toHaveTextContent("Steps: 1 selected"));
+      fireEvent.change(screen.getByTestId("quick-entry-input"), { target: { value: "Restore manual selection" } });
+      clickSave();
+
+      await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(1));
+      expect(onCreate.mock.calls[0]?.[0]?.enabledWorkflowSteps).toEqual(["manual-smoke"]);
+    });
+
+    it("merges steps selected while Fast is active after the pre-Fast selection without duplicates", async () => {
+      vi.mocked(fetchWorkflowOptionalSteps).mockResolvedValue([DEFAULT_ON_STEP, MANUAL_STEP]);
+      const onCreate = vi.fn().mockResolvedValue(CREATED_TASK);
+      renderQuickEntryBox({ onCreate, workflowId: "wf-explicit" });
+
+      const trigger = await screen.findByTestId("quick-entry-optional-steps-trigger");
+      await waitFor(() => expect(trigger).toHaveTextContent("Steps: 1 selected"));
+      fireEvent.click(screen.getByTestId("quick-entry-fast-toggle"));
+      await waitFor(() => expect(trigger).toHaveTextContent("Steps: none"));
+      fireEvent.click(trigger);
+      fireEvent.click(await screen.findByTestId("wf-optional-steps-dropdown-option-browser-verification"));
+      fireEvent.click(await screen.findByTestId("wf-optional-steps-dropdown-option-manual-smoke"));
+      fireEvent.click(screen.getByTestId("quick-entry-fast-toggle"));
+
+      await waitFor(() => expect(trigger).toHaveTextContent("Steps: 2 selected"));
+      fireEvent.change(screen.getByTestId("quick-entry-input"), { target: { value: "Merge Fast selections" } });
+      clickSave();
+
+      await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(1));
+      expect(onCreate.mock.calls[0]?.[0]?.enabledWorkflowSteps).toEqual([
+        "browser-verification",
+        "manual-smoke",
+      ]);
+    });
+
+    it("falls back to default-on steps when metadata resolves while Fast is active", async () => {
+      let resolveOptionalSteps: (steps: typeof DEFAULT_ON_STEP[]) => void = () => {};
+      vi.mocked(fetchWorkflowOptionalSteps).mockReturnValue(new Promise((resolve) => {
+        resolveOptionalSteps = resolve;
+      }));
+      const onCreate = vi.fn().mockResolvedValue(CREATED_TASK);
+      renderQuickEntryBox({ onCreate, workflowId: "wf-explicit" });
+
+      await waitFor(() => expect(fetchWorkflowOptionalSteps).toHaveBeenCalledWith("wf-explicit", TEST_PROJECT_ID));
+      fireEvent.click(screen.getByTestId("quick-entry-fast-toggle"));
+      await act(async () => {
+        resolveOptionalSteps([DEFAULT_ON_STEP]);
+      });
+
+      const trigger = await screen.findByTestId("quick-entry-optional-steps-trigger");
+      await waitFor(() => expect(trigger).toHaveTextContent("Steps: none"));
+      fireEvent.click(screen.getByTestId("quick-entry-fast-toggle"));
+      await waitFor(() => expect(trigger).toHaveTextContent("Steps: 1 selected"));
+      fireEvent.change(screen.getByTestId("quick-entry-input"), { target: { value: "Restore deferred Fast selection" } });
+      clickSave();
+
+      await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(1));
+      expect(onCreate.mock.calls[0]?.[0]?.enabledWorkflowSteps).toEqual(["browser-verification"]);
+    });
+
+    it("uses the new workflow default-on selection after a Fast-mode workflow change", async () => {
+      const SECOND_WORKFLOW_DEFAULT_ON_STEP = {
+        ...DEFAULT_ON_STEP,
+        templateId: "code-review",
+        name: "Code review",
+      };
+      vi.mocked(fetchWorkflowOptionalSteps).mockResolvedValue([DEFAULT_ON_STEP]);
+      const onCreate = vi.fn().mockResolvedValue(CREATED_TASK);
+      const { props, rerender } = renderQuickEntryBox({ onCreate, workflowId: "wf-explicit" });
+
+      const trigger = await screen.findByTestId("quick-entry-optional-steps-trigger");
+      await waitFor(() => expect(trigger).toHaveTextContent("Steps: 1 selected"));
+      fireEvent.click(screen.getByTestId("quick-entry-fast-toggle"));
+      await waitFor(() => expect(trigger).toHaveTextContent("Steps: none"));
+      vi.mocked(fetchWorkflowOptionalSteps).mockResolvedValue([SECOND_WORKFLOW_DEFAULT_ON_STEP]);
+      rerender(<QuickEntryBox {...props} workflowId="wf-second" />);
+
+      await waitFor(() => expect(fetchWorkflowOptionalSteps).toHaveBeenCalledWith("wf-second", TEST_PROJECT_ID));
+      await waitFor(() => expect(trigger.isConnected).toBe(false));
+      const updatedTrigger = await screen.findByTestId("quick-entry-optional-steps-trigger");
+      await waitFor(() => expect(updatedTrigger).toHaveTextContent("Steps: none"));
+      expect(screen.getByTestId("quick-entry-fast-toggle")).toHaveAttribute("aria-pressed", "true");
+      fireEvent.click(updatedTrigger);
+      await screen.findByTestId("wf-optional-steps-dropdown-option-code-review");
+      fireEvent.mouseDown(document.body);
+      fireEvent.click(screen.getByTestId("quick-entry-fast-toggle"));
+      await waitFor(() => expect(updatedTrigger).toHaveTextContent("Steps: 1 selected"));
+      fireEvent.change(screen.getByTestId("quick-entry-input"), { target: { value: "Use new workflow selection" } });
+      clickSave();
+
+      await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(1));
+      expect(onCreate.mock.calls[0]?.[0]?.enabledWorkflowSteps).toEqual(["code-review"]);
+    });
+
+    it("keeps standard creates without optional-step metadata undefined after a Fast round-trip", async () => {
+      vi.mocked(fetchWorkflowOptionalSteps).mockResolvedValue([]);
+      const onCreate = vi.fn().mockResolvedValue(CREATED_TASK);
+      renderQuickEntryBox({ onCreate, workflowId: "wf-empty" });
+
+      await waitFor(() => expect(fetchWorkflowOptionalSteps).toHaveBeenCalledWith("wf-empty", TEST_PROJECT_ID));
+      expect(screen.queryByTestId("quick-entry-optional-steps-trigger")).toBeNull();
+      fireEvent.click(screen.getByTestId("quick-entry-fast-toggle"));
+      fireEvent.click(screen.getByTestId("quick-entry-fast-toggle"));
+      fireEvent.change(screen.getByTestId("quick-entry-input"), { target: { value: "No optional steps" } });
+      clickSave();
+
+      await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(1));
+      expect(onCreate.mock.calls[0]?.[0]?.enabledWorkflowSteps).toBeUndefined();
+    });
+
     it("submits explicit empty optional steps when Fast is created before optional-step metadata loads", async () => {
       vi.mocked(fetchWorkflowOptionalSteps).mockReturnValue(new Promise(() => undefined));
       const onCreate = vi.fn().mockResolvedValue(CREATED_TASK);
@@ -2188,36 +2195,6 @@ describe("QuickEntryBox", () => {
       expect(screen.getByTestId("quick-entry-save")).toBeTruthy();
     });
 
-    it("shows deps/models/save controls directly when expanded", () => {
-      renderQuickEntryBox({});
-
-      // Controls region starts expanded/visible
-      expect(document.getElementById("quick-entry-controls")?.hasAttribute("hidden")).toBe(false);
-
-      // Type something
-      expandQuickEntry();
-      const textarea = screen.getByTestId("quick-entry-input");
-      fireEvent.change(textarea, { target: { value: "Task with models" } });
-
-      expect(screen.getByTestId("quick-entry-deps")).toBeTruthy();
-      expect(screen.getByTestId("quick-entry-models")).toBeTruthy();
-      expect(screen.getByTestId("quick-entry-save")).toBeTruthy();
-    });
-
-    it("shows Subtask but no Plan button when expanded", () => {
-      renderQuickEntryBox({});
-
-      // Controls region starts expanded/visible
-      expect(document.getElementById("quick-entry-controls")?.hasAttribute("hidden")).toBe(false);
-
-      expandQuickEntry();
-      const textarea = screen.getByTestId("quick-entry-input");
-      fireEvent.change(textarea, { target: { value: "Task to plan" } });
-
-      expect(screen.queryByTestId("plan-button")).not.toBeInTheDocument();
-      expect(screen.getByTestId("subtask-button")).toBeTruthy();
-    });
-
     it("shows Fast toggle when expanded", () => {
       renderQuickEntryBox({});
       expandQuickEntry();
@@ -2228,15 +2205,6 @@ describe("QuickEntryBox", () => {
       expect(fastToggle).toHaveAttribute("aria-label", "Toggle fast execution mode");
       expect(fastToggle).not.toHaveTextContent("Fast");
       expect(fastToggle.querySelector("svg")?.classList.contains("lucide-zap")).toBe(true);
-    });
-
-    it("shows Priority selector in expanded controls", () => {
-      renderQuickEntryBox({});
-      expandQuickEntry();
-
-      const priorityButton = screen.getByTestId("quick-entry-priority-button");
-      expect(priorityButton).toBeTruthy();
-      expectQuickEntryPriorityButton("normal");
     });
 
     it("keeps every primary icon control in one btn-icon cluster across toggle and priority states", () => {
@@ -2309,6 +2277,47 @@ describe("QuickEntryBox", () => {
       const payload = props.onCreate.mock.calls[0]?.[0];
       expect(payload).not.toHaveProperty("branch");
       expect(payload).not.toHaveProperty("baseBranch");
+    });
+
+    it("omits plan approval while preserving the desktop and mobile primary action row", async () => {
+      const onCreate = vi.fn().mockResolvedValue(CREATED_TASK);
+      mockDesktopViewport();
+      const first = renderQuickEntryBox({ onCreate });
+      expandQuickEntry();
+
+      const primaryIdsInDomOrder = () => Array.from(
+        screen.getByTestId("quick-entry-primary-group").querySelectorAll<HTMLButtonElement>("button[data-testid]"),
+      ).map((button) => button.dataset.testid);
+      const survivingPrimaryIds = [
+        "quick-entry-attach",
+        "quick-entry-github-toggle",
+        "quick-entry-session-advisor-toggle",
+        "quick-entry-priority-button",
+        "quick-entry-fast-toggle",
+        "quick-entry-save",
+      ];
+      expect(screen.queryByTestId("quick-entry-plan-approval-toggle")).toBeNull();
+      expect(primaryIdsInDomOrder()).toEqual(survivingPrimaryIds);
+      const desktopPrimaryGroup = screen.getByTestId("quick-entry-primary-group");
+      for (const testId of survivingPrimaryIds) {
+        expect(desktopPrimaryGroup).toContainElement(screen.getByTestId(testId));
+      }
+
+      fireEvent.change(screen.getByTestId("quick-entry-input"), { target: { value: "Ordinary task" } });
+      fireEvent.click(screen.getByTestId("quick-entry-save"));
+      await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(1));
+      expect(onCreate.mock.calls[0]?.[0]).not.toHaveProperty("requirePlanApproval");
+
+      first.unmount();
+      mockMobileViewport();
+      renderQuickEntryBox({ onCreate });
+      expandQuickEntry();
+      expect(screen.queryByTestId("quick-entry-plan-approval-toggle")).toBeNull();
+      expect(primaryIdsInDomOrder()).toEqual(survivingPrimaryIds);
+      const mobilePrimaryGroup = screen.getByTestId("quick-entry-primary-group");
+      for (const testId of survivingPrimaryIds) {
+        expect(mobilePrimaryGroup).toContainElement(screen.getByTestId(testId));
+      }
     });
 
     it("toggles Fast pressed state", () => {
@@ -2772,24 +2781,6 @@ describe("QuickEntryBox", () => {
       expect(secondPayload.executionMode).toBeUndefined();
     });
 
-    it("clears Fast state after Subtask flow reset", async () => {
-      const onSubtaskBreakdown = vi.fn();
-      renderQuickEntryBox({ onSubtaskBreakdown });
-
-      expandQuickEntry();
-      const textarea = screen.getByTestId("quick-entry-input");
-      fireEvent.click(screen.getByTestId("quick-entry-fast-toggle"));
-      fireEvent.change(textarea, { target: { value: "subtask input" } });
-      fireEvent.click(screen.getByTestId("subtask-button"));
-
-      await waitFor(() => {
-        expect(onSubtaskBreakdown).toHaveBeenCalled();
-      });
-
-      expandQuickEntry();
-      expect(screen.getByTestId("quick-entry-fast-toggle").getAttribute("aria-pressed")).toBe("false");
-    });
-
     it("resets priority to normal after successful task creation", async () => {
       const { props } = renderQuickEntryBox({});
       expandQuickEntry();
@@ -2812,25 +2803,6 @@ describe("QuickEntryBox", () => {
       await waitFor(() => {
         expectQuickEntryPriorityButton("normal");
       });
-    });
-
-    it("resets priority to normal after Subtask flow", async () => {
-      const onSubtaskBreakdown = vi.fn();
-      renderQuickEntryBox({ onSubtaskBreakdown });
-
-      expandQuickEntry();
-      const textarea = screen.getByTestId("quick-entry-input");
-      fireEvent.change(textarea, { target: { value: "subtask reset" } });
-      openPriorityMenu();
-      fireEvent.click(screen.getByTestId("quick-entry-priority-option-urgent"));
-      fireEvent.click(screen.getByTestId("subtask-button"));
-
-      await waitFor(() => {
-        expect(onSubtaskBreakdown).toHaveBeenCalled();
-      });
-
-      expandQuickEntry();
-      expectQuickEntryPriorityButton("normal");
     });
 
     it("opens dependency dropdown when clicking deps button", () => {
@@ -2932,47 +2904,27 @@ describe("QuickEntryBox", () => {
       const select = screen.getByTestId("custom-model-dropdown-thinking") as HTMLSelectElement;
       expect(select).toBeTruthy();
       const options = Array.from(select.options).map((o) => o.value);
-      expect(options).toEqual(["", "off", "minimal", "low", "medium", "high", "xhigh"]);
+      expect(options).toEqual(["", "off", "minimal", "low", "medium", "high", "xhigh", "max"]);
       expect(screen.getByTestId("model-submenu-back")).toBeTruthy();
     });
 
-    it("clicking Executor opens submenu with CustomModelDropdown", () => {
+    it.each([
+      ["Executor", "model-menu-executor", "custom-model-dropdown-executor model"],
+      ["Plan", "model-menu-plan", "custom-model-dropdown-plan model"],
+      ["Reviewer", "model-menu-validator", "custom-model-dropdown-validator model"],
+    ] as const)("clicking %s opens submenu with CustomModelDropdown", (_label, menuTestId, dropdownTestId) => {
       renderQuickEntryBox({});
       expandQuickEntry();
       const textarea = screen.getByTestId("quick-entry-input");
 
       fireEvent.change(textarea, { target: { value: "Task with models" } });
       openModelMenu();
-      fireEvent.click(screen.getByTestId("model-menu-executor"));
+      fireEvent.click(screen.getByTestId(menuTestId));
 
-      // Submenu should show the dropdown for executor
-      expect(screen.getByTestId("custom-model-dropdown-executor model")).toBeTruthy();
+      // Submenu should show the dropdown for the selected lane
+      expect(screen.getByTestId(dropdownTestId)).toBeTruthy();
       // Back button should be visible
       expect(screen.getByTestId("model-submenu-back")).toBeTruthy();
-    });
-
-    it("clicking Plan opens submenu with CustomModelDropdown", () => {
-      renderQuickEntryBox({});
-      expandQuickEntry();
-      const textarea = screen.getByTestId("quick-entry-input");
-
-      fireEvent.change(textarea, { target: { value: "Task with models" } });
-      openModelMenu();
-      fireEvent.click(screen.getByTestId("model-menu-plan"));
-
-      expect(screen.getByTestId("custom-model-dropdown-plan model")).toBeTruthy();
-    });
-
-    it("clicking Reviewer opens submenu with CustomModelDropdown", () => {
-      renderQuickEntryBox({});
-      expandQuickEntry();
-      const textarea = screen.getByTestId("quick-entry-input");
-
-      fireEvent.change(textarea, { target: { value: "Task with models" } });
-      openModelMenu();
-      fireEvent.click(screen.getByTestId("model-menu-validator"));
-
-      expect(screen.getByTestId("custom-model-dropdown-validator model")).toBeTruthy();
     });
 
     it("back button returns to top-level model menu", () => {
@@ -3016,48 +2968,30 @@ describe("QuickEntryBox", () => {
       expect(screen.queryByTestId("model-submenu-back")).toBeNull();
     });
 
-    it("selecting Plan model updates the Plan menu item value", () => {
+    it.each([
+      ["Plan", "model-menu-plan", "dropdown-select-plan model"],
+      ["Reviewer", "model-menu-validator", "dropdown-select-validator model"],
+    ] as const)("selecting %s model updates its menu item value", (_label, menuTestId, selectTestId) => {
       renderQuickEntryBox({});
       expandQuickEntry();
       const textarea = screen.getByTestId("quick-entry-input");
 
       fireEvent.change(textarea, { target: { value: "Task with models" } });
       openModelMenu();
-      fireEvent.click(screen.getByTestId("model-menu-plan"));
+      fireEvent.click(screen.getByTestId(menuTestId));
 
       // Select a model via mocked dropdown
-      fireEvent.click(screen.getByTestId("dropdown-select-plan model"));
+      fireEvent.click(screen.getByTestId(selectTestId));
 
       // Go back to top-level menu
       fireEvent.click(screen.getByTestId("model-submenu-back"));
 
-      // Plan menu item should show the selected model, not "Using default"
-      const planItem = screen.getByTestId("model-menu-plan");
-      expect(planItem.textContent).toContain("anthropic/claude-sonnet-4-5");
-      expect(planItem.textContent).not.toContain("Using default");
+      // Menu item should show the selected model, not "Using default"
+      const menuItem = screen.getByTestId(menuTestId);
+      expect(menuItem.textContent).toContain("anthropic/claude-sonnet-4-5");
+      expect(menuItem.textContent).not.toContain("Using default");
       // Should have active class
-      expect(planItem.classList.contains("model-menu-item--active")).toBe(true);
-    });
-
-    it("selecting Reviewer model updates the Reviewer menu item value", () => {
-      renderQuickEntryBox({});
-      expandQuickEntry();
-      const textarea = screen.getByTestId("quick-entry-input");
-
-      fireEvent.change(textarea, { target: { value: "Task with models" } });
-      openModelMenu();
-      fireEvent.click(screen.getByTestId("model-menu-validator"));
-
-      // Select a model via mocked dropdown
-      fireEvent.click(screen.getByTestId("dropdown-select-validator model"));
-
-      // Go back to top-level menu
-      fireEvent.click(screen.getByTestId("model-submenu-back"));
-
-      // Reviewer menu item should show the selected model
-      const validatorItem = screen.getByTestId("model-menu-validator");
-      expect(validatorItem.textContent).toContain("anthropic/claude-sonnet-4-5");
-      expect(validatorItem.classList.contains("model-menu-item--active")).toBe(true);
+      expect(menuItem.classList.contains("model-menu-item--active")).toBe(true);
     });
 
     it("clearing Plan model returns menu item to default state", () => {
@@ -3267,40 +3201,6 @@ describe("QuickEntryBox", () => {
       expect(localStorage.getItem(QUICK_ENTRY_STORAGE_KEY)).toBe("  Plan this task  ");
     });
 
-    it("calls onSubtaskBreakdown and clears input when Subtask clicked", async () => {
-      const onSubtaskBreakdown = vi.fn();
-      const { props } = renderQuickEntryBox({ onSubtaskBreakdown });
-      expandQuickEntry();
-      const textarea = screen.getByTestId("quick-entry-input");
-
-      fireEvent.change(textarea, { target: { value: "Break this down" } });
-      fireEvent.click(screen.getByTestId("subtask-button"));
-
-      await waitFor(() => {
-        expect(onSubtaskBreakdown).toHaveBeenCalledWith("Break this down");
-      });
-
-      // Input should be cleared
-      expect((textarea as HTMLTextAreaElement).value).toBe("");
-    });
-
-    it("passes selected workflow id through Subtask quick-entry handoff and omits Plan", async () => {
-      const onPlanningMode = vi.fn();
-      const onSubtaskBreakdown = vi.fn();
-      renderQuickEntryBox({ onPlanningMode, onSubtaskBreakdown, workflowId: "WF-123" });
-      expandQuickEntry();
-      const textarea = screen.getByTestId("quick-entry-input");
-
-      fireEvent.change(textarea, { target: { value: "Create in custom workflow" } });
-      expect(screen.queryByTestId("plan-button")).not.toBeInTheDocument();
-      fireEvent.click(screen.getByTestId("subtask-button"));
-
-      await waitFor(() => {
-        expect(onSubtaskBreakdown).toHaveBeenCalledWith("Create in custom workflow", "WF-123");
-      });
-      expect(onPlanningMode).not.toHaveBeenCalled();
-    });
-
     it("omits legacy quick-entry Plan handoff", () => {
       const onPlanningMode = vi.fn();
       renderQuickEntryBox({ onPlanningMode });
@@ -3311,42 +3211,6 @@ describe("QuickEntryBox", () => {
 
       expect(screen.queryByTestId("plan-button")).not.toBeInTheDocument();
       expect(onPlanningMode).not.toHaveBeenCalled();
-    });
-
-    it("omits Plan and keeps Subtask disabled when description is empty", () => {
-      renderQuickEntryBox({});
-      expandQuickEntry();
-      const textarea = screen.getByTestId("quick-entry-input");
-
-      fireEvent.change(textarea, { target: { value: "Some task" } });
-
-      expect(screen.queryByTestId("plan-button")).not.toBeInTheDocument();
-      const subtaskButton = screen.getByTestId("subtask-button") as HTMLButtonElement;
-      expect(subtaskButton.disabled).toBe(false);
-
-      fireEvent.change(textarea, { target: { value: "" } });
-
-      expect(screen.queryByTestId("plan-button")).not.toBeInTheDocument();
-      expect((screen.getByTestId("subtask-button") as HTMLButtonElement).disabled).toBe(true);
-    });
-
-
-    it("Subtask button prevents textarea blur on mousedown", () => {
-      renderQuickEntryBox({});
-      expandQuickEntry();
-      const textarea = screen.getByTestId("quick-entry-input");
-
-      fireEvent.change(textarea, { target: { value: "Task to break down" } });
-
-      // Get subtask button and trigger mousedown (prevents blur)
-      const subtaskButton = screen.getByTestId("subtask-button");
-      fireEvent.mouseDown(subtaskButton);
-
-      // Trigger blur on textarea
-      fireEvent.blur(textarea);
-
-      // Controls should still be visible immediately after blur
-      expect(screen.getByTestId("subtask-button")).toBeTruthy();
     });
 
     it("does not leave a Plan tooltip or click target when description is empty", () => {
@@ -3903,18 +3767,6 @@ describe("QuickEntryBox", () => {
       expect(controls?.hasAttribute("hidden")).toBe(true);
     });
 
-    it("textarea aria-expanded reflects disclosure state, not textarea height", () => {
-      renderQuickEntryBox();
-      const textarea = screen.getByTestId("quick-entry-input");
-
-      fireEvent.focus(textarea);
-      expect(textarea.classList.contains("quick-entry-input--expanded")).toBe(true);
-      expect(textarea.getAttribute("aria-expanded")).toBe("true");
-
-      toggleQuickEntry();
-      expect(textarea.classList.contains("quick-entry-input--expanded")).toBe(false);
-      expect(textarea.getAttribute("aria-expanded")).toBe("false");
-    });
   });
 
   describe("localStorage persistence", () => {
@@ -3967,14 +3819,6 @@ describe("QuickEntryBox", () => {
       });
     });
 
-    it("defaults to expanded when localStorage is empty", () => {
-      renderQuickEntryBox();
-      const toggleButton = screen.getByTestId("quick-entry-toggle");
-
-      expect(toggleButton.getAttribute("aria-expanded")).toBe("true");
-      expect(document.getElementById("quick-entry-controls")?.hasAttribute("hidden")).toBe(false);
-    });
-
     it("does not persist disclosure state to localStorage when toggling", async () => {
       renderQuickEntryBox({});
       const toggleButton = screen.getByTestId("quick-entry-toggle");
@@ -3997,22 +3841,6 @@ describe("QuickEntryBox", () => {
       expect(toggleButton.getAttribute("aria-expanded")).toBe("true");
       // localStorage still should not have the key
       expect(localStorage.getItem("kb-quick-entry-expanded")).toBeNull();
-    });
-
-    it("aria-expanded attribute updates correctly when toggling", () => {
-      renderQuickEntryBox({});
-      const toggleButton = screen.getByTestId("quick-entry-toggle");
-
-      // Initially expanded
-      expect(toggleButton.getAttribute("aria-expanded")).toBe("true");
-
-      // Click to collapse
-      fireEvent.click(toggleButton);
-      expect(toggleButton.getAttribute("aria-expanded")).toBe("false");
-
-      // Click to expand
-      fireEvent.click(toggleButton);
-      expect(toggleButton.getAttribute("aria-expanded")).toBe("true");
     });
 
     it("restores description from localStorage on mount", () => {
@@ -4124,22 +3952,6 @@ describe("QuickEntryBox", () => {
       expect(screen.queryByText("Refining...")).not.toBeInTheDocument();
     });
 
-    it("omits refine controls in mobile while preserving adjacent actions", () => {
-      mockMobileViewport();
-      renderQuickEntryBox({});
-      expandQuickEntry();
-      const textarea = screen.getByTestId("quick-entry-input");
-      fireEvent.change(textarea, { target: { value: "Mobile quick-add task" } });
-
-      expectQuickAddRefineAbsent();
-      expect(screen.queryByRole("button", { name: /^Refine$/i })).not.toBeInTheDocument();
-      expect(screen.getByTestId("quick-entry-save")).toBeInTheDocument();
-      expect(screen.getByTestId("quick-entry-attach")).toBeInTheDocument();
-      expect(screen.getByTestId("subtask-button")).toBeInTheDocument();
-      expect(screen.getByTestId("quick-entry-deps")).toBeInTheDocument();
-      expect(screen.getByTestId("quick-entry-models")).toBeInTheDocument();
-    });
-
     it("does not call the AI refine API path from Quick Add", async () => {
       const api = await import("../../api");
       const refineSpy = vi.mocked(api.refineText);
@@ -4155,29 +3967,9 @@ describe("QuickEntryBox", () => {
       });
       expect(refineSpy).not.toHaveBeenCalled();
     });
-
-    it("keeps the action row free of orphaned refine shells when Subtask is omitted", () => {
-      renderQuickEntryBox({ onSubtaskBreakdown: undefined });
-      expandQuickEntry();
-      const actionsContainer = screen.getByTestId("quick-entry-actions");
-
-      expectQuickAddRefineAbsent();
-      expect(screen.queryByTestId("subtask-button")).not.toBeInTheDocument();
-      expect(actionsContainer.querySelector(".refine-trigger-wrap")).toBeNull();
-      expect(actionsContainer.contains(screen.getByTestId("quick-entry-deps"))).toBe(true);
-      expect(actionsContainer.contains(screen.getByTestId("quick-entry-models"))).toBe(true);
-    });
   });
 
   describe("Save action", () => {
-    it("shows save action inline when expanded", () => {
-      renderQuickEntryBox({});
-      expandQuickEntry();
-      const textarea = screen.getByTestId("quick-entry-input");
-      fireEvent.change(textarea, { target: { value: "Task to save" } });
-      expect(screen.getByTestId("quick-entry-save")).toBeTruthy();
-    });
-
     it("save action is disabled when textarea is empty", () => {
       renderQuickEntryBox({});
       expandQuickEntry();
@@ -4252,70 +4044,13 @@ describe("QuickEntryBox", () => {
   });
 
   describe("Button visibility when collapsed", () => {
-    it("controls div does not have hidden attribute by default", () => {
-      renderQuickEntryBox({});
-      const controls = document.getElementById("quick-entry-controls");
-      expect(controls?.hasAttribute("hidden")).toBe(false);
-    });
-
     it("toggle button is always visible regardless of expanded state", () => {
       renderQuickEntryBox({});
       expect(screen.getByTestId("quick-entry-toggle")).toBeTruthy();
     });
-
-    it("shows inline controls by default", () => {
-      renderQuickEntryBox({});
-
-      expect(document.getElementById("quick-entry-controls")?.hasAttribute("hidden")).toBe(false);
-
-      expandQuickEntry();
-
-      expect(document.getElementById("quick-entry-controls")?.hasAttribute("hidden")).toBe(false);
-      expect(screen.queryByTestId("plan-button")).not.toBeInTheDocument();
-      expect(screen.getByTestId("subtask-button")).toBeTruthy();
-      expect(screen.queryByTestId("refine-button")).not.toBeInTheDocument();
-      expect(screen.getByTestId("quick-entry-deps")).toBeTruthy();
-      expect(screen.getByTestId("quick-entry-models")).toBeTruthy();
-      expect(screen.getByTestId("quick-entry-save")).toBeTruthy();
-    });
-
-    it("hides controls again after collapsing via toggle", () => {
-      renderQuickEntryBox({});
-
-      expandQuickEntry();
-      expect(document.getElementById("quick-entry-controls")?.hasAttribute("hidden")).toBe(false);
-
-      toggleQuickEntry();
-
-      expect(document.getElementById("quick-entry-controls")?.hasAttribute("hidden")).toBe(true);
-    });
   });
 
   describe("Consolidated actions layout (FN-781, FN-1088)", () => {
-    it("renders Subtask in actions area without Plan or Refine shells", () => {
-      renderQuickEntryBox({});
-      expandQuickEntry();
-
-      expect(screen.getByTestId("quick-entry-actions")).toBeTruthy();
-
-      const actionsContainer = screen.getByTestId("quick-entry-actions");
-      expect(screen.queryByTestId("plan-button")).not.toBeInTheDocument();
-      expect(screen.queryByTestId("refine-button")).not.toBeInTheDocument();
-      expect(actionsContainer.querySelector(".refine-trigger-wrap")).toBeNull();
-      expect(actionsContainer.contains(screen.getByTestId("subtask-button"))).toBe(true);
-    });
-
-    it("hides the Subtask quick-add action without leaving an action-row shell when the callback is omitted", () => {
-      renderQuickEntryBox({ onSubtaskBreakdown: undefined });
-      expandQuickEntry();
-
-      const actionsContainer = screen.getByTestId("quick-entry-actions");
-      expect(screen.queryByTestId("subtask-button")).not.toBeInTheDocument();
-      expect(screen.queryByTitle("Break down into AI-generated subtasks")).not.toBeInTheDocument();
-      expect(screen.queryByTestId("plan-button")).not.toBeInTheDocument();
-      expect(screen.queryByTestId("refine-button")).not.toBeInTheDocument();
-      expect(actionsContainer.querySelector(".refine-trigger-wrap")).toBeNull();
-    });
 
     it("does not render actions when not expanded", () => {
       renderQuickEntryBox({});
@@ -4332,31 +4067,6 @@ describe("QuickEntryBox", () => {
       expect(screen.getByTestId("quick-entry-deps")).toBeTruthy();
       expect(screen.getByTestId("quick-entry-models")).toBeTruthy();
       expect(screen.getByTestId("quick-entry-save")).toBeTruthy();
-    });
-
-    it("keeps all task creation controls together when disclosure is expanded", () => {
-      renderQuickEntryBox({});
-      expandQuickEntry();
-      const textarea = screen.getByTestId("quick-entry-input");
-      fireEvent.change(textarea, { target: { value: "A task with all features" } });
-
-      const controlsPanel = document.getElementById("quick-entry-controls");
-      expect(controlsPanel?.hasAttribute("hidden")).toBe(false);
-
-      expect(screen.queryByTestId("plan-button")).not.toBeInTheDocument();
-      expect(screen.getByTestId("subtask-button")).toBeTruthy();
-      expect(screen.queryByTestId("refine-button")).not.toBeInTheDocument();
-      expect(screen.getByTestId("quick-entry-deps")).toBeTruthy();
-      expect(screen.getByTestId("quick-entry-models")).toBeTruthy();
-      expect(screen.getByTestId("quick-entry-save")).toBeTruthy();
-
-      expect(screen.queryByTestId("plan-button")).not.toBeInTheDocument();
-      expect(screen.queryByTestId("refine-button")).not.toBeInTheDocument();
-      expect(controlsPanel?.querySelector(".refine-trigger-wrap")).toBeNull();
-      expect(controlsPanel?.contains(screen.getByTestId("subtask-button"))).toBe(true);
-      expect(controlsPanel?.contains(screen.getByTestId("quick-entry-deps"))).toBe(true);
-      expect(controlsPanel?.contains(screen.getByTestId("quick-entry-models"))).toBe(true);
-      expect(controlsPanel?.contains(screen.getByTestId("quick-entry-save"))).toBe(true);
     });
   });
 
@@ -4623,36 +4333,8 @@ describe("QuickEntryBox", () => {
   });
 
   describe("Model menu mobile viewport width", () => {
-    it("uses wider width on mobile viewports (≤640px)", () => {
+    it("uses mobile width, clamped left position, and stays within viewport on mobile (≤640px)", () => {
       // Simulate a narrow mobile viewport
-      vi.spyOn(window, "innerWidth", "get").mockReturnValue(375);
-
-      renderQuickEntryBox({});
-      expandQuickEntry();
-
-      openModelMenu();
-      const menu = screen.getByTestId("model-nested-menu");
-
-      // On mobile, width should be viewport width minus padding (375 - 32 = 343)
-      const menuWidth = parseFloat(menu.style.width);
-      expect(menuWidth).toBe(375 - 32);
-    });
-
-    it("left position is clamped to horizontal padding on mobile", () => {
-      vi.spyOn(window, "innerWidth", "get").mockReturnValue(375);
-
-      renderQuickEntryBox({});
-      expandQuickEntry();
-
-      openModelMenu();
-      const menu = screen.getByTestId("model-nested-menu");
-
-      // Left should be clamped to at least 16px (horizontal padding)
-      const menuLeft = parseFloat(menu.style.left);
-      expect(menuLeft).toBeGreaterThanOrEqual(16);
-    });
-
-    it("menu stays fully within viewport on mobile", () => {
       const viewportWidth = 375;
       vi.spyOn(window, "innerWidth", "get").mockReturnValue(viewportWidth);
 
@@ -4662,8 +4344,13 @@ describe("QuickEntryBox", () => {
       openModelMenu();
       const menu = screen.getByTestId("model-nested-menu");
 
-      const menuLeft = parseFloat(menu.style.left);
+      // On mobile, width should be viewport width minus padding (375 - 32 = 343)
       const menuWidth = parseFloat(menu.style.width);
+      expect(menuWidth).toBe(viewportWidth - 32);
+
+      // Left should be clamped to at least 16px (horizontal padding)
+      const menuLeft = parseFloat(menu.style.left);
+      expect(menuLeft).toBeGreaterThanOrEqual(16);
 
       // Right edge should not exceed viewport minus horizontal padding
       expect(menuLeft + menuWidth).toBeLessThanOrEqual(viewportWidth - 16);
@@ -4739,17 +4426,6 @@ describe("QuickEntryBox", () => {
       expect(modelsButton.className).toContain("btn");
     });
 
-    it("keeps Subtask touch-target classes without Plan or Refine", () => {
-      vi.spyOn(window, "innerWidth", "get").mockReturnValue(375);
-
-      renderQuickEntryBox({});
-      expandQuickEntry();
-
-      expect(screen.queryByRole("button", { name: /^Plan$/i })).not.toBeInTheDocument();
-      expect(screen.queryByRole("button", { name: /^Refine$/i })).not.toBeInTheDocument();
-      expect(screen.getByRole("button", { name: /Subtask/i }).className).toContain("btn");
-    });
-
     it("keeps model menu portal within mobile viewport", () => {
       const viewportWidth = 375;
       vi.spyOn(window, "innerWidth", "get").mockReturnValue(viewportWidth);
@@ -4780,42 +4456,6 @@ describe("QuickEntryBox", () => {
       const rect = depDropdown.getBoundingClientRect();
       expect(rect.left).toBeGreaterThanOrEqual(0);
       expect(rect.right).toBeLessThanOrEqual(viewportWidth);
-    });
-
-    it("responds to clicks for toggle, subtask, and deps without Plan or Refine", async () => {
-      const onPlanningMode = vi.fn();
-      const onSubtaskBreakdown = vi.fn();
-
-      renderQuickEntryBox({ onPlanningMode, onSubtaskBreakdown });
-
-      const toggle = screen.getByTestId("quick-entry-toggle");
-      const input = screen.getByTestId("quick-entry-input");
-      const ensureExpanded = () => {
-        if (toggle.getAttribute("aria-expanded") !== "true") {
-          fireEvent.click(toggle);
-        }
-      };
-
-      ensureExpanded();
-      expect(toggle).toHaveAttribute("aria-expanded", "true");
-
-      fireEvent.change(input, { target: { value: "Mobile interaction task" } });
-      expect(screen.queryByRole("button", { name: /^Plan$/i })).not.toBeInTheDocument();
-      expect(onPlanningMode).not.toHaveBeenCalled();
-
-      ensureExpanded();
-      fireEvent.change(input, { target: { value: "Break this down" } });
-      fireEvent.click(screen.getByRole("button", { name: /Subtask/i }));
-      expect(onSubtaskBreakdown).toHaveBeenCalledWith("Break this down");
-
-      ensureExpanded();
-      fireEvent.change(input, { target: { value: "Refine should be absent" } });
-      expect(screen.queryByRole("button", { name: /^Refine$/i })).not.toBeInTheDocument();
-      expect(screen.queryByTestId("refine-clarify")).not.toBeInTheDocument();
-
-      ensureExpanded();
-      fireEvent.click(screen.getByTestId("quick-entry-deps"));
-      expect(document.querySelector(".dep-dropdown")).toBeInTheDocument();
     });
   });
 
@@ -5184,7 +4824,7 @@ describe("QuickEntryBox", () => {
   });
 
   describe("description expand functionality removed", () => {
-    it("does not render expand button when textarea is focused and has content", async () => {
+    it("does not render expand/collapse buttons or fullscreen textarea, even focused with content", () => {
       renderQuickEntryBox({});
       const textarea = screen.getByTestId("quick-entry-input");
 
@@ -5192,21 +4832,9 @@ describe("QuickEntryBox", () => {
       fireEvent.focus(textarea);
       fireEvent.change(textarea, { target: { value: "Test task description" } });
 
-      // Expand button should NOT be present
+      // None of the removed affordances should be present
       expect(screen.queryByTestId("quick-entry-expand")).not.toBeInTheDocument();
-    });
-
-    it("does not render collapse button", () => {
-      renderQuickEntryBox({});
-
-      // Collapse button should NOT be present
       expect(screen.queryByTestId("quick-entry-collapse")).not.toBeInTheDocument();
-    });
-
-    it("does not render fullscreen textarea", () => {
-      renderQuickEntryBox({});
-
-      // Fullscreen textarea should NOT be present
       expect(screen.queryByTestId("quick-entry-input-fullscreen")).not.toBeInTheDocument();
     });
 
@@ -5227,19 +4855,6 @@ describe("QuickEntryBox", () => {
         expect(onCreate).toHaveBeenCalledWith(
           expect.objectContaining({ description: "Test task description" }),
         );
-      });
-    });
-
-    it("textarea expands on focus with autoExpand", async () => {
-      renderQuickEntryBox({ autoExpand: true });
-      const textarea = screen.getByTestId("quick-entry-input");
-
-      // Focus should trigger expansion
-      fireEvent.focus(textarea);
-
-      // Textarea should have expanded class
-      await waitFor(() => {
-        expect(textarea).toHaveClass("quick-entry-input--expanded");
       });
     });
 
@@ -5305,32 +4920,20 @@ describe("QuickEntryBox", () => {
     expect(screen.queryByText("Select execution node")).not.toBeInTheDocument();
   });
 
-  it("hides the node picker when no registered nodes are available", () => {
-    mockQuickEntryNodes([]);
-    renderQuickEntryBox({});
-
-    expandQuickEntry();
-
-    expect(screen.queryByTestId("quick-entry-node-button")).not.toBeInTheDocument();
-    expect(document.querySelector(".quick-entry-box .node-trigger-wrap")).toBeNull();
-  });
-
-  it("shows the node picker when any remote node is available", () => {
-    mockQuickEntryNodes([
-      { id: "remote", name: "Remote Only", status: "online", type: "remote" },
-    ]);
-    renderQuickEntryBox({});
-
-    expandQuickEntry();
-
-    expect(screen.getByTestId("quick-entry-node-button")).toBeInTheDocument();
-  });
-
-  it("shows the node picker when multiple local nodes are registered", () => {
-    mockQuickEntryNodes([
-      { id: "local-a", name: "Local A", status: "online", type: "local" },
-      { id: "local-b", name: "Local A", status: "offline", type: "local" },
-    ]);
+  it.each([
+    [
+      "any remote node is available",
+      [{ id: "remote", name: "Remote Only", status: "online", type: "remote" }],
+    ],
+    [
+      "multiple local nodes are registered",
+      [
+        { id: "local-a", name: "Local A", status: "online", type: "local" },
+        { id: "local-b", name: "Local A", status: "offline", type: "local" },
+      ],
+    ],
+  ] as const)("shows the node picker when %s", (_label, nodes) => {
+    mockQuickEntryNodes([...nodes]);
     renderQuickEntryBox({});
 
     expandQuickEntry();
@@ -5669,6 +5272,36 @@ describe("QuickEntryBox", () => {
       await waitFor(() => expect(onMoveTask).toHaveBeenCalledWith("FN-hold", "working"));
     });
 
+    /*
+    FNXC:QuickAddStart 2026-08-26-19:19:
+    Reported symptom: on a DUPLICATED Ideas workflow ("Coding ideas V2") the composer's Start button
+    created the card but never started it. Start keyed its atomic destination on the literal
+    `builtin:coding-ideas` id, so a copy fell through to a promotion that skipped the Planning hold
+    lane and moved into the WIP lane — a transition the server always rejects. Assert the composer
+    surface creates in the duplicate's own Planning lane and issues no move at all.
+    */
+    it("creates a duplicated Ideas workflow's Start in its own Planning lane", async () => {
+      const duplicatedIdeasWorkflow = {
+        id: "WF-014",
+        name: "Coding ideas V2",
+        columns: [
+          { id: "ideas", name: "Ideas", flags: { intake: true, manualIntake: true } },
+          { id: "todo", name: "Planning", flags: { hold: true } },
+          { id: "in-progress", name: "In progress", flags: { countsTowardWip: true } },
+          { id: "done", name: "Done", flags: { complete: true } },
+        ],
+      };
+      const onCreate = vi.fn().mockResolvedValue({ ...CREATED_TASK, id: "FN-clone", column: "todo", workflowId: duplicatedIdeasWorkflow.id });
+      const onMoveTask = vi.fn().mockResolvedValue({});
+      renderQuickEntryBox({ onCreate, onMoveTask, workflowId: duplicatedIdeasWorkflow.id, workflowOptions: [duplicatedIdeasWorkflow] });
+      enterDescription();
+
+      clickStart();
+
+      await waitFor(() => expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({ workflowId: duplicatedIdeasWorkflow.id, column: "todo" })));
+      expect(onMoveTask).not.toHaveBeenCalled();
+    });
+
     it("disables Start until a description is entered and never hides it mid-typing", () => {
       renderQuickEntryBox({ onMoveTask: vi.fn(), workflowId: ideasWorkflow.id, workflowOptions: [ideasWorkflow] });
 
@@ -5762,6 +5395,40 @@ describe("QuickEntryBox", () => {
         unmount();
       }
 
+    });
+  });
+
+  describe("quota-safe draft persistence (FN-9160)", () => {
+    it("evicts an over-cap Quick Add draft and warns only once", () => {
+      const addToast = vi.fn();
+      localStorage.setItem(QUICK_ENTRY_STORAGE_KEY, "prior draft");
+      renderQuickEntryBox({ addToast });
+
+      fireEvent.change(screen.getByTestId("quick-entry-input"), { target: { value: "x".repeat(MAX_PERSISTED_DRAFT_BYTES + 1) } });
+
+      expect(screen.getByTestId("quick-entry-input")).toHaveValue("x".repeat(MAX_PERSISTED_DRAFT_BYTES + 1));
+      expect(localStorage.getItem(QUICK_ENTRY_STORAGE_KEY)).toBeNull();
+      expect(addToast).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps the reported scoped Quick Add draft usable and submit-ready when storage throws", async () => {
+      const onCreate = vi.fn().mockResolvedValue(undefined);
+      const addToast = vi.fn();
+      const setItem = vi.spyOn(localStorage, "setItem").mockImplementation((key) => {
+        if (key === QUICK_ENTRY_STORAGE_KEY) {
+          throw new DOMException("Quota exceeded", "QuotaExceededError");
+        }
+      });
+      renderQuickEntryBox({ onCreate, addToast });
+      const textarea = screen.getByTestId("quick-entry-input") as HTMLTextAreaElement;
+
+      expect(() => fireEvent.change(textarea, { target: { value: "still creates despite quota" } })).not.toThrow();
+      expect(textarea).toHaveValue("still creates despite quota");
+      expect(addToast).toHaveBeenCalledTimes(1);
+      fireEvent.click(screen.getByTestId("quick-entry-save"));
+
+      await waitFor(() => expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({ description: "still creates despite quota" })));
+      expect(setItem).toHaveBeenCalledWith(QUICK_ENTRY_STORAGE_KEY, "still creates despite quota");
     });
   });
 

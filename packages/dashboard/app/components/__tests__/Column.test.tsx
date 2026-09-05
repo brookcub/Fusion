@@ -7,26 +7,24 @@ import userEvent from "@testing-library/user-event";
 import { Column } from "../Column";
 import type { Task, Column as ColumnType } from "@fusion/core";
 
+const { rebuildTaskSpecMock } = vi.hoisted(() => ({ rebuildTaskSpecMock: vi.fn() }));
+vi.mock("../../api", async (importOriginal) => ({
+  ...(await importOriginal()),
+  rebuildTaskSpec: rebuildTaskSpecMock,
+}));
+
 // Mock child components to keep tests focused on the Column badge behavior
 const taskCardRenderSpy = vi.fn();
 
 vi.mock("../TaskCard", () => ({
-  TaskCard: React.memo(({ task, onPromote, isPromoting }: { task: Task; onPromote?: (taskId: string) => Promise<void>; isPromoting?: boolean }) => {
+  TaskCard: React.memo(({ task }: { task: Task }) => {
     taskCardRenderSpy(task.id);
-    return (
-      <div data-testid={`task-${task.id}`}>
-        {onPromote && (
-          <button type="button" data-testid={`card-promote-${task.id}`} disabled={isPromoting} onClick={() => void onPromote(task.id)}>
-            {isPromoting ? "Promoting…" : "Promote"}
-          </button>
-        )}
-      </div>
-    );
+    return <div data-testid={`task-${task.id}`} />;
   }),
 }));
 vi.mock("../WorktreeGroup", () => ({
-  WorktreeGroup: ({ label, activeTasks, queuedTasks }: { label: string; activeTasks: Task[]; queuedTasks: Task[] }) => (
-    <div data-testid="worktree-group" data-label={label} data-active-count={activeTasks.length} data-queued-count={queuedTasks.length}>
+  WorktreeGroup: ({ label, kind, activeTasks, queuedTasks }: { label: string; kind: string; activeTasks: Task[]; queuedTasks: Task[] }) => (
+    <div data-testid="worktree-group" data-label={label} data-kind={kind} data-active-count={activeTasks.length} data-queued-count={queuedTasks.length}>
       <span>{label}</span>
       {activeTasks.map((task) => <div key={task.id} data-testid={`group-active-${task.id}`}>{task.id}</div>)}
       {queuedTasks.map((task) => <div key={task.id} data-testid={`group-queued-${task.id}`}>{task.id}</div>)}
@@ -98,6 +96,7 @@ function makeTask(id: string): Task {
 }
 
 beforeEach(() => {
+  rebuildTaskSpecMock.mockReset();
   taskCardRenderSpy.mockClear();
   mockConfirm.mockReset();
   mockConfirm.mockResolvedValue(true);
@@ -344,163 +343,6 @@ describe("Column workflow mode (U9)", () => {
     expect(document.querySelector(".column-menu")).not.toBeNull();
   });
 
-  it("surfaces a translated rejection messageKey on a failed drop (snap-back)", async () => {
-    const addToast = vi.fn();
-    const onMoveTask = vi.fn().mockRejectedValue({
-      details: { code: "merge-blocked", messageKey: "board.rejection.mergeBlocked", retryable: false },
-    });
-    render(
-      <Column
-        {...defaultProps}
-        column={"done" as ColumnType}
-        workflowMode
-        columnDisplayName="Done"
-        columnFlags={{ complete: true }}
-        addToast={addToast}
-        onMoveTask={onMoveTask}
-        tasks={[]}
-      />,
-    );
-    const columnEl = document.querySelector('[data-column="done"]') as HTMLElement;
-    fireEvent.drop(columnEl, { dataTransfer: { getData: () => "FN-99" } });
-    await waitFor(() => expect(addToast).toHaveBeenCalled());
-    // The toast surfaces the translated merge-blocked copy (not the raw key).
-    expect(addToast.mock.calls[0][0]).toContain("merge step");
-    expect(addToast.mock.calls[0][1]).toBe("error");
-  });
-
-  it("renders a Promote affordance on hold-column cards", () => {
-    render(
-      <Column
-        {...defaultProps}
-        column={"hold-col" as ColumnType}
-        workflowMode
-        columnDisplayName="Hold"
-        columnFlags={{ hold: true }}
-        onPromote={vi.fn().mockResolvedValue(undefined)}
-        tasks={[{ ...makeTask("FN-7"), column: "hold-col" as ColumnType }]}
-      />,
-    );
-    expect(screen.getByTestId("card-promote-FN-7")).toBeDefined();
-  });
-
-  /*
-  FNXC:BoardPromote 2026-07-25-04:55:
-  The unplanned-for-execution rejection must (a) render real copy rather than the
-  raw `board.rejection.unplannedForExecution` key and (b) offer the operator an
-  explicit force override. Declining leaves the card held; confirming re-issues
-  the promote with `{ force: true }`.
-  */
-  function renderHoldColumnWithPromote(onPromote: (taskId: string, options?: { force?: boolean }) => Promise<void>) {
-    return render(
-      <Column
-        {...defaultProps}
-        column={"hold-col" as ColumnType}
-        workflowMode
-        columnDisplayName="Hold"
-        columnFlags={{ hold: true }}
-        onPromote={onPromote}
-        tasks={[{ ...makeTask("FN-7"), column: "hold-col" as ColumnType }]}
-      />,
-    );
-  }
-
-  const unplannedRejection = {
-    details: {
-      code: "unplanned-for-execution",
-      messageKey: "board.rejection.unplannedForExecution",
-      retryable: true,
-      forceable: true,
-    },
-  };
-
-  it("offers an override on unplanned-for-execution and keeps the card held when declined", async () => {
-    const onPromote = vi.fn().mockRejectedValue(unplannedRejection);
-    mockConfirm.mockResolvedValue(false);
-    renderHoldColumnWithPromote(onPromote);
-
-    fireEvent.click(screen.getByTestId("card-promote-FN-7"));
-
-    await waitFor(() => expect(mockConfirm).toHaveBeenCalled());
-    expect(mockConfirm.mock.calls[0][0]).toMatchObject({
-      title: "Start execution anyway?",
-      confirmLabel: "Start Anyway",
-      cancelLabel: "Keep Waiting",
-      danger: true,
-    });
-    expect(mockConfirm.mock.calls[0][0].message).toContain("FN-7");
-
-    await waitFor(() => expect(screen.getByTestId("column-inline-feedback")).toBeDefined());
-    // Real copy, never the raw i18n key (the FN-8471 regression).
-    expect(screen.getByTestId("column-inline-feedback").textContent).not.toContain("board.rejection");
-    expect(screen.getByTestId("column-inline-feedback").textContent).toContain("plan review");
-    expect(onPromote).toHaveBeenCalledTimes(1);
-    expect(onPromote).toHaveBeenCalledWith("FN-7");
-  });
-
-  it("re-promotes with force once the operator confirms the override", async () => {
-    const onPromote = vi.fn()
-      .mockRejectedValueOnce(unplannedRejection)
-      .mockResolvedValueOnce(undefined);
-    mockConfirm.mockResolvedValue(true);
-    renderHoldColumnWithPromote(onPromote);
-
-    fireEvent.click(screen.getByTestId("card-promote-FN-7"));
-
-    await waitFor(() => expect(onPromote).toHaveBeenCalledTimes(2));
-    expect(onPromote).toHaveBeenLastCalledWith("FN-7", { force: true });
-    expect(screen.queryByTestId("column-inline-feedback")).toBeNull();
-  });
-
-  it("does not offer an override for a capacity rejection", async () => {
-    const onPromote = vi.fn().mockRejectedValue({
-      details: { code: "capacity-exhausted", messageKey: "board.rejection.capacityExhausted", retryable: true },
-    });
-    renderHoldColumnWithPromote(onPromote);
-
-    fireEvent.click(screen.getByTestId("card-promote-FN-7"));
-    await waitFor(() => expect(screen.getByTestId("column-inline-feedback")).toBeDefined());
-    expect(mockConfirm).not.toHaveBeenCalled();
-    expect(onPromote).toHaveBeenCalledTimes(1);
-  });
-
-  it("#1410: clears the inline capacity banner when the task list changes via SSE", async () => {
-    const onPromote = vi.fn().mockRejectedValue({
-      details: { code: "capacity-exhausted", retryable: true },
-    });
-    const holdTask = { ...makeTask("FN-7"), column: "hold-col" as ColumnType };
-    const { rerender } = render(
-      <Column
-        {...defaultProps}
-        column={"hold-col" as ColumnType}
-        workflowMode
-        columnDisplayName="Hold"
-        columnFlags={{ hold: true }}
-        onPromote={onPromote}
-        tasks={[holdTask]}
-      />,
-    );
-
-    // Trigger a capacity-exhausted promote → inline banner appears.
-    fireEvent.click(screen.getByTestId("card-promote-FN-7"));
-    await waitFor(() => expect(screen.getByTestId("column-inline-feedback")).toBeDefined());
-    expect(screen.getByTestId("column-inline-feedback").textContent).toContain("capacity");
-
-    // An SSE-driven task list change (occupant moved out) re-renders the column
-    // with a different roster → the stale banner is cleared.
-    rerender(
-      <Column
-        {...defaultProps}
-        column={"hold-col" as ColumnType}
-        workflowMode
-        columnDisplayName="Hold"
-        columnFlags={{ hold: true }}
-        onPromote={onPromote}
-        tasks={[{ ...makeTask("FN-8"), column: "hold-col" as ColumnType }]}
-      />,
-    );
-    await waitFor(() => expect(screen.queryByTestId("column-inline-feedback")).toBeNull());
-  });
 });
 
 describe("Column worktree grouping setting", () => {
@@ -565,6 +407,35 @@ describe("Column worktree grouping setting", () => {
     expect(screen.getByTestId("group-active-FN-004")).toBeInTheDocument();
     expect(screen.getByTestId("group-queued-FN-005")).toBeInTheDocument();
     expect(screen.queryByTestId("task-FN-003")).toBeNull();
+  });
+
+  it("passes a single acquired workspace repo to a workspace group instead of stale singular routing", () => {
+    const workspaceTask = {
+      ...makeTask("FN-9044"),
+      column: "exec" as ColumnType,
+      worktree: "/ws/unrelated/.worktrees/stale-worktree",
+      workspaceWorktrees: {
+        "repo-a": { worktreePath: "/ws/repo-a/.worktrees/FN-9044", branch: "fusion/FN-9044" },
+      },
+    };
+    render(
+      <Column
+        {...defaultProps}
+        column={"exec" as ColumnType}
+        workflowMode
+        columnDisplayName="Executing"
+        columnFlags={{ countsTowardWip: true }}
+        showWorktreeGrouping
+        tasks={[workspaceTask]}
+        allTasks={[workspaceTask]}
+      />,
+    );
+
+    expect(screen.getByTestId("worktree-group")).toHaveAttribute("data-kind", "workspace");
+    expect(screen.getByTestId("worktree-group")).toHaveAttribute("data-label", "FN-9044");
+    expect(screen.queryByText("stale-worktree")).toBeNull();
+    expect(screen.queryByText("Unassigned")).toBeNull();
+    expect(screen.getByTestId("group-active-FN-9044")).toBeInTheDocument();
   });
 
   it("does not leave worktree shells in empty processing columns", () => {
@@ -659,21 +530,7 @@ describe("Column pagination", () => {
     expect(screen.getAllByTestId(/task-/)).toHaveLength(60);
   });
 
-  it("still handles drops when pagination is enabled", () => {
-    const tasks = Array.from({ length: 110 }, (_, index) => makeTask(`KB-${String(index + 1).padStart(3, "0")}`));
-    const onMoveTask = vi.fn().mockResolvedValue({} as Task);
-    render(<Column {...defaultProps} column="todo" tasks={tasks} onMoveTask={onMoveTask} />);
 
-    const column = screen.getByText("110").closest(".column") as HTMLElement;
-    const dataTransfer = {
-      getData: vi.fn().mockReturnValue("KB-999"),
-      dropEffect: "move",
-    };
-
-    fireEvent.drop(column, { dataTransfer });
-
-    expect(onMoveTask).toHaveBeenCalledWith("KB-999", "todo", undefined);
-  });
 
   it("does not paginate at the threshold boundary", () => {
     const tasks = Array.from({ length: 100 }, (_, index) => makeTask(`KB-${String(index + 1).padStart(3, "0")}`));
@@ -888,7 +745,7 @@ describe("Column QuickEntryBox", () => {
 });
 
 describe("Column in-progress/in-review bulk actions", () => {
-  it.each(["in-progress", "in-review"] as const)("renders Stop All and Move All to Todo actions for %s", async (column) => {
+  it.each(["in-progress", "in-review"] as const)("renders Stop All without manual move actions for %s", async (column) => {
     const user = userEvent.setup();
     render(
       <Column
@@ -908,7 +765,7 @@ describe("Column in-progress/in-review bulk actions", () => {
     expect(menuButton).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByRole("menu")).toBeTruthy();
     expect(screen.getByRole("menuitem", { name: /Stop All/i })).toBeTruthy();
-    expect(screen.getByRole("menuitem", { name: /Move All to Todo/i })).toBeTruthy();
+    expect(screen.queryByRole("menuitem", { name: /Move All/i })).toBeNull();
   });
 
   it.each(["in-progress", "in-review"] as const)("Stop All pauses only manually-pausable tasks in %s", async (column) => {
@@ -983,37 +840,6 @@ describe("Column in-progress/in-review bulk actions", () => {
     expect(screen.getByText("No manually pausable tasks")).toBeTruthy();
   });
 
-  it.each(["in-progress", "in-review"] as const)("Move All to Todo moves every task in %s", async (column) => {
-    const user = userEvent.setup();
-    const onMoveTask = vi.fn().mockResolvedValue({} as Task);
-
-    render(
-      <Column
-        {...defaultProps}
-        column={column}
-        onMoveTask={onMoveTask}
-        tasks={[
-          { ...makeTask("FN-001"), column },
-          { ...makeTask("FN-002"), column },
-        ]}
-        onPauseTask={vi.fn().mockResolvedValue({} as Task)}
-      />,
-    );
-
-    await user.click(screen.getByRole("button", { name: `${column === "in-progress" ? "In Progress" : "In Review"} column actions` }));
-    await user.click(screen.getByRole("menuitem", { name: /Move All to Todo/i }));
-
-    await waitFor(() => {
-      expect(onMoveTask).toHaveBeenCalledTimes(2);
-    });
-    expect(onMoveTask).toHaveBeenCalledWith("FN-001", "todo", undefined);
-    expect(onMoveTask).toHaveBeenCalledWith("FN-002", "todo", undefined);
-    expect(screen.queryByRole("menu")).toBeNull();
-    expect(mockConfirm).toHaveBeenCalledWith({
-      title: "Move All to Todo",
-      message: `Move all 2 ${column === "in-progress" ? "in progress" : "in review"} tasks to Todo?`,
-    });
-  });
 });
 
 describe("Column plan auto-approval action", () => {
@@ -1060,6 +886,21 @@ describe("Column plan auto-approval action", () => {
 
     expect(onTogglePlanAutoApprove).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  it("replans each task through the server and never moves cards client-side", async () => {
+    const user = userEvent.setup();
+    const onMoveTask = vi.fn();
+    rebuildTaskSpecMock.mockResolvedValue({});
+    render(<Column {...defaultProps} column="todo" projectId="project-1" onMoveTask={onMoveTask} tasks={[makeTask("FN-001"), makeTask("FN-002")]} />);
+
+    await user.click(screen.getByRole("button", { name: "Todo column actions" }));
+    await user.click(screen.getByRole("menuitem", { name: /Replan All/i }));
+
+    await waitFor(() => expect(rebuildTaskSpecMock).toHaveBeenCalledTimes(2));
+    expect(rebuildTaskSpecMock).toHaveBeenCalledWith("FN-001", "project-1");
+    expect(rebuildTaskSpecMock).toHaveBeenCalledWith("FN-002", "project-1");
+    expect(onMoveTask).not.toHaveBeenCalled();
   });
 
   it("coexists with workflow intake replan actions", async () => {
@@ -1232,7 +1073,7 @@ describe("Column Done action menu", () => {
     expect(mockConfirm).not.toHaveBeenCalled();
   });
 
-  it("hides Done menu items and leaves no standalone wrappers on non-Done columns", async () => {
+  it("shows the generic sort menu on non-complete columns without standalone wrappers", async () => {
     const user = userEvent.setup();
     const { container } = render(
       <Column
@@ -1247,12 +1088,12 @@ describe("Column Done action menu", () => {
 
     expect(screen.queryByRole("combobox", { name: "Sort Done tasks" })).toBeNull();
     expect(container.querySelector(".done-sort-control")).toBeNull();
-    expect(container.querySelector("[aria-label='Sort Done tasks']")).toBeNull();
+    expect(container.querySelector("[aria-label='Sort tasks in this column']")).toBeNull();
 
     await user.click(screen.getByRole("button", { name: "Todo column actions" }));
 
-    expect(screen.queryByRole("menuitemradio", { name: /Completion date \(newest first\)/ })).toBeNull();
-    expect(screen.queryByRole("menuitemradio", { name: /Task ID \(newest first\)/ })).toBeNull();
+    expect(screen.getByRole("menuitemradio", { name: /Arrival in this column/ })).toBeInTheDocument();
+    expect(screen.getByRole("menuitemradio", { name: /Task ID \(newest first\)/ })).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: /Archive all done tasks/i })).toBeNull();
   });
 
@@ -1271,67 +1112,6 @@ describe("Column Done action menu", () => {
   });
 });
 
-describe("Column same-column drop", () => {
-  it("does not call onMoveTask when dropping task into its current column", () => {
-    const onMoveTask = vi.fn().mockResolvedValue({} as Task);
-    const addToast = vi.fn();
-    const tasks = [{ ...makeTask("FN-001"), column: "todo" as ColumnType }];
-    
-    render(<Column {...defaultProps} column="todo" tasks={tasks} onMoveTask={onMoveTask} addToast={addToast} />);
-
-    const columnEl = screen.getByRole("heading", { name: "Todo" }).closest(".column") as HTMLElement;
-    const dataTransfer = {
-      getData: vi.fn().mockReturnValue("FN-001"),
-      dropEffect: "move",
-    };
-
-    fireEvent.drop(columnEl, { dataTransfer });
-
-    expect(onMoveTask).not.toHaveBeenCalled();
-    expect(addToast).not.toHaveBeenCalled();
-  });
-
-  it("removes drag-over styling after drop even on same column", () => {
-    const onMoveTask = vi.fn().mockResolvedValue({} as Task);
-    const tasks = [{ ...makeTask("FN-001"), column: "todo" as ColumnType }];
-    
-    render(<Column {...defaultProps} column="todo" tasks={tasks} onMoveTask={onMoveTask} />);
-
-    const columnEl = screen.getByRole("heading", { name: "Todo" }).closest(".column") as HTMLElement;
-    const dataTransfer = {
-      getData: vi.fn().mockReturnValue("FN-001"),
-      dropEffect: "move",
-    };
-
-    // First trigger dragOver to set drag-over state
-    fireEvent.dragOver(columnEl, { dataTransfer });
-    expect(columnEl.className).toContain("drag-over");
-
-    // Then drop - should remove drag-over class even for same-column drop
-    fireEvent.drop(columnEl, { dataTransfer });
-    expect(columnEl.className).not.toContain("drag-over");
-  });
-
-  it("calls onMoveTask when dropping task into a different column", () => {
-    const onMoveTask = vi.fn().mockResolvedValue({} as Task);
-    const addToast = vi.fn();
-    // Task is in "todo" column - but we're dropping it onto "in-review" column
-    // The "in-review" column should have 0 tasks initially
-    const tasksInTargetColumn: Task[] = [];
-    
-    // Dropping into "in-review" column (which has 0 tasks)
-    render(<Column {...defaultProps} column="in-review" tasks={tasksInTargetColumn} onMoveTask={onMoveTask} addToast={addToast} />);
-
-    const columnEl = screen.getAllByText("0")[0].closest(".column") as HTMLElement;
-    const dataTransfer = {
-      getData: vi.fn().mockReturnValue("FN-001"),
-      dropEffect: "move",
-    };
-
-    fireEvent.drop(columnEl, { dataTransfer });
-
-    expect(onMoveTask).toHaveBeenCalledWith("FN-001", "in-review", undefined);
-  });
 
   describe("favorite model prop forwarding (FN-770)", () => {
     it("forwards favoriteProviders, favoriteModels, and toggle callbacks to QuickEntryBox", () => {
@@ -1379,7 +1159,6 @@ describe("Column same-column drop", () => {
       expect(quickEntry.getAttribute("data-has-toggle-model-favorite")).toBe("no");
     });
   });
-});
 
 describe("Column PluginSlot integration", () => {
   it("renders PluginSlot for board-column-footer", () => {
