@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { isDefaultProviderInstance, parseProviderInstanceKey } from "../provider-instance.js";
 
 export type StoredAuthCredential = {
@@ -29,6 +29,12 @@ function getHomeDir(): string {
 }
 
 export function getCodexCliAuthPath(home = getHomeDir()): string {
+  // FNXC:ProviderAuth 2026-09-05-08:03: opt in to one existing credential file, never a personal profile mount.
+  const explicit = process.env.FUSION_CODEX_AUTH_FILE;
+  if (explicit !== undefined) {
+    if (!isAbsolute(explicit)) throw new Error("FUSION_CODEX_AUTH_FILE must be absolute");
+    return explicit;
+  }
   return join(home, ".codex", "auth.json");
 }
 

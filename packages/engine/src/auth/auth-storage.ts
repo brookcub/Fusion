@@ -144,9 +144,10 @@ class FusionFileAuthStorage implements FusionAuthStorage {
   private data: AuthFileData = {};
   private modelRuntime: ModelRuntime | undefined;
 
-  constructor(private readonly authPath: string) { this.reload(); }
+  constructor(private readonly authPath: string, private readonly externalCredentials?: () => AuthFileData) { this.reload(); }
 
   async withProviderInstanceLoginLock<T>(providerId: string, operation: () => Promise<T>): Promise<T> {
+    if (this.externalCredentials) throw new Error("External credentials are read-only; authenticate through their owner");
     return withOAuthInstanceLoginLock(this.authPath, providerId, operation);
   }
 
@@ -162,6 +163,7 @@ class FusionFileAuthStorage implements FusionAuthStorage {
     } catch { return {}; }
   }
   private async withLock<T>(fn: (current: AuthFileData) => Promise<{ result: T; changed: boolean }>): Promise<T> {
+    if (this.externalCredentials) throw new Error("External credentials are read-only; authenticate through their owner");
     return enqueueAuthWrite(this.authPath, async () => {
       this.ensureFile(); const release = await lockfile.lock(this.authPath, AUTH_LOCK_OPTIONS);
       try {
@@ -171,7 +173,10 @@ class FusionFileAuthStorage implements FusionAuthStorage {
       } finally { await release(); }
     });
   }
-  reload(): void { this.ensureFile(); this.data = this.readCurrent(); }
+  reload(): void {
+    if (this.externalCredentials) { this.data = this.externalCredentials(); return; }
+    this.ensureFile(); this.data = this.readCurrent();
+  }
   private parseReadKey(key: string): ProviderInstanceRef | undefined { return parseProviderInstanceKey(key); }
   private assertRef(ref: ProviderInstanceRef): ProviderInstanceRef {
     // format validates both ids and rejects reserved provider names before any mutator locks.
@@ -206,10 +211,11 @@ class FusionFileAuthStorage implements FusionAuthStorage {
     const candidate = data[formatProviderInstanceKey(ref)];
     return isStoredAuthCredential(candidate) ? candidate : undefined;
   }
-  get(provider: string): StoredCredential | undefined { return this.credential(this.resolveReadTarget(provider, this.data)); }
-  getInstance(ref: ProviderInstanceRef): StoredCredential | undefined { try { return this.credential(this.assertRef(ref)); } catch { return undefined; } }
-  getDefaultInstance(providerId: string): ProviderInstanceRef | undefined { return this.resolveDefaultInstance(providerId, this.data); }
+  get(provider: string): StoredCredential | undefined { if (this.externalCredentials) this.reload(); return this.credential(this.resolveReadTarget(provider, this.data)); }
+  getInstance(ref: ProviderInstanceRef): StoredCredential | undefined { if (this.externalCredentials) this.reload(); try { return this.credential(this.assertRef(ref)); } catch { return undefined; } }
+  getDefaultInstance(providerId: string): ProviderInstanceRef | undefined { if (this.externalCredentials) this.reload(); return this.resolveDefaultInstance(providerId, this.data); }
   listInstances(providerId: string): ProviderInstanceRef[] {
+    if (this.externalCredentials) this.reload();
     if (!isValidProviderId(providerId) || isReservedAuthStorageKey(providerId)) return [];
     const refs = Object.keys(this.data).map(parseProviderInstanceKey).filter((ref): ref is ProviderInstanceRef => Boolean(ref) && ref!.providerId === providerId && Boolean(this.credential(ref!, this.data)));
     const defaultRef = this.resolveDefaultInstance(providerId, this.data);
@@ -222,7 +228,7 @@ class FusionFileAuthStorage implements FusionAuthStorage {
     });
   }
   getAll(): Record<string, StoredCredential> { const result: Record<string, StoredCredential> = {}; for (const provider of this.list()) { const credential = this.get(provider); if (credential) result[provider] = credential; } return result; }
-  list(): string[] { return [...new Set(Object.keys(this.data).map(parseProviderInstanceKey).filter((ref): ref is ProviderInstanceRef => Boolean(ref) && Boolean(this.credential(ref!, this.data))).map((ref) => ref.providerId))].sort(); }
+  list(): string[] { if (this.externalCredentials) this.reload(); return [...new Set(Object.keys(this.data).map(parseProviderInstanceKey).filter((ref): ref is ProviderInstanceRef => Boolean(ref) && Boolean(this.credential(ref!, this.data))).map((ref) => ref.providerId))].sort(); }
   has(provider: string): boolean { return Boolean(this.get(provider)); }
   hasAuth(provider: string): boolean { return this.has(provider); }
   async set(provider: string, credential: StoredCredential): Promise<void> {
@@ -430,6 +436,14 @@ export function createFusionCredentialStore(authStorage: FusionAuthStorage, reso
     */
     read: async (providerId) => {
       const scopedRef = scopedRefFor(providerId);
+      // FNXC:ProviderAuth 2026-09-05-08:03: the external login owner alone refreshes its token.
+      // Codex is OAuth-only: preserve its credential type. The read-only store
+      // refuses modify before invoking a refresh callback; near-expiry is unavailable.
+      if (process.env.FUSION_CODEX_AUTH_FILE && providerId === "openai-codex") {
+        const credential = scopedRef ? authStorage.getInstance(scopedRef) : authStorage.get(providerId);
+        return credential?.type === "oauth" && typeof credential.expires === "number"
+          && credential.expires > Date.now() + 5 * 60_000 ? credential as Credential : undefined;
+      }
       if (providerId === ANTHROPIC_PROVIDER_ID) {
         // Preserve Anthropic's refresh-aware getApiKey indirection for scoped instances too.
         const token = await authStorage.getApiKey(ANTHROPIC_PROVIDER_ID, scopedRef);
@@ -763,6 +777,19 @@ export async function createFusionModelRegistry(authStorage: FusionAuthStorage, 
 
 export function createFusionAuthStorage(): FusionAuthStorage {
   const authPath = getFusionAuthPath();
+  // FNXC:ProviderAuth 2026-09-05-08:03: isolated explicit-file mode never hydrates a second
+  // credential file, reads sibling profiles, persists logins, or refreshes another owner's token.
+  if (process.env.FUSION_CODEX_AUTH_FILE !== undefined) {
+    const externalPath = getCodexCliAuthPath();
+    // FNXC:ProviderAuth 2026-09-05-10:10: the owner may rotate or revoke at any
+    // time. All presence and runtime reads share this exact-file availability gate.
+    return new FusionFileAuthStorage(authPath, () => {
+      const credential = readStoredCredentialsFromAuthFile(externalPath)["openai-codex"];
+      return credential?.type === "oauth" && typeof credential.expires === "number"
+        && Number.isFinite(credential.expires) && credential.expires > Date.now() + 5 * 60_000
+        ? { "openai-codex": credential } : {};
+    });
+  }
   const primary = new FusionFileAuthStorage(authPath);
   let supplementalCredentials = readSupplementalCredentials();
   // models.json provider API keys — final fallback after primary auth and supplemental auth.json files
