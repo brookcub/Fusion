@@ -42,6 +42,7 @@ export type CreateAuthoritativeWorkflowPrimitivesDeps = {
   graphSeamGoverningNodeId: Map<string, string>;
   graphStepActiveContext: Map<string, unknown>;
   pausedAborted: Set<string>;
+  workflowLifecycleMovesInFlight: Set<string>;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- merge requester accepts optional signal bag
   mergeRequester?: ((taskId: string, opts?: any) => Promise<any>) | null;
   getRunContextFor: (taskId: string) => EngineRunContext | undefined;
@@ -299,6 +300,33 @@ export function createAuthoritativeWorkflowPrimitivesFromExecutor(
         const taskStore = deps.store;
         const patch: Partial<TaskDetail> = {};
         /*
+        FNXC:EnginePause 2026-09-05-06:55:
+        Node-entry pause checks are necessary but not sufficient: pause may arrive after entry and
+        before this lifecycle side effect. Re-read immediately at the mutation boundary and return
+        the graph's typed abort result. Fail closed when the authority cannot be read.
+        */
+        let liveTask: Task;
+        let liveSettings: Settings;
+        try {
+          [liveTask, liveSettings] = await Promise.all([
+            taskStore.getTask(task.id),
+            taskStore.getSettings(),
+          ]);
+        } catch {
+          deps.markPausedAborted(task.id, "engine-abort", "workflow-transition:pause-state-unavailable");
+          return { outcome: "failure", value: "aborted" };
+        }
+        if (
+          _ctx.signal?.aborted
+          || liveTask.paused === true
+          || liveTask.userPaused === true
+          || liveSettings.globalPause === true
+          || liveSettings.enginePaused === true
+        ) {
+          deps.markPausedAborted(task.id, "engine-abort", "workflow-transition:pause-gate");
+          return { outcome: "failure", value: "aborted" };
+        }
+        /*
         FNXC:WorkflowLifecycleColumns 2026-07-30-21:40:
         Resolve a requested ROLE to this task's own column, because the seam that asks cannot.
 
@@ -337,7 +365,12 @@ export function createAuthoritativeWorkflowPrimitivesFromExecutor(
             moveTask?: typeof taskStore.moveTask;
           };
           if (typeof storeWithMove.moveTask === "function") {
-            await storeWithMove.moveTask(task.id, targetColumn, moveOptions);
+            deps.workflowLifecycleMovesInFlight.add(task.id);
+            try {
+              await storeWithMove.moveTask(task.id, targetColumn, moveOptions);
+            } finally {
+              deps.workflowLifecycleMovesInFlight.delete(task.id);
+            }
           } else {
             patch.column = targetColumn;
           }

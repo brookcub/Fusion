@@ -377,7 +377,7 @@ export const runVerificationParams = Type.Object({
   expectFailure: Type.Optional(
     Type.Boolean({
       description:
-        "If true, a non-zero exit code is reported but not flagged as an error. Default: false.",
+        "If true, separately records whether a non-zero exit was expected and observed. Command success always means exit code 0. Default: false.",
     }),
   ),
 });
@@ -387,7 +387,12 @@ export const runVerificationParams = Type.Object({
 // ---------------------------------------------------------------------------
 
 export interface VerificationResult {
+  /** Factual command result: true only for exit code 0. */
   success: boolean;
+  /** Whether the observed exit matched the caller's explicit expectation. */
+  expectationMet: boolean;
+  /** True only when expectFailure was requested and a non-zero exit was observed. */
+  expectedFailureObserved: boolean;
   exitCode: number | null;
   durationMs: number;
   stdout: string;
@@ -766,7 +771,15 @@ async function runVerificationCommandUnlocked(
       const exitCode = code ?? null;
       const durationMs = Date.now() - startMs;
       const zeroExit = exitCode === 0;
-      const success = expectFailure ? true : zeroExit;
+      /*
+      FNXC:Verification 2026-09-05-06:55:
+      `success` is evidence, not caller intent. The old expectFailure branch rewrote every non-zero
+      exit to success=true, allowing a failed test gate to appear green in agent tool history.
+      Preserve expectation testing as a separate dimension without corrupting exit truth.
+      */
+      const success = zeroExit;
+      const expectedFailureObserved = expectFailure && !timedOut && exitCode !== null && exitCode !== 0;
+      const expectationMet = expectFailure ? expectedFailureObserved : success;
 
       if (!success && !timedOut) {
         /*
@@ -784,6 +797,8 @@ async function runVerificationCommandUnlocked(
 
       resolve({
         success,
+        expectationMet,
+        expectedFailureObserved,
         exitCode,
         durationMs,
         stdout: flattenBuffer(stdoutBuf),
@@ -806,6 +821,8 @@ async function runVerificationCommandUnlocked(
       warnings.push(`Spawn error: ${err.message}`);
       resolve({
         success: false,
+        expectationMet: false,
+        expectedFailureObserved: false,
         exitCode: null,
         durationMs,
         stdout: flattenBuffer(stdoutBuf),
@@ -1012,6 +1029,10 @@ export function createRunVerificationTool(
       lines.push(`Exit code: ${result.exitCode ?? "null (signal)"}`);
       lines.push(`Duration: ${(result.durationMs / 1000).toFixed(1)}s`);
       lines.push(`Success: ${result.success}`);
+      if (expectFailure) {
+        lines.push(`Expected failure observed: ${result.expectedFailureObserved}`);
+        lines.push(`Expectation met: ${result.expectationMet}`);
+      }
 
       const hasFailureOutput = result.exitCode !== 0 || result.timedOut;
       if (hasFailureOutput) {
@@ -1050,6 +1071,8 @@ export function createRunVerificationTool(
         content: [{ type: "text" as const, text }],
         details: {
           success: result.success,
+          expectationMet: result.expectationMet,
+          expectedFailureObserved: result.expectedFailureObserved,
           exitCode: result.exitCode,
           durationMs: result.durationMs,
           timedOut: result.timedOut,

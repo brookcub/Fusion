@@ -350,7 +350,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
       expect(result.exitCode).toBe(42);
     });
 
-    it("returns success when expectFailure=true and command exits non-zero", async () => {
+    it("keeps command success false while separately recording an expected non-zero exit", async () => {
       const onHeartbeat = vi.fn();
       const opts: RunVerificationOptions = {
         command: "exit 3",
@@ -362,8 +362,10 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
 
       const result = await runVerificationCommand(opts);
 
-      expect(result.success).toBe(true);
+      expect(result.success).toBe(false);
       expect(result.exitCode).toBe(3);
+      expect(result.expectationMet).toBe(true);
+      expect(result.expectedFailureObserved).toBe(true);
     });
   });
 
@@ -486,6 +488,26 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
         onVerificationEnd: vi.fn(),
         log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
       });
+
+    it("never presents an expected non-zero exit as successful verification", async () => {
+      const tool = createCompactTool();
+
+      const result = await tool.execute("call-expected-failure", {
+        command: "exit 9",
+        scope: "package",
+        expectFailure: true,
+      });
+
+      const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+      expect(text).toContain("Success: false");
+      expect(text).toContain("Expected failure observed: true");
+      expect(result.details).toEqual(expect.objectContaining({
+        success: false,
+        exitCode: 9,
+        expectationMet: true,
+        expectedFailureObserved: true,
+      }));
+    });
 
     it("reduces noisy test failures to counts, failing tests, errors, and source locations", () => {
       const stdout = [
