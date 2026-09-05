@@ -30,9 +30,11 @@ import type { Settings, Task, TaskStore } from "@fusion/core";
 import { executorLog } from "../logger.js";
 import { dropPreHeldExecutorSlot } from "../concurrency/concurrency.js";
 import { getActivePrincipalHoldCooldown } from "./execute-workflow-graph.js";
+import { reconcileResumeReviewBase } from "./reconcile-resume-review-base.js";
 
 export type ExecuteCoreDeps = {
-  store: Pick<TaskStore, "getTask" | "getSettings">;
+  store: Pick<TaskStore, "getTask" | "getSettings" | "getBranchGroup" | "updateTaskAtomic">;
+  rootDir: string;
   completionFinalizedTaskIds: Set<string>;
   graphRouting: Set<string>;
   releaseSemaphore: () => void;
@@ -163,6 +165,7 @@ export async function executeCore(deps: ExecuteCoreDeps, task: Task): Promise<vo
     that nothing owns the completion of — is unreachable by construction rather than by
     convention. That is what makes `graphCompletion` a required parameter below.
     */
+    task = await reconcileResumeReviewBase(deps.store, deps.rootDir, liveTask, liveSettings);
     graphRunnerOwnsClaim = true;
     await deps.executeWorkflowGraph(task, { alreadyClaimed: true });
   } finally {

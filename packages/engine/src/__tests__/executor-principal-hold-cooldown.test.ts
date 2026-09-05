@@ -43,6 +43,9 @@ function buildTask(overrides: Partial<Task> = {}): Task {
 function buildDeps() {
   const executeWorkflowGraph = vi.fn(async () => undefined);
   return {
+    // FNXC:EnginePause 2026-09-05-11:40: dispatch now requires both live authorities.
+    rootDir: ".",
+    store: { getTask: vi.fn(async () => buildTask()), getSettings: vi.fn(async () => ({})) },
     graphRouting: new Set<string>(),
     completionFinalizedTaskIds: new Set<string>(),
     releaseSemaphore: vi.fn(),

@@ -811,6 +811,7 @@ export function buildHandleStaleInReviewPlanPauseAbortReplayDeps(host: any): any
 export function buildExecuteCoreDeps(host: any): any {
   return {
     store: host.store,
+    rootDir: host.rootDir,
     completionFinalizedTaskIds: host.completionFinalizedTaskIds,
     graphRouting: host.graphRouting,
     releaseSemaphore: () => { host.options.semaphore?.release(); },
