@@ -3009,6 +3009,111 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
     await engine.stop();
   });
 
+  it("merges a resumed continuation inside its one owned slot without releasing it early", async () => {
+    // FNXC:ContinuationMergeHandoff 2026-09-05-13:26: Exercise both real admission
+    // owners; a fresh queued merge alone cannot reproduce the continuation deadlock.
+    const { admitPlanningContinuation } = await vi.importActual<typeof import("../runtimes/in-process-runtime.js")>("../runtimes/in-process-runtime.js");
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true, maxConcurrent: 1 });
+    const task = { id: "FN-resumed-merge", column: "in-review", paused: false, mergeRetries: 0,
+      status: null, steps: [], enabledWorkflowSteps: [], branch: "fusion/fn-resumed-merge" };
+    mocks.runAiMerge.mockResolvedValueOnce({ merged: true, task });
+    mockStore.store.getTask.mockResolvedValue(task);
+    mockStore.store.listTasks.mockResolvedValue([task]);
+    mocks.currentStore = mockStore.store;
+    const engine = createEngine();
+    await engine.start();
+    let finishContinuation!: () => void;
+    const finalNode = new Promise<void>((resolve) => { finishContinuation = resolve; });
+    let mergeSettled = false;
+    let dispatchSettled = false;
+    try {
+      expect(await admitPlanningContinuation({
+        store: mockStore.store as never, projectId: "/tmp/proj_test", task: task as Task,
+        item: { id: "resume-merge", taskId: task.id, kind: "task", state: "runnable" } as never,
+        dispatch: async () => {
+          expect((await engine.onMerge(task.id)).merged).toBe(true);
+          mergeSettled = true;
+          await finalNode;
+          dispatchSettled = true;
+        },
+      })).toBe(true);
+      await vi.waitFor(() => expect(mergeSettled).toBe(true));
+      expect(mocks.runAiMerge).toHaveBeenCalledWith(mockStore.store, "/tmp/proj_test", task.id, expect.any(Object));
+      expect(projectAdmissionCoordinator.inspectProjectStateForTests("/tmp/proj_test").reservedCount).toBe(1);
+      const unrelated = vi.fn(async () => true);
+      await projectAdmissionCoordinator.admitNext({ projectId: "/tmp/proj_test", maxConcurrent: 1,
+        claimed: () => 0, claimedTaskIds: () => [], refresh: async () => [{
+          projectId: "/tmp/proj_test", taskId: "FN-unrelated", lane: "execute", consumesWorktree: false, start: unrelated,
+        }],
+      });
+      expect(unrelated).not.toHaveBeenCalled();
+      finishContinuation();
+      await vi.waitFor(() => {
+        expect(dispatchSettled).toBe(true);
+        expect(projectAdmissionCoordinator.inspectProjectStateForTests("/tmp/proj_test").reservedCount).toBe(0);
+      });
+    } finally {
+      finishContinuation();
+      await engine.stop();
+      projectAdmissionCoordinator.releaseReservation(task.id);
+    }
+  });
+
+  it("retains a cancelled continuation slot until an abort-ignoring merge body settles", async () => {
+    const { admitPlanningContinuation } = await vi.importActual<typeof import("../runtimes/in-process-runtime.js")>("../runtimes/in-process-runtime.js");
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true, maxConcurrent: 1 });
+    const task = { id: "FN-resumed-cancel", column: "in-review", paused: false, mergeRetries: 0,
+      status: null, steps: [], enabledWorkflowSteps: [], branch: "fusion/fn-resumed-cancel" };
+    mockStore.store.getTask.mockResolvedValue(task);
+    mockStore.store.listTasks.mockResolvedValue([task]);
+    mocks.currentStore = mockStore.store;
+    let settleBody!: () => void;
+    const rawBody = new Promise<void>((resolve) => { settleBody = resolve; });
+    let capturedSignal: AbortSignal | undefined;
+    mocks.runAiMerge.mockImplementationOnce(async (...args: unknown[]) => {
+      capturedSignal = (args[3] as { signal: AbortSignal }).signal;
+      await rawBody; // Deliberately ignore abort: caller settlement is not body settlement.
+      return { merged: false, task };
+    });
+    const engine = createEngine();
+    await engine.start();
+    let dispatchSettled = false;
+    try {
+      expect(await admitPlanningContinuation({
+        store: mockStore.store as never, projectId: "/tmp/proj_test", task: task as Task,
+        item: { id: "resume-cancel", taskId: task.id, kind: "task", state: "runnable" } as never,
+        dispatch: async () => {
+          try { await engine.onMerge(task.id); } finally { dispatchSettled = true; }
+        },
+      })).toBe(true);
+      await vi.waitFor(() => expect(capturedSignal).toBeDefined());
+      task.paused = true;
+      const updated = mockStore.store.on.mock.calls.findLast(([event]) => event === "task:updated")?.[1];
+      expect(updated).toBeTypeOf("function");
+      await updated!(task);
+      await vi.waitFor(() => {
+        expect(capturedSignal?.aborted).toBe(true);
+        expect(dispatchSettled).toBe(true);
+      });
+      // Flush outer finally before inspecting the still-borrowed slot.
+      await Promise.resolve();
+      expect(projectAdmissionCoordinator.inspectProjectStateForTests("/tmp/proj_test").reservedCount).toBe(1);
+      const unrelated = vi.fn(async () => true);
+      await projectAdmissionCoordinator.admitNext({ projectId: "/tmp/proj_test", maxConcurrent: 1,
+        claimed: () => 0, claimedTaskIds: () => [], refresh: async () => [{
+          projectId: "/tmp/proj_test", taskId: "FN-after-cancel", lane: "execute", consumesWorktree: false, start: unrelated,
+        }],
+      });
+      expect(unrelated).not.toHaveBeenCalled();
+      settleBody();
+      await vi.waitFor(() => expect(projectAdmissionCoordinator.inspectProjectStateForTests("/tmp/proj_test").reservedCount).toBe(0));
+    } finally {
+      settleBody();
+      await engine.stop();
+      projectAdmissionCoordinator.releaseReservation(task.id);
+    }
+  });
+
   it("does not admit a merge over the maxConcurrent agent ceiling", async () => {
     const mockStore = createMockStore({ ...baseSettings, autoMerge: true, maxConcurrent: 1, maxWorktrees: 1 });
     mockStore.store.getTask.mockResolvedValue({

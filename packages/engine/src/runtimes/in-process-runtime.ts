@@ -625,6 +625,9 @@ export async function admitPlanningContinuation(input: {
       lane: "execute",
       consumesWorktree: false,
       createdAt: input.item.createdAt ?? input.task.createdAt,
+      // FNXC:ContinuationMergeHandoff 2026-09-05-13:26: The resumed graph may
+      // await its own merge; that nested handoff borrows this same owned slot.
+      continuationOwner: true,
       start: async () => {
         // The preflight above is only a fast path. This serialized check is the
         // ownership authority when concurrent drains race the same durable row.
@@ -656,7 +659,7 @@ export async function admitPlanningContinuation(input: {
       },
     }],
   });
-  if (selected || duplicateHandled) {
+  if (selected || duplicateHandled || planningContinuationRuns.has(runKey)) {
     planningContinuationCapacityReasons.delete(runKey);
     return true;
   }
