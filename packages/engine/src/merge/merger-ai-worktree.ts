@@ -6,7 +6,7 @@ FNXC:MergerAiSplit 2026-06-25-00:00:
 Keep importing MIN_TEMP_WORKTREE_REAP_AGE_MS from self-healing.js here. Do not reverse the dependency: self-healing owns the stale-temp age policy and merger-ai-worktree only consumes it for pre-merge pruning, preserving the established self-healing import-cycle constraint.
 */
 import { execFile } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative } from "node:path";
@@ -174,7 +174,8 @@ export async function pruneExistingAiMergeWorktrees(
       cleanupAttempted = true;
       const removal = await removeDirectoryWithRetry({
         path: canonicalPath,
-        rm: (path, options) => rmSync(path, options),
+        // FNXC:MergeResponsiveness 2026-09-06-04:25: Removing dependency-heavy stale clean rooms must yield so health and operator pause remain responsive; retain the same guarded paths, retries, and awaited completion.
+        rm,
         log: (message) => void log(`AI merge pre-merge prune: ${message}`),
       });
       if (removal.removed) {

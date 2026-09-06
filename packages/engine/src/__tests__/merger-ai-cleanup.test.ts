@@ -18,6 +18,9 @@ const fsState = vi.hoisted(() => ({
   rmFailureCode: "EBUSY",
   rmPretendAbsentPath: "",
   rmCalls: [] as string[],
+  asyncRemovalPath: "",
+  asyncRemovalEntered: undefined as (() => void) | undefined,
+  asyncRemovalRelease: undefined as Promise<void> | undefined,
 }));
 
 const childState = vi.hoisted(() => ({
@@ -66,6 +69,29 @@ vi.mock("node:fs", async () => {
   };
 });
 
+vi.mock("node:fs/promises", async () => {
+  const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+  return {
+    ...actual,
+    rm: vi.fn(async (path: Parameters<typeof actual.rm>[0], options?: Parameters<typeof actual.rm>[1]) => {
+      const pathString = String(path);
+      fsState.rmCalls.push(pathString);
+      if (pathString === fsState.asyncRemovalPath) {
+        fsState.asyncRemovalEntered?.();
+        await fsState.asyncRemovalRelease;
+      }
+      if (pathString === fsState.rmPretendAbsentPath) {
+        throw Object.assign(new Error("simulated missing worktree"), { code: "ENOENT" });
+      }
+      if (pathString === fsState.rmFailurePath && fsState.rmFailuresRemaining > 0) {
+        fsState.rmFailuresRemaining--;
+        throw Object.assign(new Error(`simulated filesystem cleanup ${fsState.rmFailureCode}`), { code: fsState.rmFailureCode });
+      }
+      return actual.rm(path, options);
+    }),
+  };
+});
+
 const tracked = new Set<string>();
 const RM = { recursive: true, force: true, maxRetries: 5, retryDelay: 50 } as const;
 
@@ -77,6 +103,9 @@ afterEach(() => {
   fsState.rmFailureCode = "EBUSY";
   fsState.rmPretendAbsentPath = "";
   fsState.rmCalls = [];
+  fsState.asyncRemovalPath = "";
+  fsState.asyncRemovalEntered = undefined;
+  fsState.asyncRemovalRelease = undefined;
   childState.worktreeRemoveError = undefined;
   childState.execFileCalls = [];
   /*
@@ -135,7 +164,7 @@ function initRepoWithBranch(taskId = "FN-1"): { dir: string } {
   git(dir, `checkout -q -b ${branch}`);
   writeFileSync(join(dir, "feature.txt"), "feature work\n");
   git(dir, "add -A");
-  git(dir, "commit -q -m 'feat: work'");
+  git(dir, 'commit -q -m "feat: work"');
   git(dir, "checkout -q main");
   return { dir };
 }
@@ -469,6 +498,32 @@ describe("AI merge temp worktree cleanup", () => {
     expect(events).toEqual(expect.arrayContaining([
       expect.objectContaining({ metadata: expect.objectContaining({ phase: "pre-merge-prune", success: true }) }),
     ]));
+  });
+
+  it("keeps the event loop available while pre-merge filesystem removal is pending", async () => {
+    const projectRoot = tempProjectRoot();
+    const stale = tempAiMergeDir("fusion-ai-merge-fn-9169-responsive");
+    makeAge(stale, MIN_TEMP_WORKTREE_REAP_AGE_MS + 1_000);
+    fsState.asyncRemovalPath = realpathSync(stale);
+    const entered = new Promise<void>((resolve) => { fsState.asyncRemovalEntered = resolve; });
+    let release!: () => void;
+    fsState.asyncRemovalRelease = new Promise<void>((resolve) => { release = resolve; });
+    const { audit } = makeAudit();
+    let finished = false;
+    const pruning = pruneExistingAiMergeWorktrees("FN-9169", projectRoot, audit, vi.fn(async () => undefined))
+      .then((result) => { finished = true; return result; });
+    try {
+      expect(await Promise.race([entered.then(() => "pending"), pruning.then(() => "finished")])).toBe("pending");
+      // A health/pause callback must get an event-loop turn before removal ends.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(finished).toBe(false);
+      expect(existsSync(stale)).toBe(true);
+    } finally {
+      release();
+      await pruning;
+    }
+    expect(await pruning).toBe(1);
+    expect(existsSync(stale)).toBe(false);
   });
 
   it("treats a pre-merge registered-but-missing clean room as idempotent without retrying", async () => {
