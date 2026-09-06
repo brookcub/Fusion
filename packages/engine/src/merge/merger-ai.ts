@@ -84,6 +84,7 @@ import { recordWorkspaceBaseBranchDecision, resolveWorkspaceRepoBaseBranch } fro
 import { captureWorkspaceReviewEvidence } from "../worktree/workspace-review-evidence.js";
 import { advanceIntegrationBranchRef } from "./merger-ref-update-advance.js";
 import { enforceAiMergeSquashGates } from "./merger-ai-squash-gates.js";
+import { verifyAiMergeCandidate } from "./merger-ai-verification.js";
 import {
   assertMergeGenerationOwned,
   createMergeWriteFence,
@@ -358,6 +359,7 @@ async function recoverApprovedPreexistingAiMergeWorktree(
   if (!selected.alreadyLanded) {
     if (!task) throw new Error(`AI merge task ${taskId} disappeared before recovery squash gates`);
     await enforceAiMergeSquashGates({ store, task, taskId, mergeRoot: selected.mergeRoot, branch, tipSha: selected.tipSha, squashSha: selected.squashSha, audit, log, repoRel: ctx.repoRel, repoKeys: ctx.repoKeys });
+    const assertVerified = await verifyAiMergeCandidate({ store, taskId, mergeRoot: selected.mergeRoot, branch, tipSha: selected.tipSha, squashSha: selected.squashSha, signal, log });
     const land = await landSquash({
       projectRootDir: repoRootDir,
       mergeRoot: selected.mergeRoot,
@@ -369,7 +371,10 @@ async function recoverApprovedPreexistingAiMergeWorktree(
       resolveConflicts: stashResolveAgent,
       allowDirtyLocalCheckoutSync,
       signal,
-      assertMergeGateStillOpen: () => assertMergeGateStillOpen(ctx, repoRootDir, ctx.repoRel),
+      assertMergeGateStillOpen: async () => {
+        await assertMergeGateStillOpen(ctx, repoRootDir, ctx.repoRel);
+        await assertVerified();
+      },
     });
     if (land.outcome !== "advanced") return null;
     await store.updateTask(taskId, { aiMergeReviewReconciliation: null });
@@ -1284,6 +1289,7 @@ export async function landOneRepo(
       const freshTask = await store.getTask(taskId);
       if (!freshTask) throw new Error(`AI merge task ${taskId} disappeared before squash gates`);
       await enforceAiMergeSquashGates({ store, task: freshTask, taskId, mergeRoot, branch, tipSha, squashSha, audit, log, repoRel: ctx.repoRel, repoKeys: ctx.repoKeys });
+      const assertVerified = await verifyAiMergeCandidate({ store, taskId, mergeRoot, branch, tipSha, squashSha, signal, log });
 
       // FNXC:Workspace 2026-08-15-08:36: Persist the recovery intent before the shared ref can
       // move. A later reconciler can then settle an interrupted remote advance without re-squashing.
@@ -1318,7 +1324,10 @@ export async function landOneRepo(
         signal,
         workspaceFence,
         workspaceDispatchFence: ctx.workspaceDispatchFence,
-        assertMergeGateStillOpen: () => assertMergeGateStillOpen(ctx, repoRootDir, ctx.repoRel),
+        assertMergeGateStillOpen: async () => {
+          await assertMergeGateStillOpen(ctx, repoRootDir, ctx.repoRel);
+          await assertVerified();
+        },
         onWorkspaceRepublish: async (observedTargetSha) => {
           await log(`AI merge (workspace): re-observed remote ${workspaceFence?.remote ?? "target"} at ${short(observedTargetSha ?? "absent")} before publishing ${integrationBranch}`);
         },

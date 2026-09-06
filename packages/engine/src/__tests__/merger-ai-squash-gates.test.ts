@@ -8,12 +8,18 @@ import { resolveRepoDeclaredScopeTransform } from "../merge/merger-ai-squash-gat
 
 const policy = vi.hoisted(() => vi.fn());
 vi.mock("../merge/merge-trait.js", () => ({ resolveMergePolicy: policy }));
+const verification = vi.hoisted(() => vi.fn());
+vi.mock("../execution/verification-utils.js", async (original) => ({
+  ...await original<typeof import("../execution/verification-utils.js")>(),
+  runVerificationCommand: verification,
+}));
 
 import { resolveAiMergeRoot, runAiMerge } from "../merge/merger-ai.js";
 
 const dirs: string[] = [];
 afterEach(() => {
   policy.mockReset();
+  verification.mockReset();
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -22,7 +28,7 @@ function git(cwd: string, args: string): string {
 }
 
 function createRepo(change: (dir: string) => void): string {
-  const dir = mkdtempSync(join(tmpdir(), "fusion-ai-squash-gates-"));
+  const dir = mkdtempSync(join(tmpdir(), "fusion ai squash gates "));
   dirs.push(dir);
   git(dir, "init -q -b main");
   git(dir, "config user.email test@example.com");
@@ -99,6 +105,102 @@ describe("resolveRepoDeclaredScopeTransform", () => {
 });
 
 describe("runAiMerge approved-squash gates", () => {
+  /* FNXC:AIMergeVerification 2026-09-06-02:38: configured checks must execute at the real production pre-land seam, not merely appear in a helper test or model prompt. */
+  it("runs explicit test and build exactly once on the approved squash before landing", async () => {
+    setPolicy();
+    const dir = createRepo((root) => writeFileSync(join(root, "feature.txt"), "feature\n"));
+    const before = git(dir, "rev-parse main");
+    const { store } = makeStore(["feature.txt"]);
+    store.getSettings.mockResolvedValue({ testCommand: "node exact-test.js", buildCommand: "node exact-build.js", verificationCommandTimeoutMs: 1234 });
+    verification.mockImplementation(async (_store, cwd, _id, command) => {
+      expect(git(dir, "rev-parse main")).toBe(before);
+      expect(git(cwd, "rev-parse HEAD")).not.toBe(before);
+      return { command, exitCode: 0, success: true, stdout: "", stderr: "" };
+    });
+    const result = await runAiMerge(store, dir, "FN-9050", { manual: true }, {
+      mergeAgent: squashAgent("fusion/fn-9050"), reviewAgent: approve,
+    });
+    expect(result.merged).toBe(true);
+    expect(verification.mock.calls.map((call) => [call[3], call[4], call[9]])).toEqual([
+      ["node exact-test.js", "test", 1234], ["node exact-build.js", "build", 1234],
+    ]);
+  });
+
+  it.each(["exit", "timeout", "abort", "dirty", "head", "paused", "settings", "episode"])("refuses landing after configured verification %s", async (failure) => {
+    setPolicy();
+    const dir = createRepo((root) => writeFileSync(join(root, "feature.txt"), "feature\n"));
+    const before = git(dir, "rev-parse main");
+    const { store, task } = makeStore(["feature.txt"]);
+    store.getSettings.mockResolvedValue({ testCommand: "node exact-test.js" });
+    verification.mockImplementation(async (_store, cwd, _id, command) => {
+      if (failure === "dirty") writeFileSync(join(cwd, "feature.txt"), "mutated\n");
+      if (failure === "head") git(cwd, "-c user.name=Test -c user.email=test@example.com commit --allow-empty -m changed");
+      if (failure === "paused") task.paused = true;
+      if (failure === "settings") store.getSettings.mockResolvedValue({ testCommand: "node different-check.js" });
+      if (failure === "episode") task.aiMergeReviewReconciliation = null;
+      return { command, exitCode: failure === "exit" ? 1 : 0, success: failure !== "exit",
+        timedOut: failure === "timeout", aborted: failure === "abort", stdout: "", stderr: "" };
+    });
+    await expect(runAiMerge(store, dir, "FN-9050", { manual: true }, {
+      mergeAgent: squashAgent("fusion/fn-9050"), reviewAgent: approve,
+    })).rejects.toThrow();
+    expect(git(dir, "rev-parse main")).toBe(before);
+    expect(task.column).not.toBe("done");
+    expect(verification).toHaveBeenCalledOnce();
+  });
+
+  it("a passing test never masks a failing required build", async () => {
+    setPolicy();
+    const dir = createRepo((root) => writeFileSync(join(root, "feature.txt"), "feature\n"));
+    const before = git(dir, "rev-parse main");
+    const { store, task } = makeStore(["feature.txt"]);
+    store.getSettings.mockResolvedValue({ testCommand: "node focused-test.js", buildCommand: "node focused-build.js" });
+    verification.mockResolvedValueOnce({ exitCode: 0, success: true }).mockResolvedValueOnce({ exitCode: 1, success: false });
+    await expect(runAiMerge(store, dir, "FN-9050", { manual: true }, {
+      mergeAgent: squashAgent("fusion/fn-9050"), reviewAgent: approve,
+    })).rejects.toThrow("verification failed: build");
+    expect(verification).toHaveBeenCalledTimes(2);
+    expect(git(dir, "rev-parse main")).toBe(before);
+    expect(task.column).not.toBe("done");
+  });
+
+  it.each([0, 1])("verifies a recovered approved clean-room candidate (exit %s)", async (exitCode) => {
+    setPolicy();
+    const dir = createRepo((root) => writeFileSync(join(root, "feature.txt"), "feature\n"));
+    const before = git(dir, "rev-parse main");
+    const parent = resolveAiMergeRoot(dir);
+    mkdirSync(parent, { recursive: true });
+    const cleanRoom = mkdtempSync(join(parent, "fusion-ai-merge-fn-9050-"));
+    git(dir, `worktree add --detach "${cleanRoom}" ${before}`);
+    git(cleanRoom, "merge --squash fusion/fn-9050");
+    git(cleanRoom, 'add -A && git commit -q -m squash -m "Fusion-Task-Id: FN-9050"');
+    const squashSha = git(cleanRoom, "rev-parse HEAD");
+    const { store, task } = makeStore(["feature.txt"]);
+    task.aiMergeReviewReconciliation = {
+      sourceSha: git(dir, "rev-parse fusion/fn-9050"), integrationTipSha: before,
+      candidateSha: squashSha, candidateTreeSha: git(cleanRoom, 'rev-parse "HEAD^{tree}"'),
+      findings: [], consecutiveCleanApprovals: 2, correctivePasses: 0,
+    };
+    store.getSettings.mockResolvedValue({ testCommand: "node exact-test.js" });
+    verification.mockImplementation(async (_store, cwd) => {
+      expect(cwd).toBe(cleanRoom);
+      expect(git(dir, "rev-parse main")).toBe(before);
+      return { exitCode, success: exitCode === 0 };
+    });
+    const mergeAgent = vi.fn(async () => { throw new Error("must recover without re-merging"); });
+    const result = runAiMerge(store, dir, "FN-9050", { manual: true }, { mergeAgent, reviewAgent: approve });
+    if (exitCode) {
+      await expect(result).rejects.toThrow("verification failed");
+      expect(git(dir, "rev-parse main")).toBe(before);
+      expect(task.column).not.toBe("done");
+    } else {
+      expect((await result).merged).toBe(true);
+      expect(git(dir, "rev-parse main")).toBe(squashSha);
+    }
+    expect(verification).toHaveBeenCalledOnce();
+    expect(mergeAgent).not.toHaveBeenCalled();
+  });
+
   it("blocks a strict out-of-scope squash before main advances and records the violation", async () => {
     setPolicy();
     const dir = createRepo((root) => writeFileSync(join(root, "outside.txt"), "outside\n"));
@@ -138,9 +240,9 @@ describe("runAiMerge approved-squash gates", () => {
     const cleanRoomParent = resolveAiMergeRoot(dir);
     mkdirSync(cleanRoomParent, { recursive: true });
     const cleanRoom = mkdtempSync(join(cleanRoomParent, "fusion-ai-merge-fn-9050-"));
-    git(dir, `worktree add --detach ${cleanRoom} ${before}`);
+    git(dir, `worktree add --detach "${cleanRoom}" ${before}`);
     git(cleanRoom, "merge --squash fusion/fn-9050");
-    git(cleanRoom, "add -A && git commit -q -m squash -m 'Fusion-Task-Id: FN-9050'");
+    git(cleanRoom, 'add -A && git commit -q -m squash -m "Fusion-Task-Id: FN-9050"');
     const squashSha = git(cleanRoom, "rev-parse HEAD");
     const { store, task } = makeStore(["allowed/**"]);
     /*
@@ -155,7 +257,7 @@ describe("runAiMerge approved-squash gates", () => {
       sourceSha: git(dir, "rev-parse --verify fusion/fn-9050"),
       integrationTipSha: before,
       candidateSha: squashSha,
-      candidateTreeSha: git(cleanRoom, "rev-parse HEAD^{tree}"),
+      candidateTreeSha: git(cleanRoom, 'rev-parse "HEAD^{tree}"'),
       findings: [],
       consecutiveCleanApprovals: 2,
       correctivePasses: 0,

@@ -210,9 +210,10 @@ describe("parseReviewVerdict", () => {
     expect(buildMergeSystemPrompt().toLowerCase()).toContain("conflict");
   });
 
-  it("merge system prompt enforces new-breakage verification + commit body summary guidance", () => {
-    expect(buildMergeSystemPrompt().toLowerCase()).toContain("type-check");
-    expect(buildMergeSystemPrompt()).toMatch(/new failure/i);
+  it("merge system prompt assigns checks to the engine and retains commit body summary guidance", () => {
+    expect(buildMergeSystemPrompt()).toMatch(/engine runs the resolved required verification/i);
+    expect(buildMergeSystemPrompt()).toMatch(/do not duplicate those checks/i);
+    expect(buildMergeSystemPrompt()).not.toMatch(/discover them from the project/i);
     expect(buildMergeSystemPrompt()).toMatch(/bullet list of key changes/i);
     expect(buildMergeSystemPrompt()).toMatch(/Files changed:/i);
     // A custom 'merger' role prompt is incorporated as the base, while the hard
@@ -223,7 +224,7 @@ describe("parseReviewVerdict", () => {
     } as any;
     const p = buildMergeSystemPrompt(cfg);
     expect(p).toContain("CUSTOM MERGER PERSONA");
-    expect(p).toContain("Verify before committing");
+    expect(p).toContain("Verification ownership");
   });
 
   it("merge prompt includes user comments when present and omits the section when absent", () => {
