@@ -12,6 +12,7 @@ import { promisify } from "node:util";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
+import { isMergerVerificationCommand } from "./merge/merger-verification-command-policy.js";
 import { basename, dirname, join, relative, isAbsolute, resolve } from "node:path";
 
 const execAsync = promisify(exec);
@@ -2089,7 +2090,7 @@ the default `unrestricted`, because it guards the agent-self-escalation
 boundary (daemon token, credential stores, approvals API), not an operator
 preference. Ordinary bash permission gating remains the action gate's job.
 */
-export function wrapToolsWithBashContainment(tools: ToolDefinition[]): ToolDefinition[] {
+export function wrapToolsWithBashContainment(tools: ToolDefinition[], sessionPurpose?: string): ToolDefinition[] {
   return tools.map((tool) => {
     if (tool.name !== "bash") {
       return tool;
@@ -2105,6 +2106,12 @@ export function wrapToolsWithBashContainment(tools: ToolDefinition[]): ToolDefin
           piLog.warn(`[bash-containment] denied rule=${verdict.rule ?? "unknown"}`);
           return boundaryRejection(buildBashContainmentDenialMessage(verdict), {
             containmentRule: verdict.rule,
+          });
+        }
+        // FNXC:AIMergeVerification 2026-09-06-02:38: observe the post-RTK command; deterministic verification does not use agent tools and is unaffected.
+        if (sessionPurpose === "merger" && isMergerVerificationCommand(command)) {
+          return boundaryRejection("The engine owns merge verification and will run the resolved required checks after your reviewed squash. Do not launch duplicate checks; reconcile and commit the task's changes.", {
+            containmentRule: "engine-owned-merge-verification",
           });
         }
         return originalExecute(...args);
@@ -3000,7 +3007,7 @@ export async function createPiAgentSessionRaw(options: AgentOptions): Promise<Ag
     ];
     // FNXC:BashContainment 2026-07-26-13:20: innermost wrapper — sees the final
     // (post-rtk-rewrite) command; applies to every engine session unconditionally.
-    const toolsWithContainment = wrapToolsWithBashContainment(toolChainStart);
+    const toolsWithContainment = wrapToolsWithBashContainment(toolChainStart, options.sessionPurpose);
     const toolsWithRtkRewrite = wrapToolsWithRtkRewrite(toolsWithContainment);
     /*
      * FNXC:AgentGating 2026-07-12-17:22:
