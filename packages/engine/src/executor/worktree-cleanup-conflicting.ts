@@ -7,10 +7,12 @@ import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { rm } from "node:fs/promises";
-import { isFusionDeletableBranch, type Settings, type Task } from "@fusion/core";
+import { columnsWithFlag, isFusionDeletableBranch, resolveWorkflowIrForTask, type Settings, type Task, type TaskStore } from "@fusion/core";
 import {
   isInsideWorktreesDir,
   isRegisteredGitWorktree,
+  canonicalizePath,
+  hasUsableWorktreeShape,
   RemovalReason,
 } from "../worktree/worktree-pool.js";
 import { executorLog } from "../logger.js";
@@ -41,6 +43,23 @@ export async function cleanupConflictingWorktree(
   branch: string,
   taskId: string,
 ): Promise<boolean> {
+  // FNXC:LegacyWorktreePreservation 2026-09-06-01:22: Session gaps are not
+  // abandonment. An unfinished task still owns its assigned registered checkout;
+  // conflict recovery must not dispose it to satisfy a new naming convention.
+  const assigned = await deps.store.getTask?.(taskId);
+  if (assigned?.worktree && assigned.branch === branch
+    && canonicalizePath(assigned.worktree) === canonicalizePath(worktreePath)) {
+    let completed = false;
+    try {
+      const ir = await resolveWorkflowIrForTask(deps.store as TaskStore, taskId);
+      completed = Boolean(ir && columnsWithFlag(ir, "complete").includes(assigned.column));
+    } catch { /* unknown lifecycle is not permission to dispose the checkout */ }
+    if (!completed && (hasUsableWorktreeShape(worktreePath, deps.rootDir)
+      || await isRegisteredGitWorktree(deps.rootDir, worktreePath).catch(() => true))) {
+      await deps.store.logEntry(taskId, "Refused conflicting cleanup of the unfinished task's assigned checkout");
+      return false;
+    }
+  }
   await deps.reconcileSelfOwnedBeforeRemove(worktreePath, taskId);
 
   // FN-4811: Hard liveness gate — refuse to remove a worktree that is currently bound to

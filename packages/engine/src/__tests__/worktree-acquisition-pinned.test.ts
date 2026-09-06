@@ -275,7 +275,7 @@ describe("acquireTaskWorktree — task-pinned mode", () => {
     });
 
     expect(removeWorktree).not.toHaveBeenCalled();
-    expect(rename).toHaveBeenCalledWith(PINNED, expect.stringContaining("/.fusion/recovery/worktrees/fn-7996-"));
+    expect(rename).toHaveBeenCalledWith(PINNED, expect.stringContaining(join(".fusion", "recovery", "worktrees", "fn-7996-")));
     expect(createWorktree).toHaveBeenCalledWith("fusion/fn-7996", PINNED, "FN-7996", "main", false);
     expect(result.worktreePath).toBe(PINNED);
   });
@@ -300,8 +300,19 @@ describe("acquireTaskWorktree — task-pinned mode", () => {
       type: "worktree:pin-rederived",
       metadata: expect.objectContaining({ taskId: "FN-7996", derived: PINNED }),
     }));
-    expect(store.updateTask).toHaveBeenCalledWith("FN-7996", { worktree: PINNED });
+    expect(store.updateTask).toHaveBeenCalledWith("FN-7996", { worktree: PINNED, branch: "fusion/fn-7996", branchWriteOrigin: "engine" });
     expect(result.worktreePath).toBe(PINNED);
     expect(result.source).toBe("fresh");
+  });
+
+  it("failed replacement creation never publishes the uncreated path", async () => {
+    const store = makeStore();
+    const previous = join(ROOT, ".worktrees", "missing-old-path");
+    const createWorktree = vi.fn(async () => { throw new Error("fixture creation refused"); });
+    await expect(acquireTaskWorktree({
+      task: { ...baseTask, worktree: previous, branch: "fusion/fn-7996" },
+      rootDir: ROOT, store, settings: pinnedSettings, createWorktree,
+    })).rejects.toThrow("fixture creation refused");
+    expect(store.updateTask).not.toHaveBeenCalled();
   });
 });
