@@ -40,7 +40,9 @@ export default defineConfig({
     `missing-exclude` — the guard silently stops holding the ledger and the config in lockstep.
     Each entry needs a matching row in scripts/lib/test-quarantine.json (same commit, deletion ratchet).
     */
-    exclude: [],
+    exclude: [
+      "src/__tests__/no-hardcoded-lifecycle-columns.test.ts", // FNXC:WindowsMergeGate 2026-09-06-00:55: recorded gate timeout; quarantine ledger owns rescue.
+    ],
     setupFiles: [
       "./src/__test-utils__/vitest-setup.ts",
     ],

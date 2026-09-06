@@ -30,6 +30,7 @@ const EXPECTED_GATE_CHECKS = [
   check("pi-versions-pinned"),
   check("workspace-package-graph"),
   check("no-test-timeout-appeasement"),
+  check("no-comment-assertions-in-tests"),
   check("changeset-format"),
   check("mock-completeness"),
   check("inert-sync-lane-conversions"),
