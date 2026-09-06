@@ -18,3 +18,16 @@ held at an asynchronous boundary and proves an event-loop callback runs while
 the guarded directory still exists. It failed against the synchronous path.
 Existing cleanup tests retain active/new/other-task exclusions, idempotency,
 bounded retry, and residual registration checks on the asynchronous runner.
+
+The periodic self-healing sweep must obey the same invariant for both AI-merge
+and verification checkouts. It also uses the asynchronous runner now, retaining
+its distinct age/liveness/audit policy. Two held-removal regressions cover those
+prefixes. An HTTP timeout alone is not proof of event-loop starvation: no matching
+maintenance-sweep marker was found in the later pilot failure. Keep that failure
+distinct from the independently reproduced synchronous-cleanup defect.
+
+Merge failures now emit content-free stage/category/source-coordinate evidence
+before awaited cleanup begins. This preserves the original failure boundary when
+cleanup is slow; it does not skip cleanup, replace the original exception, or
+print error prose. The held-cleanup test exercises the real merge owner and
+requires the diagnostic before cleanup resolves. See `merge-failure-evidence.ts`.

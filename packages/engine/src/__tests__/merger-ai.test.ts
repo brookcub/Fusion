@@ -79,13 +79,13 @@ function initRepoWithBranch(opts: { branch: string; conflict?: boolean; gitignor
   writeFileSync(join(dir, "feature.txt"), "feature work\n");
   if (opts.conflict) writeFileSync(join(dir, "base.txt"), "base\nbranch-change\n");
   git(dir, "add -A");
-  git(dir, "commit -q -m 'feat: work'");
+  git(dir, 'commit -q -m "feat: work"');
 
   git(dir, "checkout -q main");
   if (opts.conflict) {
     writeFileSync(join(dir, "base.txt"), "base\nmain-change\n");
     git(dir, "add -A");
-    git(dir, "commit -q -m 'main: divergent'");
+    git(dir, 'commit -q -m "main: divergent"');
   }
   return { dir };
 }
@@ -716,6 +716,73 @@ describe("runAiMerge", () => {
 
     const msg = git(dir, "log -1 --pretty=%B main");
     expect((msg.match(/Co-authored-by:\s*Fusion <noreply@runfusion\.ai>/g) ?? []).length).toBe(1);
+  });
+
+  it.each([
+    {
+      name: "task pair, credential and thinking override project defaults",
+      task: { validatorModelProvider: "task-provider", validatorModelId: "task-small", validatorCredentialInstanceId: "task-credential", validatorThinkingLevel: "low" },
+      settings: { validatorProvider: "project-provider", validatorModelId: "project-large", validatorCredentialInstanceId: "project-credential", validatorThinkingLevel: "high" },
+      expected: { defaultProvider: "task-provider", defaultModelId: "task-small", credentialInstanceId: "task-credential", defaultThinkingLevel: "low" },
+    },
+    {
+      name: "partial task pair retains project selection",
+      task: { validatorModelProvider: "incomplete-provider" },
+      settings: { validatorProvider: "project-provider", validatorModelId: "project-model", validatorCredentialInstanceId: "project-credential", validatorThinkingLevel: "high" },
+      expected: { defaultProvider: "project-provider", defaultModelId: "project-model", credentialInstanceId: "project-credential", defaultThinkingLevel: "high" },
+    },
+    {
+      name: "test mode overrides a complete real task pair",
+      task: { validatorModelProvider: "task-provider", validatorModelId: "task-small", validatorCredentialInstanceId: "task-credential" },
+      settings: { testMode: true },
+      expected: { defaultProvider: "mock", defaultModelId: "scripted" },
+    },
+  ])("merge reviewer model selection: $name", async ({ task, settings, expected }) => {
+    const { dir } = initRepoWithBranch();
+    const { store } = makeStore(dir, task, settings);
+    createResolvedAgentSessionMock.mockReset();
+    createResolvedAgentSessionMock.mockImplementation(async (opts: any) => ({ session: {
+      prompt: async () => { opts.onText?.("REVIEW_VERDICT: approve"); },
+      dispose: vi.fn(),
+      getSessionStats: vi.fn(() => ({ tokens: { input: 1, output: 1 } })),
+    } }));
+    try {
+      await runAiMerge(store, dir, "FN-1", { manual: true }, { mergeAgent: realMergeAgent("fusion/fn-1") });
+      expect(createResolvedAgentSessionMock).toHaveBeenCalledTimes(2);
+      for (const [options] of createResolvedAgentSessionMock.mock.calls) {
+        expect(options).toMatchObject(expected);
+        if (settings.testMode) expect(options.credentialInstanceId).toBeUndefined();
+      }
+    } finally {
+      createResolvedAgentSessionMock.mockReset();
+    }
+  });
+
+  it.each(["unreadable", "missing"])("merge reviewer model selection refuses %s task authority", async (failure) => {
+    const { dir } = initRepoWithBranch();
+    const { store, task } = makeStore(dir, { validatorModelProvider: "task-provider", validatorModelId: "task-model" }, { validatorProvider: "project-provider", validatorModelId: "project-model" });
+    let reviewReads = 0;
+    store.getTask.mockImplementation(async () => {
+      // The first reviewing read supplies prompt context; the next is the real
+      // reviewer factory's fresh model-authority read. Fault only that boundary.
+      if (task.status === "reviewing" && ++reviewReads === 2) {
+        if (failure === "unreadable") throw new Error("fixture task authority unavailable");
+        return undefined;
+      }
+      return task;
+    });
+    createResolvedAgentSessionMock.mockReset();
+    createResolvedAgentSessionMock.mockImplementation(async (opts: any) => ({ session: {
+      prompt: async () => { opts.onText?.("REVIEW_VERDICT: approve"); },
+      dispose: vi.fn(),
+      getSessionStats: vi.fn(() => ({ tokens: { input: 1, output: 1 } })),
+    } }));
+    try {
+      await expect(runAiMerge(store, dir, "FN-1", { manual: true }, { mergeAgent: realMergeAgent("fusion/fn-1") })).rejects.toThrow();
+      expect(createResolvedAgentSessionMock).not.toHaveBeenCalled();
+    } finally {
+      createResolvedAgentSessionMock.mockReset();
+    }
   });
 
   it("persists AI merge agent text/thinking/tool output to agent logs", async () => {
