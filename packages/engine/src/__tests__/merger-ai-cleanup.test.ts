@@ -624,6 +624,36 @@ describe("AI merge temp worktree cleanup", () => {
     ]));
   });
 
+  it("reports the original merge failure before asynchronous cleanup settles", async () => {
+    const { dir } = initRepoWithBranch();
+    const { store } = makeStore();
+    const original = Object.assign(new TypeError("private diagnostic fixture text"), { code: "ENOENT" });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const entered = new Promise<void>((resolve) => { fsState.asyncRemovalEntered = resolve; });
+    let release!: () => void;
+    fsState.asyncRemovalRelease = new Promise<void>((resolve) => { release = resolve; });
+    const merging = runAiMerge(store, dir, "FN-1", { manual: true }, {
+      mergeAgent: async (cwd) => {
+        fsState.asyncRemovalPath = realpathSync(cwd);
+        await realMergeAgent()(cwd);
+      },
+      reviewAgent: async () => { throw original; },
+    }).then(() => undefined, (error: unknown) => error);
+    try {
+      expect(await Promise.race([entered.then(() => "pending"), merging.then(() => "finished")])).toBe("pending");
+      const diagnostic = consoleError.mock.calls.map(([message]) => String(message)).find((message) => message.includes("AI merge failure before cleanup: "));
+      expect(diagnostic).toContain('"stage":"merge-review"');
+      expect(diagnostic).toContain('"kind":"TypeError"');
+      expect(diagnostic).toContain('"code":"ENOENT"');
+      expect(diagnostic).not.toContain("private diagnostic fixture text");
+    } finally {
+      release();
+      await merging;
+      consoleError.mockRestore();
+    }
+    expect(await merging).toBe(original);
+  });
+
   it("runAiMerge calls pre-merge prune before creating worktree", async () => {
     const taskId = "FN-777";
     const { dir } = initRepoWithBranch(taskId);

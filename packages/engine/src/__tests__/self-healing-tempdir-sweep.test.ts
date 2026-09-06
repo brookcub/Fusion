@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { execFileSync, execSync } from "node:child_process";
 
 const osState = vi.hoisted(() => ({ tempRoot: "" }));
@@ -11,6 +11,9 @@ const fsState = vi.hoisted(() => ({
   rmFailuresRemaining: 0,
   rmFailureCode: "EACCES",
   rmPretendAbsentPath: "",
+  asyncRemovalPath: "",
+  asyncRemovalEntered: undefined as (() => void) | undefined,
+  asyncRemovalRelease: undefined as Promise<void> | undefined,
 }));
 const childState = vi.hoisted(() => ({ execCalls: [] as string[], execStdout: "", gitRemoveError: null as Error | null }));
 
@@ -36,6 +39,29 @@ vi.mock("node:fs", async () => {
         throw err;
       }
       return actual.rmSync(path, options);
+    }),
+  };
+});
+
+vi.mock("node:fs/promises", async () => {
+  const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+  return {
+    ...actual,
+    rm: vi.fn(async (path: Parameters<typeof actual.rm>[0], options?: Parameters<typeof actual.rm>[1]) => {
+      const pathString = String(path);
+      fsState.rmCalls.push(pathString);
+      if (pathString === fsState.asyncRemovalPath) {
+        fsState.asyncRemovalEntered?.();
+        await fsState.asyncRemovalRelease;
+      }
+      if (pathString === fsState.rmPretendAbsentPath) {
+        throw Object.assign(new Error("simulated missing worktree"), { code: "ENOENT" });
+      }
+      if (fsState.failRmPath === pathString && (fsState.rmFailuresRemaining > 0 || fsState.rmFailuresRemaining === -1)) {
+        if (fsState.rmFailuresRemaining > 0) fsState.rmFailuresRemaining--;
+        throw Object.assign(new Error("simulated tempdir rm failure"), { code: fsState.rmFailureCode });
+      }
+      return actual.rm(path, options);
     }),
   };
 });
@@ -73,6 +99,9 @@ beforeEach(() => {
   fsState.rmFailuresRemaining = 0;
   fsState.rmFailureCode = "EACCES";
   fsState.rmPretendAbsentPath = "";
+  fsState.asyncRemovalPath = "";
+  fsState.asyncRemovalEntered = undefined;
+  fsState.asyncRemovalRelease = undefined;
   childState.execCalls = [];
   childState.execStdout = "";
   childState.gitRemoveError = null;
@@ -244,6 +273,29 @@ describe("SelfHealingManager worktrees-dir sweeps", () => {
 });
 
 describe("SelfHealingManager temp-dir AI merge worktree sweep", () => {
+  it.each(["fusion-ai-merge-fn-1-responsive", "fn-verify-responsive"])("keeps the event loop available while removing %s", async (name) => {
+    const stale = tempMergeDir(name);
+    makeStale(stale);
+    fsState.asyncRemovalPath = realpathSync(stale);
+    const entered = new Promise<void>((resolve) => { fsState.asyncRemovalEntered = resolve; });
+    let release!: () => void;
+    fsState.asyncRemovalRelease = new Promise<void>((resolve) => { release = resolve; });
+    const { manager } = makeManager();
+    let finished = false;
+    const sweeping = sweep(manager).then((result) => { finished = true; return result; });
+    try {
+      expect(await Promise.race([entered.then(() => "pending"), sweeping.then(() => "finished")])).toBe("pending");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(finished).toBe(false);
+      expect(existsSync(stale)).toBe(true);
+    } finally {
+      release();
+      await sweeping;
+    }
+    expect(await sweeping).toBe(1);
+    expect(existsSync(stale)).toBe(false);
+  });
+
   it("removes stale fn-verify verification checkouts from tmpdir (leak found on the live board)", async () => {
     /*
     FNXC:TempWorktreeSweep 2026-07-31-22:55:
@@ -275,7 +327,7 @@ describe("SelfHealingManager temp-dir AI merge worktree sweep", () => {
 
     expect(existsSync(stale)).toBe(false);
     expect(sweepAudits(audits)).toEqual(expect.arrayContaining([
-      expect.objectContaining({ mutationType: "worktree:tempdir-sweep", metadata: expect.objectContaining({ path: realpathSync(sandboxRoot) + "/" + stale.split("/").pop(), success: true, reason: "stale" }) }),
+      expect.objectContaining({ mutationType: "worktree:tempdir-sweep", metadata: expect.objectContaining({ path: join(realpathSync(sandboxRoot), basename(stale)), success: true, reason: "stale" }) }),
     ]));
   });
 
@@ -294,9 +346,9 @@ describe("SelfHealingManager temp-dir AI merge worktree sweep", () => {
     expect(existsSync(staleLegacy)).toBe(false);
     expect(existsSync(staleLegacyWorktrees)).toBe(false);
     expect(sweepAudits(audits)).toEqual(expect.arrayContaining([
-      expect.objectContaining({ metadata: expect.objectContaining({ path: realpathSync(resolveAiMergeRootPath(projectRoot, undefined)) + "/fusion-ai-merge-fn-1-localstale", success: true, reason: "stale" }) }),
-      expect.objectContaining({ metadata: expect.objectContaining({ path: realpathSync(resolveLegacyAiMergeRootPath(projectRoot)) + "/fusion-ai-merge-fn-1-legacystale", success: true, reason: "stale" }) }),
-      expect.objectContaining({ metadata: expect.objectContaining({ path: realpathSync(join(projectRoot, ".worktrees", ".ai-merge")) + "/fusion-ai-merge-fn-1-legacyworktrees", success: true, reason: "stale" }) }),
+      expect.objectContaining({ metadata: expect.objectContaining({ path: join(realpathSync(resolveAiMergeRootPath(projectRoot, undefined)), "fusion-ai-merge-fn-1-localstale"), success: true, reason: "stale" }) }),
+      expect.objectContaining({ metadata: expect.objectContaining({ path: join(realpathSync(resolveLegacyAiMergeRootPath(projectRoot)), "fusion-ai-merge-fn-1-legacystale"), success: true, reason: "stale" }) }),
+      expect.objectContaining({ metadata: expect.objectContaining({ path: join(realpathSync(join(projectRoot, ".worktrees", ".ai-merge")), "fusion-ai-merge-fn-1-legacyworktrees"), success: true, reason: "stale" }) }),
     ]));
   });
 
@@ -457,7 +509,7 @@ describe("SelfHealingManager temp-dir AI merge worktree sweep", () => {
 
     expect(existsSync(stale)).toBe(false);
     expect(sweepAudits(audits)).toEqual(expect.arrayContaining([
-      expect.objectContaining({ metadata: expect.objectContaining({ path: realpathSync(sandboxRoot) + "/fusion-ai-merge-fn-999-donetask", success: true, reason: "done-task-stale" }) }),
+      expect.objectContaining({ metadata: expect.objectContaining({ path: join(realpathSync(sandboxRoot), "fusion-ai-merge-fn-999-donetask"), success: true, reason: "done-task-stale" }) }),
     ]));
   });
 

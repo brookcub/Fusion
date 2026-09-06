@@ -55,7 +55,6 @@ import {
   normalizeMergeAdvanceAutoSyncMode,
   resolvePersistAgentThinkingLog,
   resolveTaskMergeTarget,
-  resolveValidatorSettingsModel,
   resolveMergerFallbackModel,
   resolveContainedBackwardTarget,
   resolveTerminalColumns,
@@ -85,13 +84,14 @@ import { captureWorkspaceReviewEvidence } from "../worktree/workspace-review-evi
 import { advanceIntegrationBranchRef } from "./merger-ref-update-advance.js";
 import { enforceAiMergeSquashGates } from "./merger-ai-squash-gates.js";
 import { verifyAiMergeCandidate } from "./merger-ai-verification.js";
+import { reportMergeFailure, type MergeFailureStage } from "./merge-failure-evidence.js";
 import {
   assertMergeGenerationOwned,
   createMergeWriteFence,
   isMergeAbortedError,
   type MergeWriteFence,
 } from "./merge-write-fence.js";
-import { createResolvedAgentSession, resolveMergerSessionModel, resolveMergerThinkingLevel, resolveMergerFallbackThinkingLevel, resolveValidatorThinkingLevel } from "../agents/agent-session-helpers.js";
+import { createResolvedAgentSession, resolveMergerSessionModel, resolveMergerThinkingLevel, resolveMergerFallbackThinkingLevel, resolveValidatorSessionModel, resolveValidatorThinkingLevel } from "../agents/agent-session-helpers.js";
 import { promptWithFallback } from "../pi.js";
 import { AgentLogger } from "../agents/agent-logger.js";
 import { attachAgentUsageTelemetry, emitAgentSessionStart } from "../agents/agent-usage-telemetry.js";
@@ -586,8 +586,10 @@ function makeReviewAgent(store: TaskStore, settings: Settings, taskId: string, o
     // The reviewer uses the project's validator/reviewer model lane (the same
     // one used elsewhere for review), falling back to the merger model only if
     // that lane resolves to nothing.
-    const task = await store.getTask(taskId).catch(() => undefined);
-    const validator = resolveValidatorSettingsModel(settings);
+    const task = await store.getTask(taskId);
+    if (!task) throw new Error("Merge reviewer task authority unavailable");
+    // FNXC:MergeReviewerModel 2026-09-06-05:12: Task-scoped reviewer model, credential and thinking choices must reach merge review just as they reach ordinary code review; project defaults are fallbacks, not overrides.
+    const validator = resolveValidatorSessionModel(task?.validatorModelProvider, task?.validatorModelId, settings, undefined, task?.validatorCredentialInstanceId);
     const model = validator.provider && validator.modelId ? validator : resolveMergerSessionModel(settings, undefined, task);
     // FNXC:Settings-MergerModel 2026-07-16-00:00: review merger retries share the dedicated merger fallback provider/model and thinking lane.
     const mergerFallbackModel = resolveMergerFallbackModel(settings);
@@ -595,7 +597,7 @@ function makeReviewAgent(store: TaskStore, settings: Settings, taskId: string, o
     // between the validator lane and the merger default lane, so its thinking level
     // must follow the same lane it actually resolved a model from.
     const reviewThinkingLevel = validator.provider && validator.modelId
-      ? resolveValidatorThinkingLevel(undefined, settings)
+      ? resolveValidatorThinkingLevel(task?.validatorThinkingLevel, settings)
       : resolveMergerThinkingLevel(settings, task?.mergerThinkingLevel);
     let captured = "";
     const logger = new AgentLogger({
@@ -1100,6 +1102,7 @@ export async function landOneRepo(
     // 1. Clean-room worktree at the integration tip.
     let mergeRoot: string | undefined;
     let worktreeAdded = false;
+    let failureStage: MergeFailureStage = "clean-room";
     const registeredMergePaths = new Set<string>();
     const registerMergeRoot = (pathToRegister: string): void => {
       if (registeredMergePaths.has(pathToRegister)) return;
@@ -1195,6 +1198,7 @@ export async function landOneRepo(
         dependencySyncDecision = "skipped-no-commits";
         await log(`AI merge: skipping dependency sync — no-commits task (no code changes expected)`);
       } else {
+      failureStage = "dependencies";
       const depsSyncStartedAt = Date.now();
       let depsSyncResult: Awaited<ReturnType<typeof installWorktreeDependencies>> | null = null;
       try {
@@ -1256,6 +1260,7 @@ export async function landOneRepo(
       }
 
       // 2 + 3. Merge + review loop (corrective passes).
+      failureStage = "merge-review";
       let reviewResult: Awaited<ReturnType<typeof mergeAndReview>>;
       try {
         reviewResult = await mergeAndReview({
@@ -1286,9 +1291,11 @@ export async function landOneRepo(
        * clean-room squash but the integration ref has not advanced, so scope and
        * shrinkage violations can still leave every integration branch untouched.
        */
+      failureStage = "squash-gates";
       const freshTask = await store.getTask(taskId);
       if (!freshTask) throw new Error(`AI merge task ${taskId} disappeared before squash gates`);
       await enforceAiMergeSquashGates({ store, task: freshTask, taskId, mergeRoot, branch, tipSha, squashSha, audit, log, repoRel: ctx.repoRel, repoKeys: ctx.repoKeys });
+      failureStage = "candidate-verification";
       const assertVerified = await verifyAiMergeCandidate({ store, taskId, mergeRoot, branch, tipSha, squashSha, signal, log });
 
       // FNXC:Workspace 2026-08-15-08:36: Persist the recovery intent before the shared ref can
@@ -1316,6 +1323,7 @@ export async function landOneRepo(
       // 4 + 5. Land the squash on the target branch and sync the user's
       //        checkout (AI reconciles a conflicting restore).
       ctx.workspaceLand?.assertLive();
+      failureStage = "landing";
       await setStatus("landing");
       const landed = await landSquash({
         projectRootDir: repoRootDir, mergeRoot, integrationBranch, tipSha, squashSha, taskId, audit,
@@ -1344,6 +1352,9 @@ export async function landOneRepo(
       await store.updateTask(taskId, { aiMergeReviewReconciliation: null });
       await log(`AI merge: advanced ${integrationBranch} → ${short(squashSha)} (local checkout: ${landed.localSync})`);
       return { outcome: "landed", squashSha, localSync: landed.localSync, tipSha, integrationBranch, dependencySyncDecision };
+    } catch (error) {
+      reportMergeFailure(error, failureStage, (message) => aiMergeLog.error(message));
+      throw error;
     } finally {
       for (const registeredPath of registeredMergePaths) {
         activeSessionRegistry.unregisterPath(registeredPath);
