@@ -145,25 +145,80 @@ const ttyState = vi.hoisted(() => ({
   isTTYAvailable: true,
 }));
 
-vi.mock("@fusion/core", async () => {
-  const actual = await vi.importActual<typeof import("@fusion/core")>("@fusion/core");
-  return {
-    ...actual,
-    getDefaultCentralDbPath: vi.fn(() => onboardEnv.centralDbPath),
-  };
-});
+const dashboardCliState = vi.hoisted(() => ({
+  shouldSupervise: false,
+  resolvedPort: 4040,
+  resolveDashboardPort: vi.fn(async () => dashboardCliState.resolvedPort),
+}));
+
+/*
+ * FNXC:CliRoutingFixture 2026-09-05-10:55:
+ * Routing exercises the real dispatcher and onboarding decision, not database
+ * initialization or every command's transitive engine graph. Keep settings in
+ * memory and fail on unexpected command dispatch rather than loading user state.
+ */
+const unexpectedHandler = vi.hoisted(() => (name: string) => vi.fn(() => {
+  throw new Error(`Unexpected command boundary in routing fixture: ${name}`);
+}));
+vi.mock("@fusion/core", () => ({
+  getDefaultCentralDbPath: vi.fn(() => onboardEnv.centralDbPath),
+  GlobalSettingsStore: class {
+    async init() {}
+    async getSettings() { return {}; }
+  },
+  isPostgresUniqueError: vi.fn(() => false),
+  ProjectPartitionRekeyError: class extends Error {},
+  FUSION_NON_RETRYABLE_EXIT_CODE: 87,
+  isLocale: unexpectedHandler("locale validation"),
+  SUPPORTED_LOCALES: [],
+}));
+vi.mock("../commands/mcp.js", () => ({
+  runMcpList: unexpectedHandler("mcp list"), runMcpAdd: unexpectedHandler("mcp add"),
+  runMcpEdit: unexpectedHandler("mcp edit"), runMcpRemove: unexpectedHandler("mcp remove"),
+  runMcpEnable: unexpectedHandler("mcp enable"), runMcpDisable: unexpectedHandler("mcp disable"),
+  runMcpImport: unexpectedHandler("mcp import"), runMcpExport: unexpectedHandler("mcp export"),
+  runMcpValidate: unexpectedHandler("mcp validate"),
+}));
+vi.mock("../commands/mcp-memory-server.js", () => ({ runMcpMemoryServer: unexpectedHandler("memory server") }));
+vi.mock("../commands/workflow.js", () => ({ runWorkflowValidate: unexpectedHandler("workflow validate") }));
+vi.mock("../commands/branch-group.js", () => ({
+  runBranchGroupList: unexpectedHandler("branch group list"), runBranchGroupShow: unexpectedHandler("branch group show"),
+  runBranchGroupPromote: unexpectedHandler("branch group promote"), runBranchGroupAbandon: unexpectedHandler("branch group abandon"),
+}));
+vi.mock("../commands/db.js", () => ({ runDbVacuum: unexpectedHandler("db vacuum"), runDbMigrate: unexpectedHandler("db migrate") }));
+vi.mock("../commands/memory-backup.js", () => ({
+  runMemoryBackupCreate: unexpectedHandler("memory backup create"), runMemoryBackupList: unexpectedHandler("memory backup list"),
+  runMemoryBackupRestore: unexpectedHandler("memory backup restore"),
+}));
+vi.mock("../commands/knowledge-graph.js", () => ({ runKnowledgeGraphBuild: unexpectedHandler("knowledge graph") }));
+vi.mock("../commands/agent-export.js", () => ({ runAgentExport: unexpectedHandler("agent export") }));
+vi.mock("../commands/chat.js", () => ({ runChatInteractive: unexpectedHandler("chat"), parseChatCliArgs: unexpectedHandler("chat args") }));
+vi.mock("../commands/plugin-publish.js", () => ({ runPluginPublish: unexpectedHandler("plugin publish") }));
+vi.mock("../commands/skills.js", () => ({
+  runSkillsSearch: unexpectedHandler("skills search"), runSkillsInstall: unexpectedHandler("skills install"), runSkillsGet: unexpectedHandler("skills get"),
+}));
+vi.mock("../commands/computer.js", () => ({ runComputer: unexpectedHandler("computer") }));
+vi.mock("../commands/experiment-finalize.js", () => ({ runExperimentFinalize: unexpectedHandler("experiment finalize") }));
+vi.mock("../commands/update.js", () => ({ dispatchUpdateCliArgs: unexpectedHandler("update") }));
 
 vi.mock("../commands/dashboard-tui/index.js", () => ({
   isTTYAvailable: vi.fn(() => ttyState.isTTYAvailable),
 }));
 
-vi.mock("../commands/onboard.js", () => ({ runOnboard: commandMocks.runOnboard }));
+vi.mock("../commands/onboard.js", () => ({
+  runOnboard: commandMocks.runOnboard,
+  isCliOnboardingComplete: (settings: { cliOnboardingCompletedAt?: unknown }) =>
+    typeof settings.cliOnboardingCompletedAt === "string" && settings.cliOnboardingCompletedAt.trim().length > 0,
+}));
 
 vi.mock("../commands/dashboard.js", () => ({
   runDashboard: commandMocks.runDashboard,
   // FNXC:CliTests 2026-07-13-08:20: bin.ts now imports shouldSuperviseDashboard (supervision is the default) and runDashboardSupervised from dashboard.js; mock must surface both so the no-args dashboard launch test reaches runDashboard instead of failing on an undefined import.
-  shouldSuperviseDashboard: vi.fn(() => false),
+  shouldSuperviseDashboard: vi.fn(() => dashboardCliState.shouldSupervise),
   runDashboardSupervised: commandMocks.runDashboardSupervised,
+}));
+vi.mock("../commands/dashboard-port.js", () => ({
+  resolveDashboardPort: dashboardCliState.resolveDashboardPort,
 }));
 vi.mock("../commands/serve.js", () => ({ runServe: commandMocks.runServe }));
 vi.mock("../commands/daemon.js", () => ({ runDaemon: commandMocks.runDaemon }));
@@ -379,6 +434,9 @@ describe("bin command routing and fallbacks", () => {
     delete process.env.PI_PACKAGE_DIR;
     delete process.env.FUSION_SKIP_ONBOARDING;
     ttyState.isTTYAvailable = true;
+    dashboardCliState.shouldSupervise = false;
+    dashboardCliState.resolvedPort = 4040;
+    dashboardCliState.resolveDashboardPort.mockImplementation(async () => dashboardCliState.resolvedPort);
     onboardEnv.centralDbPath = join(mkdtempSync(join(tmpdir(), "fn-bin-onboard-")), "fusion-central.db");
     process.exit = vi.fn(((code?: number) => {
       throw new Error(`process.exit:${code ?? 0}`);
@@ -431,6 +489,93 @@ describe("bin command routing and fallbacks", () => {
       commandMocks.runDashboard.mockResolvedValue({ dispose: vi.fn() });
       await runBin([]);
       expect(commandMocks.runDashboard).toHaveBeenCalled();
+    },
+    30000,
+  );
+
+  it(
+    "routes bare fn dashboard mode through the resolved settings port",
+    async () => {
+      dashboardCliState.resolvedPort = 5678;
+
+      await runBin([]);
+
+      expect(dashboardCliState.resolveDashboardPort).toHaveBeenCalledWith({ explicitPort: undefined });
+      expect(commandMocks.runDashboard).toHaveBeenCalledWith(5678, {
+        paused: false,
+        dev: false,
+        noEngine: false,
+        interactive: false,
+        host: undefined,
+        noAuth: false,
+        token: undefined,
+        lang: undefined,
+      });
+    },
+    15000,
+  );
+
+  it(
+    "routes explicit dashboard mode through the resolved settings port",
+    async () => {
+      dashboardCliState.resolvedPort = 5678;
+
+      await runBin(["dashboard"]);
+
+      expect(dashboardCliState.resolveDashboardPort).toHaveBeenCalledWith({ explicitPort: undefined });
+      expect(commandMocks.runDashboard).toHaveBeenCalledWith(5678, expect.objectContaining({ interactive: false }));
+    },
+    15000,
+  );
+
+  it(
+    "passes the long dashboard port flag as an explicit resolver input",
+    async () => {
+      dashboardCliState.resolvedPort = 6789;
+
+      await runBin(["dashboard", "--port", "6789"]);
+
+      expect(dashboardCliState.resolveDashboardPort).toHaveBeenLastCalledWith({ explicitPort: 6789 });
+      expect(commandMocks.runDashboard).toHaveBeenLastCalledWith(6789, expect.any(Object));
+    },
+    15000,
+  );
+
+  it(
+    "passes the short dashboard port flag as an explicit resolver input",
+    async () => {
+      dashboardCliState.resolvedPort = 6790;
+
+      await runBin(["dashboard", "-p", "6790"]);
+
+      expect(dashboardCliState.resolveDashboardPort).toHaveBeenLastCalledWith({ explicitPort: 6790 });
+      expect(commandMocks.runDashboard).toHaveBeenLastCalledWith(6790, expect.any(Object));
+    },
+    15000,
+  );
+
+  it(
+    "passes the resolved dashboard port to the supervised parent without rewriting child args",
+    async () => {
+      dashboardCliState.shouldSupervise = true;
+      dashboardCliState.resolvedPort = 7777;
+
+      await runBin(["dashboard"]);
+
+      expect(commandMocks.runDashboardSupervised).toHaveBeenCalledWith(7777);
+      expect(commandMocks.runDashboard).not.toHaveBeenCalled();
+    },
+    15000,
+  );
+
+  it(
+    "seeds interactive dashboard startup with the resolved settings port",
+    async () => {
+      dashboardCliState.resolvedPort = 5656;
+
+      await runBin(["dashboard", "--interactive"]);
+
+      expect(commandMocks.runDashboard).toHaveBeenCalledWith(5656, expect.objectContaining({ interactive: true }));
     },
     15000,
   );

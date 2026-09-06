@@ -15,6 +15,10 @@ import { findViolations, RESOLVER } from "./lib/capacity-pool-id-check.mjs";
 
 let files;
 try {
+  /*
+  FNXC:WindowsStaticGates 2026-09-05-05:58:
+  Enumerate git pathspecs without an intermediate shell so Windows task worktrees do not pass literal single quotes to `git ls-files` and turn this fail-closed guard into a zero-file false failure.
+  */
   files = execFileSync("git", ["ls-files", "packages/*/src/**/*.ts", "packages/*/src/*.ts"], {
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
