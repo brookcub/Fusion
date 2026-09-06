@@ -25,6 +25,7 @@ import {
   tryRemoveStaleLock,
 } from "./worktree-stale-lock.js";
 import { parseStaleRegistrationPath, recoverStaleRegistration } from "./worktree-stale-registration.js";
+import { prepareWindowsWorktreeRemoval } from "./windows-worktree-removal.js";
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -709,6 +710,7 @@ export class NativeWorktreeBackend implements WorktreeBackend {
   }
 
   async remove(input: WorktreeRemoveInput): Promise<void> {
+    await prepareWindowsWorktreeRemoval(input.rootDir, input.worktreePath);
     try {
       await execAsync(`git worktree remove${input.force === false ? "" : " --force"} ${quoteShellArg(input.worktreePath)}`, {
         cwd: input.rootDir,

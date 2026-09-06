@@ -674,6 +674,7 @@ export async function runImplementation(
     // the finally block so deps.executing is cleared first (prevents re-dispatch race).
     // true = requeue to todo, false = budget exhausted (already marked failed).
     let stuckRequeue: boolean | null = null;
+    let pendingSingleSessionResume = false;
     let staleAssistantContinuationRequeue = false;
     let taskDone = false;
     let reviewAddressingActivated = false;
@@ -2623,8 +2624,7 @@ export async function runImplementation(
             return;
           }
 
-          // If paused during execution, move to todo so the scheduler can resume
-          // after unpause. This path fires when session.dispose() causes the
+          // Keep paused work in its current lane and checkout. This fires when session.dispose() causes the
           // prompt to resolve gracefully instead of throwing.
           if (deps.pausedAborted.has(task.id)) {
             if (deps.userCanceledTaskIds.has(task.id)) {
@@ -2664,10 +2664,10 @@ export async function runImplementation(
               await deps.persistTokenUsage(task.id);
               return;
             } else {
-              executorLog.log(`${task.id} paused (graceful session exit) — moving to todo`);
-              await deps.store.logEntry(task.id, "Execution paused — session preserved for resume, moved to todo");
-              deps.markGraphExecuteSelfRequeued(task.id);
-              await deps.store.moveTask(task.id, await resolveReboundColumnFor(deps.store, task.id), { preserveResumeState: true });
+              await deps.store.logEntry(task.id, "Execution paused — checkout and progress preserved in place");
+              pendingSingleSessionResume = (await recoverAbortedStepSessionInPlace(
+                deps, task.id, "graceful-pause-abort",
+              )) === "resumed-in-place";
             }
             return;
           }
@@ -3362,78 +3362,11 @@ export async function runImplementation(
           await deps.persistTokenUsage(task.id);
           return;
         } else {
-          executorLog.log(`${task.id} paused — moving to todo`);
-          if (!externalExecutionRoute.configured && worktreePath && existsSync(worktreePath)) {
-            try {
-              const settings = await deps.store.getSettings();
-              await removeWorktree({
-                worktreePath,
-                rootDir: deps.rootDir,
-                settings,
-                taskId: task.id,
-                audit,
-                reason: RemovalReason.ExecutorDispose,
-                expectedOwnerTaskId: task.id,
-                liveOwnerProbe: (path, ownerTaskId) => deps.hasActiveWorktreeBinding(ownerTaskId, path),
-              });
-              executorLog.log(`Removed old worktree for paused task: ${worktreePath}`);
-            } catch (cleanupErr: unknown) {
-              const cleanupErrMessage = cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr);
-              executorLog.warn(`Failed to remove old worktree ${worktreePath}: ${cleanupErrMessage}`);
-            }
-          }
-          // FNXC:WorkflowLifecycle 2026-06-21-00:00: FN-6722 — a mid-run abort on
-          // a task that already has real step progress must not discard that
-          // progress on the bounce to todo. The sibling pause-park path moves
-          // with preserveResumeState;
-          // this teardown branch historically did not — it cleared `branch` AND
-          // moved without preservation, which reset every step to pending
-          // (store.moveTaskInternal ~7322 resetAllStepsToPending) and dropped the
-          // pointer to the commits already on the task branch. The next dispatch
-          // then re-planned from Step 0 even though the work was committed on the
-          // branch — observably a "lost all progress / stuck" failure. Preserve the
-          // branch + resume state when there is resumable progress so execute()
-          // resumes onto the existing branch (the `acquisition.isResume &&
-          // task.branch` reconciliation ~7679) from the first incomplete step. The
-          // worktree is still removed above and its binding cleared below to free
-          // the concurrency slot (FN-6782) — only the durable pointers (branch +
-          // step state) are kept. The 9227 guard above covers the same intent but
-          // is race-contingent on the move having already landed; this makes the
-          // fall-through path safe regardless.
-          //
-          // Read progress from `latestTask` (the store snapshot fetched at ~9226),
-          // NOT the `task` parameter: `task` is frozen at dispatch time and never
-          // mutated mid-run, so a fresh task (currentStep 0, all steps pending at
-          // dispatch) whose agent committed step progress to the store during this
-          // session would otherwise look progress-less here and hit the destructive
-          // reset — the exact FN-6722 failure mode. Fall back to `task` when the
-          // store read came back empty.
-          const progressSource = latestTask ?? task;
-          const hasResumableProgress =
-            (progressSource.currentStep ?? 0) > 0
-            || (progressSource.steps?.some((step) => step.status === "done" || step.status === "in-progress") ?? false);
-          /*
-          FNXC:WorkflowLifecycle 2026-07-12-09:05:
-          Pause-bounce loop (observed on FN-7851): this teardown runs BECAUSE the user paused the task, but the plain move-to-todo below wiped the pause flags (store reopen block), leaving an unpaused dispatchable todo row. The graph-failure classifier then read `paused=false, userPaused=false`, misclassified the abort as engine-internal, and auto-continued the session; once the shared graphResumeRetryCount budget was exhausted the scheduler simply re-dispatched the row seconds later — so pausing an in-progress task could never stick. When the pause that caused this abort is still in force at teardown time, move with `preservePause` so the row lands in todo still parked (`paused` kept; scheduler skips paused/userPaused todo rows) and the classifier sees the pause and routes benignly. An unpause during the teardown window leaves `paused` unset and restores the old requeue-for-normal-scheduling behavior.
-          */
-          const pauseStillInForce = latestTask?.paused === true;
-          await deps.store.updateTask(
-            task.id,
-            hasResumableProgress ? { worktree: undefined } : { worktree: undefined, branch: undefined },
-          );
-          await deps.store.logEntry(
-            task.id,
-            pauseStillInForce
-              ? "Execution paused — agent terminated, parked in todo (pause preserved, awaiting explicit unpause)"
-              : "Execution paused — agent terminated, moved to todo",
-            undefined,
-            deps.getRunContextFor(task.id),
-          );
-          deps.markGraphExecuteSelfRequeued(task.id);
-          await deps.store.moveTask(task.id, await resolveReboundColumnFor(deps.store, task.id), {
-            ...(hasResumableProgress ? { preserveResumeState: true } : {}),
-            ...(pauseStillInForce ? { preservePause: true } : {}),
-          });
+          // Pause is not disposal authority: dirty bytes, binding, branch, and lane survive.
+          await deps.store.logEntry(task.id, "Execution paused — checkout and progress preserved in place");
+          pendingSingleSessionResume = (await recoverAbortedStepSessionInPlace(
+            deps, task.id, "pause-abort",
+          )) === "resumed-in-place";
         }
       } else if (deps.stuckAborted.has(task.id)) {
         // Task was killed by stuck task detector — defer requeue to finally block
@@ -4119,6 +4052,13 @@ export async function runImplementation(
        * path above has run, then bootstrap one new executor session. A Set plus
        * resumingUnpaused makes duplicate task updates idempotent.
        */
+      if (pendingSingleSessionResume) {
+        const latestTask = await deps.store.getTask(task.id);
+        const settings = await deps.store.getSettings();
+        if (!latestTask.paused && !latestTask.userPaused && !settings.globalPause && !settings.enginePaused) {
+          await deps.reexecuteTaskInPlace(task.id);
+        }
+      }
       await deps.resumeApprovalAfterUnwindIfNeeded(task.id);
     }
 }

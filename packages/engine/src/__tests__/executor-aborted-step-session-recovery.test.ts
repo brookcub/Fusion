@@ -3,10 +3,12 @@ import type { Task } from "@fusion/core";
 import "./executor-test-helpers.js";
 import { TaskExecutor } from "../executor.js";
 import { executingTaskLock } from "../agents/active-session-registry.js";
+import { removeWorktree } from "../worktree/worktree-pool.js";
 import {
   createMockStore,
   createWorkflowRoutingAgentStore,
   mockExecuteAll,
+  mockedCreateFnAgent,
   resetExecutorMocks,
 } from "./executor-test-helpers.js";
 import { evaluateLifecycleDirectionPostcondition } from "@fusion/core";
@@ -78,6 +80,53 @@ describe("aborted step-session recovery", () => {
       ...overrides,
     });
   }
+
+  it.each([
+    ["throw", "paused"], ["graceful", "paused"],
+    ["throw", "userPaused"], ["graceful", "userPaused"],
+    ["throw", "enginePaused"], ["graceful", "globalPause"],
+    ["throw", "resumed"], ["graceful", "resumed"],
+  ] as const)("preserves single-session work on %s with %s", async (exit, pause) => {
+    const store = createMockStore();
+    const subject = productionTask({ id: "FUSI-006-SINGLE" });
+    store.getTask.mockResolvedValue(subject);
+    const settings = {
+      maxConcurrent: 2, maxWorktrees: 4, pollIntervalMs: 15_000,
+      autoMerge: false, runStepsInNewSessions: false, maxParallelSteps: 1,
+      enginePaused: false, globalPause: false,
+    };
+    store.getSettings.mockImplementation(async () => settings);
+    let finish!: () => void;
+    let fail!: (error: Error) => void;
+    const pending = new Promise<void>((resolve, reject) => { finish = resolve; fail = reject; });
+    const prompt = vi.fn(() => pending);
+    mockedCreateFnAgent.mockResolvedValue({ session: { prompt, dispose: vi.fn() } } as never);
+    const executor = new TaskExecutor(store as never, "/tmp/test", {
+      agentStore: createWorkflowRoutingAgentStore(store).agentStore,
+    });
+    const running = (executor as any).runImplementation(subject, vi.fn(), vi.fn());
+    await vi.waitFor(() => expect(prompt).toHaveBeenCalledOnce());
+    const before = await store.getTask(subject.id);
+    if (pause === "paused" || pause === "userPaused") store._setRow(subject.id, { [pause]: true });
+    if (pause === "enginePaused" || pause === "globalPause") settings[pause] = true;
+    (executor as any).pausedAborted.add(subject.id);
+    const resumed = vi.spyOn(executor, "execute").mockImplementation(async () => {
+      expect(executingTaskLock.has(subject.id)).toBe(false);
+    });
+    store.updateTask.mockClear();
+    store.moveTask.mockClear();
+    vi.mocked(removeWorktree).mockClear();
+    if (exit === "throw") fail(new Error("Session terminated")); else finish();
+    await running;
+    await vi.runOnlyPendingTimersAsync();
+    const after = await store.getTask(subject.id);
+    for (const key of ["column", "worktree", "branch", "steps", "currentStep", "effectiveNodeId"] as const) {
+      expect(after[key], key).toEqual(before[key]);
+    }
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(removeWorktree).not.toHaveBeenCalled();
+    expect(resumed).toHaveBeenCalledTimes(pause === "resumed" ? 1 : 0);
+  });
 
   async function executeAbortTrigger(
     trigger: "graceful-pause-abort" | "step-failure" | "pause-abort" | "session-failure",

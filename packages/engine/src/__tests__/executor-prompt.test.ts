@@ -814,7 +814,7 @@ describe("TaskExecutor pause behavior", () => {
 
   afterEach(settleLeakedBackgroundRuns);
 
-  it("terminates agent and moves task to todo when paused during execution", async () => {
+  it("terminates the agent and preserves its lane when paused during execution", async () => {
     const store = createMockStore();
     const disposeFn = vi.fn();
 
@@ -846,20 +846,8 @@ describe("TaskExecutor pause behavior", () => {
       updatedAt: new Date().toISOString(),
     });
 
-    // Should move to todo, NOT mark as failed.
-    // FNXC:ExecutorMoveTaskOptions 2026-07-12: executor.ts:11622-11625 now always passes a moveTask options object built from conditional spreads.
-    /*
-    FNXC:EngineTests 2026-07-23-21:40 (FN-8464 / #2403):
-    A pause-abort bounce to todo preserves resume state ONLY when the run recorded resumable
-    progress (currentStep > 0 or a step marked done/in-progress). A FRESH task's first
-    implementation pass now OWNS the step projection: `runProjectedGraphTaskStep` defers the
-    atomic `startStep` in-progress write until the task has a real worktree (FN-8464 baseline
-    cwd gating) and #2403 routed step starts through the dependency-gated `store.startStep`.
-    A pause landing during that first session therefore finds every step still `pending`,
-    so the bounce carries no `preserveResumeState` — the conditional spreads collapse to `{}`.
-    The protective intent is unchanged: pause parks in todo and never marks the task failed.
-    */
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", {});
+    // Pause is not permission to move backward or mark failure.
+    expect(store.moveTask).not.toHaveBeenCalled();
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-001", { status: "failed" });
   });
 
@@ -894,14 +882,12 @@ describe("TaskExecutor pause behavior", () => {
 
     // Should NOT move to in-review (paused tasks skip that logic)
     expect(store.moveTask).not.toHaveBeenCalledWith("FN-001", "in-review");
-    // Should move to todo instead (regression: was stranding in in-progress).
-    // Pause-graceful path flags preserveResumeState so the bounce keeps
-    // the worktree and accumulated step progress.
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", { preserveResumeState: true });
+    // Explicit unpause resumes in place; no lifecycle bounce is needed.
+    expect(store.moveTask).not.toHaveBeenCalled();
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-001", { status: "failed" });
   });
 
-  it("moves paused task to todo when session ends gracefully (regression for FN-827)", async () => {
+  it("preserves paused task in place when session ends gracefully", async () => {
     const store = createMockStore();
     const disposeFn = vi.fn();
 
@@ -934,10 +920,8 @@ describe("TaskExecutor pause behavior", () => {
       updatedAt: new Date().toISOString(),
     });
 
-    // The critical fix: task must end in todo, not stranded in in-progress.
-    // The pause path must also flag preserveResumeState so the move does not
-    // wipe accumulated step progress and the worktree pointer.
-    expect(store.moveTask).toHaveBeenCalledWith("FN-805", "todo", { preserveResumeState: true });
+    // Paused tasks retain their lane and checkout for explicit resume.
+    expect(store.moveTask).not.toHaveBeenCalled();
     // Should NOT be marked as failed
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-805", expect.objectContaining({ status: "failed" }));
     // Should log the pause event
@@ -958,6 +942,11 @@ describe("TaskExecutor pause behavior", () => {
         session: {
           prompt: vi.fn().mockImplementation(async () => {
             promptCallCount++;
+            if (promptCallCount > 1) {
+              store._setRow("FN-001", { paused: true });
+              store._trigger("task:updated", { id: "FN-001", paused: true, column: "in-progress" });
+              return;
+            }
             // Simulate pause during execution
             store._trigger("task:updated", { id: "FN-001", paused: true, column: "in-progress" });
             // Simulate rapid unpause while executor is still handling the pause
@@ -983,19 +972,18 @@ describe("TaskExecutor pause behavior", () => {
       updatedAt: new Date().toISOString(),
     });
 
-    // The task should still be moved to todo exactly once (the pause took effect)
-    // Even if unpause happened rapidly, the session was already disposed
+    // Unwinding a pause must never bounce the card to todo.
     const todoCalls = store.moveTask.mock.calls.filter(
       (call: any[]) => call[0] === "FN-001" && call[1] === "todo",
     );
-    expect(todoCalls.length).toBe(1);
+    expect(todoCalls.length).toBe(0);
     // Should NOT have duplicate in-review calls
     const inReviewCalls = store.moveTask.mock.calls.filter(
       (call: any[]) => call[0] === "FN-001" && call[1] === "in-review",
     );
     expect(inReviewCalls.length).toBe(0);
-    // Agent should only have been prompted once
-    expect(promptCallCount).toBe(1);
+    // One resumed session starts after unwind, then remains explicitly paused.
+    await vi.waitFor(() => expect(promptCallCount).toBe(2));
   });
 
   it("skips paused tasks during resumeOrphaned", async () => {
@@ -1444,6 +1432,7 @@ describe("TaskExecutor pause behavior", () => {
       session: {
         prompt: vi.fn().mockImplementation(async () => {
           // Simulate pause — session ends gracefully
+          store._setRow("FN-001", { paused: true });
           store._trigger("task:updated", { id: "FN-001", paused: true, column: "in-progress" });
         }),
         dispose: vi.fn(),
@@ -1471,9 +1460,8 @@ describe("TaskExecutor pause behavior", () => {
     );
     expect(clearCalls.length).toBe(0);
 
-    // Task should be moved to todo (ready for resume) with preserveResumeState
-    // so step progress and the worktree survive the pause→unpause hop.
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", { preserveResumeState: true });
+    // Pause retains the current lane as well as the session.
+    expect(store.moveTask).not.toHaveBeenCalled();
   });
 
   it("falls back to fresh session when sessionFile no longer exists on disk", async () => {
@@ -2363,6 +2351,7 @@ describe("TaskExecutor global pause behavior", () => {
     await vi.waitFor(() => {
       if (implementationCallCount < 2) throw new Error("waiting for both implementation sessions in-flight");
     }, { timeout: 5000 });
+    store.getSettings.mockResolvedValue({ ...(await store.getSettings()), globalPause: true });
     store._trigger("settings:updated", {
       settings: { globalPause: true },
       previous: { globalPause: false },
@@ -2370,20 +2359,21 @@ describe("TaskExecutor global pause behavior", () => {
     releaseBarrier();
     await run;
 
-    // Global pause should move both tasks out of in-progress without marking failed.
+    // Global pause disposes sessions without moving either task backward or forward.
     const moveCalls = store.moveTask.mock.calls;
-    expect(moveCalls.some(([id, column]) => id === "FN-002" && /^(todo|in-review)$/.test(String(column)))).toBe(true);
-    expect(moveCalls.some(([id, column]) => id === "FN-001" && /^(todo|in-review)$/.test(String(column)))).toBe(true);
+    expect(moveCalls.some(([id, column]) => id === "FN-002" && /^(todo|in-review)$/.test(String(column)))).toBe(false);
+    expect(moveCalls.some(([id, column]) => id === "FN-001" && /^(todo|in-review)$/.test(String(column)))).toBe(false);
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-001", { status: "failed" });
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-002", { status: "failed" });
   });
 
-  it("moves paused tasks to todo (not marked as failed)", async () => {
+  it("retains globally paused tasks in place without marking failure", async () => {
     const store = createMockStore();
 
     mockedCreateFnAgent.mockImplementation(async () => ({
       session: {
         prompt: vi.fn().mockImplementation(async () => {
+          store.getSettings.mockResolvedValue({ ...(await store.getSettings()), globalPause: true });
           store._trigger("settings:updated", {
             settings: { globalPause: true },
             previous: { globalPause: false },
@@ -2401,16 +2391,8 @@ describe("TaskExecutor global pause behavior", () => {
       createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     });
 
-    // FNXC:ExecutorMoveTaskOptions 2026-07-12: executor.ts:11622-11625 now always passes a moveTask options object (conditional spreads collapse to {} when nothing to preserve); previously undefined. Intent (not marked failed) unchanged.
-    /*
-    FNXC:EngineTests 2026-07-23-21:40 (FN-8464 / #2403):
-    A global-pause abort must park the task in todo without failing it. Resume state is
-    preserved only when the run recorded resumable progress; a fresh task's first
-    implementation pass owns the step projection (startStep is deferred until a real
-    worktree exists), so a pause during that first session leaves all steps `pending`
-    and the bounce options collapse to `{}`.
-    */
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", {});
+    // Global pause is not a backward lifecycle transition, including for fresh work.
+    expect(store.moveTask).not.toHaveBeenCalled();
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-001", { status: "failed" });
   });
 
