@@ -13,6 +13,10 @@ function isUsableDashboardPort(port: unknown): port is number {
   return typeof port === "number" && Number.isInteger(port) && port > 0;
 }
 
+function isExplicitDashboardPort(port: unknown): port is number {
+  return typeof port === "number" && Number.isInteger(port) && port >= 0;
+}
+
 async function readGlobalDashboardPortSettings(): Promise<{ daemonPort?: unknown }> {
   return new GlobalSettingsStore(resolveGlobalDir()).getSettings();
 }
@@ -27,7 +31,8 @@ export async function resolveDashboardPort({
   explicitPort,
   readSettings = readGlobalDashboardPortSettings,
 }: ResolveDashboardPortOptions = {}): Promise<number> {
-  if (isUsableDashboardPort(explicitPort)) {
+  // FNXC:DashboardPortSettings 2026-09-06-04:12: An explicit zero asks the OS for an available port and must still outrank settings.
+  if (isExplicitDashboardPort(explicitPort)) {
     return explicitPort;
   }
 

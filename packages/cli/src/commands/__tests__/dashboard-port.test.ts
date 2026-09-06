@@ -11,6 +11,14 @@ describe("resolveDashboardPort", () => {
     expect(readSettings).not.toHaveBeenCalled();
   });
 
+  it("preserves an explicit zero before settings", async () => {
+    const readSettings = vi.fn(async () => ({ daemonPort: 5678 }));
+
+    await expect(resolveDashboardPort({ explicitPort: 0, readSettings })).resolves.toBe(0);
+
+    expect(readSettings).not.toHaveBeenCalled();
+  });
+
   it("uses daemonPort from settings when no CLI port exists", async () => {
     const readSettings = vi.fn(async () => ({ daemonPort: 5678 }));
 
