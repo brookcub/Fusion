@@ -241,15 +241,14 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
     const testGateScript = rootPackageJson.scripts?.["test:gate"] ?? "";
     const staticGateScript = rootPackageJson.scripts?.["test:gate:static"] ?? "";
 
-    expect(testGateScript).toContain("node scripts/run-static-gate-checks.mjs");
+    expect(testGateScript).toBe("node scripts/run-merge-gate.mjs");
     expect(staticGateScript).toContain("node scripts/check-no-" + "no" + "hup" + ".mjs"); // process-supervisor-allowlist: asserts the gate wires the checker; not a real spawn
     expect(staticGateScript).toContain("node scripts/check-no-kill-" + "40" + "40" + ".mjs"); // port-4040-allowlist: asserts the gate wires the checker; not a real port bind
     expect(staticGateScript).toContain("node scripts/check-no-test-timeout-appeasement.mjs");
     expect(staticGateScript).toContain("node scripts/check-changeset-format.mjs");
-    expect(testGateScript).toContain("pnpm --filter @fusion/engine test:core");
-    expect(testGateScript).toContain("pnpm --filter @fusion/core test:pg-gate");
-    expect(testGateScript).toContain("pnpm --filter @fusion/core test:unit-gate");
-    expect(testGateScript).toContain("pnpm --filter @runfusion/fusion test:ci-shape");
+    // FNXC:WindowsMergeGate 2026-09-05-14:45: Lane membership and fail-closed
+    // ordering have behavioral coverage in scripts/__tests__/run-merge-gate.
+    expect(existsSync(join(workspaceRoot, "scripts/run-merge-gate.mjs"))).toBe(true);
   });
 
   it("pins engine test:core to the engine-core vitest project", () => {
