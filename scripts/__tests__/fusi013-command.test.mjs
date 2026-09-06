@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createConnection } from 'node:net';
+import { performance } from 'node:perf_hooks';
 import test from 'node:test';
 import { runRegressionCommand } from '../lib/run-regression-command.mjs';
 

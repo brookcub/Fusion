@@ -1,4 +1,5 @@
 import { resolve } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { tsImport } from 'tsx/esm/api';
 const { superviseSpawn } = await tsImport('../../packages/core/src/process/process-supervisor.ts', import.meta.url);
 

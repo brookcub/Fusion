@@ -16,6 +16,7 @@ import { runRegressionCommand } from "./lib/run-regression-command.mjs";
 import { readWorkspacePackageGraph } from "./check-workspace-package-graph.mjs";
 import { finishIsolatedRegression } from "./lib/finish-isolated-regression.mjs";
 import { createHash } from "node:crypto";
+import { performance } from "node:perf_hooks";
 
 const root = resolve(import.meta.dirname, "..");
 const deadline = performance.now() + 150_000;
@@ -24,12 +25,18 @@ const directory = mkdtempSync(join(tmpdir(), "fusion fusi013 "));
 const evidenceDir = join(directory, "evidence");
 const home = join(directory, "home");
 const baselineRoot = join(directory, "baseline");
+const powerShellCache = join(directory, "powershell-module-cache");
 mkdirSync(home);
 mkdirSync(evidenceDir);
+mkdirSync(powerShellCache);
 
 for (const key of ["DATABASE_URL", "PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE", "FUSION_PG_TEST_NATIVE_ROOT", "FUSION_EMBEDDED_PG_RUNTIME_DIR", "FUSION_NATIVE_STAGING_DIR", "NODE_PATH"]) delete process.env[key];
 process.env.HOME = home;
 process.env.USERPROFILE = home;
+// FNXC:TaskLogRegression 2026-09-06-13:55: The Windows process containment
+// helper imports PowerShell modules. Keep its analysis cache in this owned temp
+// directory so a focused regression never creates source-tree artifacts.
+process.env.PSModuleAnalysisCachePath = join(powerShellCache, "ModuleAnalysisCache");
 
 function runGit(args, cwd = root) {
   return runRegressionCommand("git", args, { cwd, deadline, stdio: "ignore" });
