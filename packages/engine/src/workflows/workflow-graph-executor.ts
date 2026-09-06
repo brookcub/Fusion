@@ -163,6 +163,7 @@ export type WorkflowNodeAbortKind = "engine-pause";
 export const WORKFLOW_INTERRUPTED_NODE_ID_CONTEXT_KEY = "workflow:interruptedNodeId";
 export const WORKFLOW_INTERRUPTED_NODE_ABORT_KIND_CONTEXT_KEY = "workflow:interruptedNodeAbortKind";
 export const WORKFLOW_OPTIONAL_GROUP_CONTEXT_KEY = "workflow:optionalGroupActive";
+export const WORKFLOW_OPTIONAL_GROUP_PHASE_CONTEXT_KEY = "workflow:optionalGroupPhase";
 /** Explicit parent marker for template execution; never inferred from template labels or output. */
 export const WORKFLOW_REVIEW_KIND_CONTEXT_KEY = "workflow:reviewKind";
 export const WORKFLOW_NODE_ENGINE_PAUSE_ABORT_KIND: WorkflowNodeAbortKind = "engine-pause";
@@ -1160,6 +1161,7 @@ export class WorkflowGraphExecutor {
               const optionalGroupContext = {
                 ...(contextOverride ?? context),
                 [WORKFLOW_OPTIONAL_GROUP_CONTEXT_KEY]: node.id,
+                [WORKFLOW_OPTIONAL_GROUP_PHASE_CONTEXT_KEY]: stepPhase,
                 ...(this.workflowReviewKind(node) ? { [WORKFLOW_REVIEW_KIND_CONTEXT_KEY]: this.workflowReviewKind(node) } : {}),
               };
               return this.executeMaterializedTemplateNode(tNode, task, settings, optionalGroupContext, ir, sig);

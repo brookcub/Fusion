@@ -5,6 +5,7 @@ import { runVerificationCommand } from "../execution/verification-utils.js";
 import { assertMergeGenerationOwned } from "./merge-write-fence.js";
 import { isMergeActiveStatus } from "./merge-active-status.js";
 import { inferDefaultTestCommand } from "./merger-workspace-test-commands.js";
+import { verificationHash, verificationSettingsHash } from "./merge-verification-evidence.js";
 
 const exec = promisify(execFile);
 async function git(cwd: string, args: string[]): Promise<string> {
@@ -80,6 +81,24 @@ export async function verifyAiMergeCandidate(input: {
   };
   await assertVerifiedCandidate();
   const { settings } = initial;
+  const receipt: NonNullable<NonNullable<Task["mergeDetails"]>["verificationReceipts"]>[number] = {
+    schema: 1, candidateSha: squashSha, sourceSha, settingsSha256: verificationSettingsHash(settings),
+    startedAt: new Date().toISOString(), outcome: "pending", checks: [],
+  };
+  const persistReceipt = async () => {
+    await store.updateTaskAtomic(taskId, current => {
+      assertMergeGenerationOwned(signal, taskId);
+      if (current.paused || current.userPaused || taskIdentity(current) !== episode) {
+        throw new Error("AI merge verification refused: receipt authority changed");
+      }
+      return { mergeDetails: { ...current.mergeDetails, verificationReceipts: [
+        ...(current.mergeDetails?.verificationReceipts ?? []).filter(r => r.candidateSha !== squashSha),
+        { ...receipt, checks: [...receipt.checks] },
+      ].slice(-32) } };
+    });
+  };
+  // FNXC:MergeEvidence 2026-09-06-06:00: Invalidate older same-candidate success before a new attempt; failed checks leave pending evidence, never stale green proof.
+  await persistReceipt();
   // Explicit commands win unchanged; inference is only for an absent test command.
   const testCommand = settings.testCommand?.trim() || inferDefaultTestCommand(
     mergeRoot, undefined, settings.buildCommand, tipSha, squashSha,
@@ -101,6 +120,11 @@ export async function verifyAiMergeCandidate(input: {
       throw new Error(`AI merge verification failed: ${type}; candidate not landed`);
     }
     await assertVerifiedCandidate();
+    receipt.checks.push({ type, commandSha256: verificationHash(command), exitCode: 0 });
   }
+  receipt.completedAt = new Date().toISOString();
+  receipt.outcome = commands.length ? "passed" : "not-run";
+  await persistReceipt();
+  await assertVerifiedCandidate();
   return assertVerifiedCandidate;
 }

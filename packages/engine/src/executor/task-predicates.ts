@@ -12,6 +12,11 @@ export function isTaskWorkComplete(task: Task): boolean {
   return task.steps.every((s) => s.status === "done" || s.status === "skipped");
 }
 
+/** FNXC:MergeEvidence 2026-09-06-06:00: A candidate check (even passed) is not a landing. Completed-work recovery must not re-execute implementation merely because a pre-land receipt exists. */
+export function hasRecordedLanding(task: Pick<Task, "mergeDetails">): boolean {
+  return task.mergeDetails?.mergeConfirmed === true || Boolean(task.mergeDetails?.commitSha);
+}
+
 /** Failed with "without calling fn_task_done" and zero step progress. */
 export function isNoProgressNoTaskDoneFailure(task: Task): boolean {
   return task.status === "failed" &&

@@ -80,6 +80,7 @@ import {
   filterCustomToolsForReadonly,
 } from "../workflows/workflow-step-tool-policy.js";
 import { executorLog } from "../logger.js";
+import { buildPostMergeEvidence } from "../merge/merge-verification-evidence.js";
 import { mergeEffectiveSettings } from "../project/effective-settings.js";
 import { injectReviewAdvisoryNotes } from "./workflow-step-failure-injection.js";
 import { parseAwaitInputQuestionToolCall } from "./await-input-parse.js";
@@ -746,12 +747,16 @@ CRITICAL SCOPING RULES — read before doing anything else:
     Graph dispatch supplies a start-time target so input-mode detection survives task edits between
     nodes. Direct workflow-step callers retain the live resolver for backward compatibility.
     */
+    const postMergeEvidence = workflowStep.phase === "post-merge"
+      ? buildPostMergeEvidence(await deps.store.getTask(task.id), await deps.store.getSettings()) : "";
     const systemPrompt = `You are a workflow step agent executing: ${workflowStep.name}
 
   Task Context:
   - Task ID: ${task.id}
   - Task Description: ${task.description}
   - Worktree: ${worktreePath}
+
+  ${postMergeEvidence}
 
   ${scopeBlock}${reviewConvergenceContext ? `\n\n${reviewConvergenceContext}` : ""}${workflowStepUserCommentSection ? `\n\n${workflowStepUserCommentSection}` : ""}${priorFindingsBlock}
 

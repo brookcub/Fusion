@@ -27,6 +27,7 @@ describe("AI merge verification with real child exits", () => {
     const store = {
       getTask: vi.fn(async () => task), getSettings: vi.fn(async () => settings),
       logEntry: vi.fn(async () => undefined), appendAgentLog: vi.fn(async () => undefined),
+      updateTaskAtomic: vi.fn(async (_id, updater) => { Object.assign(task, await updater(task)); return task; }),
     } as unknown as TaskStore;
     const verification = verifyAiMergeCandidate({ store, taskId: task.id, mergeRoot: root,
       branch: task.branch, tipSha: base, squashSha: head, log: async () => undefined });
@@ -37,7 +38,10 @@ describe("AI merge verification with real child exits", () => {
   });
   it("reports not-run rather than verified when there are no commands", async () => {
     const log = vi.fn(async () => undefined);
-    const store = { getTask: async () => ({ id: "FIXTURE", branch: "fusion/fixture" }), getSettings: async () => ({}) } as unknown as TaskStore;
+    const task = { id: "FIXTURE", branch: "fusion/fixture" };
+    const store = { getTask: async () => task, getSettings: async () => ({}),
+      updateTaskAtomic: async (_id, updater) => { Object.assign(task, await updater(task)); return task; },
+    } as unknown as TaskStore;
     await verifyAiMergeCandidate({ store, taskId: "FIXTURE", mergeRoot: root,
       branch: "fusion/fixture", tipSha: base, squashSha: head, log });
     expect(log).toHaveBeenCalledWith(expect.stringContaining("not-run"));

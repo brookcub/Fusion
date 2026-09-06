@@ -14,7 +14,7 @@
 import type { Task, TaskStore } from "@fusion/core";
 import { executorLog } from "../logger.js";
 import type { EngineRunContext } from "../util/run-audit.js";
-import { isTaskWorkComplete } from "./task-predicates.js";
+import { hasRecordedLanding, isTaskWorkComplete } from "./task-predicates.js";
 
 export type UnpauseResumeDeps = {
   store: TaskStore;
@@ -78,7 +78,7 @@ export async function dispatchUnpauseResume(
     }
 
     deps.approvalSuspended.delete(task.id);
-    if (isTaskWorkComplete(task) && !task.mergeDetails) {
+    if (isTaskWorkComplete(task) && !hasRecordedLanding(task)) {
       deps.resumingUnpaused.delete(task.id);
       deps.recoveringCompleted.add(task.id);
       handoffOwnsClaim = true; // prevent finally from double-deleting a already-cleared claim
