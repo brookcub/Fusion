@@ -10,6 +10,7 @@ import { emitBoundedRunAudit } from "../run-audit/emit-bounded-run-audit.js";
  */
 import { and, eq, isNull } from "drizzle-orm";
 import {TaskStore} from "../store.js";
+import { TaskNotFoundError } from "./errors.js";
 import type { Task, TaskDetail, TaskLogEntry, TaskLogEntryWriteOptions, RunMutationContext, TaskReleaseGateVerdict } from "../types.js";
 import {findWorkflowColumn} from "../plugins/plugin-gate-verdict.js";
 import {getTraitRegistry} from "../workflows/trait-registry.js";
@@ -365,7 +366,12 @@ export async function logEntryImpl(store: TaskStore, id: string, action: string,
           `async-comments-attachments.ts`, which are sentinels for the same reason.
           */
           if (state === "archived") throw new Error(`Task ${id} is archived — logging is read-only`);
-          if (state === null) throw new Error(`Task ${id} not found`);
+          /*
+          FNXC:TaskActivityLog404 2026-09-06-08:16:
+          A missing project-scoped task is a typed lookup miss so HTTP callers can
+          return 404 without classifying unrelated persistence failures as missing.
+          */
+          if (state === null) throw new TaskNotFoundError(id);
         }
 
         const dir = store.taskDir(id);
@@ -411,7 +417,12 @@ export async function logEntryImpl(store: TaskStore, id: string, action: string,
             const layer = store.asyncLayer!;
       const pgRow = await readTaskRow(layer, id, { includeDeleted: true });
       if (!pgRow) {
-        throw new Error(`Task ${id} not found`);
+        /*
+        FNXC:TaskActivityLog404 2026-09-06-08:16:
+        Preserve the canonical typed lookup error on the fast PostgreSQL append path;
+        the dashboard maps only this proven miss to HTTP 404.
+        */
+        throw new TaskNotFoundError(id);
       }
       /*
       FNXC:WorkflowLifecycleColumns 2026-07-30-21:20 (audited — REAL, deferred with the cost stated):
