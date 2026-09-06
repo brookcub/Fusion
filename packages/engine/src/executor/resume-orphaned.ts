@@ -15,7 +15,7 @@ import { readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { executorLog } from "../logger.js";
 import { getResumeOrphanDelayMs } from "./resume-orphan-delay.js";
-import { isNoProgressNoTaskDoneFailure, isTaskWorkComplete } from "./task-predicates.js";
+import { hasRecordedLanding, isNoProgressNoTaskDoneFailure, isTaskWorkComplete } from "./task-predicates.js";
 
 const yieldEventLoop = (): Promise<void> => new Promise((resolve) => setImmediateCb(resolve));
 
@@ -185,7 +185,7 @@ export async function resumeOrphaned(deps: ResumeOrphanedDeps): Promise<void> {
     }
     // Fast-path: if the task already completed its work (all steps done),
     // move it directly to in-review instead of re-executing from scratch.
-    if (isTaskWorkComplete(task) && !task.mergeDetails) {
+    if (isTaskWorkComplete(task) && !hasRecordedLanding(task)) {
       if (deps.recoveringCompleted.has(task.id)) {
         executorLog.debug(`${task.id} completed-task recovery already running - skipping duplicate startup recovery`);
         continue;

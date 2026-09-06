@@ -25,6 +25,7 @@ import type { EngineRunContext } from "../util/run-audit.js";
 import type { WorkflowNodeResult } from "../workflows/workflow-graph-executor.js";
 import {
   WORKFLOW_OPTIONAL_GROUP_CONTEXT_KEY,
+  WORKFLOW_OPTIONAL_GROUP_PHASE_CONTEXT_KEY,
   WORKFLOW_REVIEW_KIND_CONTEXT_KEY,
 } from "../workflows/workflow-graph-executor.js";
 import { workflowNodeRequiresWorktree } from "../workflows/workflow-node-execution-needs.js";
@@ -776,7 +777,8 @@ export async function runGraphCustomNode(
       name: typeof cfg.name === "string" && cfg.name.trim() ? cfg.name : node.id,
       description: typeof cfg.description === "string" ? cfg.description : "",
       mode,
-      phase: "pre-merge",
+      // FNXC:MergeEvidence 2026-09-06-06:00: Materialized group children must retain their parent's phase so real post-merge sessions receive landed verification evidence.
+      phase: (optionalGroupId ? graphContext?.[WORKFLOW_OPTIONAL_GROUP_PHASE_CONTEXT_KEY] : cfg.phase) === "post-merge" ? "post-merge" : "pre-merge",
       gateMode: node.kind === "gate" || cfg.gateMode === "gate" ? "gate" : "advisory",
       prompt,
       toolMode: cfg.toolMode === "coding" ? "coding" : "readonly",

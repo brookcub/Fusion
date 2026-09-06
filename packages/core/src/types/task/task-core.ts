@@ -45,6 +45,17 @@ import type {
 } from "./task-log.js";
 
 export interface MergeDetails {
+  /** FNXC:MergeEvidence 2026-09-06-06:00: Engine-owned check receipts bind review evidence to exact candidates, not agent-log history. No command text or output is duplicated here. */
+  verificationReceipts?: Array<{
+    schema: 1;
+    candidateSha: string;
+    sourceSha: string;
+    settingsSha256: string;
+    startedAt: string;
+    completedAt?: string;
+    outcome: "pending" | "passed" | "not-run";
+    checks: Array<{ type: "test" | "build"; commandSha256: string; exitCode: 0 }>;
+  }>;
   commitSha?: string;
   /**
    * FNXC:AIMerge 2026-08-28-09:29:

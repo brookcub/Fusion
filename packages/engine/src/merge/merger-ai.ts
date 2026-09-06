@@ -3888,7 +3888,9 @@ async function finalizeMerged(
     ]);
     const landedFiles = capturedLandedFiles ?? [];
     const mergedAt = task.mergeDetails?.mergedAt ?? new Date().toISOString();
+    const verificationReceipts = (await store.getTask(taskId))?.mergeDetails?.verificationReceipts;
     mergeDetails = {
+      ...(verificationReceipts ? { verificationReceipts } : {}),
       commitSha: landedSha,
       ...(landedBranchTipSha ? { landedBranchTipSha } : {}),
       landedFiles,

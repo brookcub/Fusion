@@ -298,6 +298,25 @@ describe("CE workflow-step executor integration", () => {
 
   // ── Item 3: synthesized WorkflowStep from a skill graph node ────────────────
   describe("runGraphCustomNode skill node (U1/U2)", () => {
+    it.each(["post-merge", "pre-merge"])("carries %s phase from the real optional group to its workflow session boundary", async phase => {
+      const store = createMockStore();
+      const task = baseStepTask({ enabledWorkflowSteps: ["fixture-review"] });
+      store.getTask.mockResolvedValue(task as any);
+      const { executor } = makeExecutor(store);
+      const stepCall = vi.spyOn(executor as any, "executeWorkflowStep").mockResolvedValue({ success: true, output: "APPROVE" });
+      const ir: WorkflowIr = { version: "v2", name: "phase-fixture", columns: [],
+        nodes: [{ id: "start", kind: "start" }, { id: "fixture-review", kind: "optional-group", config: {
+          phase, defaultOn: true, template: { nodes: [{ id: "fixture-step", kind: "prompt", config: { prompt: "Review", toolMode: "readonly" } }], edges: [] },
+        } }, { id: "end", kind: "end" }],
+        edges: [{ from: "start", to: "fixture-review" }, { from: "fixture-review", to: "end" }],
+      };
+      const settings = await store.getSettings();
+      const graph = new WorkflowGraphExecutor({ runCustomNode: (node, live, context) =>
+        (executor as any).runGraphCustomNode(node, live, settings, undefined, context) });
+      expect((await graph.run(task as any, settings, ir)).outcome).toBe("success");
+      expect(stepCall).toHaveBeenCalledOnce();
+      expect(stepCall.mock.calls[0]![1]).toMatchObject({ phase, toolMode: "readonly" });
+    });
     it("carries skillName onto the synthesized step AND prepends the conventions preamble", async () => {
       const store = createMockStore();
       store.getTask.mockResolvedValue(baseStepTask() as any);

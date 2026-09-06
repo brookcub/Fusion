@@ -319,6 +319,10 @@ describe("runAiMerge", () => {
     expect(result.merged).toBe(true);
     expect(mergeAgent).toHaveBeenCalledOnce();
     expect(reviewAgent).toHaveBeenCalledTimes(2);
+    const landed = await store.getTask("FN-1");
+    expect(landed.mergeDetails.verificationReceipts).toContainEqual(expect.objectContaining({
+      candidateSha: landed.mergeDetails.commitSha, sourceSha: landed.mergeDetails.landedBranchTipSha, outcome: "not-run",
+    }));
     expect(reviewedCandidates[0]).toBeTruthy();
     expect(reviewedCandidates[1]).toBe(reviewedCandidates[0]);
     expect(logs.some((line) => /rejected \(blocking\)/i.test(line))).toBe(false);

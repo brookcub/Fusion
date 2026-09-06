@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import "./executor-test-helpers.js";
 import { TaskExecutor } from "../executor.js";
+import { verificationHash, verificationSettingsHash } from "../merge/merge-verification-evidence.js";
 import {
   createMockStore,
   mockedCreateFnAgent,
@@ -9,6 +10,7 @@ import {
 } from "./executor-test-helpers.js";
 
 type CapturedSession = {
+  systemPrompt?: string;
   sessionPurpose?: string;
   defaultProvider?: string;
   defaultModelId?: string;
@@ -24,6 +26,7 @@ function captureSession(output: string | string[] = '{"verdict":"APPROVE","notes
   mockedCreateFnAgent.mockImplementation(async (opts: any) => {
     const response = Array.isArray(output) ? output[Math.min(sessionCount++, output.length - 1)]! : output;
     holder.last = {
+      systemPrompt: opts.systemPrompt,
       sessionPurpose: opts.sessionPurpose,
       defaultProvider: opts.defaultProvider,
       defaultModelId: opts.defaultModelId,
@@ -117,6 +120,7 @@ async function runStepWithSettings(
 ) {
   const store = createMockStore();
   store.getSettings.mockResolvedValue(settings);
+  if (options.step?.phase === "post-merge") store.getTask.mockResolvedValue(baseTask(options.task));
   const executor = makeExecutor(store);
   const captured = captureSession(options.output);
 
@@ -136,6 +140,20 @@ describe("executor workflow-step model resolution", () => {
   beforeEach(() => {
     resetExecutorMocks();
     quietGit();
+  });
+
+  it("delivers fresh candidate-bound verification to the actual post-merge session", async () => {
+    const settings = { testCommand: "node check-fixture.mjs" };
+    const sha = "a".repeat(40);
+    const captured = await runStepWithSettings(settings, {
+      step: { phase: "post-merge" }, task: { mergeDetails: { mergeConfirmed: true, commitSha: sha,
+        verificationReceipts: [{ schema: 1, candidateSha: sha, sourceSha: "b".repeat(40),
+          settingsSha256: verificationSettingsHash(settings), startedAt: "2026-09-06T06:00:00Z",
+          completedAt: "2026-09-06T06:00:01Z", outcome: "passed",
+          checks: [{ type: "test", commandSha256: verificationHash(settings.testCommand), exitCode: 0 }] }] } },
+    });
+    expect(captured.systemPrompt).toContain(`"candidateSha":"${sha}","evidence":"passed"`);
+    expect(captured.systemPrompt).toContain('"exitCode":0');
   });
 
   it("uses the project execution lane instead of the global default when the step has no override", async () => {
