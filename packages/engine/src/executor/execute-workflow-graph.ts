@@ -5,6 +5,7 @@
  * Runs the graph-owned workflow path: claim routing, node preparation, custom-node
  * execution, foreach worktree deps, and terminal handleGraphFailure.
  */
+import { assertRecoveryCurrent, assertRecoveryIr, PostMergeRecoveryRefusal, recoveryTaskIsCurrent, requireRecoveryPublication, type PostMergeRecoveryPlan } from "./post-merge-recovery.js";
 import type {
   AgentStore,
   Settings,
@@ -220,6 +221,9 @@ function reviewConvergenceResetPatch(
 }
 
 export type WorkflowStepResultPersistFence = {
+  /** Additional identity CAS for explicit post-merge recovery. */
+  taskGuard?: (task: Task) => boolean;
+  expectedWorkflowId?: string;
   signal?: AbortSignal;
   requireAttemptStartedAt?: string;
   /** A failed pending write may recover only if no different attempt has since claimed this step. */
@@ -278,6 +282,7 @@ type RuntimeWorkflowStepResultStore = {
   updateWorkflowStepResultsFenced?: (
     taskId: string,
     compute: (current: Task) => WorkflowStepResultPatch | null,
+    expectedWorkflowId?: string,
   ) => Promise<FencedWorkflowStepResultOutcome>;
   updateTaskAtomic?: (
     taskId: string,
@@ -345,13 +350,18 @@ async function writeWorkflowStepResultPatch(
   deps: Pick<ExecuteWorkflowGraphDeps, "store" | "getRunContextFor">,
   taskId: string,
   compute: (current: Task) => WorkflowStepResultPatch | null,
+  expectedWorkflowId?: string,
 ): Promise<{ applied: boolean; task?: Task }> {
   const store = deps.store as TaskStore & RuntimeWorkflowStepResultStore;
   if (typeof store.updateWorkflowStepResultsFenced === "function") {
-    const outcome = await store.updateWorkflowStepResultsFenced(taskId, compute);
+    const outcome = await store.updateWorkflowStepResultsFenced(taskId, compute, expectedWorkflowId);
     if (outcome.applied) return { applied: true, task: outcome.task };
     if (outcome.reason !== "unavailable") return { applied: false };
   }
+
+  // Recovery requires the cross-process, selection-bound writer; never degrade
+  // to an in-process or unfenced compatibility store.
+  if (expectedWorkflowId !== undefined) return { applied: false };
 
   if (typeof store.updateTaskAtomic === "function") {
     let applied = false;
@@ -420,7 +430,7 @@ export async function persistWorkflowStepResultWithOutcome(
     let activityResults: CoreWorkflowStepResult[] | undefined;
 
     const compute = (current: Task, options?: { requireScopeRevision?: number }): WorkflowStepResultPatch | null => {
-      if (fence.signal?.aborted) {
+      if (fence.signal?.aborted || (fence.taskGuard && !fence.taskGuard(current))) {
         fenceRefused = true;
         return null;
       }
@@ -481,6 +491,7 @@ export async function persistWorkflowStepResultWithOutcome(
         (current) => compute(current, repositoryScopeRevision === undefined
           ? undefined
           : { requireScopeRevision: repositoryScopeRevision }),
+        fence.expectedWorkflowId,
       );
       if (!written.applied) fenceRefused = true;
     }
@@ -562,8 +573,13 @@ export async function discardWorkflowStepLease(
 export async function executeWorkflowGraph(
   deps: ExecuteWorkflowGraphDeps,
   task: Task,
-  opts?: { alreadyClaimed?: boolean },
+  opts?: { alreadyClaimed?: boolean; postMergeRecovery?: PostMergeRecoveryPlan },
 ): Promise<void> {
+    const recovery = opts?.postMergeRecovery;
+    // Recovery failures never enter the generic replan/reimplementation router.
+    const handleFailure: ExecuteWorkflowGraphDeps["handleGraphFailure"] = recovery
+      ? async () => { await deps.store.logEntry(task.id, "Post-merge recovery stopped without verified completion").catch(() => undefined); }
+      : deps.handleGraphFailure;
     /*
     FNXC:WorkflowAgentRouting 2026-08-10-01:15:
     Honor an active principal-hold cooldown BEFORE the graph is entered — re-entering only to re-fence and
@@ -608,11 +624,12 @@ export async function executeWorkflowGraph(
       deps.outerConcurrencyClaims.add(task.id);
     }
     try {
+      if (recovery) await assertRecoveryCurrent(deps.store, recovery);
       let settings: Settings;
       try {
         settings = await deps.store.getSettings();
       } catch (err) {
-        await deps.handleGraphFailure(task, {
+        await handleFailure(task, {
           disposition: "failed",
           outcome: "failure",
           reason: `settings-load-failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -665,7 +682,7 @@ export async function executeWorkflowGraph(
         FNXC:FastOptionalSteps 2026-06-30-09:45:
         Fast mode only clears optional workflow steps by default; explicit `enabledWorkflowSteps` remains operator intent. Minimal or older stores that cannot resolve the graph must fail closed, even in fast mode, rather than falling through and silently skipping the selected optional-group body.
         */
-        await deps.handleGraphFailure(task, {
+        await handleFailure(task, {
           disposition: "failed",
           outcome: "failure",
           reason:
@@ -680,7 +697,7 @@ export async function executeWorkflowGraph(
           ? await deps.store.getTaskWorkflowSelectionAsync(task.id)
           : deps.store.getTaskWorkflowSelection(task.id);
       } catch (err) {
-        await deps.handleGraphFailure(task, {
+        await handleFailure(task, {
           disposition: "failed",
           outcome: "failure",
           reason: `workflow-selection-failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -724,6 +741,7 @@ export async function executeWorkflowGraph(
       } catch {
         columnAgentIr = undefined;
       }
+      if (recovery) assertRecoveryIr(columnAgentIr, recovery);
       if (columnAgentIr) {
         const missingEntryArtifacts: string[] = [];
         for (const artifact of workflowEntryArtifacts(columnAgentIr)) {
@@ -732,7 +750,7 @@ export async function executeWorkflowGraph(
             content = await deps.readTaskArtifact(task.id, artifact.key);
           } catch (error) {
             const failureValue = requiredArtifactReadFailedValue(artifact.key);
-            await deps.handleGraphFailure(task, {
+            await handleFailure(task, {
               disposition: "failed",
               outcome: "failure",
               reason: `workflow-required-artifact-read-failed:${artifact.key}:${error instanceof Error ? error.message : String(error)}`,
@@ -744,6 +762,7 @@ export async function executeWorkflowGraph(
           if (typeof content !== "string" || !content.trim()) missingEntryArtifacts.push(artifact.key);
         }
         if (missingEntryArtifacts.length > 0) {
+          if (recovery) throw new PostMergeRecoveryRefusal("Recovery requires preserved workflow artifacts");
           const liveTask = await deps.store.getTask(task.id).catch(() => task);
           await deps.recoverMissingRequiredArtifacts(liveTask, missingEntryArtifacts, { source: "graph-entry" });
           return;
@@ -824,6 +843,11 @@ export async function executeWorkflowGraph(
       */
       let continuation: WorkflowWorkItem | undefined;
       const runner = new WorkflowGraphTaskRunner({
+        requireDurableWorkflowStepResults: !!recovery,
+        ...(recovery ? { validateResolvedWorkflow: (workflowId: string, ir: WorkflowIr) => {
+          if (workflowId !== "builtin:coding") throw new PostMergeRecoveryRefusal("Recovery workflow changed");
+          assertRecoveryIr(ir, recovery);
+        } } : {}),
         localNodeId: deps.options.getLocalNodeId?.(),
         store: {
           ...deps.store,
@@ -846,6 +870,7 @@ export async function executeWorkflowGraph(
         prepareNodeExecution: (node, nodeTask, requirement) =>
           deps.prepareGraphNodeExecution(node, nodeTask, settings, requirement),
         beforeNodeExecution: async (node, nodeTask, context) => {
+          if (recovery) await assertRecoveryCurrent(deps.store, recovery);
           const principalAdmission = await admitWorkflowPrincipalBeforeNode(
             {
               store: deps.store,
@@ -1034,14 +1059,20 @@ export async function executeWorkflowGraph(
         holdPlanReviewNoOp: async (nodeTask, suspension) => {
           continuation = await deps.holdPlanReviewNoOpContinuation(nodeTask, suspension, continuation, resolvedRunId);
         },
-        recordWorkflowStepResult: (
+        recordWorkflowStepResult: async (
           taskId: string,
           result: CoreWorkflowStepResult,
           fence?: WorkflowStepResultPersistFence,
-        ) => persistWorkflowStepResultWithOutcome(deps, taskId, result, {
+        ) => {
+          if (recovery) await assertRecoveryCurrent(deps.store, recovery);
+          const outcome = await persistWorkflowStepResultWithOutcome(deps, taskId, result, {
           ...fence,
           signal: graphAbortSignal,
-        }),
+          ...(recovery ? { taskGuard: (current: Task) => recoveryTaskIsCurrent(current, recovery), expectedWorkflowId: "builtin:coding" } : {}),
+          });
+          if (recovery) requireRecoveryPublication(outcome);
+          return outcome;
+        },
         discardWorkflowStepLease: (taskId: string, workflowStepId: string, startedAt: string) =>
           discardWorkflowStepLease(deps, taskId, workflowStepId, startedAt),
         isRepositoryScopeReviewEdgeCurrent: async (taskId: string, workflowStepId: string, revision: number): Promise<boolean> => {
@@ -1070,6 +1101,9 @@ export async function executeWorkflowGraph(
           ? loadedDetail
           : { ...task, prompt: task.prompt ?? task.description ?? "" };
         const workItems = await deps.store.listWorkflowWorkItemsForTask?.(task.id, { kinds: ["task"] }) ?? [];
+        if (recovery && workItems.some((item) => ACTIVE_WORKFLOW_WORK_ITEM_STATES.includes(item.state))) {
+          throw new Error("Post-merge recovery refused competing workflow ownership");
+        }
         for (let index = workItems.length - 1; index >= 0; index -= 1) {
           const candidate = workItems[index];
           if (ACTIVE_WORKFLOW_WORK_ITEM_STATES.includes(candidate.state)) {
@@ -1105,10 +1139,10 @@ export async function executeWorkflowGraph(
          * Only a TOP-LEVEL node id is a legal resume point. A foreach template node id
          * is not in ir.nodes; re-enter at the column resume node instead of terminalizing.
          */
-        const resumeNodeId = continuation?.nodeId
+        const resumeNodeId = recovery?.entryNodeId ?? (continuation?.nodeId
           && columnAgentIr?.nodes.some((candidate) => candidate.id === continuation?.nodeId)
           ? continuation.nodeId
-          : undefined;
+          : undefined);
         if (continuation?.nodeId && resumeNodeId === undefined) {
           executorLog.debug(
             `[workflow-graph] ${task.id}: continuation node '${continuation.nodeId}' is not a top-level graph node `
@@ -1127,7 +1161,7 @@ export async function executeWorkflowGraph(
         executorLog.error(
           `[workflow-graph] ${task.id} interpreter threw — parking task as workflow failure: ${err instanceof Error ? err.message : String(err)}`,
         );
-        await deps.handleGraphFailure(task, {
+        await handleFailure(task, {
           disposition: "failed",
           outcome: "failure",
           reason: `interpreter-error: ${err instanceof Error ? err.message : String(err)}`,
@@ -1223,7 +1257,7 @@ export async function executeWorkflowGraph(
       if (result.disposition === "fell-back") {
         await closeContinuation("failed");
         executorLog.warn(`[workflow-graph] ${task.id} could not resolve workflow — parking task instead of legacy fallback: ${result.reason}`);
-        await deps.handleGraphFailure(task, {
+        await handleFailure(task, {
           ...result,
           disposition: "failed",
           outcome: "failure",
@@ -1262,9 +1296,10 @@ export async function executeWorkflowGraph(
       }
       if (result.disposition === "failed") {
         await closeContinuation("failed");
-        await deps.handleGraphFailure(task, result);
+        await handleFailure(task, result);
       } else if (result.disposition === "completed") {
         await closeContinuation("succeeded");
+        if (recovery) return;
         const live = await deps.store.getTask(task.id).catch(() => task);
         if ((live as TaskDetail).mergeDetails?.mergeConfirmed === true && (live as TaskDetail).column !== await resolveCompleteColumnFor(deps.store, task.id)) {
           await deps.finalizeMergeConfirmedWorkflowGraphTask(task.id, "graph-completed");

@@ -425,6 +425,7 @@ export async function updateWorkflowStepResultsFencedImpl(
   store: TaskStore,
   id: string,
   compute: WorkflowStepResultsFencedCompute,
+  expectedWorkflowId?: string,
 ): Promise<WorkflowStepResultsFencedUpdateResult> {
   const layer = store.asyncLayer;
   if (!layer) return { applied: false, reason: "unavailable" };
@@ -435,6 +436,16 @@ export async function updateWorkflowStepResultsFencedImpl(
       const row = await readTaskRowInTransaction(tx, id, { includeDeleted: true }, layer.projectId);
       if (!row) return { applied: false, reason: "task-missing" };
       if (row.deletedAt) return { applied: false, reason: "task-deleted" };
+
+      // Recovery publishes only for the workflow it admitted. The row lock also
+      // orders against selection deletion, which does not take the task advisory lock.
+      if (expectedWorkflowId !== undefined) {
+        const selectionTable = schema.project.taskWorkflowSelection;
+        const [selection] = await tx.select({ workflowId: selectionTable.workflowId })
+          .from(selectionTable).where(and(eq(selectionTable.projectId, layer.projectId?.trim() || "__legacy_unscoped__"),
+            eq(selectionTable.taskId, id))).for("share");
+        if (selection?.workflowId !== expectedWorkflowId) return { applied: false, reason: "refused" };
+      }
 
       const current = store.rowToTask(store.pgRowToTaskRow(row));
       const patch = compute(current);

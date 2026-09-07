@@ -77,6 +77,9 @@ export interface WorkflowGraphRunnerStore {
 }
 
 export interface WorkflowGraphTaskRunnerDeps {
+  requireDurableWorkflowStepResults?: boolean;
+  /** Optional recovery admission over the exact parsed IR this runner will execute. */
+  validateResolvedWorkflow?: (workflowId: string, ir: WorkflowIr) => void;
   /*
    * FNXC:PlanReviewLease 2026-07-26-21:05:
    * Cluster node id forwarded to the graph executor so review-gate leases are stamped with WHERE
@@ -271,6 +274,7 @@ export class WorkflowGraphTaskRunner {
       The linear WorkflowStep compiler was removed; the graph interpreter is the sole executor. `parseWorkflowIr` (which validates branching graphs via validateV2) is now the only IR validity gate here — there is no separate linear-compile pre-check to satisfy.
       */
       validatedIr = parseWorkflowIr(definition.ir);
+      this.deps.validateResolvedWorkflow?.(selection.workflowId, validatedIr);
     } catch (err) {
       return this.failBeforeSideEffects(task.id, `invalid-ir: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -387,6 +391,7 @@ export class WorkflowGraphTaskRunner {
           : undefined;
 
       const executor = new WorkflowGraphExecutor({
+        requireDurableWorkflowStepResults: this.deps.requireDurableWorkflowStepResults,
         localNodeId: this.deps.localNodeId,
         seams: wrappedSeams,
         primitives: wrappedPrimitives,
@@ -482,7 +487,7 @@ export class WorkflowGraphTaskRunner {
       };
     } catch (err) {
       const reason = `interpreter-error: ${err instanceof Error ? err.message : String(err)}`;
-      if (sideEffectsRan) {
+      if (sideEffectsRan || this.deps.requireDurableWorkflowStepResults) {
         // Too late to fall back — the caller parks the task for human review.
         this.emit("terminal", task.id, `${definition.id}:failed (${reason})`);
         return { disposition: "failed", outcome: "failure", reason, visitedNodeIds: invoked };

@@ -2240,8 +2240,9 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   async updateWorkflowStepResultsFenced(
     id: string,
     compute: import("./task-store/task-mutation-ops.js").WorkflowStepResultsFencedCompute,
+    expectedWorkflowId?: string,
   ): Promise<import("./task-store/task-mutation-ops.js").WorkflowStepResultsFencedUpdateResult> {
-    return updateWorkflowStepResultsFencedImpl(this, id, compute);
+    return updateWorkflowStepResultsFencedImpl(this, id, compute, expectedWorkflowId);
   }
   /**
    * FNXC:LifecycleContainment 2026-08-30-13:36:

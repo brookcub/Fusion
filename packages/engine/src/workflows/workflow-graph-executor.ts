@@ -254,6 +254,8 @@ export interface WorkflowNodePreparationRequirement {
 }
 
 export interface WorkflowGraphExecutorDeps {
+  /** Recovery cannot execute or complete without durable verification receipts. */
+  requireDurableWorkflowStepResults?: boolean;
   /*
    * FNXC:PlanReviewLease 2026-07-26-20:18:
    * Cluster node id stamped onto review-gate leases (`WorkflowStepResult.leaseNodeId`). It lets a
@@ -1952,8 +1954,10 @@ export class WorkflowGraphExecutor {
     order against Reset's PostgreSQL transaction; updateWorkflowStepResultsFenced owns that enforcement.
     Return true on this refusal because false has the separate repository-scope-superseded meaning.
     */
-    if (this.isRunAborted()) return { scopeCurrent: true, persisted: false };
-    if (!this.deps.recordWorkflowStepResult) return { scopeCurrent: true, persisted: false };
+    if (this.isRunAborted() || !this.deps.recordWorkflowStepResult) {
+      if (this.deps.requireDurableWorkflowStepResults) throw new Error("Recovery result publication unavailable");
+      return { scopeCurrent: true, persisted: false };
+    }
     try {
       const outcome = await this.deps.recordWorkflowStepResult(taskId, result, {
         ...fence,
@@ -1962,13 +1966,17 @@ export class WorkflowGraphExecutor {
       const receipt = typeof outcome === "object" && outcome !== null
         ? outcome as Partial<WorkflowStepResultPersistenceOutcome>
         : undefined;
+      if (this.deps.requireDurableWorkflowStepResults && (receipt?.persisted !== true || receipt.scopeCurrent !== true)) {
+        throw new Error("Recovery result publication refused");
+      }
       if (typeof receipt?.scopeCurrent === "boolean" && typeof receipt.persisted === "boolean") {
         return { scopeCurrent: receipt.scopeCurrent, persisted: receipt.persisted };
       }
       // Legacy in-memory seams return void after mutating their record array. Preserve that contract
       // while production returns the explicit receipt required for predecessor-CAS admission.
       return { scopeCurrent: outcome !== false, persisted: outcome !== false };
-    } catch {
+    } catch (error) {
+      if (this.deps.requireDurableWorkflowStepResults) throw error;
       // Result recording is additive — a sink failure must not affect the run.
       return { scopeCurrent: true, persisted: false };
     }

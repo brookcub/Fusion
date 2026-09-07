@@ -2729,6 +2729,24 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
 
   // Merge task (in-review → done, merges branch + cleans worktree)
   // Uses AI merge handler if provided, falls back to store.mergeTask
+  // FNXC:PostMergeRecovery 2026-09-07-02:00: A landed task can lack its final
+  // verification after interruption. This is not a retry of implementation.
+  router.post("/tasks/:id/retry-post-merge", async (req, res) => {
+    const expectedCommitSha = req.body?.expectedCommitSha;
+    if (typeof expectedCommitSha !== "string" || !/^[0-9a-f]{40}$/.test(expectedCommitSha)) {
+      throw badRequest("An exact expectedCommitSha is required");
+    }
+    const { engine } = await getProjectContext(req);
+    const executor = engine?.getRuntime().getExecutor();
+    if (!executor) throw conflict("Project executor is unavailable");
+    try {
+      const result = await executor.retryPostMerge(req.params.id, expectedCommitSha);
+      res.status(result.outcome === "already-complete" ? 200 : 202).json(result);
+    } catch {
+      throw conflict("Post-merge recovery refused: verify landing, pause state, workflow and active ownership");
+    }
+  });
+
   router.post("/tasks/:id/merge", async (req, res) => {
     try {
       const { store: scopedStore, engine } = await getProjectContext(req);
