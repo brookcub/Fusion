@@ -331,6 +331,7 @@ export async function runGraphCustomNode(
   columnBinding?: WorkflowColumnAgent,
   graphContext?: Record<string, unknown>,
   outputLanguage?: ResolvedTaskOutputLanguage,
+  executionPolicy?: { forceReadonly?: boolean },
 ): Promise<WorkflowNodeResult> {
     const cfg = node.config ?? {};
     let live = await deps.store.getTask(nodeTask.id);
@@ -986,6 +987,7 @@ export async function runGraphCustomNode(
             : { ...scriptOutcome, reviewInputFingerprint };
         }
         return deps.executeWorkflowStep(live, step, worktreePath, settings, nodeEnv, {
+          forceReadonly: executionPolicy?.forceReadonly === true,
           unattended,
           principalAgentId,
           outputLanguage,

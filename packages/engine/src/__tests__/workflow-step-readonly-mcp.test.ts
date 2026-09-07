@@ -114,4 +114,17 @@ describe("workflow-step readonly MCP policy", () => {
       readonlyMcpServerAllowlist: undefined,
     });
   });
+
+  it("keeps explicit recovery read-only despite workflow inline-fix settings", async () => {
+    const { executor } = makeExecutor();
+    const captured = captureSession();
+    const spawn = vi.spyOn(executor as any, "createSpawnAgentTool");
+    const node: WorkflowIrNode = { id: "post-merge-verification-step", kind: "prompt", config: {
+      name: "Post-merge verification", prompt: "Inspect the landed result.",
+      toolMode: "readonly", reviewCanFixInline: true,
+    } };
+    await (executor as any).runGraphCustomNode(node, task(), {}, undefined, undefined, undefined, { forceReadonly: true });
+    expect(captured.at(-1)?.tools).toBe("readonly");
+    expect(spawn).not.toHaveBeenCalled();
+  });
 });

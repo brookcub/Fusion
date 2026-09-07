@@ -236,6 +236,8 @@ export async function executeWorkflowStep(
   rejection produced entirely by a wrong diff base.
   */
   stepOptions?: {
+    /** Recovery-only capability ceiling, independent of mutable review settings. */
+    forceReadonly?: boolean;
     unattended?: boolean;
     principalAgentId?: string;
     outputLanguage?: ResolvedTaskOutputLanguage;
@@ -248,7 +250,8 @@ export async function executeWorkflowStep(
   },
 ): Promise<WorkflowStepOutcome> {
   const diffBaseCommitSha = stepOptions?.diffBaseCommitSha ?? task.baseCommitSha;
-    let toolMode: "coding" | "readonly" = workflowStep.toolMode || "readonly";
+    const forceReadonly = stepOptions?.forceReadonly === true;
+    let toolMode: "coding" | "readonly" = forceReadonly ? "readonly" : workflowStep.toolMode || "readonly";
     // (U3) Genuinely-unattended run — set FUSION_HEADLESS=1 below so skills record
     // assumptions and proceed instead of parking on a question. Explicit opt-in
     // only (default false = board run); see runGraphCustomNode / KTD-3.
@@ -292,7 +295,7 @@ export async function executeWorkflowStep(
       ? await mergeEffectiveSettings(deps.store, task, settings).catch(() => settings)
       : settings;
     const reviewerInlineFixesEnabled = (effectiveReviewSettings as Settings & { reviewerInlineFixes?: boolean }).reviewerInlineFixes === true;
-    const allowReviewerInlineFixes = reviewerInlineFixesEnabled && isReviewTypeWorkflowStep && workflowStep.mode === "prompt";
+    const allowReviewerInlineFixes = !forceReadonly && reviewerInlineFixesEnabled && isReviewTypeWorkflowStep && workflowStep.mode === "prompt";
     const allowPlanReviewPromptWrite = allowReviewerInlineFixes && isPlanReviewStep;
     if (allowReviewerInlineFixes && !isPlanReviewStep) {
       toolMode = "coding";

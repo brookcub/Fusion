@@ -833,7 +833,8 @@ export async function executeWorkflowGraph(
         resolution here so a later task-description or settings edit cannot retarget their output.
         */
         execute: (node, nodeTask, nodeSettings, columnBinding, context) =>
-          deps.runGraphCustomNode(node, nodeTask, nodeSettings, columnBinding, context, outputLanguage),
+          deps.runGraphCustomNode(node, nodeTask, nodeSettings, columnBinding, context, outputLanguage,
+            recovery ? { forceReadonly: true } : undefined),
         resolveColumnBinding: resolveBindingForNode,
       });
       /*

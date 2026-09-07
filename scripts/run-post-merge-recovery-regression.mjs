@@ -20,7 +20,7 @@ process.env.PSModuleAnalysisCachePath = join(evidence, "ModuleAnalysisCache");
 const deadline = performance.now() + 300_000;
 const lanes = [
   ["core", ["src/__tests__/post-merge-recovery-fence.pg.test.ts"]],
-  ["engine", ["src/__tests__/post-merge-recovery.test.ts", "src/__tests__/workflow-graph-post-merge.test.ts", "src/__tests__/persist-workflow-step-result-abort-fence.test.ts"]],
+  ["engine", ["src/__tests__/post-merge-recovery.test.ts", "src/__tests__/workflow-step-readonly-mcp.test.ts", "src/__tests__/workflow-graph-post-merge.test.ts", "src/__tests__/persist-workflow-step-result-abort-fence.test.ts"]],
   ["dashboard", ["src/__tests__/post-merge-recovery-route.test.ts", "src/__tests__/task-log-route.pg.test.ts"]],
 ];
 let identity; let shutdownVerified = false; let lifecycleFailed = false; let exitCode = 1;
