@@ -74,6 +74,7 @@ export interface WorkflowGraphRunnerStore {
   getTaskWorkflowSelectionAsync?(taskId: string): Promise<{ workflowId: string; stepIds: string[] } | undefined>;
   getWorkflowDefinition(id: string): Promise<WorkflowDefinition | undefined>;
   getTask?(taskId: string): Promise<TaskDetail>;
+  getSettings?(): Promise<Pick<Settings, "globalPause" | "enginePaused">>;
 }
 
 export interface WorkflowGraphTaskRunnerDeps {
@@ -416,6 +417,25 @@ export class WorkflowGraphTaskRunner {
         Production graph runs must fetch live task steps during foreach replay. The runner is the workflow boundary that has store access, so it supplies the fresh projection seam instead of making executor self-healing guess after a stale step node fails.
         */
         getTaskSteps: async (stepTask) => (await this.deps.store.getTask?.(stepTask.id))?.steps ?? stepTask.steps ?? [],
+        // Durable checkpoint closure must never treat a stale run snapshot as
+        // store authority when the task disappeared or cannot be read.
+        getAuthoritativeTaskSteps: async (stepTask) => {
+          if (!this.deps.store.getTask) throw new Error("task store cannot read authoritative steps");
+          if (!this.deps.store.getSettings) throw new Error("settings store cannot read checkpoint pause state");
+          const liveTask = await this.deps.store.getTask(stepTask.id);
+          if (!liveTask) throw new Error(`task ${stepTask.id} is unavailable for checkpoint settlement`);
+          if (liveTask.paused || liveTask.userPaused) {
+            throw new Error(`task ${stepTask.id} is paused for checkpoint settlement`);
+          }
+          // Read pause state after the potentially slow task fetch. A pause can
+          // become durable while that fetch is pending; an earlier settings
+          // snapshot would incorrectly authorize the checkpoint write.
+          const settings = await this.deps.store.getSettings();
+          if (settings.globalPause || settings.enginePaused) {
+            throw new Error("checkpoint settlement blocked while the engine is paused");
+          }
+          return liveTask.steps ?? [];
+        },
         // Step-inversion (KTD-11, U10): worktree isolation + parallel scheduling.
         allocateInstanceWorktree: this.deps.allocateInstanceWorktree,
         resolveIntegrationBase: this.deps.resolveIntegrationBase,

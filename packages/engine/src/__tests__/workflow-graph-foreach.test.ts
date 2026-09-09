@@ -178,6 +178,177 @@ describe("WorkflowGraphExecutor foreach (U3)", () => {
     expect(exec).not.toHaveBeenCalled();
   });
 
+  it("settles an interrupted shared checkpoint when its exact same-run step is terminal", async () => {
+    const stale: WorkflowStepInstanceState = {
+      taskId: "FN-FOREACH", runId: "resume-run", foreachNodeId: "fe",
+      stepIndex: 1, pinnedStepCount: 2, currentNodeId: "exec", status: "in-progress",
+      baselineSha: "baseline-before-interruption", checkpointId: "checkpoint-before-interruption",
+      reworkCount: 2, verdict: "REVISE",
+    };
+    const saved: WorkflowStepInstanceState[] = [];
+    const exec = vi.fn(async () => ({ outcome: "failure" as const, value: "must-not-replay" }));
+    const executor = new WorkflowGraphExecutor({
+      runId: "resume-run",
+      seams: baseSeams({ stepExecute: exec }),
+      getTaskSteps: async () => taskWithStepStatuses(["done", "done"]).steps as TaskStep[],
+      getAuthoritativeTaskSteps: async () => taskWithStepStatuses(["done", "done"]).steps as TaskStep[],
+      stepInstancePersistence: {
+        loadInstanceStates: async (taskId, runId) => {
+          expect([taskId, runId]).toEqual(["FN-FOREACH", "resume-run"]);
+          return [{ ...stale, branchName: null, integratedAt: null }];
+        },
+        saveInstanceState: async (row) => { saved.push({ ...row }); },
+      },
+    });
+
+    const result = await executor.run(
+      taskWithStepStatuses(["done", "in-progress"]), settingsOn(), foreachIr(singleExecuteTemplate()),
+    );
+
+    expect(result.outcome).toBe("success");
+    expect(exec).not.toHaveBeenCalled();
+    expect(saved).toEqual([{ ...stale, branchName: null, integratedAt: null, status: "completed" }]);
+  });
+
+  it("is idempotent for an already completed exact shared checkpoint", async () => {
+    const completed: WorkflowStepInstanceState = {
+      taskId: "FN-FOREACH", runId: "resume-run", foreachNodeId: "fe",
+      stepIndex: 0, pinnedStepCount: 1, currentNodeId: "exec", status: "completed", reworkCount: 0,
+    };
+    const save = vi.fn();
+    const executor = new WorkflowGraphExecutor({
+      runId: "resume-run", seams: baseSeams(),
+      getTaskSteps: async () => taskWithStepStatuses(["done"]).steps as TaskStep[],
+      getAuthoritativeTaskSteps: async () => taskWithStepStatuses(["done"]).steps as TaskStep[],
+      stepInstancePersistence: { loadInstanceStates: async () => [completed], saveInstanceState: save },
+    });
+    const result = await executor.run(taskWithStepStatuses(["in-progress"]), settingsOn(), foreachIr(singleExecuteTemplate()));
+    expect(result.outcome).toBe("success");
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["duplicate", (stale: WorkflowStepInstanceState) => [{ ...stale }, { ...stale }]],
+    ["worktree", (stale: WorkflowStepInstanceState) => [{ ...stale, branchName: "isolated-branch" }]],
+    ["contradictory-pin", (stale: WorkflowStepInstanceState) => [{ ...stale, pinnedStepCount: 2 }]],
+  ])("refuses %s checkpoint settlement rather than replaying or rewriting it", async (_name, rowsFor) => {
+    const stale: WorkflowStepInstanceState = {
+      taskId: "FN-FOREACH", runId: "resume-run", foreachNodeId: "fe",
+      stepIndex: 0, pinnedStepCount: 1, currentNodeId: "exec", status: "in-progress", reworkCount: 0,
+    };
+    const exec = vi.fn(async () => ({ outcome: "failure" as const, value: "must-not-replay" }));
+    const save = vi.fn();
+    const executor = new WorkflowGraphExecutor({
+      runId: "resume-run", seams: baseSeams({ stepExecute: exec }),
+      getTaskSteps: async () => taskWithStepStatuses(["done"]).steps as TaskStep[],
+      getAuthoritativeTaskSteps: async () => taskWithStepStatuses(["done"]).steps as TaskStep[],
+      stepInstancePersistence: { loadInstanceStates: async () => rowsFor(stale), saveInstanceState: save },
+    });
+
+    const result = await executor.run(taskWithStepStatuses(["in-progress"]), settingsOn(), foreachIr(singleExecuteTemplate()));
+
+    expect(result.outcome).toBe("failure");
+    expect(exec).not.toHaveBeenCalled();
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when an authoritative checkpoint read or write fails", async () => {
+    const exec = vi.fn(async () => ({ outcome: "failure" as const, value: "must-not-replay" }));
+    for (const persistence of [
+      { loadInstanceStates: async () => { throw new Error("read unavailable"); }, saveInstanceState: vi.fn() },
+      { loadInstanceStates: async () => [{ taskId: "FN-FOREACH", runId: "resume-run", foreachNodeId: "fe", stepIndex: 0, pinnedStepCount: 1, currentNodeId: "exec", status: "in-progress" as const, reworkCount: 0 }], saveInstanceState: async () => { throw new Error("write unavailable"); } },
+    ]) {
+      const executor = new WorkflowGraphExecutor({
+        runId: "resume-run", seams: baseSeams({ stepExecute: exec }),
+        getTaskSteps: async () => taskWithStepStatuses(["done"]).steps as TaskStep[],
+        getAuthoritativeTaskSteps: async () => taskWithStepStatuses(["done"]).steps as TaskStep[],
+        stepInstancePersistence: persistence,
+      });
+      const result = await executor.run(taskWithStepStatuses(["in-progress"]), settingsOn(), foreachIr(singleExecuteTemplate()));
+      expect(result.outcome).toBe("failure");
+    }
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("refuses settlement when only the stale-compatible reader is available", async () => {
+    const stale: WorkflowStepInstanceState = {
+      taskId: "FN-FOREACH", runId: "resume-run", foreachNodeId: "fe",
+      stepIndex: 0, pinnedStepCount: 1, currentNodeId: "exec", status: "in-progress", reworkCount: 0,
+    };
+    const save = vi.fn();
+    const executor = new WorkflowGraphExecutor({
+      runId: "resume-run", seams: baseSeams(),
+      // This models the runner's ordinary replay fallback; it is intentionally
+      // insufficient authority for mutating a persisted checkpoint.
+      getTaskSteps: async () => taskWithStepStatuses(["done"]).steps as TaskStep[],
+      stepInstancePersistence: { loadInstanceStates: async () => [stale], saveInstanceState: save },
+    });
+    const result = await executor.run(taskWithStepStatuses(["in-progress"]), settingsOn(), foreachIr(singleExecuteTemplate()));
+    expect(result.outcome).toBe("failure");
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it("does not settle when the terminal proof changes or the run aborts during its persistence read", async () => {
+    const stale: WorkflowStepInstanceState = {
+      taskId: "FN-FOREACH", runId: "resume-run", foreachNodeId: "fe",
+      stepIndex: 0, pinnedStepCount: 1, currentNodeId: "exec", status: "in-progress", reworkCount: 0,
+    };
+    const runCase = async (mode: "changed" | "aborted") => {
+      const controller = new AbortController();
+      const save = vi.fn();
+      let reads = 0;
+      const executor = new WorkflowGraphExecutor({
+        runId: "resume-run", signal: controller.signal, seams: baseSeams(),
+        getTaskSteps: async () => {
+          reads += 1;
+          if (mode === "aborted" && reads === 2) controller.abort();
+          return taskWithStepStatuses([mode === "changed" && reads > 1 ? "in-progress" : "done"]).steps as TaskStep[];
+        },
+        getAuthoritativeTaskSteps: async () => {
+          reads += 1;
+          if (mode === "aborted" && reads === 2) controller.abort();
+          return taskWithStepStatuses([mode === "changed" && reads > 1 ? "in-progress" : "done"]).steps as TaskStep[];
+        },
+        stepInstancePersistence: {
+          loadInstanceStates: async () => [stale],
+          saveInstanceState: save,
+        },
+      });
+      const result = await executor.run(taskWithStepStatuses(["in-progress"]), settingsOn(), foreachIr(singleExecuteTemplate()));
+      expect(result.outcome).toBe("failure");
+      if (mode === "aborted") {
+        expect(save).not.toHaveBeenCalled();
+      } else {
+        // The changed projection may legitimately resume its now-live work,
+        // but it must not use the stale terminal observation to complete it.
+        expect(save.mock.calls.map(([row]) => row.status)).not.toContain("completed");
+      }
+    };
+    await runCase("changed");
+    await runCase("aborted");
+  });
+
+  it.each(["changed", "aborted"] as const)("does not write when the strict post-load read is %s", async (mode) => {
+    const controller = new AbortController();
+    const stale: WorkflowStepInstanceState = {
+      taskId: "FN-FOREACH", runId: "resume-run", foreachNodeId: "fe",
+      stepIndex: 0, pinnedStepCount: 1, currentNodeId: "exec", status: "in-progress", reworkCount: 0,
+    };
+    const save = vi.fn();
+    const executor = new WorkflowGraphExecutor({
+      runId: "resume-run", signal: controller.signal, seams: baseSeams(),
+      getTaskSteps: async () => taskWithStepStatuses(["done"]).steps as TaskStep[],
+      getAuthoritativeTaskSteps: async () => {
+        if (mode === "aborted") controller.abort();
+        return taskWithStepStatuses([mode === "changed" ? "in-progress" : "done"]).steps as TaskStep[];
+      },
+      stepInstancePersistence: { loadInstanceStates: async () => [stale], saveInstanceState: save },
+    });
+    const result = await executor.run(taskWithStepStatuses(["in-progress"]), settingsOn(), foreachIr(singleExecuteTemplate()));
+    expect(result.outcome).toBe("failure");
+    expect(save).not.toHaveBeenCalled();
+  });
+
   it("resume skips mixed done and skipped instances and runs pending steps only", async () => {
     const executedStepIndexes: number[] = [];
     const seams = baseSeams({
