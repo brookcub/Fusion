@@ -116,10 +116,16 @@ async function runStepWithSettings(
     step?: Record<string, unknown>;
     stepOptions?: Record<string, unknown>;
     output?: string | string[];
+    workflowValues?: Record<string, unknown>;
   } = {},
 ) {
   const store = createMockStore();
   store.getSettings.mockResolvedValue(settings);
+  if (options.workflowValues) {
+    store.getWorkflowDefinition = vi.fn(async () => undefined);
+    store.getWorkflowSettingValues = vi.fn(() => options.workflowValues);
+    store.getWorkflowSettingsProjectId = vi.fn(() => "isolated-model-routing-project");
+  }
   if (options.step?.phase === "post-merge") store.getTask.mockResolvedValue(baseTask(options.task));
   const executor = makeExecutor(store);
   const captured = captureSession(options.output);
@@ -140,6 +146,66 @@ describe("executor workflow-step model resolution", () => {
   beforeEach(() => {
     resetExecutorMocks();
     quietGit();
+  });
+
+  it.each([
+    ["plan-review", "Plan Review", "pre-merge"],
+    ["code-review", "Code Review", "pre-merge"],
+    ["post-merge-verification", "Post-merge verification", "post-merge"],
+  ])("honors persisted workflow reviewer model and effort in %s", async (id, name, phase) => {
+    const settings = {
+      validatorGlobalProvider: "openai-codex",
+      validatorGlobalModelId: "gpt-5.3-codex-spark",
+      validatorGlobalThinkingLevel: "low",
+    };
+    const captured = await runStepWithSettings(settings, {
+      workflowValues: { validatorProvider: "pi-claude-cli", validatorModelId: "claude-opus-4-8", validatorThinkingLevel: "medium" },
+      step: { id: `graph:${id}-step`, name, optionalGroupId: id, phase },
+    });
+    expect(captured).toMatchObject({ defaultProvider: "pi-claude-cli", defaultModelId: "claude-opus-4-8", defaultThinkingLevel: "medium" });
+    expect(settings).not.toHaveProperty("validatorProvider");
+  });
+
+  it("honors persisted execution settings for ordinary workflow prompts", async () => {
+    const captured = await runStepWithSettings({ defaultProvider: "openai", defaultModelId: "old-default" }, {
+      workflowValues: { executionProvider: "openai-codex", executionModelId: "gpt-5.6-terra", executionThinkingLevel: "medium" },
+    });
+    expect(captured).toMatchObject({ defaultProvider: "openai-codex", defaultModelId: "gpt-5.6-terra", defaultThinkingLevel: "medium" });
+  });
+
+  it("keeps explicit task reviewer overrides above persisted workflow defaults", async () => {
+    const captured = await runStepWithSettings({}, {
+      workflowValues: { validatorProvider: "pi-claude-cli", validatorModelId: "claude-opus-4-8", validatorThinkingLevel: "medium" },
+      task: { validatorModelProvider: "openai-codex", validatorModelId: "gpt-5.6-sol", validatorThinkingLevel: "high" },
+      step: { name: "Code Review", optionalGroupId: "code-review" },
+    });
+    expect(captured).toMatchObject({ defaultProvider: "openai-codex", defaultModelId: "gpt-5.6-sol", defaultThinkingLevel: "high" });
+  });
+
+  it("keeps test mode authoritative over persisted workflow reviewer settings", async () => {
+    const captured = await runStepWithSettings({ testMode: true }, {
+      workflowValues: { validatorProvider: "pi-claude-cli", validatorModelId: "claude-opus-4-8" },
+      step: { name: "Code Review", optionalGroupId: "code-review" },
+    });
+    expect(captured).toMatchObject({ defaultProvider: "mock", defaultModelId: "scripted" });
+  });
+
+  it("passes persisted reviewer fallback model and effort into the session", async () => {
+    const captured = await runStepWithSettings({}, {
+      workflowValues: { validatorProvider: "pi-claude-cli", validatorModelId: "claude-opus-4-8",
+        validatorFallbackProvider: "openai-codex", validatorFallbackModelId: "gpt-5.6-sol", validatorFallbackThinkingLevel: "high" },
+      step: { name: "Code Review", optionalGroupId: "code-review" },
+    });
+    expect(captured).toMatchObject({ defaultProvider: "pi-claude-cli", defaultModelId: "claude-opus-4-8",
+      fallbackProvider: "openai-codex", fallbackModelId: "gpt-5.6-sol", fallbackThinkingLevel: "high" });
+  });
+
+  it("keeps complete node overrides above persisted workflow reviewer settings", async () => {
+    const captured = await runStepWithSettings({}, {
+      workflowValues: { validatorProvider: "pi-claude-cli", validatorModelId: "claude-opus-4-8", validatorThinkingLevel: "medium" },
+      step: { name: "Code Review", optionalGroupId: "code-review", modelProvider: "openai-codex", modelId: "gpt-5.6-sol", thinkingLevel: "high" },
+    });
+    expect(captured).toMatchObject({ defaultProvider: "openai-codex", defaultModelId: "gpt-5.6-sol", defaultThinkingLevel: "high" });
   });
 
   it("delivers fresh candidate-bound verification to the actual post-merge session", async () => {

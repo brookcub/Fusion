@@ -249,6 +249,15 @@ export async function executeWorkflowStep(
     dispatchLabel?: string;
   },
 ): Promise<WorkflowStepOutcome> {
+  /*
+   * FNXC:WorkflowModelRouting 2026-09-09-03:20:
+   * Graph callers supply raw project settings, while role models and reasoning
+   * live in workflow setting-values. Resolve that overlay once before any policy
+   * or session reads so plan/code/post-merge review cannot silently use an old
+   * global validator. Ordinary prompt nodes inherit their execution lane too;
+   * explicit task and node overrides retain their existing higher precedence.
+   */
+  settings = await mergeEffectiveSettings(deps.store, task, settings);
   const diffBaseCommitSha = stepOptions?.diffBaseCommitSha ?? task.baseCommitSha;
     const forceReadonly = stepOptions?.forceReadonly === true;
     let toolMode: "coding" | "readonly" = forceReadonly ? "readonly" : workflowStep.toolMode || "readonly";
@@ -289,11 +298,11 @@ export async function executeWorkflowStep(
       || optionalGroupId === "browser-verification";
     /*
      * FNXC:WorkflowReviewers 2026-09-03-05:40:
-     * Graph execution supplies the raw project settings map, but `reviewerInlineFixes` is workflow-owned and absent from `DEFAULT_PROJECT_SETTINGS`. Resolve the review step's effective workflow settings once so both its declaration default and an operator's stored value reach the tool-policy decision; reading the raw map made both unreachable. The two-tier merge still lets an explicit base value win over a declaration default.
+     * `reviewerInlineFixes` is workflow-owned and absent from raw project settings.
+     * The entry-point overlay supplies both declared defaults and stored values
+     * to tool policy and model routing through the same effective snapshot.
      */
-    const effectiveReviewSettings = isReviewTypeWorkflowStep
-      ? await mergeEffectiveSettings(deps.store, task, settings).catch(() => settings)
-      : settings;
+    const effectiveReviewSettings = settings;
     const reviewerInlineFixesEnabled = (effectiveReviewSettings as Settings & { reviewerInlineFixes?: boolean }).reviewerInlineFixes === true;
     const allowReviewerInlineFixes = !forceReadonly && reviewerInlineFixesEnabled && isReviewTypeWorkflowStep && workflowStep.mode === "prompt";
     const allowPlanReviewPromptWrite = allowReviewerInlineFixes && isPlanReviewStep;
