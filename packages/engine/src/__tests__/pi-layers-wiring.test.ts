@@ -21,6 +21,7 @@ const packageManagerResolveMock = vi.fn().mockResolvedValue({ extensions: [] });
 const findMock = vi.fn();
 const getAllMock = vi.fn(() => [] as any[]);
 const registerProviderMock = vi.fn();
+const nativeStreamMock = vi.fn(() => ({ marker: "stream" }));
 const refreshMock = vi.fn();
 const settingsManagerInMemoryMock = vi.fn(() => ({ kind: "settings-manager" }));
 const setFallbackResolverMock = vi.fn();
@@ -123,7 +124,7 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   Without this export the layers wiring suite fails every createFnAgent path.
   */
   ModelRuntime: {
-    create: async () => ({ getAuth: async () => ({ auth: { headers: {} as Record<string, string> } }) }),
+    create: async () => ({ getAuth: async () => ({ auth: { headers: {} as Record<string, string> } }), streamSimple: nativeStreamMock }),
   },
   ModelRegistry: class {
     static create(..._args: unknown[]) {
@@ -170,6 +171,45 @@ describe("createFnAgent prompt layer wiring", () => {
         setThinkingLevel: vi.fn(),
       },
     });
+  });
+
+  it("binds concurrent native Claude streams to their own session cwd without changing other options", async () => {
+    const { createFnAgent } = await import("../pi.js");
+    const directories = ["/tmp/task one", "/tmp/task two"];
+    const parentCwd = process.cwd();
+    await Promise.all(directories.map((cwd) => createFnAgent({ cwd, systemPrompt: "test", defaultProvider: "pi-claude-cli", defaultModelId: "claude-opus-4-8" })));
+    const options = Object.freeze({ temperature: 0, cwd: "wrong daemon cwd" });
+    for (const [session] of createAgentSessionMock.mock.calls) {
+      session.modelRuntime.streamSimple({ provider: "pi-claude-cli" }, {}, options);
+      expect(nativeStreamMock.mock.lastCall?.[2]).toEqual({ ...options, cwd: session.cwd });
+      session.modelRuntime.streamSimple({ provider: "unrelated" }, {}, options);
+      expect(nativeStreamMock.mock.lastCall?.[2]).toBe(options);
+    }
+    expect(createAgentSessionMock.mock.calls.map(([session]) => session.cwd).sort()).toEqual(directories);
+    expect(process.cwd()).toBe(parentCwd);
+  });
+
+  it("uses an explicit reconciled list on the session loader and guards its second registration pass", async () => {
+    const { createFnAgent } = await import("../pi.js");
+    const { resolveClaudeCliExtensionFromModuleUrl } = await import("@fusion/core");
+    existsSyncMock.mockImplementation((path) => /pi-claude-cli[/\\](package\.json|index\.ts)$/.test(String(path)));
+    readFileSyncMock.mockReturnValue(JSON.stringify({ pi: { extensions: ["index.ts"] } }));
+    const resolution = resolveClaudeCliExtensionFromModuleUrl(new URL("../pi.ts", import.meta.url).href);
+    expect(resolution.status).toBe("ok");
+    if (resolution.status !== "ok") throw new Error("fixture bundle not resolved");
+    const correct = { name: "pi-claude-cli", extensionPath: resolution.path, config: { marker: "correct" } };
+    const alias = { ...correct, extensionPath: "/tmp/renamed/index.ts", config: { marker: "old" } };
+    const other = { ...alias, name: "other-provider" };
+    discoverAndLoadExtensionsMock.mockResolvedValueOnce({ errors: [], runtime: { pendingProviderRegistrations: [alias, correct, other, alias] } });
+    packageManagerResolveMock.mockResolvedValueOnce({ extensions: [{ enabled: true, path: other.extensionPath }] });
+    await createFnAgent({ cwd: "/tmp/test-project", systemPrompt: "test" });
+    expect(registerProviderMock).toHaveBeenCalledWith(correct.name, correct.config);
+    expect(registerProviderMock).not.toHaveBeenCalledWith(alias.name, alias.config);
+    expect(registerProviderMock).toHaveBeenCalledWith(other.name, other.config);
+    expect(capturedResourceLoaderOptions.noExtensions).toBe(true);
+    expect(capturedResourceLoaderOptions.additionalExtensionPaths).toEqual(discoverAndLoadExtensionsMock.mock.calls[0][0]);
+    const second = capturedResourceLoaderOptions.extensionsOverride({ runtime: { pendingProviderRegistrations: [alias, correct, other, alias] } });
+    expect(second.runtime.pendingProviderRegistrations).toEqual([correct, other]);
   });
 
   it("passes stable layer as systemPromptOverride when layers provided", async () => {

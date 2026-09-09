@@ -1378,6 +1378,8 @@ export {
 } from "./central/project-root-guard.js";
 export { discoverPiExtensions, formatPiExtensionSource, getEnabledPiExtensionPaths, getFusionAgentDir, getFusionAgentSettingsPath, getLegacyPiAgentDir, getPiExtensionDiscoveryDirs, getProjectRootFromWorktree, reconcileClaudeCliPaths, reconcileDroidCliPaths, resolvePiExtensionProjectRoot, updatePiExtensionDisabledIds } from "./plugins/pi-extensions.js";
 export type { PiExtensionEntry, PiExtensionSettings, PiExtensionSource } from "./plugins/pi-extensions.js";
+export { resolveClaudeCliExtensionFromModuleUrl, selectClaudeCliProviderRegistrations } from "./plugins/claude-cli-extension.js";
+export type { ClaudeCliExtensionResolution } from "./plugins/claude-cli-extension.js";
 export { canTransition, getValidTransitions, resolveDependencyOrder } from "./board/board.js";
 export { computeBlockerFanoutMap, BLOCKER_ESCALATION_COLUMNS, isStaleBlockedByBlocker } from "./tasks/blocker-fanout.js";
 export type { BlockerFanoutEntry, BlockerEscalation, ComputeBlockerFanoutOptions } from "./tasks/blocker-fanout.js";

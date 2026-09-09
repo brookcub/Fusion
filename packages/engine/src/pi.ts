@@ -46,6 +46,8 @@ import {
   getLegacyPiAgentDir,
   getProjectRootFromWorktree,
   reconcileClaudeCliPaths,
+  resolveClaudeCliExtensionFromModuleUrl,
+  selectClaudeCliProviderRegistrations,
   reconcileDroidCliPaths,
   mergeBuiltInGrokProviderModels,
   mergeBuiltInZaiProviderModels,
@@ -1523,25 +1525,12 @@ function getPackageManagerAgentDir(): string {
  * always wins over any externally-installed `pi-claude-cli`.
  *
  * Returns null when the vendored package isn't available (e.g. someone
- * embedded `@fusion/engine` standalone without bundling the fork) — callers
- * should treat that as "no override needed, leave external paths alone".
+ * embedded `@fusion/engine` standalone without bundling the fork). Native
+ * Claude is unavailable in that case; external aliases are not substitutes.
  */
 function resolveVendoredClaudeCliEntry(): string | null {
-  try {
-    const require_ = createRequire(import.meta.url);
-    const pkgJsonPath = require_.resolve("@fusion/pi-claude-cli/package.json");
-    const pkgJson = JSON.parse(readFileSync(pkgJsonPath, "utf-8")) as {
-      pi?: { extensions?: unknown };
-    };
-    const extensions = pkgJson.pi?.extensions;
-    if (!Array.isArray(extensions) || extensions.length === 0) return null;
-    const entry = extensions[0];
-    if (typeof entry !== "string" || entry.length === 0) return null;
-    const path = resolve(dirname(pkgJsonPath), entry);
-    return existsSync(path) ? path : null;
-  } catch {
-    return null;
-  }
+  const resolution = resolveClaudeCliExtensionFromModuleUrl(import.meta.url);
+  return resolution.status === "ok" ? resolution.path : null;
 }
 
 /**
@@ -1567,7 +1556,12 @@ function resolveVendoredDroidCliEntry(): string | null {
   }
 }
 
-async function registerExtensionProviders(cwd: string, modelRegistry: ModelRegistry): Promise<void> {
+async function registerExtensionProviders(cwd: string, modelRegistry: ModelRegistry): Promise<{ paths: string[]; vendoredClaudeCli: string | null }> {
+  const vendoredClaudeCli = resolveVendoredClaudeCliEntry();
+  if (!vendoredClaudeCli) {
+    extensionsLog.warn("Bundled native Claude adapter unavailable; external pi-claude-cli adapters and registrations are disabled. Repair the Fusion installation before using native Claude.");
+  }
+  let paths: string[] = [];
   registerBuiltInZaiProvider(modelRegistry, (message) => extensionsLog.warn(message));
   registerBuiltInGrokProvider(modelRegistry, (message) => extensionsLog.warn(message));
 
@@ -1596,7 +1590,6 @@ async function registerExtensionProviders(cwd: string, modelRegistry: ModelRegis
     // or `npm:pi-claude-cli` in agent settings). Upstream has known timing
     // and once-and-lock MCP-config bugs that we fix in the fork; loading both
     // also produces unpredictable provider-registration winners.
-    const vendoredClaudeCli = resolveVendoredClaudeCliEntry();
     const reconciledPaths = reconcileClaudeCliPaths(
       [...getEnabledPiExtensionPaths(cwd), ...packageExtensionPaths],
       vendoredClaudeCli,
@@ -1610,6 +1603,7 @@ async function registerExtensionProviders(cwd: string, modelRegistry: ModelRegis
       reconciledPaths,
       vendoredDroidCli,
     );
+    paths = doubleReconciledPaths;
 
     const extensionsResult = await discoverAndLoadExtensions(
       doubleReconciledPaths,
@@ -1621,7 +1615,9 @@ async function registerExtensionProviders(cwd: string, modelRegistry: ModelRegis
       extensionsLog.warn(`Failed to load ${path}: ${error}`);
     }
 
-    for (const { name, config, extensionPath } of extensionsResult.runtime.pendingProviderRegistrations) {
+    for (const { name, config, extensionPath } of selectClaudeCliProviderRegistrations(
+      extensionsResult.runtime.pendingProviderRegistrations, vendoredClaudeCli,
+    )) {
       try {
         modelRegistry.registerProvider(name, config);
       } catch (error) {
@@ -1648,6 +1644,7 @@ async function registerExtensionProviders(cwd: string, modelRegistry: ModelRegis
       log: (message) => extensionsLog.warn(message),
     });
   }
+  return { paths, vendoredClaudeCli };
 }
 
 // ── Worktree Path Boundary Helpers ──────────────────────────────────────────
@@ -2653,7 +2650,7 @@ export async function createPiAgentSessionRaw(options: AgentOptions): Promise<Ag
   // and resource loading all use the correct root when cwd is a worktree,
   // subdirectory, or any path other than the project root itself.
   const resolvedProjectRoot = getProjectRootFromWorktree(options.cwd) ?? resolvePiExtensionProjectRoot(options.cwd);
-  await registerExtensionProviders(resolvedProjectRoot, modelRegistry);
+  const providerExtensions = await registerExtensionProviders(resolvedProjectRoot, modelRegistry);
 
   const customProviders = readCustomProviders();
   for (const provider of customProviders) {
@@ -2896,7 +2893,18 @@ export async function createPiAgentSessionRaw(options: AgentOptions): Promise<Ag
       if (forced.length === 0) return dynamic;
       return [...dynamic, `Before starting work, you are REQUIRED to read these available skills: ${forced.join(", ")}. All other available skills may be consulted on demand when relevant.`];
     },
-    ...(effectiveExtensionPaths.length > 0 ? { additionalExtensionPaths: [...effectiveExtensionPaths] } : {}),
+    // Reuse the checked discovery list: SDK automatic discovery would load a
+    // rejected alias again and re-register its provider during session binding.
+    noExtensions: true,
+    additionalExtensionPaths: [...new Set(reconcileClaudeCliPaths(
+      [...providerExtensions.paths, ...effectiveExtensionPaths], providerExtensions.vendoredClaudeCli,
+    ))],
+    extensionsOverride: (base) => {
+      base.runtime.pendingProviderRegistrations = selectClaudeCliProviderRegistrations(
+        base.runtime.pendingProviderRegistrations, providerExtensions.vendoredClaudeCli,
+      );
+      return base;
+    },
     ...(normalizedAdditionalSkillPaths.length > 0
       ? { additionalSkillPaths: normalizedAdditionalSkillPaths }
       : {}),
@@ -2922,6 +2930,16 @@ export async function createPiAgentSessionRaw(options: AgentOptions): Promise<Ag
     attachSessionRoutingHeaders(modelRuntime, sessionRoutingId);
   }
   attachAnthropicClaudeCodeIdentityHeaders(modelRuntime);
+  // ModelRuntime is created for this session. The SDK does not forward cwd to
+  // custom providers; bind it here without mutating the process or caller options.
+  if (typeof modelRuntime.streamSimple === "function") {
+    const sessionCwd = options.cwd;
+    const stream = modelRuntime.streamSimple.bind(modelRuntime);
+    modelRuntime.streamSimple = (model, context, streamOptions) => stream(model, context,
+      model.provider === "pi-claude-cli"
+        ? { ...streamOptions, cwd: sessionCwd } as typeof streamOptions
+        : streamOptions);
+  }
 
   const createSessionWithModel = async (modelOverride?: typeof selectedModel) => {
     // pi-coding-agent 0.68+: `tools` is a string[] allowlist of tool names, not

@@ -2606,3 +2606,5 @@ export { promoteResearchFinding } from "./research/research-feature-promotion.js
 export type { ResearchFeaturePromotionInput } from "./research/research-feature-promotion.js";
 export { ACTIVE_WORKFLOW_WORK_ITEM_STATES } from "./types.js";
 export * from "./task-document-concurrency.js";
+export { resolveClaudeCliExtensionFromModuleUrl, selectClaudeCliProviderRegistrations } from "./plugins/claude-cli-extension.js";
+export type { ClaudeCliExtensionResolution } from "./plugins/claude-cli-extension.js";

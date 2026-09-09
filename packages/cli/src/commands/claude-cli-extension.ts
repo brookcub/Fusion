@@ -14,106 +14,11 @@
  * settings.json churn.
  */
 
-import { existsSync, readFileSync } from "node:fs";
-import { createRequire } from "node:module";
-import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-
-const require_ = createRequire(import.meta.url);
-
-/**
- * Outcome of resolving the bundled @fusion/pi-claude-cli extension entry.
- *
- * - `"ok"`: the absolute path to the extension file was found — push it into
- *   the paths array passed to `discoverAndLoadExtensions`.
- * - `"not-installed"`: the package isn't in node_modules (unusual — it's a
- *   hard dep, so this typically means a corrupted install).
- * - `"missing-entry"`: the package is present but its package.json doesn't
- *   declare a pi.extensions entry, or the file it points to doesn't exist.
- *   Indicates a @fusion/pi-claude-cli version mismatch or a broken upstream release.
- * - `"error"`: something unexpected — the reason is captured so the caller
- *   can surface it in the provider card.
- */
-export type ClaudeCliExtensionResolution =
-  | { status: "ok"; path: string; packageVersion: string }
-  | { status: "not-installed" }
-  | { status: "missing-entry"; reason: string }
-  | { status: "error"; reason: string };
-
-/**
- * Resolve the absolute path to `@fusion/pi-claude-cli`'s pi extension entry file.
- *
- * The package is bundled into the published @runfusion/fusion as
- * `dist/pi-claude-cli/` (see tsup.config.ts) so it is not a runtime npm
- * dependency. We look for that bundled copy first by walking up from this
- * module's location, and fall back to `require.resolve` for monorepo
- * dev/test runs where this file executes from `src/` rather than `dist/`.
- */
-export function resolveClaudeCliExtensionFromModuleUrl(
-  moduleUrl: string,
-): ClaudeCliExtensionResolution {
-  let pkgJsonPath: string | undefined;
-
-  // Bundled lookup: when running from dist/, sibling dir dist/pi-claude-cli/
-  // holds the staged extension. Walk up a few levels to also catch nested
-  // layouts (e.g. dist/commands/foo.js) without hard-coding depth.
-  const here = dirname(fileURLToPath(moduleUrl));
-  for (const rel of ["pi-claude-cli", "../pi-claude-cli", "../../pi-claude-cli"]) {
-    const candidate = resolve(here, rel, "package.json");
-    if (existsSync(candidate)) {
-      pkgJsonPath = candidate;
-      break;
-    }
-  }
-
-  if (!pkgJsonPath) {
-    try {
-      pkgJsonPath = require_.resolve("@fusion/pi-claude-cli/package.json");
-    } catch {
-      return { status: "not-installed" };
-    }
-  }
-
-  let pkgJson: { pi?: { extensions?: unknown }; version?: string };
-  try {
-    pkgJson = JSON.parse(readFileSync(pkgJsonPath, "utf-8")) as typeof pkgJson;
-  } catch (err) {
-    return {
-      status: "error",
-      reason: `Failed to read @fusion/pi-claude-cli package.json: ${err instanceof Error ? err.message : String(err)}`,
-    };
-  }
-
-  const extensions = pkgJson.pi?.extensions;
-  if (!Array.isArray(extensions) || extensions.length === 0) {
-    return {
-      status: "missing-entry",
-      reason: "@fusion/pi-claude-cli package.json has no pi.extensions array",
-    };
-  }
-
-  const rawEntry = extensions[0];
-  if (typeof rawEntry !== "string" || rawEntry.length === 0) {
-    return {
-      status: "missing-entry",
-      reason: "@fusion/pi-claude-cli pi.extensions[0] is not a valid path string",
-    };
-  }
-
-  const entryPath = resolve(dirname(pkgJsonPath), rawEntry);
-  if (!existsSync(entryPath)) {
-    return {
-      status: "missing-entry",
-      reason: `@fusion/pi-claude-cli extension file not found at ${entryPath}`,
-    };
-  }
-
-  return {
-    status: "ok",
-    path: entryPath,
-    packageVersion: pkgJson.version ?? "unknown",
-  };
-}
+import { resolveClaudeCliExtensionFromModuleUrl } from "@fusion/core";
+import type { ClaudeCliExtensionResolution } from "@fusion/core";
+export { resolveClaudeCliExtensionFromModuleUrl } from "@fusion/core";
+export type { ClaudeCliExtensionResolution } from "@fusion/core";
 
 export function resolveClaudeCliExtension(): ClaudeCliExtensionResolution {
   return resolveClaudeCliExtensionFromModuleUrl(import.meta.url);

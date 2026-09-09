@@ -439,6 +439,21 @@ export function updatePiExtensionDisabledIds(cwd: string, disabledIds: string[],
  */
 function isExternalClaudeCliPath(p: string, vendoredPath: string | null): boolean {
   if (vendoredPath && p === vendoredPath) return false;
+  // An installed package can be renamed (e.g. claude-cli-lanes). Inspect its
+  // nearest manifest before loading any extension code, not just its folder name.
+  try {
+    let directory = statSync(p).isDirectory() ? p : dirname(p);
+    for (let depth = 0; depth < 4; depth++) {
+      const manifest = join(directory, "package.json");
+      if (existsSync(manifest)) {
+        const pkg = JSON.parse(readFileSync(manifest, "utf-8")) as { name?: unknown };
+        return pkg.name === "@fusion/pi-claude-cli" || pkg.name === "pi-claude-cli";
+      }
+      const parent = dirname(directory);
+      if (parent === directory) break;
+      directory = parent;
+    }
+  } catch { /* Missing or malformed manifests retain the legacy path check. */ }
   // Match a path segment "pi-claude-cli" delimited by either separator.
   return /(^|[/\\])pi-claude-cli([/\\]|$)/i.test(p);
 }
@@ -459,8 +474,8 @@ function isExternalClaudeCliPath(p: string, vendoredPath: string | null): boolea
  *     depending on load order.
  *
  * Behaviour:
- *  - When `vendoredPath` is null (caller couldn't find the fork — typically
- *    because Fusion isn't running): return the input unchanged.
+ *  - When `vendoredPath` is null: still reject known native adapters. An old
+ *    external copy must not silently substitute for an unavailable bundle.
  *  - When `vendoredPath` is set: drop every external pi-claude-cli path and
  *    ensure the vendored path is loaded first.
  */
@@ -468,10 +483,8 @@ export function reconcileClaudeCliPaths(
   paths: readonly string[],
   vendoredPath: string | null,
 ): string[] {
-  if (!vendoredPath) {
-    return [...paths];
-  }
   const filtered = paths.filter((p) => !isExternalClaudeCliPath(p, vendoredPath));
+  if (!vendoredPath) return filtered;
   if (!filtered.includes(vendoredPath)) {
     return [vendoredPath, ...filtered];
   }
