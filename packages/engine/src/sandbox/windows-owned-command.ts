@@ -6,7 +6,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { superviseSpawn } from "@fusion/core";
 
-import source from "./windows-owned-command-source.json";
+import source from "./windows-owned-command-source.js";
 import type { SandboxRunOptions, SandboxRunResult } from "./types.js";
 
 const SETUP_TIMEOUT_MS = 15_000;
@@ -35,7 +35,7 @@ export async function runWindowsOwnedCommand(
   let directory: string;
   try {
     directory = await mkdtemp(join(tmpdir(), "fusion-owned-command-"));
-    await writeFile(join(directory, "owner.ps1"), source.source, "utf8");
+    await writeFile(join(directory, "owner.ps1"), source, "utf8");
   } catch {
     return { ...empty, spawnError: new Error("Windows command owner could not be prepared") };
   }

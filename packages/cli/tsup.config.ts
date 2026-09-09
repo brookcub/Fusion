@@ -350,16 +350,23 @@ function runWorkspaceCommand(command: string, args: string[], cwd: string, timeo
   });
 }
 
-async function ensureDesktopRuntimeAssetsBuilt() {
-  if (existsSync(desktopRuntimeSrc)) {
-    return;
-  }
+type DesktopBuildRunner = (command: string, args: string[], cwd: string, timeoutMs?: number) => Promise<void>;
 
+export async function refreshDesktopRuntimeAssets(
+  { desktopRuntimeDir = desktopRuntimeSrc, exists = existsSync, run = runWorkspaceCommand }: {
+    desktopRuntimeDir?: string;
+    exists?: (path: string) => boolean;
+    run?: DesktopBuildRunner;
+  } = {},
+): Promise<void> {
   /*
    * FNXC:DesktopPackaging 2026-07-01-20:53:
-   * The published CLI package must contain the desktop runtime it launches. Build the private desktop package during CLI packaging when dist is absent, but keep this strictly in the repository build path — the installed `fusion desktop` command itself must never run pnpm from an operator's cwd.
+   * A full CLI package stages desktop's embedded @fusion/engine closure. An
+   * existing desktop/dist cannot prove that closure matches this build's engine
+   * source, so release packaging always refreshes it. Fast local CLI builds
+   * still skip this entire path below.
    */
-  console.log("Desktop runtime assets missing; building @fusion/desktop before staging CLI package assets...");
+  console.log("Refreshing @fusion/desktop before staging full CLI package assets...");
   /*
    * FNXC:DesktopPackaging 2026-07-23-23:05:
    * The desktop build's `pnpm deploy` production-closure staging resolves and installs ~1300+
@@ -368,10 +375,10 @@ async function ensureDesktopRuntimeAssetsBuilt() {
    * (exit 143). Give the desktop sub-build a 30-minute budget; release.yml's job timeout was
    * widened to match.
    */
-  await runWorkspaceCommand("pnpm", ["--filter", "@fusion/desktop", "build"], workspaceRoot, 1_800_000);
+  await run("pnpm", ["--filter", "@fusion/desktop", "build"], workspaceRoot, 1_800_000);
 
-  if (!existsSync(desktopRuntimeSrc)) {
-    throw new Error(`[tsup] Desktop runtime build did not create expected assets at ${desktopRuntimeSrc}`);
+  if (!exists(desktopRuntimeDir)) {
+    throw new Error(`[tsup] Desktop runtime build did not create expected assets at ${desktopRuntimeDir}`);
   }
 }
 
@@ -538,7 +545,7 @@ const cliBuildConfig = {
     if (existsSync(desktopRuntimeDest)) {
       rmSync(desktopRuntimeDest, { recursive: true, force: true });
     }
-    await ensureDesktopRuntimeAssetsBuilt();
+    await refreshDesktopRuntimeAssets();
     /*
      * FNXC:DesktopPackaging 2026-07-01-20:31:
      * Published `@runfusion/fusion` desktop launches must resolve Electron runtime assets from the installed package, not from the operator's current directory. Stage the private @fusion/desktop dist output under CLI dist/desktop so npm installs can launch without pnpm workspace discovery or host JSON parsing.
