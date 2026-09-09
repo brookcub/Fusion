@@ -503,6 +503,14 @@ An `optional-group` node's `phase` config selects one of two phases:
 
 Post-merge runs **graph-native**: after a successful merge the executor continues traversal to any post-merge optional-group node reachable from the merge region (and to plain post-merge nodes that follow a `seam:"merge"` node), running it via the same optional-group execution + recording path with `phase: "post-merge"` and non-blocking failures. This is gated by `experimentalFeatures.graphNativePostMerge`, which is **default-ON** and is now the single owner of post-merge execution — the legacy merger-owned post-merge path was deleted, so there is no fallback and post-merge work runs exactly once via the graph.
 
+### Landed and verified completion
+
+A recorded merge remains **landed** even when post-merge proof is missing, pending, stale, unavailable, or failed. Fusion derives the separate **verified completion** status at read time from merge proof, the current candidate and effective verification settings, configured command receipts, and required post-merge workflow results; it does not write a second mutable success flag or undo the landed commit.
+
+A current matching passing receipt can support verified completion. A nonzero terminal receipt is **failed**; identity or settings mismatch is **stale**; malformed or missing authority/proof is **unavailable**; and a dispatched or required workflow check without a terminal pass is **pending** or **not run**. An older passing receipt cannot override a newer pending or failed attempt. A task with no configured verification command is not falsely shown as passed.
+
+Required post-merge checks that are failed, pending, stale, unavailable, missing, or not run keep verified completion false while preserving the merge and implementation history. Advisory post-merge failures remain visible as warnings without becoming required completion gates. Existing post-merge recovery can record a later current pass without replaying implementation or re-merging; changes to candidate, settings, pause state, or active ownership still prevent stale recovery.
+
 > **Note on Fast Mode:** When a task has `executionMode: "fast"`, every **pre-merge** optional group is bypassed, including groups explicitly named in `enabledWorkflowSteps`. The graph records terminal `skipped` evidence for each bypassed pre-merge group so merge admission remains auditable. `parse-steps` is retargeted to one synthetic implementation occurrence, per-step `step-review` is routed past without a verdict, and post-merge groups remain active and run normally.
 
 ## Execution Modes

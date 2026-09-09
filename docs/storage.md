@@ -242,6 +242,14 @@ Important execution nuance:
   - done tasks: prefer `mergeDetails.landedFiles`
   - in-progress/in-review (or legacy pre-FN-4646 tasks): fall back to `task.modifiedFiles`
 
+## Verification evidence and completion projection
+
+<!-- FNXC:CompletionEvidence 2026-09-09-10:36: FUSI-007 keeps merge proof durable while deriving current verification truth from receipts and workflow results rather than persisting a second success flag. -->
+
+- `task.mergeDetails.verificationReceipts` is additive historical evidence. Each receipt is interpreted against its landed candidate, source identity, and effective verification settings; an old receipt remains readable but cannot authorize a changed candidate or configuration.
+- Public task reads derive compact `completionEvidence` at read time. The projection distinguishes landed work from verified completion and classifies required proof as passed, failed, stale, unavailable, pending, or not applicable without changing task lifecycle state.
+- A failed required post-merge result or newer pending attempt masks an older passing receipt. Advisory failures remain diagnostics, not required completion blockers. Archived or authority-incomplete reads conservatively report historical or unavailable evidence rather than promoting a legacy pass.
+
 ## Legacy SQLite FTS5 task-index maintenance (historical, FN-5943 / FN-5976)
 
 This section records the pre-PostgreSQL design for migration archaeology. It is not an active runtime architecture or recommendation.

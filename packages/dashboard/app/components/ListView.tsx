@@ -27,6 +27,7 @@ import { ALL_WORKFLOWS_BOARD_VIEW_ID } from "../utils/boardWorkflowSelection";
 import {
   getRunningOptionalGateBadge,
   getRunningWorkflowStepLabel,
+  getTaskCompletionEvidenceBadge,
   getUnifiedTaskProgress,
   isNonPlanningOptionalGateBadge,
 } from "../utils/taskProgress";
@@ -3008,6 +3009,9 @@ export function ListView({
                           flags instead. Enforced by column-role-degraded-flags.test.ts, which caught this.
                           */
                           const optionalGateBadge = getRunningOptionalGateBadge(task, getTaskColumnFlags(task));
+                          // FNXC:CompletionEvidence 2026-09-09-10:36: Grouped and table List renders share the
+                          // card presenter so a complete-trait lane never hides failed or pending required proof.
+                          const completionEvidenceBadge = getTaskCompletionEvidenceBadge(task);
                           const showOptionalGateBadge = Boolean(optionalGateBadge) && isAgentActive;
                           /*
                           FNXC:TaskCardBadgePrecedence 2026-08-06-14:53:
@@ -3104,6 +3108,15 @@ export function ListView({
                                     {statusBadgeLabel}
                                   </span>
                                 ) : null}
+                                {completionEvidenceBadge && (
+                                  <span
+                                    className={`list-status-badge verification-${completionEvidenceBadge.testId}${completionEvidenceBadge.testId === "verification-failed" ? " failed" : ""}${completionEvidenceBadge.testId === "verification-pending" ? " pulsing" : ""}`}
+                                    title={completionEvidenceBadge.title}
+                                    data-testid={`list-${completionEvidenceBadge.testId}-${task.id}`}
+                                  >
+                                    {completionEvidenceBadge.label}
+                                  </span>
+                                )}
                                 {isTaskReverted(task.sourceMetadata) && (isCompleteColumnRole(getTaskColumnFlags(task), task.column) || isArchivedColumnRole(getTaskColumnFlags(task), task.column)) && (
                                   <span className="list-status-badge list-status-badge--reverted" title={t("tasks.revertedBadgeTitle", "This task's changes were reverted")} aria-label={t("tasks.revertedBadgeTitle", "This task's changes were reverted")}>{t("tasks.revertedBadge", "Reverted")}</span>
                                 )}
@@ -3304,6 +3317,9 @@ export function ListView({
                           flags instead. Enforced by column-role-degraded-flags.test.ts, which caught this.
                           */
                           const optionalGateBadge = getRunningOptionalGateBadge(task, getTaskColumnFlags(task));
+                            // FNXC:CompletionEvidence 2026-09-09-10:36: Keep the table renderer aligned with
+                            // grouped cards; presentation must not change completion truth.
+                            const completionEvidenceBadge = getTaskCompletionEvidenceBadge(task);
                             const showOptionalGateBadge = Boolean(optionalGateBadge) && isAgentActive;
                             const suppressPlanningStatusBadge = showOptionalGateBadge && isNonPlanningOptionalGateBadge(optionalGateBadge);
                             const isPlanningStatusBadge = !isReviewBudgetExhausted
@@ -3394,6 +3410,15 @@ export function ListView({
                                       </span>
                                     ) : showOptionalGateBadge ? null : (
                                       <span className="list-status-badge">-</span>
+                                    )}
+                                    {completionEvidenceBadge && (
+                                      <span
+                                        className={`list-status-badge verification-${completionEvidenceBadge.testId}${completionEvidenceBadge.testId === "verification-failed" ? " failed" : ""}${completionEvidenceBadge.testId === "verification-pending" ? " pulsing" : ""}`}
+                                        title={completionEvidenceBadge.title}
+                                        data-testid={`list-${completionEvidenceBadge.testId}-${task.id}`}
+                                      >
+                                        {completionEvidenceBadge.label}
+                                      </span>
                                     )}
                                     {isTaskReverted(task.sourceMetadata) && (isCompleteColumnRole(getTaskColumnFlags(task), task.column) || isArchivedColumnRole(getTaskColumnFlags(task), task.column)) && (
                                       <span className="list-status-badge list-status-badge--reverted" title={t("tasks.revertedBadgeTitle", "This task's changes were reverted")} aria-label={t("tasks.revertedBadgeTitle", "This task's changes were reverted")}>{t("tasks.revertedBadge", "Reverted")}</span>
