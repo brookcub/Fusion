@@ -29,7 +29,7 @@
 
 const MINUTE = 60_000;
 import { spawn as nodeSpawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 import { resolvePnpmCommand } from "./pnpm-command.mjs";
@@ -222,6 +222,7 @@ export function runWithWatchdog({
     const nativeCancelDirectory = nativeWindowsJob ? mkdtempSync(join(tmpdir(), "fusion-watchdog-")) : null;
     const nativeCancelFile = nativeCancelDirectory ? join(nativeCancelDirectory, "cancel") : null;
     const nativeOutcomeFile = nativeCancelDirectory ? join(nativeCancelDirectory, "outcome.json") : null;
+    const nativeReadyFile = nativeCancelDirectory ? join(nativeCancelDirectory, "ready") : null;
     const hasBudget = Number.isFinite(budgetMs) && budgetMs > 0;
     const launchCommand = nativeWindowsJob ? "powershell.exe" : resolvedCommand.command;
     const launchArgs = nativeWindowsJob ? [
@@ -231,12 +232,15 @@ export function runWithWatchdog({
       "-TimeoutMs", String(hasBudget ? Math.floor(budgetMs) : -1),
       "-CancelFile", nativeCancelFile,
       "-OutcomeFile", nativeOutcomeFile,
+      "-ReadyFile", nativeReadyFile,
     ] : resolvedCommand.args;
     const startedAt = now();
     let lastHeartbeatAt = null;
     let timedOut = false;
     let diagnostics = null;
     let forceKillTimer = null;
+    let nativeSetupTimer = null;
+    let nativeReadyPoll = null;
     let settled = false;
     let cancellationSignal = null;
 
@@ -251,6 +255,21 @@ export function runWithWatchdog({
       env,
       ...(cwd ? { cwd } : {}),
     }); } catch (error) { if (nativeCancelDirectory) rmSync(nativeCancelDirectory, { recursive: true, force: true }); throw error; }
+
+    if (nativeWindowsJob) {
+      nativeSetupTimer = setTimeout(() => {
+        if (settled || existsSync(nativeReadyFile)) return;
+        settled = true;
+        try { child.kill("SIGTERM"); } catch {}
+        rmSync(nativeCancelDirectory, { recursive: true, force: true });
+        reject(new Error("native watchdog helper setup did not become ready"));
+      }, 15_000);
+      nativeSetupTimer.unref?.();
+      nativeReadyPoll = setInterval(() => {
+        if (existsSync(nativeReadyFile)) { clearTimeout(nativeSetupTimer); clearInterval(nativeReadyPoll); nativeSetupTimer = null; nativeReadyPoll = null; }
+      }, 25);
+      nativeReadyPoll.unref?.();
+    }
 
     const heartbeat = setInterval(() => {
       lastHeartbeatAt = now();
@@ -351,6 +370,8 @@ export function runWithWatchdog({
       clearInterval(heartbeat);
       if (watchdog) clearTimeout(watchdog);
       if (forceKillTimer) clearTimeout(forceKillTimer);
+      if (nativeSetupTimer) clearTimeout(nativeSetupTimer);
+      if (nativeReadyPoll) clearInterval(nativeReadyPoll);
       for (const [sig, handler] of signalHandlers) process.removeListener(sig, handler);
       process.removeListener("exit", onProcExit);
     }

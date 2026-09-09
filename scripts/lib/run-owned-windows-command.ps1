@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$Executable, [Parameter(Mandatory=$true)][string]$ArgumentsBase64, [Parameter(Mandatory=$true)][int]$TimeoutMs, [string]$CancelFile, [Parameter(Mandatory=$true)][string]$OutcomeFile)
+param([Parameter(Mandatory=$true)][string]$Executable, [Parameter(Mandatory=$true)][string]$ArgumentsBase64, [Parameter(Mandatory=$true)][int]$TimeoutMs, [string]$CancelFile, [string]$OutcomeFile, [string]$ReadyFile)
 $ErrorActionPreference = 'Stop'
 # FNXC:TaskLogRegression 2026-09-06-13:47: Assign suspended children to a
 # kill-on-close native job before they execute. A timeout owns descendants,
@@ -9,6 +9,7 @@ using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Diagnostics;
 using System.IO;
 using System.Web.Script.Serialization;
 public static class RegressionJob {
@@ -55,12 +56,13 @@ public static class RegressionJob {
      Check(CreateProcess(executable,command,IntPtr.Zero,IntPtr.Zero,true,0x08000004,IntPtr.Zero,null,ref startup,out process));
      Check(AssignProcessToJobObject(job,process.process)); assigned=true;
      Check(ResumeThread(process.thread)!=0xffffffff);
-     uint wait=258, code=0; int elapsed=0; string outcome="";
-     while(timeout<0 || elapsed<timeout) {
+     uint wait=258, code=0; string outcome=""; var stopwatch=Stopwatch.StartNew();
+     while(timeout<0 || stopwatch.ElapsedMilliseconds<timeout) {
        if(!String.IsNullOrEmpty(cancelFile) && File.Exists(cancelFile)) { code=125; outcome="cancelled"; break; }
-       uint slice=(uint)(timeout<0 ? 50 : Math.Min(50,timeout-elapsed)); wait=WaitForSingleObject(process.process,slice);
+       int remaining=timeout<0 ? 50 : Math.Max(1,timeout-(int)Math.Min(Int32.MaxValue,stopwatch.ElapsedMilliseconds));
+       uint slice=(uint)Math.Min(50,remaining); wait=WaitForSingleObject(process.process,slice);
        if(wait==0) { Check(GetExitCodeProcess(process.process,out code)); break; }
-       if(wait!=258) throw new Win32Exception(); elapsed+=(int)slice;
+       if(wait!=258) throw new Win32Exception();
      }
      if(wait==258 && outcome=="") { code=124; outcome="timeout"; }
      if(outcome=="") outcome="exit";
@@ -81,12 +83,13 @@ public static class RegressionJob {
 '@
 try {
   $application = (Get-Command $Executable -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+  if ($ReadyFile) { [IO.File]::WriteAllText($ReadyFile, 'ready') }
   # Preserve exact argv in the Base64 JSON until the native method decodes it;
   # PowerShell therefore cannot enumerate or rebind individual arguments.
   $completion = [RegressionJob]::RunEncoded($application, $ArgumentsBase64, $TimeoutMs, $CancelFile)
-  [IO.File]::WriteAllText($OutcomeFile, ('{"outcome":"' + $completion.Outcome + '","jobEmpty":true,"exitCode":' + $completion.ExitCode + '}'))
+  if ($OutcomeFile) { [IO.File]::WriteAllText($OutcomeFile, ('{"outcome":"' + $completion.Outcome + '","jobEmpty":true,"exitCode":' + $completion.ExitCode + '}')) }
   exit $completion.ExitCode
 } catch {
-  try { [IO.File]::WriteAllText($OutcomeFile, '{"outcome":"helper-failure","jobEmpty":false}') } catch {}
+  if ($OutcomeFile) { try { [IO.File]::WriteAllText($OutcomeFile, '{"outcome":"helper-failure","jobEmpty":false}') } catch {} }
   [Console]::Error.WriteLine("owned command setup or shutdown failed: $($_.Exception.Message)"); exit 125
 }

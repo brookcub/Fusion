@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { spawn as realSpawn } from "node:child_process";
+import { spawn as realSpawn, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
@@ -314,6 +314,13 @@ test("runWithWatchdog preserves ordinary native exits 124 and 125", { skip: proc
     assert.equal(result.timedOut, false);
     assert.equal(result.signal, null);
   }
+});
+
+test("native Job helper preserves the legacy no-receipt invocation", { skip: process.platform !== "win32" }, () => {
+  const helper = resolve(import.meta.dirname, "..", "lib", "run-owned-windows-command.ps1");
+  const args64 = Buffer.from(JSON.stringify(["-e", "process.exit(7)"])).toString("base64");
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-File", helper, "-Executable", process.execPath, "-ArgumentsBase64", args64, "-TimeoutMs", "10000"], { encoding: "utf8" });
+  assert.equal(result.status, 7);
 });
 
 test("runWithWatchdog honors a disabled native budget", { skip: process.platform !== "win32" }, async () => {
