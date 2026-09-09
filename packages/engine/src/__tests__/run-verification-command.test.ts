@@ -1,9 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
 import { tmpdir } from "node:os";
-import { mkdtempSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { SandboxBackend } from "../sandbox/types.js";
 import { fileURLToPath } from "node:url";
+import { withVerificationSlot } from "../concurrency/verification-concurrency.js";
 import {
   BOUNDED_VERIFICATION_GUIDANCE,
   MARATHON_SOFT_CAP_SEC,
@@ -46,6 +47,14 @@ function isProcessAlive(pid: number): boolean {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForProcessExit(pid: number, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (isProcessAlive(pid)) {
+    if (Date.now() >= deadline) throw new Error(`Process ${pid} did not exit within ${timeoutMs}ms`);
+    await sleep(25);
+  }
 }
 
 /**
@@ -132,6 +141,130 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
     expect(backend.prepare).toHaveBeenCalledWith(expect.objectContaining({ allowedWritePaths: [] }));
     expect(backend.runStreaming).toHaveBeenCalledWith("echo sandboxed", expect.objectContaining({ cwd: tempDir }));
     expect(result).toMatchObject({ success: true, stdout: "sandboxed" });
+  });
+
+  it("threads the owning tool abort signal into sandboxed verification", async () => {
+    const controller = new AbortController();
+    const backend: SandboxBackend = {
+      capabilities: () => ({ id: "native", supportsNetworkPolicy: true, supportsFilesystemPolicy: true, supportsStreaming: true, platform: "any" }),
+      prepare: vi.fn(async () => {}),
+      run: vi.fn(),
+      runStreaming: vi.fn(async () => ({ outcome: "aborted" as const, phase: "pre-start" as const, stdout: "", stderr: "" })),
+      dispose: vi.fn(async () => {}),
+    };
+    const tool = createRunVerificationTool({
+      worktreePath: tempDir,
+      rootDir: tempDir,
+      sandboxBackend: backend,
+      taskId: "FUSI-017-SYNTHETIC",
+      recordActivity: vi.fn(),
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    });
+
+    const result = await tool.execute!("call-aborted", { command: "echo never-runs", scope: "package" }, controller.signal);
+
+    expect(backend.runStreaming).toHaveBeenCalledWith("echo never-runs", expect.objectContaining({ signal: controller.signal }));
+    expect(result.details).toMatchObject({ success: false, aborted: true, timedOut: false });
+    expect(result.content[0]?.type === "text" ? result.content[0].text : "").toContain("Command canceled");
+  });
+
+  it("terminates the disposable native verification tree when the owning session aborts", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fusion-verify-abort-"));
+    const fixturePath = join(root, "verification-parent.cjs");
+    const childPidPath = join(root, "verification-child.pid");
+    writeFileSync(fixturePath, [
+      "const { spawn } = require('node:child_process');",
+      "const { writeFileSync } = require('node:fs');",
+      "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
+      "writeFileSync(process.argv[2], String(child.pid));",
+      "setInterval(() => {}, 1000);",
+    ].join("\n"));
+    const controller = new AbortController();
+    const started = Date.now();
+    const resultPromise = runVerificationCommand({
+      command: `\"${process.execPath}\" \"${fixturePath}\" \"${childPidPath}\"`,
+      cwd: root,
+      timeoutMs: 30_000,
+      onHeartbeat: vi.fn(),
+      bypassVerificationSlot: true,
+      signal: controller.signal,
+    });
+    while (!readFileSync(childPidPath, { encoding: "utf8", flag: "a+" }).trim()) await sleep(10);
+    const childPid = Number.parseInt(readFileSync(childPidPath, "utf8"), 10);
+    controller.abort();
+
+    const result = await resultPromise;
+
+    expect(result).toMatchObject({ success: false, aborted: true, timedOut: false });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.durationMs).toBeLessThan(10_000);
+    await waitForProcessExit(childPid);
+    expect(Date.now() - started).toBeLessThan(10_000);
+  });
+
+  it("reports queued verification cancellation without starting the command", async () => {
+    let releaseSlot!: () => void;
+    const slotReleased = new Promise<void>((resolve) => { releaseSlot = resolve; });
+    let enteredSlot!: () => void;
+    const slotEntered = new Promise<void>((resolve) => { enteredSlot = resolve; });
+    const holder = withVerificationSlot(async () => {
+      enteredSlot();
+      await slotReleased;
+    });
+    await slotEntered;
+    const controller = new AbortController();
+    const tool = createRunVerificationTool({
+      worktreePath: tempDir,
+      rootDir: tempDir,
+      taskId: "FUSI-017-SYNTHETIC",
+      recordActivity: vi.fn(),
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    });
+    const queued = tool.execute!("queued-abort", { command: "echo should-not-start", scope: "package" }, controller.signal);
+    controller.abort();
+
+    const result = await queued;
+    releaseSlot();
+    await holder;
+
+    expect(result.details).toMatchObject({ success: false, aborted: true, exitCode: null });
+    expect(result.content[0]?.type === "text" ? result.content[0].text : "").toContain("Command canceled");
+  });
+
+  it.each([
+    ["a zero exit", false, { outcome: "success" as const, stdout: "completed", stderr: "", bufferOverflow: false }, 0],
+    ["an expected non-zero exit", true, { outcome: "non-zero-exit" as const, exitCode: 1, stdout: "failed", stderr: "" }, 1],
+  ])("does not accept %s from sandbox verification after cancellation", async (_caseName, expectFailure, outcome, exitCode) => {
+    const controller = new AbortController();
+    const backend: SandboxBackend = {
+      capabilities: () => ({ id: "native", supportsNetworkPolicy: true, supportsFilesystemPolicy: true, supportsStreaming: true, platform: "any" }),
+      prepare: vi.fn(async () => {}),
+      run: vi.fn(),
+      runStreaming: vi.fn(async () => {
+        controller.abort();
+        return outcome;
+      }),
+      dispose: vi.fn(async () => {}),
+    };
+
+    const result = await runVerificationCommand({
+      command: "echo completed",
+      cwd: tempDir,
+      timeoutMs: 1_000,
+      expectFailure,
+      onHeartbeat: vi.fn(),
+      bypassVerificationSlot: true,
+      sandboxBackend: backend,
+      signal: controller.signal,
+    });
+
+    expect(result).toMatchObject({
+      exitCode,
+      success: false,
+      aborted: true,
+      expectationMet: false,
+      expectedFailureObserved: false,
+    });
   });
   const workspaceRoot = fileURLToPath(new URL("../../../../", import.meta.url));
 

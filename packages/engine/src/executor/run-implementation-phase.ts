@@ -30,7 +30,14 @@ export async function runImplementationPhase(
   prepared?: PreparedWorktree,
 ): Promise<{ taskDone: boolean; modifiedFiles: string[]; exit?: ImplementationExit }> {
   let captured: { taskDone: boolean; modifiedFiles: string[]; exit?: ImplementationExit } = { taskDone: false, modifiedFiles: [] };
+  /*
+  FNXC:SessionContinuationHandoff 2026-09-09-03:11:
+  A runtime callback can arrive more than once while a replacement or stale session settles.
+  The graph receives one typed completion result, so retain the first accepted payload rather than
+  letting a late callback replace the durable handoff evidence.
+  */
   const graphCompletion: GraphCompletionCallback = (info) => {
+    if (captured.taskDone) return;
     captured = { ...captured, taskDone: true, modifiedFiles: info.modifiedFiles };
   };
   /* Recorded independently of `graphCompletion`: the out-of-band exits never call it. */

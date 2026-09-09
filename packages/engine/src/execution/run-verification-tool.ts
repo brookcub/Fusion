@@ -320,6 +320,30 @@ function killVerificationProcess(supervised: SupervisedChild, signal: NodeJS.Sig
   supervised.kill(signal);
 }
 
+function terminateVerificationProcessTree(supervised: SupervisedChild, signal: NodeJS.Signals): Promise<void> {
+  if (process.platform !== "win32" || typeof supervised.pid !== "number") {
+    supervised.kill(signal);
+    return Promise.resolve();
+  }
+
+  /*
+  FNXC:SessionContinuationHandoff 2026-09-09-05:08:
+  Windows cannot signal a shell process group, and ProcessSupervisor.kill() only terminates its
+  immediate child there. Run taskkill against the still-live supervised root before touching that
+  root directly, so its owned descendants are included in the cancellation boundary.
+  */
+  const reaper = superviseSpawn("taskkill.exe", ["/pid", String(supervised.pid), "/T", "/F"], {
+    stdio: "ignore",
+    windowsHide: true,
+    maxLifetimeMs: 5_000,
+  });
+  return reaper.waitExit().then((exit) => {
+    if (exit.code !== 0) {
+      throw new Error(`taskkill failed for verification tree ${supervised.pid} (exit ${exit.code ?? "signal"})`);
+    }
+  });
+}
+
 function reapVerificationProcessGroup(supervised: SupervisedChild): void {
   /*
    * FNXC:Verification 2026-06-21-10:00:
@@ -404,6 +428,8 @@ export interface VerificationResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /** True when the owning task/session aborted this command rather than timing it out. */
+  aborted: boolean;
   killed: boolean;
   command: string;
   cwd: string;
@@ -682,6 +708,21 @@ async function runVerificationCommandUnlocked(
   const stderrBuf = createBuffer();
 
   return new Promise<VerificationResult>((resolve) => {
+    type CleanupOutcome = { error?: Error };
+    const settleAfterProcessTreeCleanup = async (result: VerificationResult, cleanup: Promise<CleanupOutcome> | undefined) => {
+      const outcome = cleanup ? await cleanup : undefined;
+      if (!outcome?.error) {
+        resolve(result);
+        return;
+      }
+      resolve({
+        ...result,
+        success: false,
+        expectationMet: false,
+        expectedFailureObserved: false,
+        warnings: [...result.warnings, `Verification cleanup failed: ${outcome.error.message}`],
+      });
+    };
     const supervised = superviseSpawn(command, [], {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
@@ -699,8 +740,40 @@ async function runVerificationCommandUnlocked(
     const child = supervised.child;
 
     let timedOut = false;
+    let aborted = false;
     let killed = false;
     let settled = false;
+    let killTimer: ReturnType<typeof setTimeout> | null = null;
+    let processTreeTermination: Promise<CleanupOutcome> | undefined;
+
+    /*
+    FNXC:SessionContinuationHandoff 2026-09-09-05:08:
+    Cancellation cleanup has one owned, immediately-observed outcome. Do not overwrite a rejecting
+    taskkill promise with a later signal attempt: an unproved process tree is a failed verification,
+    not a clean release for a successor graph session.
+    */
+    const requestProcessTreeTermination = (signal: NodeJS.Signals) => {
+      if (processTreeTermination) return processTreeTermination;
+      processTreeTermination = terminateVerificationProcessTree(supervised, signal).then(
+        () => ({}),
+        (cause: unknown) => ({ error: cause instanceof Error ? cause : new Error(String(cause)) }),
+      );
+      return processTreeTermination;
+    };
+
+    const abortVerification = () => {
+      if (settled || aborted) return;
+      aborted = true;
+      requestProcessTreeTermination("SIGTERM");
+      killTimer = setTimeout(() => {
+        if (!settled) {
+          killed = true;
+          requestProcessTreeTermination("SIGKILL");
+        }
+      }, SIGKILL_GRACE_MS);
+    };
+    if (opts.signal?.aborted) abortVerification();
+    else opts.signal?.addEventListener("abort", abortVerification, { once: true });
 
     // ── Quiet-interval synthetic heartbeat ──────────────────────────────────
     let lastLineMs = Date.now();
@@ -719,22 +792,21 @@ async function runVerificationCommandUnlocked(
     }, QUIET_HEARTBEAT_INTERVAL_MS);
 
     // ── Hard timeout ────────────────────────────────────────────────────────
-    let killTimer: ReturnType<typeof setTimeout> | null = null;
     const hardTimer = setTimeout(() => {
       if (settled) return;
       timedOut = true;
       executorLog.warn(
         `[fn_run_verification] hard timeout (${timeoutMs / 1000}s) — sending SIGTERM to: ${command}`,
       );
-      killVerificationProcess(supervised, "SIGTERM");
+      requestProcessTreeTermination("SIGTERM");
 
       killTimer = setTimeout(() => {
         if (!settled) {
           executorLog.warn(
             `[fn_run_verification] SIGTERM ignored — sending SIGKILL to: ${command}`,
           );
-          killVerificationProcess(supervised, "SIGKILL");
           killed = true;
+          requestProcessTreeTermination("SIGKILL");
         }
       }, SIGKILL_GRACE_MS);
     }, timeoutMs);
@@ -776,6 +848,7 @@ async function runVerificationCommandUnlocked(
       clearInterval(quietTimer);
       clearTimeout(hardTimer);
       if (killTimer) clearTimeout(killTimer);
+      opts.signal?.removeEventListener("abort", abortVerification);
 
       // Flush remainders
       if (stdoutRemainder) appendToBuffer(stdoutBuf, stdoutRemainder);
@@ -790,8 +863,8 @@ async function runVerificationCommandUnlocked(
       exit to success=true, allowing a failed test gate to appear green in agent tool history.
       Preserve expectation testing as a separate dimension without corrupting exit truth.
       */
-      const success = zeroExit;
-      const expectedFailureObserved = expectFailure && !timedOut && exitCode !== null && exitCode !== 0;
+      const success = zeroExit && !timedOut && !aborted;
+      const expectedFailureObserved = expectFailure && !timedOut && !aborted && exitCode !== null && exitCode !== 0;
       const expectationMet = expectFailure ? expectedFailureObserved : success;
 
       if (!success && !timedOut) {
@@ -808,7 +881,7 @@ async function runVerificationCommandUnlocked(
         reapVerificationProcessGroup(supervised);
       }
 
-      resolve({
+      settleAfterProcessTreeCleanup({
         success,
         expectationMet,
         expectedFailureObserved,
@@ -817,11 +890,12 @@ async function runVerificationCommandUnlocked(
         stdout: flattenBuffer(stdoutBuf),
         stderr: flattenBuffer(stderrBuf),
         timedOut,
+        aborted,
         killed,
         command,
         cwd,
         warnings,
-      });
+      }, processTreeTermination);
     });
 
     child.on("error", (err) => {
@@ -830,9 +904,10 @@ async function runVerificationCommandUnlocked(
       clearInterval(quietTimer);
       clearTimeout(hardTimer);
       if (killTimer) clearTimeout(killTimer);
+      opts.signal?.removeEventListener("abort", abortVerification);
       const durationMs = Date.now() - startMs;
       warnings.push(`Spawn error: ${err.message}`);
-      resolve({
+      settleAfterProcessTreeCleanup({
         success: false,
         expectationMet: false,
         expectedFailureObserved: false,
@@ -841,11 +916,12 @@ async function runVerificationCommandUnlocked(
         stdout: flattenBuffer(stdoutBuf),
         stderr: flattenBuffer(stderrBuf) + `\nSpawn error: ${err.message}`,
         timedOut: false,
+        aborted,
         killed: false,
         command,
         cwd,
         warnings,
-      });
+      }, processTreeTermination);
     });
   });
 }
@@ -866,18 +942,18 @@ function sandboxOutcomeToResult(
   const expectedFailureObserved = expectFailure && result.outcome === "non-zero-exit" && result.exitCode !== null && result.exitCode !== 0;
   const facts = { success, expectedFailureObserved, expectationMet: expectFailure ? expectedFailureObserved : success };
   if (result.outcome === "success") {
-    return { ...facts, exitCode: 0, durationMs, stdout: result.stdout, stderr: result.stderr, timedOut: false, killed: false, command, cwd, warnings: [] };
+    return { ...facts, exitCode: 0, durationMs, stdout: result.stdout, stderr: result.stderr, timedOut: false, aborted: false, killed: false, command, cwd, warnings: [] };
   }
   if (result.outcome === "non-zero-exit") {
-    return { ...facts, exitCode: result.exitCode, durationMs, stdout: result.stdout, stderr: result.stderr, timedOut: false, killed: false, command, cwd, warnings: [] };
+    return { ...facts, exitCode: result.exitCode, durationMs, stdout: result.stdout, stderr: result.stderr, timedOut: false, aborted: false, killed: false, command, cwd, warnings: [] };
   }
   if (result.outcome === "timeout") {
-    return { ...facts, exitCode: null, durationMs, stdout: result.stdout, stderr: result.stderr, timedOut: true, killed: true, command, cwd, warnings: [] };
+    return { ...facts, exitCode: null, durationMs, stdout: result.stdout, stderr: result.stderr, timedOut: true, aborted: false, killed: true, command, cwd, warnings: [] };
   }
   if (result.outcome === "aborted") {
-    return { ...facts, exitCode: null, durationMs, stdout: result.stdout, stderr: result.stderr, timedOut: false, killed: true, command, cwd, warnings: ["verification aborted"] };
+    return { ...facts, exitCode: null, durationMs, stdout: result.stdout, stderr: result.stderr, timedOut: false, aborted: true, killed: true, command, cwd, warnings: ["verification aborted"] };
   }
-  return { ...facts, exitCode: null, durationMs, stdout: result.stdout, stderr: result.stderr, timedOut: false, killed: false, command, cwd, warnings: [result.error.message] };
+  return { ...facts, exitCode: null, durationMs, stdout: result.stdout, stderr: result.stderr, timedOut: false, aborted: false, killed: false, command, cwd, warnings: [result.error.message] };
 }
 
 /** Keep task-tool verification on the selected backend's streaming process path. */
@@ -891,7 +967,24 @@ async function runSandboxedVerificationCommand(opts: Pick<RunVerificationOptions
     signal: opts.signal,
     env: { COREPACK_ENABLE_DOWNLOAD_PROMPT: "0" },
   });
-  return sandboxOutcomeToResult(opts.command, opts.cwd, startedAt, opts.expectFailure === true, result);
+  const completed = sandboxOutcomeToResult(opts.command, opts.cwd, startedAt, opts.expectFailure === true, result);
+  if (opts.signal?.aborted) {
+    /*
+    FNXC:SessionContinuationHandoff 2026-09-09-05:08:
+    An abort races every sandbox outcome, including an expected non-zero exit. Cancellation is not
+    proof of either success or an expected failure, so clear both acceptance dimensions regardless
+    of the command's eventual exit status.
+    */
+    return {
+      ...completed,
+      success: false,
+      expectationMet: false,
+      expectedFailureObserved: false,
+      aborted: true,
+      warnings: [...completed.warnings, "verification aborted after command exit"],
+    };
+  }
+  return completed;
 }
 
 // ---------------------------------------------------------------------------
@@ -972,6 +1065,7 @@ export function createRunVerificationTool(
     execute: async function execute(
       _toolCallId: string,
       params: Static<typeof runVerificationParams>,
+      signal?: AbortSignal,
     ): ReturnType<NonNullable<ToolDefinition["execute"]>> {
       /*
       FNXC:WorkspaceVerification 2026-08-22-22:49:
@@ -990,7 +1084,7 @@ export function createRunVerificationTool(
           return { content: [{ type: "text" as const, text: "No modified workspace repositories require verification." }], details: { success: true, repositories: [] } };
         }
         const results = [];
-        for (const repo of modifiedRepos) results.push(await execute(_toolCallId, { ...params, repo: repo.repo }));
+        for (const repo of modifiedRepos) results.push(await execute(_toolCallId, { ...params, repo: repo.repo }, signal));
         const repositoryResults = results as Array<{ content: Array<{ type: "text"; text: string }>; details: { success?: boolean } }>;
         const success = repositoryResults.every((result) => result.details.success === true);
         return {
@@ -1107,7 +1201,27 @@ export function createRunVerificationTool(
             onHeartbeat: recordActivity,
             sandboxBackend,
             sandboxPolicy,
+            signal,
           });
+        } catch (error) {
+          if (signal?.aborted && error instanceof Error && error.name === "AbortError") {
+            return {
+              success: false,
+              expectationMet: false,
+              expectedFailureObserved: false,
+              exitCode: null,
+              durationMs: 0,
+              stdout: "",
+              stderr: "",
+              timedOut: false,
+              aborted: true,
+              killed: false,
+              command: effectiveCommand,
+              cwd: resolvedCwd,
+              warnings: ["verification aborted while waiting for the shared slot"],
+            } satisfies VerificationResult;
+          }
+          throw error;
         } finally {
           onVerificationEnd?.();
         }
@@ -1127,6 +1241,8 @@ export function createRunVerificationTool(
         lines.push(
           `Command timed out after ${timeoutSec}s and was ${result.killed ? "killed (SIGKILL)" : "terminated (SIGTERM)"}.\n`,
         );
+      } else if (result.aborted) {
+        lines.push("Command canceled because its owning task session was aborted.\n");
       }
 
       if (selectedRepo) lines.push(`Repository: ${selectedRepo.repo}`);
@@ -1180,6 +1296,7 @@ export function createRunVerificationTool(
           exitCode: result.exitCode,
           durationMs: result.durationMs,
           timedOut: result.timedOut,
+          aborted: result.aborted,
           killed: result.killed,
           command: result.command,
           cwd: result.cwd,

@@ -571,8 +571,6 @@ export function createTaskDoneTool(
           return { content: [{ type: "text" as const, text: successMessage }], details: {} };
         }
 
-        onDone();
-
         // Mark all pending/in-progress steps as done
         for (let i = 0; i < task.steps.length; i++) {
           if (task.steps[i].status !== "done" && task.steps[i].status !== "skipped") {
@@ -654,6 +652,14 @@ export function createTaskDoneTool(
         if (latestColumn === await resolveWipTargetForTask(store, taskId) && !hardPauseActive) {
           deps.scheduleCompletedTaskWatchdog(taskId, "fn_task_done");
         }
+
+        /*
+        FNXC:SessionContinuationHandoff 2026-09-09-03:11:
+        Graph completion is an acceptance signal, not a promise to write later. Finish every
+        required step, summary, recommendation, and task-state write before notifying the graph;
+        a rejected durable write must leave this runtime incomplete for bounded recovery.
+        */
+        onDone();
 
         const successMessage = hardPauseActive
           ? "Task marked complete. Completion handoff deferred until pause is cleared."
