@@ -1,5 +1,7 @@
 ---
-"@fusion/engine": patch
+"@runfusion/fusion": patch
 ---
 
-Settle an obsolete shared foreach checkpoint only after a fresh task-store read confirms its same-run step is terminal.
+summary: Resume completed steps without replaying work or leaving obsolete checkpoints active.
+category: fix
+dev: Close exact shared foreach checkpoints only after a fresh task and settings read proves terminal, unpaused authority.

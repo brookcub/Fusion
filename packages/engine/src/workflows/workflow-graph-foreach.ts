@@ -162,9 +162,10 @@ async function settleAuthoritativeTerminalCheckpoint(
     || checkpoint.integratedAt != null) {
     throw new WorkflowIrError(`ambiguous foreach checkpoint settlement for ${state.foreachNodeId}#${state.stepIndex}`);
   }
-  // A prior successful write is idempotent. Do not downgrade its provenance or
-  // turn a harmless resumed read into a failure.
-  if (checkpoint.status === "completed") return;
+  // An already-terminal checkpoint needs no settlement. A paused/interrupted
+  // earlier attempt may be failed while its task step is now done; preserve
+  // that failure verbatim instead of rewriting history or blocking normal resume.
+  if (checkpoint.status === "completed" || checkpoint.status === "failed") return;
   if (checkpoint.status !== "in-progress") {
     throw new WorkflowIrError(`non-settleable foreach checkpoint for ${state.foreachNodeId}#${state.stepIndex}`);
   }
@@ -515,7 +516,7 @@ export async function runForeach(
     let liveSteps: TaskStep[];
     try {
       liveSteps = await Promise.resolve(env.getLiveSteps?.() ?? env.steps);
-    } catch (error) {
+    } catch {
       schedulerLog.warn(`foreach ${foreachNode.id} for task ${env.task.id}: authoritative step read failed`);
       return { outcome: "failure", value: "authoritative-step-read-failed", visitedNodeIds };
     }

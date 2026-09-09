@@ -210,10 +210,10 @@ describe("WorkflowGraphExecutor foreach (U3)", () => {
     expect(saved).toEqual([{ ...stale, branchName: null, integratedAt: null, status: "completed" }]);
   });
 
-  it("is idempotent for an already completed exact shared checkpoint", async () => {
+  it.each(["completed", "failed"] as const)("preserves an already terminal %s shared checkpoint without rewriting history", async (status) => {
     const completed: WorkflowStepInstanceState = {
       taskId: "FN-FOREACH", runId: "resume-run", foreachNodeId: "fe",
-      stepIndex: 0, pinnedStepCount: 1, currentNodeId: "exec", status: "completed", reworkCount: 0,
+      stepIndex: 0, pinnedStepCount: 1, currentNodeId: "exec", status, reworkCount: 0,
     };
     const save = vi.fn();
     const executor = new WorkflowGraphExecutor({
