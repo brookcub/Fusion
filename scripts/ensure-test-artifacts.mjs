@@ -332,7 +332,7 @@ function writeRemediation(stderrWrite, pkgEntries, filterCommand, rootDir, exist
   stderrWrite("[test-bootstrap] reference: FN-4232, FN-4605\n\n");
 }
 
-function run(
+export function runArtifactBuild(
   command,
   args,
   cwd,
@@ -346,7 +346,11 @@ function run(
     readdirFn = readdirSync,
   } = {},
 ) {
-  const result = spawnFn(command, args, { cwd, stdio: "inherit" });
+  const result = spawnFn(command, args, {
+    cwd,
+    stdio: "inherit",
+    shell: process.platform === "win32" && command === "pnpm",
+  });
   if (result.status !== 0) {
     const filterCommand = `${command} ${args.join(" ")}`;
     const packageNames = args.filter((entry, index) => args[index - 1] === "--filter");
@@ -381,7 +385,7 @@ function resolveWorkspaceRoot(explicitRootDir) {
 
 export function ensureTestArtifacts(
   rootDir,
-  runFn = run,
+  runFn = runArtifactBuild,
   existsFn = existsSync,
   statFn = statSync,
   readdirFn = readdirSync,
@@ -393,7 +397,7 @@ export function ensureTestArtifacts(
   // rebuild. The default-runner (real CLI) path uses it; injected test runners
   // can opt in via runOptions.artifactCache / runOptions.gitFn but default to
   // disabled so existing mtime-based tests keep exercising the mtime path.
-  const useContentCache = runFn === run || runOptions.artifactCache !== undefined;
+  const useContentCache = runFn === runArtifactBuild || runOptions.artifactCache !== undefined;
   const cacheOptions = useContentCache
     ? {
         artifactCache: runOptions.artifactCache ?? readArtifactCache(resolvedRootDir),
@@ -427,7 +431,7 @@ export function ensureTestArtifacts(
 
   const names = missingOrStale.map((pkg) => pkg.name);
   console.log(`[test-bootstrap] rebuilding workspace dist artifacts (missing or stale): ${names.join(", ")}`);
-  if (runFn === run) {
+  if (runFn === runArtifactBuild) {
     runFn("pnpm", [...names.flatMap((name) => ["--filter", name]), "build"], resolvedRootDir, {
       ...runOptions,
       pkgEntries: missingOrStale,

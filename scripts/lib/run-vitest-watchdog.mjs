@@ -88,6 +88,10 @@ export const DEFAULT_GRACE_MS = 5_000;
 export const DEFAULT_HEARTBEAT_MS = 5_000;
 export const TIMEOUT_EXIT_CODE = 124;
 
+export function needsWindowsPnpmShell(command, platform = process.platform) {
+  return platform === "win32" && command === "pnpm";
+}
+
 /**
  * Derive a wall-clock budget for one invocation.
  *
@@ -179,6 +183,7 @@ export function captureHangDiagnostics({ label, command, args, budgetMs, started
  * @param {string} [opts.label]
  * @param {(msg: string) => void} [opts.log]
  * @param {object} opts.spawn      injected spawn (node:child_process spawn); required for testability
+ * @param {boolean} [opts.shell]    required for the Windows pnpm.cmd shim only
  * @param {string} [opts.cwd]       working directory for the spawned child (preserves callers that
  *   ran the test command from a fixed root, e.g. test-changed.mjs's rootDir)
  * @param {() => number} [opts.now] injected clock (defaults to Date.now)
@@ -197,6 +202,7 @@ export function runWithWatchdog({
   label = command,
   log = console.error,
   spawn,
+  shell = needsWindowsPnpmShell(command),
   now = () => Date.now(),
   killGroup = null,
 }) {
@@ -218,6 +224,7 @@ export function runWithWatchdog({
       detached: true,
       stdio: "inherit",
       env,
+      shell,
       ...(cwd ? { cwd } : {}),
     });
 

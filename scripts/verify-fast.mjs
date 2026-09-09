@@ -359,6 +359,7 @@ export async function runStep(step, { spawnFn = spawn, log = console.log, errLog
     label: step.label,
     log: errLog,
     spawn: spawnFn,
+    shell: process.platform === "win32" && step.command === "pnpm",
   });
   const elapsedS = ((Date.now() - startedAt) / 1000).toFixed(1);
   if (timedOut || signal || code !== 0) {

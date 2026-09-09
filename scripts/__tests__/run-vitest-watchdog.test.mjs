@@ -9,6 +9,7 @@ import {
   deriveBudgetMs,
   summarizeActiveHandles,
   captureHangDiagnostics,
+  needsWindowsPnpmShell,
   runWithWatchdog,
 } from "../lib/run-vitest-watchdog.mjs";
 
@@ -35,6 +36,12 @@ test("deriveBudgetMs: no fresh timing falls back to the per-class ceiling", () =
     deriveBudgetMs({ klass: "shard", expectedDurationMs: 0, timingsFresh: true }),
     CLASS_BUDGET_BANDS.shard.ceiling,
   );
+});
+
+test("needsWindowsPnpmShell is limited to pnpm.cmd", () => {
+  assert.equal(needsWindowsPnpmShell("pnpm", "win32"), true);
+  assert.equal(needsWindowsPnpmShell("node", "win32"), false);
+  assert.equal(needsWindowsPnpmShell("pnpm", "linux"), false);
 });
 
 test("deriveBudgetMs: fresh timing tightens within the band", () => {
@@ -249,4 +256,16 @@ test("runWithWatchdog: passes cwd through to spawn when provided", async () => {
   child.emit("close", 0, null);
   await p;
   assert.equal(capturedOpts.cwd, "/tmp/repo-root");
+});
+
+test("runWithWatchdog: passes Windows pnpm shim compatibility to spawn", async () => {
+  let capturedOpts = null;
+  const child = makeFakeChild();
+  const pending = runWithWatchdog({
+    command: "pnpm", args: ["--version"], shell: true, budgetMs: 10_000, label: "pnpm", log: () => {},
+    spawn: (_command, _args, options) => { capturedOpts = options; return child; }, killGroup: () => {},
+  });
+  child.emit("close", 0, null);
+  await pending;
+  assert.equal(capturedOpts.shell, true);
 });
