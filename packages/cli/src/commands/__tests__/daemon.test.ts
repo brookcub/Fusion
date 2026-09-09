@@ -873,6 +873,28 @@ describe("runDaemon", () => {
     process.exit = originalExit;
   });
 
+  it("excludes renamed native aliases before loading and rejects untrusted native registrations", async () => {
+    const { getEnabledPiExtensionPaths } = await import("@fusion/core");
+    const { discoverAndLoadExtensions } = await import("@earendil-works/pi-coding-agent");
+    const alias = mkdtempSync(join(tmpdir(), "daemon-native-alias-"));
+    writeFileSync(join(alias, "package.json"), JSON.stringify({ name: "@fusion/pi-claude-cli", pi: { extensions: ["index.ts"] } }));
+    const entry = join(alias, "index.ts");
+    writeFileSync(entry, "export default () => { throw new Error('must not load'); };");
+    vi.mocked(getEnabledPiExtensionPaths).mockReturnValueOnce([entry, "/other.ts"]);
+    vi.mocked(discoverAndLoadExtensions).mockResolvedValueOnce({
+      runtime: { pendingProviderRegistrations: [
+        { name: "pi-claude-cli", extensionPath: entry, config: { models: [] } },
+        { name: "other-provider", extensionPath: "/other.ts", config: { models: [] } },
+      ] }, errors: [],
+    } as unknown as Awaited<ReturnType<typeof discoverAndLoadExtensions>>);
+    await runDaemon({});
+    expect(vi.mocked(discoverAndLoadExtensions).mock.calls[0][0]).not.toContain(entry);
+    expect(vi.mocked(discoverAndLoadExtensions).mock.calls[0][0]).toContain("/other.ts");
+    expect(mocks.modelRegistry.registerProvider).not.toHaveBeenCalledWith("pi-claude-cli", expect.anything());
+    expect(mocks.modelRegistry.registerProvider).toHaveBeenCalledWith("other-provider", { models: [] });
+    await triggerSignal("SIGINT");
+  });
+
   it("initializes stores, starts engine services, and creates a headless server with daemon auth", async () => {
     await runDaemon({});
 

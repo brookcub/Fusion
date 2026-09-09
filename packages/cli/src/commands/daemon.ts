@@ -24,6 +24,7 @@ import {
   mergeBuiltInGrokProviderModels,
   mergeBuiltInZaiProviderModels,
   reconcileClaudeCliPaths,
+  selectClaudeCliProviderRegistrations,
   registerBuiltInGrokProvider,
   registerBuiltInZaiProvider,
 } from "@fusion/core";
@@ -718,7 +719,7 @@ export async function runDaemon(opts: DaemonOptions = {}) {
       name,
       config,
       extensionPath,
-    } of extensionsResult.runtime.pendingProviderRegistrations) {
+    } of selectClaudeCliProviderRegistrations(extensionsResult.runtime.pendingProviderRegistrations, claudeCliPaths[0] ?? null)) {
       try {
         modelRegistry.registerProvider(name, config);
       } catch (error) {

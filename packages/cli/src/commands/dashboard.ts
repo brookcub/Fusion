@@ -14,6 +14,8 @@ import {
   PluginLoader,
   getTaskMergeBlocker,
   getEnabledPiExtensionPaths,
+  reconcileClaudeCliPaths,
+  selectClaudeCliProviderRegistrations,
   isEphemeralAgent,
   DaemonTokenManager,
   GlobalSettingsStore,
@@ -1917,14 +1919,15 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
 
     // Load all enabled extensions: Fusion/Pi filesystem-discovered + package-resolved.
     const extensionsResult = await phaseTime("discoverAndLoadExtensions", () => discoverAndLoadExtensions(
-      [
+      // FNXC:NativeClaudeStartup 2026-09-09-09:46: Dashboard preloads run before engine sessions; exclude stale aliases before their initializers execute.
+      reconcileClaudeCliPaths([
         ...selfExtensionPaths,
         ...getEnabledPiExtensionPaths(cwd),
         ...packageExtensionPaths,
         ...claudeCliPaths,
         ...droidCliPaths,
         ...llamaCppPaths,
-      ],
+      ], claudeCliPaths[0] ?? null),
       cwd,
       join(cwd, ".fusion", "disabled-auto-extension-discovery"),
     ), logPhase);
@@ -1933,7 +1936,9 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
       logSink.log(`Failed to load ${path}: ${error}`, "extensions");
     }
 
-    for (const { name, config, extensionPath } of extensionsResult.runtime.pendingProviderRegistrations) {
+    for (const { name, config, extensionPath } of selectClaudeCliProviderRegistrations(
+      extensionsResult.runtime.pendingProviderRegistrations, claudeCliPaths[0] ?? null,
+    )) {
       try {
         modelRegistry.registerProvider(name, config);
       } catch (error) {

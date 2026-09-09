@@ -1,4 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tempWorkspace } from "@fusion/test-utils";
 
 const harness = vi.hoisted(() => {
   let settings: Record<string, unknown> = {};
@@ -24,6 +27,7 @@ const harness = vi.hoisted(() => {
     stop = vi.fn(async () => undefined);
     setLoadingStatus = vi.fn();
     setSystemInfo = vi.fn();
+    setUpdateStatus = vi.fn();
     setReady = vi.fn();
     setTaskStats = vi.fn();
     setInteractiveData = vi.fn((data: Record<string, unknown>) => { this.interactiveData = data; });
@@ -92,6 +96,8 @@ const harness = vi.hoisted(() => {
   });
 
   return {
+    extensionFixture: undefined as undefined | { canonical: string | null; paths: string[] },
+    registerProvider: vi.fn(),
     FakeDashboardTui,
     FakeLogSink,
     app,
@@ -131,6 +137,7 @@ vi.mock("@fusion/core", async (importOriginal) => {
   }
   return {
     ...actual,
+    getEnabledPiExtensionPaths: () => harness.extensionFixture?.paths ?? [],
     createTaskStoreForBackend: vi.fn(() => harness.createTaskStore()),
     AutomationStore: NoopStore,
     AgentStore: class extends NoopStore { listAgents = vi.fn(async () => []); },
@@ -146,6 +153,25 @@ vi.mock("@fusion/core", async (importOriginal) => {
     setDiagnosticStoreListenerCheck: vi.fn(),
   };
 });
+
+vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@earendil-works/pi-coding-agent")>()),
+  DefaultPackageManager: class { resolve = async () => ({ extensions: [] }); },
+}));
+
+vi.mock("@fusion/engine", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@fusion/engine")>()),
+  createFusionModelRegistry: async () => ({ registerProvider: harness.registerProvider, getAll: () => [], find: () => undefined }),
+  refreshFusionModelRegistry: async () => undefined,
+  PeerExchangeService: class { start() {} stop() {} updateGlobalSettings() {} },
+}));
+
+vi.mock("../claude-cli-extension.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../claude-cli-extension.js")>()),
+  resolveClaudeCliExtensionPaths: () => ({ paths: harness.extensionFixture?.canonical ? [harness.extensionFixture.canonical] : [], resolution: null }),
+}));
+
+vi.mock("../self-extension.js", () => ({ resolveSelfExtension: () => ({ status: "not-installed", reason: "isolated fixture" }) }));
 
 vi.mock("@fusion/dashboard", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@fusion/dashboard")>()),
@@ -204,7 +230,40 @@ function expectedConcurrency(settings: Record<string, unknown>): Pick<Record<str
  * runDashboard callback that stops reading live settings and reintroduces private defaults.
  */
 describe("dashboard TUI concurrency settings", () => {
-  beforeEach(() => harness.reset());
+  let processListeners: Map<string | symbol, Function[]>;
+  beforeEach(() => {
+    harness.reset();
+    harness.extensionFixture = undefined;
+    processListeners = new Map(process.eventNames().map((event) => [event, process.listeners(event)]));
+  });
+  afterEach(() => {
+    for (const event of process.eventNames()) {
+      for (const listener of process.listeners(event)) {
+        if (!processListeners.get(event)?.includes(listener)) process.removeListener(event, listener as (...args: any[]) => void);
+      }
+    }
+  });
+
+  it.each([true, false])("dashboard startup never executes a renamed native alias (canonical available=%s)", async (available) => {
+    const root = tempWorkspace("dashboard-native-alias-");
+    const alias = join(root, "claude-cli-lanes");
+    mkdirSync(alias);
+    const marker = join(root, "alias-executed.json");
+    const canonical = join(root, "canonical.ts");
+    const other = join(root, "other.ts");
+    writeFileSync(join(alias, "package.json"), JSON.stringify({ name: "@fusion/pi-claude-cli", pi: { extensions: ["index.ts"] } }));
+    writeFileSync(join(alias, "index.ts"), `import { writeFileSync } from "node:fs"; export default () => { writeFileSync(${JSON.stringify(marker)}, "executed"); throw new Error("renamed alias executed"); };`);
+    writeFileSync(canonical, 'export default pi => pi.registerProvider("pi-claude-cli", { models: [], marker: "canonical" });');
+    writeFileSync(other, 'export default pi => { pi.registerProvider("other-provider", { models: [], marker: "other" }); pi.registerProvider("pi-claude-cli", { models: [], marker: "impostor" }); };');
+    harness.extensionFixture = { canonical: available ? canonical : null, paths: [join(alias, "index.ts"), other] };
+    await runDashboard(0, { noEngine: true, noAuth: true });
+    expect(existsSync(marker)).toBe(false);
+    expect(harness.registerProvider).toHaveBeenCalledWith("other-provider", expect.objectContaining({ marker: "other" }));
+    expect(harness.registerProvider).not.toHaveBeenCalledWith("pi-claude-cli", expect.objectContaining({ marker: "impostor" }));
+    const native = harness.registerProvider.mock.calls.filter(([name]) => name === "pi-claude-cli");
+    expect(native).toHaveLength(available ? 1 : 0);
+    if (available) expect(native[0][1]).toEqual(expect.objectContaining({ marker: "canonical" }));
+  });
 
   it.each([
     ["unset", {}],

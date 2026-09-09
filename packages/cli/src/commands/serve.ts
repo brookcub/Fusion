@@ -19,6 +19,8 @@ import {
   INSIGHT_EXTRACTION_SCHEDULE_NAME,
   processAndAuditInsightExtraction,
   getEnabledPiExtensionPaths,
+  reconcileClaudeCliPaths,
+  selectClaudeCliProviderRegistrations,
   mergeBuiltInGrokProviderModels,
   mergeBuiltInZaiProviderModels,
   registerBuiltInGrokProvider,
@@ -816,14 +818,14 @@ export async function runServe(
     setHostExtensionPaths(selfExtensionPaths);
 
     const extensionsResult = await discoverAndLoadExtensions(
-      [
+      reconcileClaudeCliPaths([
         ...selfExtensionPaths,
         ...getEnabledPiExtensionPaths(primaryCwd),
         ...packageExtensionPaths,
         ...claudeCliPaths,
         ...droidCliPaths,
         ...llamaCppPaths,
-      ],
+      ], claudeCliPaths[0] ?? null),
       primaryCwd,
       join(primaryCwd, ".fusion", "disabled-auto-extension-discovery"),
     );
@@ -836,7 +838,7 @@ export async function runServe(
       name,
       config,
       extensionPath,
-    } of extensionsResult.runtime.pendingProviderRegistrations) {
+    } of selectClaudeCliProviderRegistrations(extensionsResult.runtime.pendingProviderRegistrations, claudeCliPaths[0] ?? null)) {
       try {
         modelRegistry.registerProvider(name, config);
       } catch (error) {
