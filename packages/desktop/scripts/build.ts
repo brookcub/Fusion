@@ -36,7 +36,7 @@ async function ensureDashboardBuild(): Promise<void> {
   // Build the dashboard server dist and copy registry-manifest.json here so the packaged
   // embedded runtime never depends on a separate `@fusion/dashboard build` workflow step.
   console.log("[desktop:build] Building dashboard server runtime...");
-  await buildDashboard();
+  await buildDashboard({ includeClient: false });
   await cp(dashboardRegistryManifestSource, dashboardRegistryManifestDist);
 
   console.log("[desktop:build] Building dashboard client for file:// desktop loading...");
