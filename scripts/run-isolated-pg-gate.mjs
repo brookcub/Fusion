@@ -20,6 +20,16 @@ export async function withOwnedPostgres(lifecycle, run, verifyStopped = async ()
   finally { await lifecycle.stop(); await verifyStopped(); }
 }
 
+export async function finishGateProcess(code) {
+  // FNXC:RequiredPgGate 2026-09-09-14:53: embedded-postgres registers
+  // async-exit-hook, whose beforeExit handler exits
+  // with a fixed zero and overrides process.exitCode. Cleanup/absence proof
+  // must finish first; then flush the receipt and preserve the actual verdict.
+  await Promise.all([process.stdout, process.stderr].map((stream) =>
+    new Promise((done) => stream.write('', done))));
+  process.exit(code);
+}
+
 export function processAbsent(pid) {
   try { process.kill(pid, 0); return false; }
   catch (error) { return error.code === 'ESRCH'; }
@@ -44,7 +54,7 @@ export async function requireStopped(identity, { pidAbsent = processAbsent, port
   throw Error('owned PostgreSQL shutdown unproven');
 }
 
-export async function runIsolatedPgGate() {
+export async function runIsolatedPgGate({ invocation: selectedInvocation } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'fusion pg gate '));
   const home = join(directory, 'home'); mkdirSync(home);
   // This process is only the PG lane. Isolate native staging and test state too.
@@ -65,17 +75,22 @@ export async function runIsolatedPgGate() {
     const log = openSync(join(directory, 'vitest.log'), 'wx');
     let exit;
     try {
-      const invocation = vitestInvocation(gateLanes.find((lane) => lane.postgres));
+      // Focused integration tests can reuse the same private-cluster ownership,
+      // zero-skip acceptance and verified shutdown instead of inventing a runner.
+      const invocation = selectedInvocation ?? vitestInvocation(gateLanes.find((lane) => lane.postgres));
       const args = invocation.args.filter((arg) => !arg.startsWith('--reporter='));
-      args.push('--reporter=json', '--outputFile=' + reportPath);
+      // JSON alone omits suite-level setup errors in this Vitest version.
+      // Keep human diagnostics in the private lane log, not the public receipt.
+      args.push('--reporter=default', '--reporter=json', '--outputFile=' + reportPath);
       exit = await runChild(args, { cwd: invocation.cwd, stdio: ['ignore', log, log],
-        env: { ...process.env, FUSION_PG_TEST_URL_BASE: url.toString().replace(/\/$/, ''), FUSION_PG_TEST_SKIP: '0', FUSION_PG_TEST_SETUP_PARTICIPANT: '1' } });
+        env: { ...process.env, FUSION_PG_TEST_URL_BASE: url.toString().replace(/\/$/, ''), FUSION_PG_TEST_SKIP: '0', FUSION_PG_TEST_REQUIRED: '1', FUSION_PG_TEST_SETUP_PARTICIPANT: '1' } });
     } finally { closeSync(log); }
     let report;
     try { report = JSON.parse(readFileSync(reportPath, 'utf8')); } catch { /* fail closed below */ }
     const passed = pgResultPassed(exit, report);
     receipt = { lane: 'test:pg-gate', passed, tests: report?.numPassedTests ?? 0,
-      skipped: report?.numPendingTests ?? null, evidence: directory };
+      skipped: report?.numPendingTests ?? null, failedSuites: report?.numFailedTestSuites ?? null,
+      childExit: exit.code, evidence: directory };
     return passed ? 0 : 1;
   }, async () => {
     if (identity) await requireStopped(identity);
@@ -86,6 +101,8 @@ export async function runIsolatedPgGate() {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  try { process.exitCode = await runIsolatedPgGate(); }
-  catch { console.error('[pg-gate] private setup or cleanup failed'); process.exitCode = 1; }
+  let code = 1;
+  try { code = await runIsolatedPgGate(); }
+  catch { console.error('[pg-gate] private setup or cleanup failed'); }
+  await finishGateProcess(code);
 }

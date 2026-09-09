@@ -34,9 +34,9 @@
  * });
  * ```
  *
- * The gate-safe contract: tests using this helper are auto-skipped when PG is
- * not available, so they never break the merge gate in CI environments without
- * PostgreSQL. Run locally with PG on 5432 to exercise the PG paths.
+ * Optional local runs skip when PG is unavailable. The owned merge-gate lane
+ * sets FUSION_PG_TEST_REQUIRED=1 with an explicit private endpoint: those tests
+ * must execute SQL assertions or fail, never silently skip on a failed probe.
  */
 
 import { randomUUID } from "node:crypto";
@@ -44,6 +44,7 @@ import { Worker } from "node:worker_threads";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { createPostgresDdlAdmissionGate } from "./pg-ddl-admission.js";
+import { selectPgTestExecution } from "./pg-test-execution-policy.js";
 import { tmpdir } from "node:os";
 import {
   createPgTimeoutBoundaryObserver,
@@ -195,16 +196,19 @@ function computePgAvailable(): boolean {
   return probeTcpReachable(host, port);
 }
 
-export const PG_AVAILABLE = computePgAvailable();
+const pgExecution = selectPgTestExecution(process.env, computePgAvailable);
+export const PG_AVAILABLE = pgExecution.available;
 
 /** Test-only observation seam for proving harness DDL remains structurally bounded. */
 export const __pgTestDdlAdmission = createPostgresDdlAdmissionGate({
-  available: () => PG_AVAILABLE,
+  available: () => pgExecution.enabled,
   urlBase: PG_TEST_URL_BASE,
 });
 
 /**
- * A conditional `describe` that runs when PG is available and skips otherwise.
+ * A conditional `describe` that runs when PG is available or explicitly
+ * required. Required execution does not imply a healthy database: SQL setup
+ * and assertions must prove that, or fail the lane.
  * Use this instead of bare `describe` for any test file that needs a real
  * PostgreSQL connection.
  *
@@ -214,7 +218,7 @@ export const __pgTestDdlAdmission = createPostgresDdlAdmissionGate({
  * registered tests, which vitest treats as a failure ("no tests found") —
  * breaking the gate-safe contract in CI environments without PostgreSQL.
  */
-export const pgDescribe: typeof vitestDescribe = PG_AVAILABLE
+export const pgDescribe: typeof vitestDescribe = pgExecution.enabled
   ? vitestDescribe
   : (vitestDescribe.skip as typeof vitestDescribe);
 
