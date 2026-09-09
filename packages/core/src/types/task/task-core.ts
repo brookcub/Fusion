@@ -53,8 +53,14 @@ export interface MergeDetails {
     settingsSha256: string;
     startedAt: string;
     completedAt?: string;
-    outcome: "pending" | "passed" | "not-run";
-    checks: Array<{ type: "test" | "build"; commandSha256: string; exitCode: 0 }>;
+    /** FNXC:VerificationEvidence 2026-09-09-03:59: Candidate-bound receipts retain terminal failures so a valid failed check is distinct from missing or stale proof. */
+    outcome: "pending" | "passed" | "failed" | "not-run";
+    checks: Array<{
+      type: "test" | "build";
+      commandSha256: string;
+      exitCode: number;
+      failureKind?: "nonzero" | "timeout" | "aborted" | "execution-error" | "cached";
+    }>;
   }>;
   commitSha?: string;
   /**

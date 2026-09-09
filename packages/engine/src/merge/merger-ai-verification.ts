@@ -92,7 +92,9 @@ export async function verifyAiMergeCandidate(input: {
         throw new Error("AI merge verification refused: receipt authority changed");
       }
       return { mergeDetails: { ...current.mergeDetails, verificationReceipts: [
-        ...(current.mergeDetails?.verificationReceipts ?? []).filter(r => r.candidateSha !== squashSha),
+        // FNXC:VerificationEvidence 2026-09-09-03:59: A later attempt masks older proof in the
+        // derived view but history is retained for diagnosis; replace only this attempt's write.
+        ...(current.mergeDetails?.verificationReceipts ?? []).filter(r => !(r.candidateSha === squashSha && r.startedAt === receipt.startedAt)),
         { ...receipt, checks: [...receipt.checks] },
       ].slice(-32) } };
     });
@@ -117,6 +119,12 @@ export async function verifyAiMergeCandidate(input: {
       undefined, "merger", undefined, settings.verificationCommandTimeoutMs);
     await log(`AI merge verification: ${type} candidate=${squashSha} exit=${result.exitCode} timedOut=${result.timedOut === true} aborted=${result.aborted === true}`);
     if (result.exitCode !== 0 || !result.success || result.timedOut || result.aborted || result.executionError || result.cached) {
+      const failureKind = result.timedOut ? "timeout" : result.aborted ? "aborted"
+        : result.executionError ? "execution-error" : result.cached ? "cached" : "nonzero";
+      receipt.checks.push({ type, commandSha256: verificationHash(command), exitCode: result.exitCode, failureKind });
+      receipt.completedAt = new Date().toISOString();
+      receipt.outcome = "failed";
+      await persistReceipt();
       throw new Error(`AI merge verification failed: ${type}; candidate not landed`);
     }
     await assertVerifiedCandidate();

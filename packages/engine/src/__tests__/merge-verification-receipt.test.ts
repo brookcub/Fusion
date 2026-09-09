@@ -31,11 +31,11 @@ it("durably binds successful check evidence to the candidate without copying com
 });
 
 it.each([{ exitCode: 1, success: false }, { exitCode: 0, success: true, cached: true },
-  { exitCode: 0, success: true, timedOut: true }])("does not publish successful evidence for rejected command %j", async (result) => {
+  { exitCode: 0, success: true, timedOut: true }])("persists failed evidence for rejected command %j", async (result) => {
   const f = fixture(); run.mockResolvedValue(result);
   await expect(f.check()).rejects.toThrow("verification failed");
-  expect(f.updateTaskAtomic).toHaveBeenCalledOnce();
-  expect(f.task.mergeDetails?.verificationReceipts?.[0]?.outcome).toBe("pending");
+  expect(f.updateTaskAtomic).toHaveBeenCalledTimes(2);
+  expect(f.task.mergeDetails?.verificationReceipts?.[0]).toMatchObject({ outcome: "failed", completedAt: expect.any(String) });
 });
 
 it("refuses landing when receipt durability fails", async () => {
