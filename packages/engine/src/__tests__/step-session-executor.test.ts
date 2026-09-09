@@ -26,6 +26,17 @@ vi.mock("../worktree/worktree-hooks.js", () => ({
   IDENTITY_GUARD_BYPASS_ENV: "FUSION_MERGER_BYPASS_IDENTITY_GUARD",
 }));
 
+/*
+FNXC:SessionContinuationHandoff 2026-09-09-05:21:
+Parallel session tests own deterministic step isolation, not the native worktree remover. Stub the
+remover at the module boundary because its real child-process cleanup cannot settle under this file's
+fake timers; retaining the call assertion proves every disposable parallel worktree is still released.
+*/
+vi.mock("../worktree/worktree-backend.js", async () => {
+  const actual = await vi.importActual<typeof import("../worktree/worktree-backend.js")>("../worktree/worktree-backend.js");
+  return { ...actual, removeWorktree: vi.fn().mockResolvedValue(undefined) };
+});
+
 // ── Shared test fixtures ──────────────────────────────────────────────
 
 function makePrompt(steps: string[]): string {
@@ -2300,10 +2311,9 @@ describe("StepSessionExecutor", () => {
       const failures = results.filter((r) => !r.success);
       expect(successes.length + failures.length).toBe(2);
 
-      // Worktree cleanup should still happen
-      expect(mockedExecSync).toHaveBeenCalledWith(
-        expect.stringContaining("git worktree remove"),
-        expect.anything(),
+      // Worktree cleanup remains owned by the shared backend boundary.
+      expect(vi.mocked(worktreeBackendModule.removeWorktree)).toHaveBeenCalledWith(
+        expect.objectContaining({ taskId: "FN-001", reason: "step-session-cleanup" }),
       );
     });
 
@@ -2516,17 +2526,22 @@ describe("StepSessionExecutor", () => {
           return "";
         });
 
-        let releaseStep0: (() => void) | undefined;
+        let releaseStep0!: () => void;
         const step0Gate = new Promise<void>((resolve) => {
           releaseStep0 = resolve;
+        });
+        let observeStep0Start!: () => void;
+        const step0Started = new Promise<void>((resolve) => {
+          observeStep0Start = resolve;
         });
         const executionEvents: string[] = [];
 
         mockedCreateFnAgent.mockImplementation(({ cwd }: any) => {
-          if (cwd === "/project/.worktrees/wt-step-0") {
+          if (cwd.endsWith("fn-001-step-0")) {
             return Promise.resolve({
               session: makeMockSession(async () => {
                 executionEvents.push("step-0-start");
+                observeStep0Start();
                 await step0Gate;
                 executionEvents.push("step-0-end");
               }),
@@ -2553,7 +2568,8 @@ describe("StepSessionExecutor", () => {
 
         const resultsPromise = executor.executeAll();
 
-        releaseStep0?.();
+        await step0Started;
+        releaseStep0();
         const results = await resultsPromise;
 
         expect(executionEvents.includes("step-0-start")).toBe(true);
@@ -2670,9 +2686,13 @@ describe("StepSessionExecutor", () => {
           return "";
         });
 
-        let releaseParallel: (() => void) | undefined;
+        let releaseParallel!: () => void;
         const parallelGate = new Promise<void>((resolve) => {
           releaseParallel = resolve;
+        });
+        let observeParallelStart!: () => void;
+        const parallelStarted = new Promise<void>((resolve) => {
+          observeParallelStart = resolve;
         });
 
         let activeParallelSteps = 0;
@@ -2690,10 +2710,11 @@ describe("StepSessionExecutor", () => {
             } as any);
           }
 
-          const label = cwd.endsWith("wt-mixed-0") ? "parallel-0" : "parallel-1";
+          const label = cwd.endsWith("fn-001-step-0") ? "parallel-0" : "parallel-1";
           return Promise.resolve({
             session: makeMockSession(async () => {
               events.push(`${label}-start`);
+              observeParallelStart();
               activeParallelSteps++;
               maxActiveParallelSteps = Math.max(maxActiveParallelSteps, activeParallelSteps);
               await parallelGate;
@@ -2712,7 +2733,8 @@ describe("StepSessionExecutor", () => {
 
         const resultsPromise = executor.executeAll();
 
-        releaseParallel?.();
+        await parallelStarted;
+        releaseParallel();
         const results = await resultsPromise;
 
         expect(results).toHaveLength(3);
@@ -2827,15 +2849,14 @@ describe("StepSessionExecutor", () => {
 
         await executor.executeAll();
 
-        const removeCalls = mockedExecSync.mock.calls
-          .map(([cmd]) => cmd)
-          .filter((cmd): cmd is string => typeof cmd === "string" && cmd.includes("git worktree remove"));
+        const removedPaths = vi.mocked(worktreeBackendModule.removeWorktree).mock.calls
+          .map(([options]) => options.worktreePath);
 
-        expect(removeCalls).toHaveLength(2);
-        expect(removeCalls.some((cmd) => cmd.includes("wt-clean-0"))).toBe(true);
-        expect(removeCalls.some((cmd) => cmd.includes("wt-clean-1"))).toBe(true);
-        expect(removeCalls.some((cmd) => cmd.includes("wt-clean-2"))).toBe(false);
-        expect(removeCalls.some((cmd) => cmd.includes("/project/.worktrees/main"))).toBe(false);
+        expect(removedPaths).toHaveLength(2);
+        expect(removedPaths.some((path) => path.includes("fn-001-step-0"))).toBe(true);
+        expect(removedPaths.some((path) => path.includes("fn-001-step-1"))).toBe(true);
+        expect(removedPaths.some((path) => path.includes("fn-001-step-2"))).toBe(false);
+        expect(removedPaths).not.toContain("/project/.worktrees/main");
       });
     });
   });
@@ -2983,7 +3004,8 @@ describe("StepSessionExecutor", () => {
           rootDir: "/project",
           taskId: "FN-001",
           settings,
-          worktreePath: expect.stringContaining("/project/.worktrees/"),
+          reason: "step-session-cleanup",
+          worktreePath: expect.stringContaining("fn-001-step-"),
         }),
       );
     });
@@ -3154,6 +3176,55 @@ describe("StepSessionExecutor", () => {
 
     afterEach(() => {
       vi.useRealTimers();
+    });
+
+    it("uses live terminal progress before reduced-context recovery", async () => {
+      const task = makeTaskDetail({
+        id: "FUSI-017-SYNTHETIC",
+        prompt: `# Task: FUSI-017-SYNTHETIC\n\n## Steps\n\n### Step 0: Completed effect\n- [x] Recorded effect\n\n### Step 1: Current pending requirement\n- [ ] Preserve refreshed context`,
+        steps: [
+          { name: "Completed effect", status: "pending" },
+          { name: "Current pending requirement", status: "in-progress" },
+        ],
+      });
+      const liveTask = {
+        ...task,
+        steps: [
+          { name: "Completed effect", status: "done" },
+          { name: "Current pending requirement", status: "in-progress" },
+        ],
+      };
+      const store = {
+        appendAgentLog: vi.fn().mockResolvedValue(undefined),
+        getTask: vi.fn().mockResolvedValue(liveTask),
+      } as unknown as TaskStore;
+      const prompts: string[] = [];
+      mockedCreateFnAgent.mockResolvedValue({ session: makeMockSession() } as any);
+
+      const { promptWithFallback } = await import("../pi.js");
+      let calls = 0;
+      vi.mocked(promptWithFallback).mockImplementation(async (_session: any, prompt: string) => {
+        prompts.push(prompt);
+        if (calls++ === 0) throw new Error("context window exceeds limit (2013)");
+      });
+      const { compactSessionContext } = await import("../pi.js");
+      vi.mocked(compactSessionContext).mockResolvedValue(null);
+
+      const executor = new StepSessionExecutor({
+        store,
+        taskDetail: task,
+        worktreePath: "/project/.worktrees/main",
+        rootDir: "/project",
+        settings: makeSettings({ maxParallelSteps: 1 }),
+      });
+      const results = await executor.executeAll();
+
+      expect(results).toEqual([expect.objectContaining({ stepIndex: 1, success: true, retries: 0 })]);
+      expect(mockedCreateFnAgent).toHaveBeenCalledTimes(1);
+      expect(prompts).toHaveLength(2);
+      expect(prompts[0]).toContain("Step 1 of task FUSI-017-SYNTHETIC");
+      expect(prompts[1]).toContain("step 1 of task FUSI-017-SYNTHETIC");
+      expect(prompts.every((prompt) => prompt.includes("Current pending requirement"))).toBe(true);
     });
 
     it("succeeds when compact-and-resume recovers from context-limit error", async () => {
