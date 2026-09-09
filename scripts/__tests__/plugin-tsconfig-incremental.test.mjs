@@ -18,6 +18,8 @@ function runTsc(cwd) {
   execFileSync(process.execPath, [tscPath, "-p", "tsconfig.json"], {
     cwd,
     stdio: "pipe",
+    timeout: 30_000,
+    windowsHide: true,
   });
 }
 
@@ -42,13 +44,10 @@ test("plugin TypeScript cache is package-local, regenerates, and invalidates sha
     const pluginsDir = path.join(root, "plugins");
     writeJson(path.join(pluginsDir, "tsconfig.base.json"), {
       compilerOptions: {
-        target: "ES2024",
-        module: "NodeNext",
-        moduleResolution: "NodeNext",
-        declaration: true,
-        incremental: true,
-        tsBuildInfoFile: "${configDir}/dist/.tsbuildinfo",
-        strict: true,
+        ...base.compilerOptions,
+        // The synthetic programs need no ambient Node declarations; retain every
+        // other production setting so this validates the actual cache contract.
+        types: [],
       },
     });
     writeJson(path.join(root, "node_modules", "@fixture", "shared", "package.json"), {
@@ -63,6 +62,7 @@ test("plugin TypeScript cache is package-local, regenerates, and invalidates sha
     const second = path.join(pluginsDir, "second");
     for (const pluginDir of [first, second]) {
       writeJson(path.join(pluginDir, "tsconfig.json"), pluginConfig());
+      writeJson(path.join(pluginDir, "package.json"), { type: "module" });
       mkdirSync(path.join(pluginDir, "src"), { recursive: true });
       writeFileSync(path.join(pluginDir, "src", "index.ts"), 'import { VALUE } from "@fixture/shared"; export const value = VALUE;\n', { encoding: "utf8", flush: true });
     }
@@ -72,12 +72,16 @@ test("plugin TypeScript cache is package-local, regenerates, and invalidates sha
     const firstInfo = path.join(first, "dist", ".tsbuildinfo");
     const secondInfo = path.join(second, "dist", ".tsbuildinfo");
     assert.notEqual(firstInfo, secondInfo);
+    assert.ok(readFileSync(firstInfo, "utf8").length > 0, "first plugin must own a populated buildinfo file");
+    const secondInfoBefore = readFileSync(secondInfo, "utf8");
+    assert.ok(secondInfoBefore.length > 0, "second plugin must own a populated buildinfo file");
     assert.match(readFileSync(path.join(first, "dist", "index.d.ts"), "utf8"), /"first"/);
     assert.match(readFileSync(path.join(second, "dist", "index.d.ts"), "utf8"), /"first"/);
 
     rmSync(path.join(first, "dist"), { recursive: true, force: true });
     runTsc(first);
     assert.ok(readFileSync(firstInfo, "utf8").length > 0, "missing dist must regenerate the package-local buildinfo");
+    assert.equal(readFileSync(secondInfo, "utf8"), secondInfoBefore, "first plugin regeneration must not replace the second plugin cache");
 
     writeFileSync(sharedTypes, 'export declare const VALUE: "second";\n');
     runTsc(first);
