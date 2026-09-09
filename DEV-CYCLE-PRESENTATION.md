@@ -12,6 +12,10 @@ kill-on-close native Job. The Job itself owns the deadline and proves emptiness
 before returning. Cancellation is an owned sentinel observed by that helper,
 which terminates and proves its Job empty before returning a cancellation
 receipt; it does not rely on an unsupported negative-PID process-group signal.
+The helper emits a content-free completion receipt (`exit`, `timeout`, or
+`cancelled`, plus Job-empty proof), which the wrapper validates before returning
+so ordinary child codes 124/125 cannot be misclassified and missing or failed
+helper receipts fail loudly.
 
 Private focused evidence: resolver/artifact/watchdog tests are green, a real
 `pnpm --version` invocation returned `10.33.0`, and real Windows regressions

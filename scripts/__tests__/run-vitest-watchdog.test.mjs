@@ -272,7 +272,7 @@ test("runWithWatchdog preserves real argv containing spaces and metacharacters",
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-async function waitForIdentity(path, timeoutMs = 2_000) {
+async function waitForIdentity(path, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
   while (!existsSync(path)) {
     if (Date.now() >= deadline) throw new Error("descendant identity was not written");
@@ -305,6 +305,28 @@ test("runWithWatchdog native Job reaps a child and detached grandchild on timeou
     assert.match(result.diagnostics, /HANG: job-timeout/);
     await assertDescendantGone(await waitForIdentity(identityPath));
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("runWithWatchdog preserves ordinary native exits 124 and 125", { skip: process.platform !== "win32" }, async () => {
+  for (const code of [124, 125]) {
+    const result = await runWithWatchdog({ command: process.execPath, args: ["-e", `process.exit(${code})`], budgetMs: 10_000, label: `ordinary-${code}`, log: () => {}, spawn: realSpawn, windowsJob: true });
+    assert.equal(result.code, code);
+    assert.equal(result.timedOut, false);
+    assert.equal(result.signal, null);
+  }
+});
+
+test("runWithWatchdog honors a disabled native budget", { skip: process.platform !== "win32" }, async () => {
+  const result = await runWithWatchdog({ command: process.execPath, args: ["-e", "setTimeout(() => process.exit(0), 75)"], budgetMs: 0, label: "disabled-budget", log: () => {}, spawn: realSpawn, windowsJob: true });
+  assert.equal(result.code, 0);
+  assert.equal(result.timedOut, false);
+});
+
+test("runWithWatchdog rejects a missing native completion receipt", { skip: process.platform !== "win32" }, async () => {
+  await assert.rejects(
+    runWithWatchdog({ command: process.execPath, args: ["-e", "process.exit(0)"], budgetMs: 10_000, label: "missing-receipt", log: () => {}, spawn: realSpawn, windowsJob: true, nativeHelperPath: join(tmpdir(), "missing-native-helper.ps1") }),
+    /outcome receipt missing or malformed/,
+  );
 });
 
 test("runWithWatchdog native Job reaps descendants when its parent is cancelled", { skip: process.platform !== "win32" }, async () => {

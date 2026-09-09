@@ -29,7 +29,7 @@
 
 const MINUTE = 60_000;
 import { spawn as nodeSpawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 import { resolvePnpmCommand } from "./pnpm-command.mjs";
@@ -194,6 +194,7 @@ export function captureHangDiagnostics({ label, command, args, budgetMs, started
  * @param {boolean} [opts.windowsJob] use the lightweight native Job wrapper.
  *   The default only enables it for Node's real spawn; fake-child unit tests
  *   retain their portable process-group model.
+ * @param {string} [opts.nativeHelperPath] test seam for native receipt refusal.
  */
 export function runWithWatchdog({
   command,
@@ -209,6 +210,7 @@ export function runWithWatchdog({
   now = () => Date.now(),
   killGroup = null,
   windowsJob = process.platform === "win32" && spawn === nodeSpawn,
+  nativeHelperPath = resolvePath(import.meta.dirname, "run-owned-windows-command.ps1"),
 }) {
   if (typeof spawn !== "function") {
     throw new Error("runWithWatchdog requires an injected `spawn` function");
@@ -219,13 +221,16 @@ export function runWithWatchdog({
     const nativeWindowsJob = windowsJob;
     const nativeCancelDirectory = nativeWindowsJob ? mkdtempSync(join(tmpdir(), "fusion-watchdog-")) : null;
     const nativeCancelFile = nativeCancelDirectory ? join(nativeCancelDirectory, "cancel") : null;
+    const nativeOutcomeFile = nativeCancelDirectory ? join(nativeCancelDirectory, "outcome.json") : null;
+    const hasBudget = Number.isFinite(budgetMs) && budgetMs > 0;
     const launchCommand = nativeWindowsJob ? "powershell.exe" : resolvedCommand.command;
     const launchArgs = nativeWindowsJob ? [
-      "-NoProfile", "-NonInteractive", "-File", resolvePath(import.meta.dirname, "run-owned-windows-command.ps1"),
+      "-NoProfile", "-NonInteractive", "-File", nativeHelperPath,
       "-Executable", resolvedCommand.command,
       "-ArgumentsBase64", Buffer.from(JSON.stringify(resolvedCommand.args)).toString("base64"),
-      "-TimeoutMs", String(Math.max(1, Math.floor(budgetMs))),
+      "-TimeoutMs", String(hasBudget ? Math.floor(budgetMs) : -1),
       "-CancelFile", nativeCancelFile,
+      "-OutcomeFile", nativeOutcomeFile,
     ] : resolvedCommand.args;
     const startedAt = now();
     let lastHeartbeatAt = null;
@@ -237,14 +242,15 @@ export function runWithWatchdog({
 
     // process-supervisor-allowlist: foreground wrapper signals the whole vitest
     // process group on death/timeout; not a background daemon.
-    const child = spawn(launchCommand, launchArgs, {
+    let child;
+    try { child = spawn(launchCommand, launchArgs, {
       // The native helper owns a Job Object; a detached console group adds no
       // containment and can break inherited-handle startup for its child.
       detached: !nativeWindowsJob,
       stdio: "inherit",
       env,
       ...(cwd ? { cwd } : {}),
-    });
+    }); } catch (error) { if (nativeCancelDirectory) rmSync(nativeCancelDirectory, { recursive: true, force: true }); throw error; }
 
     const heartbeat = setInterval(() => {
       lastHeartbeatAt = now();
@@ -298,7 +304,7 @@ export function runWithWatchdog({
     // is empty. A second outer timer could kill that helper before it proves
     // descendant cleanup.
     const watchdog =
-      !nativeWindowsJob && Number.isFinite(budgetMs) && budgetMs > 0
+      !nativeWindowsJob && hasBudget
         ? setTimeout(() => {
             timedOut = true;
             diagnostics = captureHangDiagnostics({
@@ -345,7 +351,6 @@ export function runWithWatchdog({
       clearInterval(heartbeat);
       if (watchdog) clearTimeout(watchdog);
       if (forceKillTimer) clearTimeout(forceKillTimer);
-      if (nativeCancelDirectory) rmSync(nativeCancelDirectory, { recursive: true, force: true });
       for (const [sig, handler] of signalHandlers) process.removeListener(sig, handler);
       process.removeListener("exit", onProcExit);
     }
@@ -354,6 +359,7 @@ export function runWithWatchdog({
       if (settled) return;
       settled = true;
       cleanup();
+      if (nativeCancelDirectory) rmSync(nativeCancelDirectory, { recursive: true, force: true });
       reject(error);
     });
 
@@ -361,8 +367,16 @@ export function runWithWatchdog({
       if (settled) return;
       settled = true;
       cleanup();
-      const nativeTimeout = nativeWindowsJob && code === TIMEOUT_EXIT_CODE;
-      const nativeCancelled = nativeWindowsJob && code === 125 && cancellationSignal != null;
+      let nativeOutcome = null;
+      if (nativeWindowsJob) {
+        try { nativeOutcome = JSON.parse(readFileSync(nativeOutcomeFile, "utf8")); } catch { if (nativeCancelDirectory) rmSync(nativeCancelDirectory, { recursive: true, force: true }); reject(new Error("native watchdog outcome receipt missing or malformed")); return; }
+        if (!nativeOutcome || nativeOutcome.jobEmpty !== true || !["exit", "timeout", "cancelled"].includes(nativeOutcome.outcome) || !Number.isInteger(nativeOutcome.exitCode) || nativeOutcome.exitCode !== code) {
+          if (nativeCancelDirectory) rmSync(nativeCancelDirectory, { recursive: true, force: true }); reject(new Error("native watchdog outcome receipt is unproven")); return;
+        }
+        rmSync(nativeCancelDirectory, { recursive: true, force: true });
+      }
+      const nativeTimeout = nativeWindowsJob && nativeOutcome.outcome === "timeout";
+      const nativeCancelled = nativeWindowsJob && nativeOutcome.outcome === "cancelled" && cancellationSignal != null;
       if (nativeTimeout) {
         timedOut = true;
         diagnostics = captureHangDiagnostics({ label, command, args, budgetMs, startedAt, lastHeartbeatAt, now: now() });
