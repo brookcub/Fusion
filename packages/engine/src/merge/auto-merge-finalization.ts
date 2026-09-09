@@ -339,7 +339,7 @@ export async function finalizeProvenAutoMergeTask({
     return { outcome: "blocked", task: latest, previousColumn: latest.column, reason: postMergeBlocker };
   }
   const checklistReconciliation = planConfirmedMergeChecklistReconciliation(latest);
-  const reconciledSteps = latest.steps.map((step, index) =>
+  const reconciledSteps = (latest.steps ?? []).map((step, index) =>
     checklistReconciliation.skippedStepIndexes.includes(index) ? { ...step, status: "skipped" as const } : step,
   );
   const reconciledWorkflowStepResults = (latest.workflowStepResults ?? []).map((result) =>
@@ -348,9 +348,19 @@ export async function finalizeProvenAutoMergeTask({
       : result,
   );
 
-  const proofVerdict = await validateWorkflowDoneMergeProof({ ...latest, mergeDetails } as Task, {
+  /*
+  FNXC:CompletionEvidence 2026-09-09-05:43:
+  Confirmed landing may reconcile obsolete pre-merge receipts, but it must not turn unfinished
+  implementation into skipped work. Validate the reconciled row with its remaining steps so a
+  landed task stays truthful rather than being promoted as verified complete.
+  */
+  const proofVerdict = await validateWorkflowDoneMergeProof({
+    ...latest,
+    mergeDetails,
+    steps: reconciledSteps,
+    workflowStepResults: reconciledWorkflowStepResults,
+  } as Task, {
     result,
-    checkWorkflowSteps: false,
     isCompleteColumn,
   });
   if (!proofVerdict.ok) {

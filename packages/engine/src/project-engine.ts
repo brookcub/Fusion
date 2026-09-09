@@ -4240,10 +4240,21 @@ export class ProjectEngine {
                 runtimeLog.warn(
                   `Auto-merge: ${taskId} merge-confirmed finalize blocked — ${finalization.reason ?? "unknown"}`,
                 );
+                const finalizationReason = finalization.reason ?? "unknown";
                 await store.logEntry(
                   taskId,
-                  `Merge confirmed finalization blocked — ${finalization.reason ?? "unknown"}. Task parked for manual completion.`,
+                  `Merge confirmed finalization blocked — ${finalizationReason}. Task parked for manual completion.`,
                 );
+                /*
+                FNXC:CompletionEvidence 2026-09-09-05:43:
+                Durable merge proof records that landing succeeded, but a blocked finalizer must not
+                clear the task state or skip unfinished work to make that landing appear complete.
+                Keep the commit intact and park the unresolved completion condition explicitly.
+                */
+                await store.updateTask(taskId, {
+                  status: "failed",
+                  error: `Merge confirmed but finalization blocked: ${finalizationReason}`,
+                });
                 continue;
               }
               const mergedTask = finalization.task ?? (await store.getTask(taskId).catch(() => null)) ?? task;

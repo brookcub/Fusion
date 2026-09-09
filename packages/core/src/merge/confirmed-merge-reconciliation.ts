@@ -40,10 +40,14 @@ export function planConfirmedMergeChecklistReconciliation(
   not make the row real. Measured: a task whose row carried no `steps` threw
   "Cannot read properties of undefined (reading 'map')" and the landed merge never finalized.
   */
+  /*
+  FNXC:CompletionEvidence 2026-09-09-05:43:
+  A durable merge proves landing, not that unfinished implementation or required validation may be
+  discarded. Reconciliation may retire only obsolete pre-merge workflow receipts; ordinary task
+  steps remain intact so the finalization proof check can expose genuinely outstanding work.
+  */
   return {
-    skippedStepIndexes: (task.steps ?? [])
-      .map((step, index) => step.status === "pending" || step.status === "in-progress" ? index : -1)
-      .filter((index) => index >= 0),
+    skippedStepIndexes: [],
     reconciledWorkflowStepIds: (task.workflowStepResults ?? [])
       // FNXC:CompletionEvidence 2026-09-09-04:24: Landing reconciliation may retire obsolete
       // pre-merge work, but it must preserve pending post-merge validation as outstanding proof.

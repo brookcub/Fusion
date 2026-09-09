@@ -578,7 +578,7 @@ describe("ProjectEngine merge error recovery", () => {
     expect(store.moveTask).not.toHaveBeenCalledWith(TASK_ID, "done");
     expect(store.updateTask).toHaveBeenCalledWith(TASK_ID, {
       status: "failed",
-      error: "Merge confirmed but finalization blocked: task has incomplete steps",
+      error: "Merge confirmed but finalization blocked: incomplete-workflow-steps",
     });
     expect(store.logEntry).toHaveBeenCalledWith(
       TASK_ID,

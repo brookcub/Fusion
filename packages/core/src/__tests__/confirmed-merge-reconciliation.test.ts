@@ -2,12 +2,12 @@ import { describe, expect, it } from "vitest";
 import { getPostMergeFinalizeBlocker, planConfirmedMergeChecklistReconciliation } from "../merge/confirmed-merge-reconciliation.js";
 
 describe("confirmed merge reconciliation", () => {
-  it("does not re-run stale review or checklist gates after a confirmed merge", () => {
+  it("reconciles obsolete pre-merge receipts without discarding unfinished task work", () => {
     expect(getPostMergeFinalizeBlocker({ status: "merging", error: undefined })).toBeUndefined();
     expect(planConfirmedMergeChecklistReconciliation({
       steps: [{ name: "Implementation", status: "pending" }, { name: "Done", status: "done" }],
       workflowStepResults: [{ workflowStepId: "code-review", workflowStepName: "Code Review", status: "pending" }],
-    })).toEqual({ skippedStepIndexes: [0], reconciledWorkflowStepIds: ["code-review"] });
+    })).toEqual({ skippedStepIndexes: [], reconciledWorkflowStepIds: ["code-review"] });
   });
 
   it("does not let a finalizer-inflicted failed status wedge proven-landed work", () => {
