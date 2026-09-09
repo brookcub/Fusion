@@ -28,6 +28,7 @@
  */
 
 const MINUTE = 60_000;
+import { resolvePnpmCommand } from "./pnpm-command.mjs";
 
 /**
  * Per-invocation-class budget bands (milliseconds). The floor/ceiling are the
@@ -206,6 +207,7 @@ export function runWithWatchdog({
   }
 
   return new Promise((resolve, reject) => {
+    const resolvedCommand = resolvePnpmCommand(command, args);
     const startedAt = now();
     let lastHeartbeatAt = null;
     let timedOut = false;
@@ -215,7 +217,7 @@ export function runWithWatchdog({
 
     // process-supervisor-allowlist: foreground wrapper signals the whole vitest
     // process group on death/timeout; not a background daemon.
-    const child = spawn(command, args, {
+    const child = spawn(resolvedCommand.command, resolvedCommand.args, {
       detached: true,
       stdio: "inherit",
       env,

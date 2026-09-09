@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { spawn as realSpawn } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   CLASS_BUDGET_BANDS,
@@ -250,4 +254,20 @@ test("runWithWatchdog: passes cwd through to spawn when provided", async () => {
   child.emit("close", 0, null);
   await p;
   assert.equal(capturedOpts.cwd, "/tmp/repo-root");
+});
+
+test("runWithWatchdog preserves real argv containing spaces and metacharacters", async () => {
+  const root = mkdtempSync(join(tmpdir(), "watchdog argv & "));
+  const output = join(root, "received args.json");
+  const fixture = join(root, "argv fixture &.mjs");
+  const args = [fixture, output, "space value", "literal & value"];
+  try {
+    writeFileSync(fixture, "import {writeFileSync} from 'node:fs'; writeFileSync(process.argv[2], JSON.stringify(process.argv.slice(3)));\n");
+    const result = await runWithWatchdog({
+      command: process.execPath, args, budgetMs: 10_000, label: "argv-roundtrip", log: () => {},
+      spawn: realSpawn,
+    });
+    assert.equal(result.code, 0);
+    assert.deepEqual(JSON.parse(readFileSync(output, "utf8")), ["space value", "literal & value"]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
