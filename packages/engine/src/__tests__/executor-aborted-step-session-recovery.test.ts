@@ -86,6 +86,9 @@ describe("aborted step-session recovery", () => {
     ["throw", "userPaused"], ["graceful", "userPaused"],
     ["throw", "enginePaused"], ["graceful", "globalPause"],
     ["throw", "resumed"], ["graceful", "resumed"],
+    ["throw-without-markers", "paused"], ["throw-without-markers", "userPaused"],
+    ["throw-without-markers", "enginePaused"], ["throw-without-markers", "globalPause"],
+    ["late-pause-aborted-owner", "paused"], ["late-pause-aborted-owner", "userPaused"],
   ] as const)("preserves single-session work on %s with %s", async (exit, pause) => {
     const store = createMockStore();
     const subject = productionTask({ id: "FUSI-006-SINGLE" });
@@ -104,19 +107,31 @@ describe("aborted step-session recovery", () => {
     const executor = new TaskExecutor(store as never, "/tmp/test", {
       agentStore: createWorkflowRoutingAgentStore(store).agentStore,
     });
+    const ownerController = new AbortController();
+    if (exit === "late-pause-aborted-owner") {
+      (executor as any).activeWorkflowGraphAbortControllers.set(subject.id, ownerController);
+    }
     const running = (executor as any).runImplementation(subject, vi.fn(), vi.fn());
     await vi.waitFor(() => expect(prompt).toHaveBeenCalledOnce());
     const before = await store.getTask(subject.id);
-    if (pause === "paused" || pause === "userPaused") store._setRow(subject.id, { [pause]: true });
+    if (exit === "late-pause-aborted-owner") {
+      ownerController.abort();
+      (executor as any).activeWorkflowGraphAbortControllers.delete(subject.id);
+      store.getSettings.mockImplementationOnce(async () => {
+        store._setRow(subject.id, { [pause]: true });
+        return settings;
+      });
+    } else if (pause === "paused" || pause === "userPaused") store._setRow(subject.id, { [pause]: true });
     if (pause === "enginePaused" || pause === "globalPause") settings[pause] = true;
-    (executor as any).pausedAborted.add(subject.id);
+    if (exit !== "throw-without-markers" && exit !== "late-pause-aborted-owner") (executor as any).pausedAborted.add(subject.id);
     const resumed = vi.spyOn(executor, "execute").mockImplementation(async () => {
       expect(executingTaskLock.has(subject.id)).toBe(false);
     });
     store.updateTask.mockClear();
     store.moveTask.mockClear();
     vi.mocked(removeWorktree).mockClear();
-    if (exit === "throw") fail(new Error("Session terminated")); else finish();
+    if (exit === "throw-without-markers" || exit === "late-pause-aborted-owner") fail(new Error("request was aborted"));
+    else if (exit === "throw") fail(new Error("Session terminated")); else finish();
     await running;
     await vi.runOnlyPendingTimersAsync();
     const after = await store.getTask(subject.id);

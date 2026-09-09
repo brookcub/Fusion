@@ -418,7 +418,7 @@ export function buildMarkStuckAbortedDeps(host: any): any {
     ...facadeMethods(host, [
       "resolveResumeLanes", "getWorktreePath", "terminateAllChildren",
       "awaitAbortInFlightTaskWork", "clearPausedAborted", "resetStepsIfWorkLost",
-      "hasActiveWorktreeBinding",
+      "hasActiveWorktreeBinding", "getRunContextFor",
     ]),
     ensureWorkspaceConfig: withWorkspaceResolver(host),
     reexecuteTaskInPlace: async (taskId: string) => {

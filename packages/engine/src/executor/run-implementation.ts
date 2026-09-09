@@ -168,6 +168,7 @@ import {
 import { buildExecutionPrompt } from "./execution-prompt.js";
 import { resolveReboundColumnFor, resolveTerminalColumnsFor } from "./lifecycle-columns.js";
 import { recoverAbortedStepSessionInPlace } from "./recover-aborted-step-session.js";
+import { recoveryIsHeld } from "./recovery-pause-guard.js";
 import { detectPendingReviewBlock } from "./pending-review-block.js";
 import { detectPseudoPause } from "./pseudo-pause.js";
 import { isInvalidAssistantContinuationErrorMessage } from "./requeue-loop.js";
@@ -675,6 +676,7 @@ export async function runImplementation(
     // true = requeue to todo, false = budget exhausted (already marked failed).
     let stuckRequeue: boolean | null = null;
     let pendingSingleSessionResume = false;
+    const implementationAbortSignal = deps.activeWorkflowGraphAbortControllers.get(task.id)?.signal;
     let staleAssistantContinuationRequeue = false;
     let taskDone = false;
     let reviewAddressingActivated = false;
@@ -3201,6 +3203,17 @@ export async function runImplementation(
       if (agentDispatchedRotation) agentRotationEvent?.recordOutcome("rotation-succeeded");
     } catch (err: unknown) {
       const { message: errorMessage, detail: errorDetail, stack: errorStack } = formatError(err);
+      // FNXC:RecoveryPause 2026-09-09-05:12: A late abort may outlive both runtime markers; durable pause wins over transient-error cleanup.
+      if (await recoveryIsHeld(deps.store, task.id)) {
+        executorLog.debug(`${task.id}: late implementation failure held in place by authoritative control`);
+        return;
+      }
+      if (implementationAbortSignal?.aborted) {
+        pendingSingleSessionResume = (await recoverAbortedStepSessionInPlace(
+          deps, task.id, "pause-abort",
+        )) === "resumed-in-place";
+        return;
+      }
       if (deps.depAborted.has(task.id)) {
         // Dependency added mid-execution — discard worktree and move to triage
         deps.depAborted.delete(task.id);
