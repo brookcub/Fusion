@@ -83,3 +83,20 @@ behind already-terminal steps, preserving existing failed/completed history.
 These candidates still require integrated gates, immutable packaging and private
 lifecycle verification before the public Task System deployment path is used.
 The live pilot remains paused; this document is not a claim of deployment or DONE.
+
+## Integrated acceptance
+
+At source integration `0d12f9aec3ae5976d7d8dcdd7b36e427d2216f5d`, the complete
+`pnpm test:gate` passed: 16 static validators, 177 core tests, 461 engine tests,
+72 CLI tests and 10 isolated PostgreSQL gate tests (720 tests total). The private
+PostgreSQL shutdown was verified. The repaired merger fixtures retain the prior
+command-dependent success/failure/abort behavior at an explicit fake backend;
+they do not manufacture native Job receipts. No gate assertion was removed.
+
+Integrated checkpoint + queue + admission + observer + wrapper regressions:
+102 passed, one pre-existing unrelated skip, 26.96 seconds. Final Terra review
+of native deltas: PASS, 29 native/failure/mapping tests passed in 16.9 seconds,
+with source lint and engine typecheck exit 0. The actual live public status was
+refreshed after testing: running/ready, both configured projects desired/actual
+paused, no drift. Packaging and private lifecycle rehearsal remain separate
+from these source-test results.
