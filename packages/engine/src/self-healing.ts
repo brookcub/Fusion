@@ -248,6 +248,7 @@ import type {
   RecoverFailedPreMergeStepOutcome,
   ReviewRemediationAttemptDescriptor,
 } from "./executor/recover-failed-pre-merge-step.js";
+import { permitsFailedStepCodeRemediation } from "./executor/recover-failed-pre-merge-step.js";
 
 export {
   extractTaskIdFromTempMergeDir,
@@ -9860,6 +9861,9 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       };
 
       const candidates = tasks.filter((task) => {
+        // FNXC:ReviewFailureRecovery 2026-09-09-06:13: Refuse provider/protocol review failures before counters or revision logs are written; the existing failed gate remains the visible blocker.
+        const remediationTarget = latestFailedPreMergeStep(task);
+        if (remediationTarget && !permitsFailedStepCodeRemediation(remediationTarget)) return false;
         /* Precomputed above, so this filter stays synchronous. */
         if (!(reviewLanesByTask.get(task.id) ?? new Set(["in-review"])).has(task.column)) return false;
         if (!allowsAutoMergeProcessing(task, settings)) return false;

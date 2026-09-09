@@ -1,6 +1,6 @@
 import { vi } from "vitest";
 import type { Mock } from "vitest";
-import type { Task } from "@fusion/core";
+import { planRemediationPlacement, type Task, type TaskStep } from "@fusion/core";
 import { installTaskWorktreeIdentityGuard } from "../worktree/worktree-hooks.js";
 import type * as ReviewerModule from "../execution/reviewer.js";
 
@@ -702,6 +702,14 @@ export function createMockStore() {
       const patch = await updater(current);
       applyPatch(id, patch ?? undefined);
       return store.getTask(id);
+    }),
+    // FNXC:ReviewFailureRecovery 2026-09-09-06:13: Authored REVISE fixtures use the real named-remediation route, which requires a write-through append seam rather than the old verdict-free trailing fallback.
+    appendRemediationSteps: vi.fn(async (id: string, steps: readonly TaskStep[], options: { wave?: number } = {}) => {
+      const current = await store.getTask(id) as Task;
+      const appended = steps.map((step) => ({ ...step, status: "pending" as const }));
+      const placement = planRemediationPlacement(current.steps ?? [], appended);
+      applyPatch(id, { steps: placement.steps, currentStep: placement.insertionIndex });
+      return { task: await store.getTask(id), appended, appendedCount: appended.length, wave: options.wave ?? 1, ...placement };
     }),
     mergeWorkspaceWorktreeEntry: vi.fn((
       id: string,

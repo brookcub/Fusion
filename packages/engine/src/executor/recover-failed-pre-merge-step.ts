@@ -7,7 +7,7 @@
  * from that failed gate while retaining the gate's structured findings for the implementer.
  */
 import type { Task, TaskStore, WorkflowStepResult as CoreWorkflowStepResult } from "@fusion/core";
-import { hasPreMergeRemediationAutoMergeHold, resolveStepReopenPolicy, resolveWorkflowIrForTask } from "@fusion/core";
+import { hasPreMergeRemediationAutoMergeHold, requiresAuthoredReviewVerdict, resolveStepReopenPolicy, resolveWorkflowIrForTask } from "@fusion/core";
 import { executorLog } from "../logger.js";
 import type { EngineRunContext } from "../util/run-audit.js";
 import type {
@@ -96,6 +96,17 @@ export function isRecoverFailedPreMergeStepScheduled(outcome: RecoverFailedPreMe
 }
 
 /**
+ * FNXC:ReviewFailureRecovery 2026-09-09-06:13:
+ * Provider/protocol failure is not a request to change product code. Recovery shares merge's
+ * semantic review identity, including renamed and verdict-required gates. Only an authored REVISE
+ * may spend a review-fix budget; script failures retain their status-based remediation contract.
+ */
+export function permitsFailedStepCodeRemediation(target: CoreWorkflowStepResult): boolean {
+  return target.verdict === "REVISE"
+    || (target.verdict === undefined && !requiresAuthoredReviewVerdict(target.workflowStepId, target));
+}
+
+/**
  * FNXC:LifecycleContainment 2026-08-30-13:36:
  * A claimed recovery runs against the same fenced store the live requester uses. Its refusal
  * branches — operator hold, checkout unavailable, zero/exhausted budget, the convergence ladder —
@@ -133,6 +144,9 @@ export async function recoverFailedPreMergeWorkflowStepDetailed(
       executorLog.warn(`${task.id}: no failed pre-merge workflow step to recover from`);
       return { kind: "skipped" };
     }
+
+    // FNXC:ReviewFailureRecovery 2026-09-09-06:13: Keep the failed gate and its diagnostic intact; no budget, ladder, log spam, or trailing-step fallback is authorized.
+    if (!permitsFailedStepCodeRemediation(target)) return { kind: "skipped" };
 
     if (hasPreMergeRemediationAutoMergeHold(liveTask, await deps.store.getSettings())) {
       const reason = "operator-authored task-level auto-merge Off holds failed-step recovery";

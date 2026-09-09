@@ -930,8 +930,10 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
         phase: "pre-merge",
         status: "failed",
         output: "Fix the review finding.",
+        verdict: "REVISE",
       }],
     });
+    store.getTask.mockResolvedValue(liveTask);
     const executor = new TaskExecutor(store, "/tmp/test");
     const sendBack = vi.spyOn(executor as any, "sendTaskBackForFix").mockResolvedValue(undefined);
 
@@ -960,6 +962,7 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
           phase: "pre-merge",
           status: "failed",
           output: "Fix the review finding.",
+          verdict: "REVISE",
         }],
       });
       const executor = new TaskExecutor(store, "/tmp/test");
@@ -982,9 +985,11 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
         phase: "pre-merge",
         status: "failed",
         output: "Fix the review finding.",
+        verdict: "REVISE",
         completedAt: new Date().toISOString(),
       }],
     });
+    store.getTask.mockResolvedValue(liveTask);
     store.getSettings.mockResolvedValue({ maxPostReviewFixes: 3 });
     const executor = new TaskExecutor(store, "/tmp/test");
     const sendBack = vi.spyOn(executor as any, "sendTaskBackForFix").mockResolvedValue(undefined);
@@ -999,7 +1004,7 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
       expect.any(String),
       true,
       false,
-      { attempt: 4, max: undefined },
+      { attempt: 4, max: 3 },
       undefined,
       true,
       "reopen-trailing",
@@ -1027,10 +1032,12 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
         phase: "pre-merge",
         status: "failed",
         output: "Fix the review finding.",
+        verdict: "REVISE",
         findings,
         completedAt: new Date().toISOString(),
       }],
     });
+    store.getTask.mockResolvedValue(liveTask);
     store.getSettings.mockResolvedValue({ maxPostReviewFixes: 3 });
     const executor = new TaskExecutor(store, "/tmp/test");
     const sendBack = vi.spyOn(executor as any, "sendTaskBackForFix").mockResolvedValue(undefined);
@@ -1038,18 +1045,21 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
     await expect(executor.recoverFailedPreMergeWorkflowStep(liveTask)).resolves.toBe(true);
 
     expect(sendBack).toHaveBeenCalledWith(
-      liveTask,
+      await store.getTask(liveTask.id),
       liveTask.worktree,
       "Fix the review finding.",
       "Code Review",
       expect.any(String),
       true,
       false,
-      expect.anything(),
+      undefined,
       findings,
       true,
-      "reopen-trailing",
+      "none",
     );
+    expect((await store.getTask(liveTask.id)).steps).toContainEqual(expect.objectContaining({
+      status: "pending", remediation: expect.objectContaining({ findingId: "f-blocking", gate: "Code Review" }),
+    }));
   });
 
   /*
@@ -1072,6 +1082,7 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
         phase: "pre-merge",
         status: "failed",
         output: "Fix the review finding.",
+        verdict: "REVISE",
         completedAt: new Date().toISOString(),
       }],
     });

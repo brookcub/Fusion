@@ -6402,6 +6402,7 @@ describe("SelfHealingManager", () => {
           workflowStepName: "Browser Verification",
           phase: "pre-merge" as const,
           status: "failed" as const,
+          verdict: "REVISE" as const,
           output: "SSE reconnect leaks /api/events connections when view toggles.",
           startedAt: "2026-04-17T21:08:24.135Z",
           completedAt: "2026-04-17T21:35:32.036Z",

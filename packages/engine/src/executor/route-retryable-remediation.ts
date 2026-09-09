@@ -15,6 +15,7 @@ import { resolveTerminalColumnsFor } from "./lifecycle-columns.js";
 import { latestFailedPreMergeWorkflowStep } from "./graph-failure-pure.js";
 import { optionalStepRevisionLogOutcome } from "./optional-step-revision.js";
 import { resolveRemediationCheckout } from "./resolve-remediation-checkout.js";
+import { permitsFailedStepCodeRemediation } from "./recover-failed-pre-merge-step.js";
 
 export type RouteRetryableRemediationDeps = {
   store: TaskStore;
@@ -40,6 +41,8 @@ export async function routeRetryableRemediationGraphFailureToPreMergeFix(
   if ((await resolveTerminalColumnsFor(deps.store, live.id)).includes(live.column)) return false;
   const target = latestFailedPreMergeWorkflowStep(live);
   if (!target || !resolveRemediationCheckout(live, target)) return false;
+  // FNXC:ReviewFailureRecovery 2026-09-09-06:13: The graph retry entry must not spend a code-fix attempt for a review that never authored REVISE.
+  if (!permitsFailedStepCodeRemediation(target)) return false;
   const settings = await deps.store.getSettings().catch(() => undefined);
   if (!settings || settings.globalPause === true || settings.enginePaused === true) return false;
   if (!allowsAutoMergeProcessing(live, settings) && !(await deps.isLiveSharedBranchGroupMember(live))) return false;

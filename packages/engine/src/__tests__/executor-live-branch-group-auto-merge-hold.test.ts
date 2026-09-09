@@ -148,6 +148,7 @@ describe("executor shared-branch autoMerge:false liveness gates", () => {
         phase: "pre-merge",
         status: "failed",
         output: "Please revise",
+        verdict: "REVISE",
       }],
     });
     store.getTask.mockResolvedValue(task);
@@ -180,7 +181,10 @@ describe("executor shared-branch autoMerge:false liveness gates", () => {
       nodeId: "plan-review",
     })).resolves.toBe(true);
 
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo", { preserveWorktree: true, workflowMoveSource: "workflow-remediation" });
+    expect(store.moveTask).toHaveBeenCalledWith(task.id, "todo", {
+      preserveWorktree: true, workflowMoveSource: "workflow-remediation",
+      moveSource: "engine", lifecycleReason: "plan-review-revise-replan",
+    });
     expect(store.updateTask).toHaveBeenCalledWith(task.id, expect.objectContaining({ status: "needs-replan" }), undefined);
   });
 
@@ -193,6 +197,7 @@ describe("executor shared-branch autoMerge:false liveness gates", () => {
         phase: "pre-merge",
         status: "failed",
         output: "Please revise",
+        verdict: "REVISE",
       }],
     });
     store.getTask.mockResolvedValue(task);
@@ -242,6 +247,7 @@ describe("executor shared-branch autoMerge:false liveness gates", () => {
         phase: "pre-merge",
         status: "failed",
         output: "Please revise",
+        verdict: "REVISE",
       }],
     });
     const sendBack = vi.spyOn(executor as any, "sendTaskBackForFix");
