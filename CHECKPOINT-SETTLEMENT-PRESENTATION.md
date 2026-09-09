@@ -38,5 +38,6 @@ repair preserves them unchanged rather than relabeling them completed. Final
 focused validation after this correction: 65 passed / one unrelated skip in
 20.96 seconds; engine typecheck exit 0. Scoped lint found one unused catch binding,
 which was removed; the final scoped source rerun exited 0. Tests are ignored by this repository's
-ESLint configuration and are validated by Vitest and TypeScript, not claimed linted.
+ESLint configuration and engine TypeScript configuration. These test files are
+validated by Vitest, not claimed linted or typechecked.
 No PostgreSQL, models, artifacts, or live task state are used by the focused tests.
