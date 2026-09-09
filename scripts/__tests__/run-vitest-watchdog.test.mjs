@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { spawn as realSpawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -334,6 +334,65 @@ test("runWithWatchdog rejects a missing native completion receipt", { skip: proc
     runWithWatchdog({ command: process.execPath, args: ["-e", "process.exit(0)"], budgetMs: 10_000, label: "missing-receipt", log: () => {}, spawn: realSpawn, windowsJob: true, nativeHelperPath: join(tmpdir(), "missing-native-helper.ps1") }),
     /outcome receipt missing or malformed/,
   );
+});
+
+test("native setup refusal removes handlers and terminates its helper", async () => {
+  const before = process.listenerCount("SIGHUP");
+  const child = makeFakeChild();
+  let killed = false;
+  child.kill = () => { killed = true; child.emit("close", null, "SIGTERM"); };
+  const running = runWithWatchdog({command: "fixture", args: [], spawn: fakeSpawn(child),
+    windowsJob: true, budgetMs: 1000, nativeDeadlines: { setupMs: 10, cleanupMs: 10 }, log: () => {}});
+  const refused = assert.rejects(running, /setup.*unproven/);
+  await new Promise(done => setTimeout(done, 40));
+  await refused;
+  assert.equal(killed, true);
+  assert.equal(process.listenerCount("SIGHUP"), before);
+});
+
+test("native helper failure during cancellation never reports successful cancellation", async () => {
+  const child = makeFakeChild();
+  let outcome;
+  const running = runWithWatchdog({ command: "fixture", args: [], windowsJob: true,
+    budgetMs: 1000, log: () => {}, spawn: (_command, args) => {
+      outcome = args[args.indexOf("-OutcomeFile") + 1]; return child;
+    }});
+  const refused = assert.rejects(running, /unproven/);
+  process.emit("SIGHUP");
+  writeFileSync(outcome, JSON.stringify({outcome: "helper-failure", jobEmpty: false}));
+  child.emit("close", 125, null);
+  await refused;
+});
+
+test("native ready helper that ignores cancellation is bounded and never green", async () => {
+  const child = makeFakeChild();
+  let killed = false;
+  child.kill = () => { killed = true; child.emit("close", null, "SIGTERM"); };
+  const before = process.listenerCount("SIGHUP");
+  const running = runWithWatchdog({command: "fixture", args: [], windowsJob: true,
+    budgetMs: 0, nativeDeadlines: {setupMs: 100, cleanupMs: 10}, log: () => {},
+    spawn: (_command, args) => { writeFileSync(args[args.indexOf("-ReadyFile")+1], "ready"); return child; }});
+  const refused = assert.rejects(running, /cancellation deadline.*unproven/);
+  process.emit("SIGHUP");
+  await new Promise(done => setTimeout(done, 40));
+  await refused;
+  assert.equal(killed, true);
+  assert.equal(process.listenerCount("SIGHUP"), before);
+});
+
+test("native malformed or contradictory completion receipts are refused", async () => {
+  for (const content of ["broken-json", '{"outcome":"exit","exitCode":0,"jobEmpty":false}',
+      '{"outcome":"timeout","exitCode":0,"jobEmpty":true}',
+      '{"outcome":"cancelled","exitCode":0,"jobEmpty":true}']) {
+    const child = makeFakeChild();
+    const running = runWithWatchdog({command: "fixture", args: [], windowsJob: true,
+      budgetMs: 1000, log: () => {}, spawn: (_command, args) => {
+        writeFileSync(args[args.indexOf("-OutcomeFile")+1], content); return child;
+      }});
+    const refused = assert.rejects(running, /malformed|unproven/);
+    child.emit("close", 0, null);
+    await refused;
+  }
 });
 
 test("runWithWatchdog native Job reaps descendants when its parent is cancelled", { skip: process.platform !== "win32" }, async () => {

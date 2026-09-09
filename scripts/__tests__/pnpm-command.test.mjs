@@ -27,3 +27,13 @@ test("non-pnpm commands retain their executable and argv", () => {
     command: "node", args: ["file with spaces.js"],
   });
 });
+
+test("Windows pnpm discovery refuses missing, failed, or unavailable entrypoints", () => {
+  for (const found of [{status: 1, stdout: "C:\\stale\\pnpm.cmd"},
+      {error: new Error("timeout"), stdout: "C:\\stale\\pnpm.cmd"}, {status: 0, stdout: ""},
+      {status: 0, stdout: "C:\\missing\\pnpm.cmd"}]) {
+    assert.throws(() => resolvePnpmCommand("pnpm", [], {platform: "win32",
+      resolve: () => { throw new Error("not local"); }, findShim: () => found, exists: () => false}),
+    /discovery failed|entrypoint is unavailable/);
+  }
+});

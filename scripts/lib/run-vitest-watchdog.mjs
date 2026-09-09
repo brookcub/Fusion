@@ -195,6 +195,7 @@ export function captureHangDiagnostics({ label, command, args, budgetMs, started
  *   The default only enables it for Node's real spawn; fake-child unit tests
  *   retain their portable process-group model.
  * @param {string} [opts.nativeHelperPath] test seam for native receipt refusal.
+ * @param {{setupMs: number, cleanupMs: number}} [opts.nativeDeadlines] bounded helper deadlines; injectable for tests.
  */
 export function runWithWatchdog({
   command,
@@ -211,6 +212,7 @@ export function runWithWatchdog({
   killGroup = null,
   windowsJob = process.platform === "win32" && spawn === nodeSpawn,
   nativeHelperPath = resolvePath(import.meta.dirname, "run-owned-windows-command.ps1"),
+  nativeDeadlines = { setupMs: 15_000, cleanupMs: 5_000 },
 }) {
   if (typeof spawn !== "function") {
     throw new Error("runWithWatchdog requires an injected `spawn` function");
@@ -241,6 +243,7 @@ export function runWithWatchdog({
     let forceKillTimer = null;
     let nativeSetupTimer = null;
     let nativeReadyPoll = null;
+    let nativeCompletionTimer = null;
     let settled = false;
     let cancellationSignal = null;
 
@@ -259,14 +262,19 @@ export function runWithWatchdog({
     if (nativeWindowsJob) {
       nativeSetupTimer = setTimeout(() => {
         if (settled || existsSync(nativeReadyFile)) return;
-        settled = true;
-        try { child.kill("SIGTERM"); } catch {}
-        rmSync(nativeCancelDirectory, { recursive: true, force: true });
-        reject(new Error("native watchdog helper setup did not become ready"));
-      }, 15_000);
+        refuseNativeHelper("setup deadline");
+      }, nativeDeadlines.setupMs);
       nativeSetupTimer.unref?.();
       nativeReadyPoll = setInterval(() => {
-        if (existsSync(nativeReadyFile)) { clearTimeout(nativeSetupTimer); clearInterval(nativeReadyPoll); nativeSetupTimer = null; nativeReadyPoll = null; }
+        if (existsSync(nativeReadyFile)) {
+          clearTimeout(nativeSetupTimer); clearInterval(nativeReadyPoll);
+          nativeSetupTimer = null; nativeReadyPoll = null;
+          if (hasBudget && !nativeCompletionTimer) {
+            nativeCompletionTimer = setTimeout(() => refuseNativeHelper("completion deadline"),
+              Math.max(1, budgetMs) + nativeDeadlines.cleanupMs);
+            nativeCompletionTimer.unref?.();
+          }
+        }
       }, 25);
       nativeReadyPoll.unref?.();
     }
@@ -278,9 +286,8 @@ export function runWithWatchdog({
     heartbeat.unref?.();
 
     function defaultSignalGroup(signal) {
-      // On Windows the PowerShell helper owns the Job handle. Terminating that
-      // wrapper closes its kill-on-close Job and reaps every descendant; a
-      // negative PID is not a Windows process-group contract.
+      // Ask the native owner to terminate its Job and prove it empty. Killing
+      // the helper alone cannot substitute for that completion evidence.
       if (nativeWindowsJob) {
         try {
           writeFileSync(nativeCancelFile, `${signal}\n`, { flag: "wx" });
@@ -310,7 +317,12 @@ export function runWithWatchdog({
     // suppressed Node's default exit behavior, so Ctrl-C / CI cancellation could
     // otherwise hang for the whole per-command ceiling).
     function armForceKill(triggerSignal) {
-      if (nativeWindowsJob) return;
+      if (nativeWindowsJob) {
+        if (forceKillTimer) return;
+        forceKillTimer = setTimeout(() => refuseNativeHelper("cancellation deadline"), nativeDeadlines.cleanupMs);
+        forceKillTimer.unref?.();
+        return;
+      }
       if (forceKillTimer) return;
       forceKillTimer = setTimeout(() => {
         log(`[watchdog] grace expired after ${triggerSignal}; SIGKILL: ${label}`);
@@ -372,15 +384,31 @@ export function runWithWatchdog({
       if (forceKillTimer) clearTimeout(forceKillTimer);
       if (nativeSetupTimer) clearTimeout(nativeSetupTimer);
       if (nativeReadyPoll) clearInterval(nativeReadyPoll);
+      if (nativeCompletionTimer) clearTimeout(nativeCompletionTimer);
       for (const [sig, handler] of signalHandlers) process.removeListener(sig, handler);
       process.removeListener("exit", onProcExit);
+    }
+
+    function removeNativeFiles() {
+      if (nativeCancelDirectory) rmSync(nativeCancelDirectory, { recursive: true, force: true });
+    }
+
+    function refuseNativeHelper(reason) {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      try { child.kill("SIGTERM"); } catch { /* Refusal remains unproven. */ }
+      try { removeNativeFiles(); } catch { /* Never hide the lifecycle failure. */ }
+      const error = new Error(`native watchdog ${reason}; owned cleanup unproven`);
+      error.helperPid = child.pid;
+      reject(error);
     }
 
     child.on("error", (error) => {
       if (settled) return;
       settled = true;
       cleanup();
-      if (nativeCancelDirectory) rmSync(nativeCancelDirectory, { recursive: true, force: true });
+      try { removeNativeFiles(); } catch { /* Preserve the original spawn failure. */ }
       reject(error);
     });
 
@@ -390,11 +418,22 @@ export function runWithWatchdog({
       cleanup();
       let nativeOutcome = null;
       if (nativeWindowsJob) {
-        try { nativeOutcome = JSON.parse(readFileSync(nativeOutcomeFile, "utf8")); } catch { if (nativeCancelDirectory) rmSync(nativeCancelDirectory, { recursive: true, force: true }); reject(new Error("native watchdog outcome receipt missing or malformed")); return; }
-        if (!nativeOutcome || nativeOutcome.jobEmpty !== true || !["exit", "timeout", "cancelled"].includes(nativeOutcome.outcome) || !Number.isInteger(nativeOutcome.exitCode) || nativeOutcome.exitCode !== code) {
-          if (nativeCancelDirectory) rmSync(nativeCancelDirectory, { recursive: true, force: true }); reject(new Error("native watchdog outcome receipt is unproven")); return;
+        try {
+          try { nativeOutcome = JSON.parse(readFileSync(nativeOutcomeFile, "utf8")); }
+          catch { throw new Error("native watchdog outcome receipt missing or malformed"); }
+          if (!nativeOutcome || nativeOutcome.jobEmpty !== true || !["exit", "timeout", "cancelled"].includes(nativeOutcome.outcome) || !Number.isInteger(nativeOutcome.exitCode) || nativeOutcome.exitCode !== code
+              || (nativeOutcome.outcome === "cancelled" && cancellationSignal == null)) {
+            throw new Error("native watchdog outcome receipt is unproven");
+          }
+          if ((nativeOutcome.outcome === "timeout" && code !== TIMEOUT_EXIT_CODE)
+              || (nativeOutcome.outcome === "cancelled" && code !== 125)) {
+            throw new Error("native watchdog outcome receipt is unproven");
+          }
+          removeNativeFiles();
+        } catch (error) {
+          try { removeNativeFiles(); } catch { /* Preserve the outcome failure. */ }
+          reject(error); return;
         }
-        rmSync(nativeCancelDirectory, { recursive: true, force: true });
       }
       const nativeTimeout = nativeWindowsJob && nativeOutcome.outcome === "timeout";
       const nativeCancelled = nativeWindowsJob && nativeOutcome.outcome === "cancelled" && cancellationSignal != null;

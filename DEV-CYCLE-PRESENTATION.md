@@ -24,3 +24,26 @@ tree after both timeout and explicit parent cancellation; the cancellation
 regression also passed three consecutive real runs. The test fixtures now
 normalize Windows paths before asserting missing/stale artifacts. This is a
 Workspace candidate only; it has not been released or deployed.
+# Parent adversarial review follow-up
+
+Native helper setup/cancellation deadlines now remove invocation listeners and
+timers before refusing. A stuck helper is terminated best-effort, but the result
+is explicitly **cleanup unproven**, never successful cancellation or timeout
+completion. Proven outcomes still require the native Job-empty receipt. Ordinary
+command exits 124/125 remain ordinary failures. The legacy helper invocation
+without receipt arguments remains supported.
+
+Parent validation: the three-file isolated suite passed 67 tests in 5.890 seconds,
+including real Windows descendant/listener absence and adversarial fake-helper
+startup, cancellation, and malformed-outcome cases. The subsequently added pnpm
+discovery failure tests passed 4/4 in 0.014 seconds. A prior automatic-permission
+review timed out before launching; that invocation produced no test result.
+The default isolated subprocess invocation separately refused with EPERM; the
+pure resolver tests passed using Node's no-subprocess test isolation mode.
+
+Final scoped suite after pnpm discovery validation: 68/68 passed in 5.446 seconds.
+ESLint passed for all seven changed JavaScript source/test files, using the
+existing development installation and a SHA-256-identical ESLint configuration
+without installing a second dependency tree. This is scoped lint, not the full
+repository suite. No live installation or Fusion-owned task worktree was modified
+by these tests. Final cold review remains pending.

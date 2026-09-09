@@ -4,4 +4,4 @@
 
 summary: Restore Windows verification and artifact bootstrap commands.
 category: fix
-dev: Uses the Windows pnpm.cmd compatibility launch path only for fixed pnpm command steps.
+dev: Resolves fixed pnpm commands to their JavaScript entrypoint with literal arguments, and contains Windows verification descendants in a native Job with explicit completion evidence.
