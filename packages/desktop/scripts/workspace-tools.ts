@@ -121,9 +121,12 @@ export async function buildDashboardRuntimePlugins(): Promise<void> {
 export async function buildDashboard({ includeClient = true }: { includeClient?: boolean } = {}): Promise<void> {
   const dashboardRoot = resolve(workspaceRoot, "packages", "dashboard");
   await buildDashboardRuntimePlugins();
-  // Desktop immediately builds its own clean file:// client. Do not first
-  // compile an ordinary client that that step will delete. Standalone callers
-  // retain the complete web build by default; server/plugin freshness is unchanged.
+  /*
+   * FNXC:DesktopBuild 2026-09-09-23:56:
+   * Desktop immediately builds its own clean file:// client. Do not first
+   * compile an ordinary client that that step will delete. Standalone callers
+   * retain the complete web build by default; server/plugin freshness is unchanged.
+   */
   if (includeClient) await runWorkspaceBin("vite", ["build"], dashboardRoot);
   await runWorkspaceBin("tsc", [], dashboardRoot);
   // FNXC:DesktopBuild 2026-07-01-11:45:
