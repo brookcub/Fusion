@@ -153,7 +153,7 @@ pgDescribe("FN-7551 — overseer decision points populate the intervention timel
     expect(await getPlannerInterventionTimeline(store, task.id)).toHaveLength(0);
   });
 
-  it("failed executor with no error source dispatches retry_step and emits a retry entry with attemptCount/attemptLimit", async () => {
+  it("does not emit or count a retry when failed executor recovery is retained in place", async () => {
     const task = await seedTask("in-progress");
     const { controllerWithSnapshot } = wireRealEngineOverseer(store);
     const controller = controllerWithSnapshot(observation({ taskId: task.id, stage: "executor", signal: "failed", sources: [] }));
@@ -163,10 +163,10 @@ pgDescribe("FN-7551 — overseer decision points populate the intervention timel
 
     const timeline = await getPlannerInterventionTimeline(store, task.id);
     const retryEntry = timeline.find((e) => e.action === "retry");
-    expect(retryEntry).toBeTruthy();
-    expect(retryEntry?.stage).toBe("executor");
-    expect(retryEntry?.attemptCount).toBe(1);
-    expect(retryEntry?.attemptLimit).toBe(3);
+    expect(retryEntry).toBeUndefined();
+    expect((await store.getTask(task.id)).column).toBe("in-progress");
+    const second = await controller.tick(await store.getTask(task.id));
+    expect(second?.attemptCount).toBe(0);
   });
 
   /*

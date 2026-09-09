@@ -37,8 +37,25 @@ vi.mock("node:child_process", async () => {
       });
     });
 
-  execFileFn[promisify.custom] = (file: string, args?: string[], opts?: any) =>
-    execFn[promisify.custom]([file, ...(Array.isArray(args) ? args : [])].join(" "), opts);
+  // Keep these classifier fixtures' command-keyed outcomes while production
+  // moves to argv transport. Native inspection tests exercise the real Git boundary.
+  execFileFn[promisify.custom] = async (file: string, args: string[] = [], opts?: any) => {
+    if (file !== "git") return execFn[promisify.custom]([file, ...args].join(" "), opts);
+    if (args[0] === "check-ref-format") return { stdout: "", stderr: "" };
+    const presence = args[0] === "show-ref";
+    const rendered = presence ? ["rev-parse", "--verify", `'${args[2]}^{commit}'`]
+      : args.map((arg, index) => index === 0 || arg.startsWith("-")
+        || (args[0] === "worktree") ? arg : `'${arg}'`);
+    try { return await execFn[promisify.custom]([file, ...rendered].join(" "), opts); }
+    catch (error) {
+      if (presence && (error as Error).message === "missing") Object.assign(error as object, { code: 2 });
+      // Each synthetic fixture defaults to unrelated tips unless it explicitly
+      // supplies the ancestor command. Other unexpected commands still fail.
+      if (args[0] === "merge-base" && args[1] === "--is-ancestor"
+        && (error as Error).message.startsWith("Unexpected command:")) Object.assign(error as object, { code: 1 });
+      throw error;
+    }
+  };
 
   return { exec: execFn, execSync: execSyncFn, execFile: execFileFn };
 });
