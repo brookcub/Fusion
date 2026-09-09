@@ -524,6 +524,8 @@ describe("GET /models", () => {
   });
 
   it("does not expose Claude Sonnet 5 when direct Anthropic is not configured", async () => {
+    // No-auth means no launch-environment API key as well as empty auth files.
+    vi.stubEnv("ANTHROPIC_API_KEY", undefined);
     const readFileSpy = vi.spyOn(fsPromises, "readFile").mockImplementation(async (path: any) => {
       const value = String(path);
       if (value.endsWith("auth.json")) return "{}" as never;
@@ -545,6 +547,7 @@ describe("GET /models", () => {
       expect(res.body.models.some((model: { id: string }) => model.id === "claude-sonnet-5")).toBe(false);
     } finally {
       readFileSpy.mockRestore();
+      vi.unstubAllEnvs();
     }
   });
 
@@ -1306,6 +1309,24 @@ describe("GET /auth/status", () => {
     },
   );
 
+  it.each([true, false, undefined])("reports native CLI login independently from an available binary (%s)", async (authenticated) => {
+    vi.mocked(claudeCliProbeModule.probeClaudeCli).mockResolvedValue({ available: true, authenticated, probeDurationMs: 0 });
+    const cliStore = createMockStore({
+      getGlobalSettingsStore: vi.fn().mockReturnValue({
+        ...createMockGlobalSettingsStore(),
+        getSettings: vi.fn().mockResolvedValue({ useClaudeCli: true, enginePaused: true }),
+      }),
+    });
+    const cliApp = express();
+    cliApp.use("/api", createApiRoutes(cliStore, { authStorage }));
+    const res = await GET(cliApp, "/api/auth/status");
+    expect(res.status).toBe(200);
+    expect(res.body.providers.find((provider: any) => provider.id === "claude-cli")).toMatchObject({ authenticated: authenticated === true });
+    expect(cliStore.updateGlobalSettings).not.toHaveBeenCalled();
+    expect(cliStore.moveTask).not.toHaveBeenCalled();
+    expect(cliStore.updateTask).not.toHaveBeenCalled();
+  });
+
   it("returns unauthenticated status", async () => {
     (authStorage.hasAuth as ReturnType<typeof vi.fn>).mockReturnValue(false);
 
@@ -1924,6 +1945,7 @@ describe("GET /providers/claude-cli/status", () => {
   it("returns binary + toggle diagnostics and computed readiness", async () => {
     const probeSpy = vi.spyOn(claudeCliProbeModule, "probeClaudeCli").mockResolvedValue({
       available: true,
+      authenticated: true,
       version: "claude 1.0.0",
       probeDurationMs: 10,
     });
@@ -1937,6 +1959,17 @@ describe("GET /providers/claude-cli/status", () => {
     expect(res.body.ready).toBe(true);
     expect(res.body.binary).toMatchObject({ available: true, version: "claude 1.0.0" });
     expect(res.body.extension).toMatchObject({ status: "ok" });
+  });
+
+  it.each([false, undefined])("keeps the binary available but not ready without proven native login (%s)", async (authenticated) => {
+    const probeSpy = vi.spyOn(claudeCliProbeModule, "probeClaudeCli").mockResolvedValue({ available: true, authenticated, probeDurationMs: 0 });
+    try {
+      const res = await GET(buildApp(), "/api/providers/claude-cli/status");
+      expect(res.status).toBe(200);
+      expect(res.body.binary.available).toBe(true);
+      expect(res.body.ready).toBe(false);
+      expect(store.updateGlobalSettings).not.toHaveBeenCalled();
+    } finally { probeSpy.mockRestore(); }
   });
 
   it("surfaces ACP transport state + the bridge auth-failure signal", async () => {

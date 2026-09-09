@@ -1,148 +1,110 @@
 /**
- * Probe for the locally-installed Claude CLI binary.
- *
- * Used by GET /api/providers/claude-cli/status to power the "Anthropic —
- * via Claude CLI" provider card. The card shows `authenticated=true` only
- * when the binary is on PATH *and* the user has flipped on `useClaudeCli`.
- *
- * Intentional design choices:
- *
- * - No caching. The user's PATH can change between requests (nvm switches,
- *   fresh terminal, etc.) — we'd rather pay one `spawn()` per poll than
- *   serve a stale "claude not installed" response. Claude's `--version`
- *   flag exits in ~40ms, so cost is negligible.
- *
- * - Short timeout. A misbehaving `claude` shim could hang indefinitely;
- *   we cap the probe at 2s and report `available: false` with a timeout
- *   reason rather than blocking the HTTP request.
- *
- * - No authorization. We never shell-interpolate PATH or user input.
- *   We spawn `claude --version` directly with argv, no shell.
+ * Native Claude binary availability and local login are separate facts.
+ * Path lookup, version and auth share one deadline; no model request is made.
  */
-
 import { spawn } from "node:child_process";
+// The adapter owns native child auth. The pure JS helper is inlined by the
+// dashboard/CLI bundler and ships in the adapter's existing raw source copy.
+import { buildNativeClaudeEnv } from "../../pi-claude-cli/src/native-auth-env.js";
 
-/** Result shape returned to the dashboard status endpoint. */
 export interface ClaudeCliBinaryStatus {
-  /** True if the `claude` binary was found on PATH and ran to completion. */
   available: boolean;
-  /** Trimmed stdout from `claude --version`, if available. */
+  /** Only literal loggedIn:true from a successful native auth probe is true. */
+  authenticated?: boolean;
   version?: string;
-  /** Absolute path, if we could resolve it via `which`. */
   binaryPath?: string;
-  /** Human-readable failure reason when `available === false`. */
+  /** Safe diagnostic; auth payloads and child stderr are never returned. */
   reason?: string;
-  /** Wall-clock duration of the probe, useful for debugging slow paths. */
   probeDurationMs: number;
 }
 
-/** Default probe timeout. Claude's --version is fast; 2s is generous. */
 const PROBE_TIMEOUT_MS = 2000;
+const MAX_OUTPUT_BYTES = 16_384;
 
-/**
- * Spawn `claude --version` and return a structured status result.
- *
- * Never throws — any failure is captured as `available: false` with a reason
- * so the caller (an HTTP handler) can render the provider card without
- * try/catch.
- */
-export async function probeClaudeCli(
-  options: { timeoutMs?: number } = {},
-): Promise<ClaudeCliBinaryStatus> {
-  const startedAt = Date.now();
-  const timeoutMs = options.timeoutMs ?? PROBE_TIMEOUT_MS;
+type CommandResult = { ok: boolean; stdout: string; reason?: string };
 
-  const binaryPath = await tryResolveBinaryPath("claude");
-
-  return new Promise<ClaudeCliBinaryStatus>((resolvePromise) => {
-    const finish = (result: Omit<ClaudeCliBinaryStatus, "probeDurationMs">): void => {
-      resolvePromise({ ...result, probeDurationMs: Date.now() - startedAt });
-    };
-
+function runProbe(command: string, args: string[], deadline: number, env: NodeJS.ProcessEnv): Promise<CommandResult> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return Promise.resolve({ ok: false, stdout: "", reason: "Probe timed out" });
+  return new Promise((resolve) => {
     let settled = false;
-    const child = spawn(binaryPath ?? "claude", ["--version"], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // Process already gone — nothing to do.
-      }
-      finish({
-        available: false,
-        binaryPath,
-        reason: `Probe timed out after ${timeoutMs}ms`,
-      });
-    }, timeoutMs);
-
     let stdout = "";
-    let stderr = "";
-    child.stdout?.on("data", (chunk) => {
-      stdout += chunk.toString("utf-8");
-    });
-    child.stderr?.on("data", (chunk) => {
-      stderr += chunk.toString("utf-8");
-    });
-
-    child.on("error", (err) => {
+    let outputBytes = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let child: ReturnType<typeof spawn>;
+    const finish = (result: CommandResult) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      const isNotFound = (err as NodeJS.ErrnoException).code === "ENOENT";
-      finish({
-        available: false,
-        binaryPath,
-        reason: isNotFound ? "`claude` not found on PATH" : err.message,
-      });
-    });
-
-    child.on("close", (code) => {
+      resolve(result);
+    };
+    const failAndKill = (reason: string) => {
+      finish({ ok: false, stdout: "", reason });
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+    };
+    try {
+      child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], env });
+    } catch {
+      finish({ ok: false, stdout: "", reason: "Probe could not start" });
+      return;
+    }
+    timer = setTimeout(() => failAndKill("Probe timed out"), remaining);
+    const receive = (chunk: Buffer | string, isStdout: boolean) => {
       if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (code === 0) {
-        finish({
-          available: true,
-          version: stdout.trim() || undefined,
-          binaryPath,
-        });
-      } else {
-        finish({
-          available: false,
-          binaryPath,
-          reason:
-            stderr.trim() || `claude --version exited with code ${String(code)}`,
-        });
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      outputBytes += buffer.length;
+      if (outputBytes > MAX_OUTPUT_BYTES) {
+        failAndKill("Probe output exceeded limit");
+        return;
       }
-    });
+      if (isStdout) stdout += buffer.toString("utf8");
+    };
+    child.stdout?.on("data", (chunk) => receive(chunk, true));
+    child.stderr?.on("data", (chunk) => receive(chunk, false));
+    child.on("error", () => finish({ ok: false, stdout: "", reason: "Probe process failed" }));
+    child.on("close", (code) => finish(code === 0
+      ? { ok: true, stdout }
+      : { ok: false, stdout: "", reason: "Probe exited unsuccessfully" }));
   });
 }
 
-/**
- * Best-effort `which claude`. We don't fail probe on inability to resolve
- * the path — the spawn above is the actual authority. This is just for
- * surfacing a friendly "found at /opt/homebrew/bin/claude" in the UI.
- */
-async function tryResolveBinaryPath(binary: string): Promise<string | undefined> {
-  return new Promise((resolvePromise) => {
-    const which = process.platform === "win32" ? "where" : "which";
-    const child = spawn(which, [binary], { stdio: ["ignore", "pipe", "ignore"] });
-    let out = "";
-    child.stdout?.on("data", (chunk) => {
-      out += chunk.toString("utf-8");
-    });
-    child.on("error", () => resolvePromise(undefined));
-    child.on("close", (code) => {
-      if (code === 0) {
-        const first = out.trim().split(/\r?\n/)[0];
-        resolvePromise(first?.length ? first : undefined);
-      } else {
-        resolvePromise(undefined);
-      }
-    });
-  });
+/** Never throws for CLI failures; absent or unknown login fails closed. */
+export async function probeClaudeCli(options: { timeoutMs?: number } = {}): Promise<ClaudeCliBinaryStatus> {
+  const startedAt = Date.now();
+  const requested = options.timeoutMs ?? PROBE_TIMEOUT_MS;
+  const timeoutMs = Number.isFinite(requested) ? Math.max(1, Math.min(requested, PROBE_TIMEOUT_MS)) : PROBE_TIMEOUT_MS;
+  const deadline = startedAt + timeoutMs;
+  const env = buildNativeClaudeEnv();
+  const result: ClaudeCliBinaryStatus = { available: false, authenticated: false, probeDurationMs: 0 };
+  try {
+    const path = await runProbe(process.platform === "win32" ? "where" : "which", ["claude"], deadline, env);
+    result.binaryPath = path.ok ? path.stdout.trim().split(/\r?\n/)[0] || undefined : undefined;
+    const version = await runProbe(result.binaryPath ?? "claude", ["--version"], deadline, env);
+    if (!version.ok) {
+      result.reason = version.reason;
+      return result;
+    }
+    result.available = true;
+    result.version = version.stdout.trim() || undefined;
+    const auth = await runProbe(result.binaryPath ?? "claude", ["auth", "status", "--json"], deadline, env);
+    if (!auth.ok) {
+      result.reason = auth.reason;
+      return result;
+    }
+    let status: unknown;
+    try { status = JSON.parse(auth.stdout); } catch {
+      result.reason = "Claude CLI auth status was malformed";
+      return result;
+    }
+    result.authenticated = status !== null && typeof status === "object" &&
+      !Array.isArray(status) && (status as { loggedIn?: unknown }).loggedIn === true;
+    if (!result.authenticated) result.reason = "Claude CLI login was not confirmed; run claude auth login";
+    return result;
+  } catch {
+    result.reason = "Claude CLI probe failed";
+    return result;
+  } finally {
+    result.probeDurationMs = Date.now() - startedAt;
+    if (result.reason === "Probe timed out") result.reason = `Probe timed out after ${timeoutMs}ms`;
+  }
 }

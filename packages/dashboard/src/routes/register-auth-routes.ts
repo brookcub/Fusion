@@ -812,8 +812,8 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
       }
 
       // Inject the synthetic "Anthropic — via Claude CLI" provider. Its
-      // "authenticated" state is a product of three facts: the `claude`
-      // binary must be on PATH, the user must have enabled useClaudeCli,
+      // "authenticated" state requires proven native CLI login as well as
+      // binary availability, the user must have enabled useClaudeCli,
       // and the vendored extension must have loaded cleanly. We compute
       // them here once per /auth/status call so the provider list rendered
       // by onboarding + settings stays consistent with what a direct call
@@ -832,7 +832,7 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
         providers.push({
           id: "claude-cli",
           name: "Anthropic — via Claude CLI",
-          authenticated: enabled && binary.available && extensionOk,
+          authenticated: enabled && binary.available && binary.authenticated === true && extensionOk,
           type: "cli" as const,
         });
       }
@@ -1244,11 +1244,12 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
           authReason: acpAuthReason,
         },
         // Convenience field: the provider card considers everything "ready"
-        // when the binary is available, the user has enabled the toggle,
+        // when native login is confirmed, the binary is available, the toggle is on,
         // AND the host loaded the extension without error. Surfacing this
         // keeps the UI render logic simple.
         ready:
           binary.available &&
+          binary.authenticated === true &&
           enabled &&
           (extension === null || extension.status === "ok"),
       });

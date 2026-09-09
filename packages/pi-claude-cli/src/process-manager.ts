@@ -11,15 +11,11 @@ import { randomUUID } from "node:crypto";
 import { writeFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { buildNativeClaudeEnv } from "./native-auth-env.js";
+
+export { buildNativeClaudeEnv } from "./native-auth-env.js";
 
 const systemPromptFiles = new WeakMap<ChildProcess, string>();
-
-/** Keep explicit native CLI/subscription requests off inherited direct-API auth. */
-export function buildNativeClaudeEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  return Object.fromEntries(Object.entries(source).filter(([key]) =>
-    !["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"].includes(key.toUpperCase()),
-  ));
-}
 
 function debugLog(message: string): void {
   if (process.env.PI_CLAUDE_CLI_DEBUG !== "1") return;
