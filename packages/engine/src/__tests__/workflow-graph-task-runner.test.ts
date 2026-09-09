@@ -45,6 +45,19 @@ function fullLifecycleIr(): WorkflowIr {
   };
 }
 
+function terminalForeachIr(): WorkflowIr {
+  return {
+    version: "v2", name: "terminal-foreach", columns: [{ id: "work", name: "Work", traits: [] }],
+    nodes: [
+      { id: "start", kind: "start" },
+      { id: "parse", kind: "parse-steps", config: { artifact: "PROMPT.md", parser: "step-headings" } },
+      { id: "fe", kind: "foreach", config: { source: "task-steps", template: { nodes: [{ id: "exec", kind: "prompt", config: { seam: "step-execute" } }], edges: [] } } },
+      { id: "end", kind: "end" },
+    ],
+    edges: [{ from: "start", to: "parse" }, { from: "parse", to: "fe", condition: "success" }, { from: "fe", to: "end", condition: "success" }],
+  };
+}
+
 function definition(ir: WorkflowIr): WorkflowDefinition {
   return {
     id: "WF-001",
@@ -81,6 +94,74 @@ function recordingSeams(calls: string[], overrides: Partial<Record<string, Workf
 }
 
 describe("WorkflowGraphTaskRunner (CU-U2)", () => {
+  it.each(["missing-task", "paused-task", "user-paused-task", "engine-paused", "global-paused", "missing-settings-reader", "missing-settings", "settings-read-failure"] as const)(
+    "production foreach wiring refuses %s without checkpoint writes or dispatch", async (mode) => {
+      const saved: unknown[] = [];
+      const dispatch = vi.fn(async () => ({ outcome: "success" as const }));
+      const liveTask = {
+        ...task, steps: [{ name: "already done", status: "done" }],
+        ...(mode === "paused-task" ? { paused: true } : {}),
+        ...(mode === "user-paused-task" ? { userPaused: true } : {}),
+      } as TaskDetail;
+      const store = {
+        ...storeWith(definition(terminalForeachIr())),
+        getTask: async () => mode === "missing-task" ? undefined : liveTask,
+        getSettings: mode === "missing-settings-reader" ? undefined : async () => {
+          if (mode === "settings-read-failure") throw new Error("unavailable");
+          if (mode === "missing-settings") return undefined;
+          return { enginePaused: mode === "engine-paused", globalPause: mode === "global-paused" };
+        },
+      } as WorkflowGraphRunnerStore;
+      const runner = new WorkflowGraphTaskRunner({
+        store, seams: { ...recordingSeams([]), stepExecute: dispatch }, runCustomNode: async () => ({ outcome: "success" }),
+        stepInstancePersistence: {
+          loadInstanceStates: async () => [{ taskId: task.id, runId: `${task.id}:WF-001`, foreachNodeId: "fe", stepIndex: 0, pinnedStepCount: 1, currentNodeId: "exec", status: "in-progress" as const, reworkCount: 0 }],
+          saveInstanceState: (state) => { saved.push(state); },
+        },
+      });
+      const result = await runner.run({ ...task, steps: [{ name: "stale done", status: "done" }] } as TaskDetail, flagOn, "fe");
+      expect(result.disposition).toBe("failed");
+      expect(result.visitedNodeIds).toContain("fe");
+      expect(saved).toEqual([]);
+      expect(dispatch).not.toHaveBeenCalled();
+    },
+  );
+  it.each([false, true])("production settlement uses settings read after pending task fetch (pause=%s)", async (pauseDuringRead) => {
+    const checkpoint = { taskId: task.id, runId: `${task.id}:WF-001`, foreachNodeId: "fe", stepIndex: 0,
+      pinnedStepCount: 1, currentNodeId: "exec", status: "in-progress" as const, reworkCount: 0 };
+    const saved: unknown[] = [];
+    const calls: string[] = [];
+    let persistenceLoaded = false;
+    let enginePaused = false;
+    const dispatch = vi.fn(async () => ({ outcome: "success" as const }));
+    const liveTask = { ...task, steps: [{ name: "already done", status: "done" }] } as TaskDetail;
+    const runner = new WorkflowGraphTaskRunner({
+      store: {
+        ...storeWith(definition(terminalForeachIr())),
+        getTask: async () => {
+          if (persistenceLoaded) {
+            calls.push("task-pending");
+            await Promise.resolve();
+            enginePaused = pauseDuringRead;
+            calls.push("task-returned");
+          }
+          return liveTask;
+        },
+        getSettings: async () => { calls.push("settings"); return { enginePaused, globalPause: false }; },
+      },
+      seams: { ...recordingSeams([]), stepExecute: dispatch },
+      runCustomNode: async () => ({ outcome: "success" }),
+      stepInstancePersistence: {
+        loadInstanceStates: async () => { persistenceLoaded = true; return [checkpoint]; },
+        saveInstanceState: (state) => { saved.push(state); },
+      },
+    });
+    const result = await runner.run(liveTask, flagOn, "fe");
+    expect(calls, JSON.stringify(result)).toEqual(["task-pending", "task-returned", "settings"]);
+    expect(result.disposition).toBe(pauseDuringRead ? "failed" : "completed");
+    expect(saved).toEqual(pauseDuringRead ? [] : [{ ...checkpoint, status: "completed" }]);
+    expect(dispatch).not.toHaveBeenCalled();
+  });
   it("runs the full lifecycle in graph order: custom → execute → review → merge → custom", async () => {
     const calls: string[] = [];
     const runner = new WorkflowGraphTaskRunner({

@@ -336,6 +336,8 @@ export interface WorkflowGraphExecutorDeps {
    * planning seam's latest write; tests inject a fixed list.
    */
   getTaskSteps?: (task: TaskDetail) => Promise<TaskStep[]> | TaskStep[];
+  /** Strict fresh task reader used before mutating durable foreach checkpoints. */
+  getAuthoritativeTaskSteps?: (task: TaskDetail) => Promise<TaskStep[]> | TaskStep[];
   /**
    * Step-inversion (KTD-6, U3 stub): per-instance run-state persistence for
    * foreach instances. Optional with no-op default — the real SQLite adapter is
@@ -949,6 +951,9 @@ export class WorkflowGraphExecutor {
             runId,
             steps,
             getLiveSteps: () => this.resolveTaskSteps(task),
+            getAuthoritativeLiveSteps: this.deps.getAuthoritativeTaskSteps
+              ? () => this.deps.getAuthoritativeTaskSteps!(task)
+              : undefined,
             context,
             runTemplateNode: (tNode, sig, contextOverride) =>
               this.executeMaterializedTemplateNode(tNode, task, settings, contextOverride ?? context, ir, sig),

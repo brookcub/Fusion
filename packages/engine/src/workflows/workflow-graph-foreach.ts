@@ -126,6 +126,58 @@ async function persistInstanceState(
   }
 }
 
+/**
+ * Settle an interrupted shared foreach checkpoint only when the task projection
+ * has already authoritatively reached its terminal step state. This never runs a
+ * template node or manufactures review/integration evidence; it only closes the
+ * exact same-run persisted checkpoint that would otherwise block settlement.
+ */
+async function settleAuthoritativeTerminalCheckpoint(
+  persistence: WorkflowStepInstancePersistence | undefined,
+  state: WorkflowStepInstanceState,
+  verifyTerminal: () => Promise<boolean>,
+  signal?: AbortSignal,
+): Promise<void> {
+  // An installed persistence seam is authoritative for an interrupted run. Do
+  // not turn a missing read/write capability into a false healthy settlement.
+  if (!persistence) return;
+  if (!persistence.loadInstanceStates || !persistence.saveInstanceState) {
+    throw new WorkflowIrError("foreach checkpoint persistence cannot settle an authoritative terminal step");
+  }
+  const rows = await persistence.loadInstanceStates(state.taskId, state.runId);
+  if (signal?.aborted) throw new WorkflowIrError(`terminal checkpoint settlement aborted for ${state.foreachNodeId}#${state.stepIndex}`);
+  // Match the durable identity before the expansion pin so a contradictory
+  // pin cannot be mistaken for absence of an old instance.
+  const matching = rows.filter((row) => row.foreachNodeId === state.foreachNodeId
+    && row.stepIndex === state.stepIndex);
+  if (matching.length === 0) return;
+  const checkpoint = matching[0];
+  if (matching.length !== 1
+    || checkpoint?.taskId !== state.taskId
+    || checkpoint.runId !== state.runId
+    || checkpoint.pinnedStepCount !== state.pinnedStepCount
+    // A branch/integration marker belongs to the worktree path, which never
+    // reaches this shared-isolation loop. Refuse instead of laundering it.
+    || checkpoint.branchName != null
+    || checkpoint.integratedAt != null) {
+    throw new WorkflowIrError(`ambiguous foreach checkpoint settlement for ${state.foreachNodeId}#${state.stepIndex}`);
+  }
+  // An already-terminal checkpoint needs no settlement. A paused/interrupted
+  // earlier attempt may be failed while its task step is now done; preserve
+  // that failure verbatim instead of rewriting history or blocking normal resume.
+  if (checkpoint.status === "completed" || checkpoint.status === "failed") return;
+  if (checkpoint.status !== "in-progress") {
+    throw new WorkflowIrError(`non-settleable foreach checkpoint for ${state.foreachNodeId}#${state.stepIndex}`);
+  }
+  // Re-read immediately before the write: an earlier terminal projection can
+  // become stale while persistence is loading, or while a pause/abort arrives.
+  const stillTerminal = await verifyTerminal();
+  if (signal?.aborted || !stillTerminal) {
+    throw new WorkflowIrError(`terminal checkpoint settlement lost authority for ${state.foreachNodeId}#${state.stepIndex}`);
+  }
+  await persistence.saveInstanceState({ ...checkpoint, status: "completed" });
+}
+
 export interface ForeachEnvironment {
   task: TaskDetail;
   runId: string;
@@ -133,6 +185,8 @@ export interface ForeachEnvironment {
   steps: TaskStep[];
   /** Optional live step projection reader used during restart/replay checks. */
   getLiveSteps?: () => Promise<TaskStep[]> | TaskStep[];
+  /** Strict store-backed projection used only before closing a durable checkpoint. */
+  getAuthoritativeLiveSteps?: () => Promise<TaskStep[]> | TaskStep[];
   /** The shared walk context; the active-instance key is threaded in/out of it. */
   context: Record<string, unknown>;
   /**
@@ -459,9 +513,40 @@ export async function runForeach(
     FNXC:WorkflowResume 2026-06-29-08:49:
     The workflow graph owns step replay after engine restarts. A shared-isolation foreach pins the step count at expansion, but must read the live projection before each instance so a completed task does not re-run a stale step snapshot and fail on an already-finished `step-execute` node.
     */
-    const liveSteps = await Promise.resolve(env.getLiveSteps?.() ?? env.steps).catch(() => env.steps);
-    const stepStatus = liveSteps[stepIndex]?.status ?? env.steps[stepIndex]?.status;
+    let liveSteps: TaskStep[];
+    try {
+      liveSteps = await Promise.resolve(env.getLiveSteps?.() ?? env.steps);
+    } catch {
+      schedulerLog.warn(`foreach ${foreachNode.id} for task ${env.task.id}: authoritative step read failed`);
+      return { outcome: "failure", value: "authoritative-step-read-failed", visitedNodeIds };
+    }
+    const authoritativeStepStatus = liveSteps[stepIndex]?.status;
+    const stepStatus = authoritativeStepStatus ?? env.steps[stepIndex]?.status;
     if (stepStatus === "done" || stepStatus === "skipped") {
+      if (env.signal?.aborted) return { outcome: "failure", value: "aborted", visitedNodeIds };
+      try {
+        /*
+        FNXC:ForeachCheckpointSettlement 2026-09-09-11:09:
+        An interrupted shared foreach can retain an in-progress row after its
+        same-run step is durably terminal. Settle only that exact checkpoint;
+        never replay implementation or invent review/integration evidence.
+        */
+        await settleAuthoritativeTerminalCheckpoint(env.persistence, {
+          taskId: env.task.id, runId: env.runId, foreachNodeId: foreachNode.id,
+          stepIndex, pinnedStepCount, currentNodeId: plan.entry.id, status: "in-progress", reworkCount: 0,
+        }, async () => {
+          const current = await Promise.resolve(env.getAuthoritativeLiveSteps?.());
+          const currentStatus = current?.[stepIndex]?.status;
+          return currentStatus === "done" || currentStatus === "skipped";
+        }, env.signal);
+      } catch (error) {
+        // Owned IR errors contain only static control-plane text and identifiers;
+        // foreign persistence failures expose a class, never a raw DB/message.
+        const reason = error instanceof WorkflowIrError ? error.message
+          : error instanceof Error ? error.name : "unknown-error";
+        schedulerLog.warn(`foreach ${foreachNode.id} for task ${env.task.id}: checkpoint settlement failed (${reason})`);
+        return { outcome: "failure", value: "authoritative-checkpoint-settlement-failed", visitedNodeIds };
+      }
       /*
       FNXC:EngineDiagnostics 2026-07-26-10:05:
       Resume/replay skips one log line per already-terminal step on every foreach expansion. Steady-state bookkeeping — debug (FUSION_DEBUG=scheduler). Failures/rework-exhaustion stay warn.
