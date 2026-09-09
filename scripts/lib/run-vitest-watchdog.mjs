@@ -29,7 +29,9 @@
 
 const MINUTE = 60_000;
 import { spawn as nodeSpawn } from "node:child_process";
-import { resolve as resolvePath } from "node:path";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve as resolvePath } from "node:path";
 import { resolvePnpmCommand } from "./pnpm-command.mjs";
 
 /**
@@ -215,12 +217,15 @@ export function runWithWatchdog({
   return new Promise((finish, reject) => {
     const resolvedCommand = resolvePnpmCommand(command, args);
     const nativeWindowsJob = windowsJob;
+    const nativeCancelDirectory = nativeWindowsJob ? mkdtempSync(join(tmpdir(), "fusion-watchdog-")) : null;
+    const nativeCancelFile = nativeCancelDirectory ? join(nativeCancelDirectory, "cancel") : null;
     const launchCommand = nativeWindowsJob ? "powershell.exe" : resolvedCommand.command;
     const launchArgs = nativeWindowsJob ? [
       "-NoProfile", "-NonInteractive", "-File", resolvePath(import.meta.dirname, "run-owned-windows-command.ps1"),
       "-Executable", resolvedCommand.command,
       "-ArgumentsBase64", Buffer.from(JSON.stringify(resolvedCommand.args)).toString("base64"),
       "-TimeoutMs", String(Math.max(1, Math.floor(budgetMs))),
+      "-CancelFile", nativeCancelFile,
     ] : resolvedCommand.args;
     const startedAt = now();
     let lastHeartbeatAt = null;
@@ -228,6 +233,7 @@ export function runWithWatchdog({
     let diagnostics = null;
     let forceKillTimer = null;
     let settled = false;
+    let cancellationSignal = null;
 
     // process-supervisor-allowlist: foreground wrapper signals the whole vitest
     // process group on death/timeout; not a background daemon.
@@ -252,9 +258,9 @@ export function runWithWatchdog({
       // negative PID is not a Windows process-group contract.
       if (nativeWindowsJob) {
         try {
-          child.kill("SIGTERM");
+          writeFileSync(nativeCancelFile, `${signal}\n`, { flag: "wx" });
         } catch (error) {
-          if (!(error instanceof Error) || !('code' in error) || error.code !== "ESRCH") throw error;
+          if (!(error instanceof Error) || !('code' in error) || error.code !== "EEXIST") throw error;
         }
         return;
       }
@@ -279,6 +285,7 @@ export function runWithWatchdog({
     // suppressed Node's default exit behavior, so Ctrl-C / CI cancellation could
     // otherwise hang for the whole per-command ceiling).
     function armForceKill(triggerSignal) {
+      if (nativeWindowsJob) return;
       if (forceKillTimer) return;
       forceKillTimer = setTimeout(() => {
         log(`[watchdog] grace expired after ${triggerSignal}; SIGKILL: ${label}`);
@@ -316,6 +323,7 @@ export function runWithWatchdog({
       const handler = () => {
         log(`[watchdog] received ${sig}; forwarding to group: ${label}`);
         signalGroup(sig);
+        cancellationSignal ??= sig;
         armForceKill(sig);
       };
       signalHandlers.set(sig, handler);
@@ -337,6 +345,7 @@ export function runWithWatchdog({
       clearInterval(heartbeat);
       if (watchdog) clearTimeout(watchdog);
       if (forceKillTimer) clearTimeout(forceKillTimer);
+      if (nativeCancelDirectory) rmSync(nativeCancelDirectory, { recursive: true, force: true });
       for (const [sig, handler] of signalHandlers) process.removeListener(sig, handler);
       process.removeListener("exit", onProcExit);
     }
@@ -352,12 +361,15 @@ export function runWithWatchdog({
       if (settled) return;
       settled = true;
       cleanup();
-      finish({
-        code: timedOut ? TIMEOUT_EXIT_CODE : code,
-        signal: timedOut ? null : signal,
-        timedOut,
-        diagnostics,
-      });
+      const nativeTimeout = nativeWindowsJob && code === TIMEOUT_EXIT_CODE;
+      const nativeCancelled = nativeWindowsJob && code === 125 && cancellationSignal != null;
+      if (nativeTimeout) {
+        timedOut = true;
+        diagnostics = captureHangDiagnostics({ label, command, args, budgetMs, startedAt, lastHeartbeatAt, now: now() });
+        log(diagnostics);
+      }
+      finish({ code: timedOut || nativeCancelled ? (nativeCancelled ? null : TIMEOUT_EXIT_CODE) : code,
+        signal: timedOut ? null : nativeCancelled ? cancellationSignal : signal, timedOut, diagnostics });
     });
   });
 }

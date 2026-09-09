@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$Executable, [Parameter(Mandatory=$true)][string]$ArgumentsBase64, [Parameter(Mandatory=$true)][int]$TimeoutMs)
+param([Parameter(Mandatory=$true)][string]$Executable, [Parameter(Mandatory=$true)][string]$ArgumentsBase64, [Parameter(Mandatory=$true)][int]$TimeoutMs, [string]$CancelFile)
 $ErrorActionPreference = 'Stop'
 # FNXC:TaskLogRegression 2026-09-06-13:47: Assign suspended children to a
 # kill-on-close native job before they execute. A timeout owns descendants,
@@ -9,6 +9,7 @@ using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.IO;
 using System.Web.Script.Serialization;
 public static class RegressionJob {
  [StructLayout(LayoutKind.Sequential)] struct BasicLimits { public long a,b; public uint flags; public UIntPtr c,d; public uint e; public UIntPtr f; public uint g,h; }
@@ -35,13 +36,13 @@ public static class RegressionJob {
    foreach (char c in value) { if(c=='\\') { slashes++; continue; } if(c=='\"') { text.Append('\\',slashes*2+1); text.Append(c); } else { text.Append('\\',slashes); text.Append(c); } slashes=0; }
    text.Append('\\',slashes*2); return text.Append('"').ToString();
  }
- public static int RunEncoded(string executable, string argumentsBase64, int timeout) {
+ public static int RunEncoded(string executable, string argumentsBase64, int timeout, string cancelFile) {
    string json=Encoding.UTF8.GetString(Convert.FromBase64String(argumentsBase64));
    string[] args=new JavaScriptSerializer().Deserialize<string[]>(json);
    if(args==null) throw new ArgumentException("arguments must decode to an array");
-   return Run(executable,args,timeout);
+   return Run(executable,args,timeout,cancelFile);
  }
- public static int Run(string executable, string[] args, int timeout) {
+ public static int Run(string executable, string[] args, int timeout, string cancelFile) {
    if(timeout<1) return 124;
    IntPtr job=CreateJobObject(IntPtr.Zero,null); Check(job!=IntPtr.Zero);
    Proc process=new Proc(); bool assigned=false;
@@ -54,9 +55,13 @@ public static class RegressionJob {
      Check(CreateProcess(executable,command,IntPtr.Zero,IntPtr.Zero,true,0x08000004,IntPtr.Zero,null,ref startup,out process));
      Check(AssignProcessToJobObject(job,process.process)); assigned=true;
      Check(ResumeThread(process.thread)!=0xffffffff);
-     uint wait=WaitForSingleObject(process.process,(uint)timeout);
-     if(wait!=0 && wait!=258) throw new Win32Exception();
-     uint code=124; if(wait==0) Check(GetExitCodeProcess(process.process,out code));
+     uint wait=258, code=124; int elapsed=0;
+     while(elapsed<timeout) {
+       if(!String.IsNullOrEmpty(cancelFile) && File.Exists(cancelFile)) { code=125; break; }
+       uint slice=(uint)Math.Min(50,timeout-elapsed); wait=WaitForSingleObject(process.process,slice);
+       if(wait==0) { Check(GetExitCodeProcess(process.process,out code)); break; }
+       if(wait!=258) throw new Win32Exception(); elapsed+=(int)slice;
+     }
      Check(TerminateJobObject(job,124));
      for(int attempt=0;attempt<100;attempt++) {
        Accounting accounting; Check(QueryInformationJobObject(job,1,out accounting,(uint)Marshal.SizeOf(typeof(Accounting)),IntPtr.Zero));
@@ -76,5 +81,5 @@ try {
   $application = (Get-Command $Executable -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
   # Preserve exact argv in the Base64 JSON until the native method decodes it;
   # PowerShell therefore cannot enumerate or rebind individual arguments.
-  exit [RegressionJob]::RunEncoded($application, $ArgumentsBase64, $TimeoutMs)
+  exit [RegressionJob]::RunEncoded($application, $ArgumentsBase64, $TimeoutMs, $CancelFile)
 } catch { [Console]::Error.WriteLine("owned command setup or shutdown failed: $($_.Exception.Message)"); exit 125 }
