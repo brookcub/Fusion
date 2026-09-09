@@ -121,7 +121,7 @@ export async function verifyAiMergeCandidate(input: {
     if (result.exitCode !== 0 || !result.success || result.timedOut || result.aborted || result.executionError || result.cached) {
       const failureKind = result.timedOut ? "timeout" : result.aborted ? "aborted"
         : result.executionError ? "execution-error" : result.cached ? "cached" : "nonzero";
-      receipt.checks.push({ type, commandSha256: verificationHash(command), exitCode: result.exitCode, failureKind });
+      receipt.checks.push({ type, commandSha256: verificationHash(command), exitCode: result.exitCode ?? -1, failureKind });
       receipt.completedAt = new Date().toISOString();
       receipt.outcome = "failed";
       await persistReceipt();

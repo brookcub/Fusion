@@ -51,6 +51,7 @@ import { getStalePausedReviewCopy, shouldShowStalePausedReviewBadge } from "../u
 import { getTaskAgeStalenessCopy, shouldShowTaskAgeStalenessBadge } from "../utils/taskAgeStalenessCopy";
 import {
   getRunningOptionalGateBadge,
+  getTaskCompletionEvidenceBadge,
   getRunningWorkflowStepLabel,
   getUnifiedTaskProgress,
   isNonPlanningOptionalGateBadge,
@@ -3465,6 +3466,7 @@ function TaskCardComponent({
                 ? t("tasks.statusQueued", "Queued")
                 : wipLifecycleBadgeLabel
                   ?? getTaskStatusLabel(visualStatus ?? "", t, showOptionalGateBadge ? undefined : getRunningWorkflowStepLabel(task), { idle: !isAgentActive, overlapBlockedBy: task.overlapBlockedBy ?? null, sessionContentionWaitReason: task.sessionContentionWaitReason ?? null });
+  const completionEvidenceBadge = getTaskCompletionEvidenceBadge(task);
   const hasCardMetaBadges = showPriorityBadge
     || task.executionMode === "fast"
     // FNXC:PlannerOversight 2026-07-04-00:00: the oversight badge is opt-in
@@ -3474,6 +3476,7 @@ function TaskCardComponent({
   const hasHeaderBadges = Boolean(isPaused)
     || showStatusBadge
     || showOptionalGateBadge
+    || Boolean(completionEvidenceBadge)
     || showReadyBadge
     || showQueuedBadge
     // FNXC:CodingIdeasWorkflow 2026-07-25-12:05: the header wrapper only renders when it has a
@@ -3687,6 +3690,15 @@ function TaskCardComponent({
             {showQueuedBadge && !task.overlapBlockedBy && task.blockedBy && (
               <Link className="card-queued-reason-icon" size={7} aria-hidden="true" data-testid={`card-queued-dependency-icon-${task.id}`} />
             )}
+          </span>
+        )}
+        {completionEvidenceBadge && (
+          <span
+            className={`card-status-badge verification-${completionEvidenceBadge.testId}${completionEvidenceBadge.testId === "verification-failed" ? " failed" : ""}${completionEvidenceBadge.testId === "verification-pending" ? " pulsing" : ""}`}
+            title={completionEvidenceBadge.title}
+            data-testid={`card-${completionEvidenceBadge.testId}-${task.id}`}
+          >
+            {completionEvidenceBadge.label}
           </span>
         )}
         {showOptionalGateBadge && optionalGateBadge && (

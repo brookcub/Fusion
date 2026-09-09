@@ -122,6 +122,22 @@ describe("getRunningOptionalGateBadge", () => {
     } as Task)).toBeUndefined();
   });
 
+  it("badges running post-merge verification in a complete lane", () => {
+    expect(getRunningOptionalGateBadge({
+      ...makeTask({
+        enabledWorkflowSteps: ["post-merge-verification"],
+        workflowStepResults: [{
+          workflowStepId: "post-merge-verification",
+          workflowStepName: "Post-merge verification",
+          phase: "post-merge",
+          status: "pending",
+          startedAt: "2026-07-11T12:00:00.000Z",
+        }],
+      }),
+      column: "done",
+    } as Task)).toMatchObject({ label: "Post-merge verification", testId: "post-merge-verification" });
+  });
+
   it("returns undefined when the gate is not running", () => {
     expect(getRunningOptionalGateBadge({
       ...makeTask({

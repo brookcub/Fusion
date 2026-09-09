@@ -252,6 +252,28 @@ know a review is in flight.
 */
 const REVIEW_LANE_COLUMNS = new Set(["in-review"]);
 
+export interface TaskCompletionEvidenceBadge {
+  label: string;
+  title: string;
+  testId: "verification-failed" | "verification-pending" | "verification-stale" | "verification-unavailable" | "verification-advisory";
+}
+
+/**
+ * FNXC:CompletionEvidence 2026-09-09-04:24: Every task surface uses this compact presenter so a
+ * landed card cannot silently look verified when current required proof is failed, pending, stale,
+ * or unavailable. Advisory diagnostics remain visible without becoming a completion blocker.
+ */
+export function getTaskCompletionEvidenceBadge(task: Pick<Task, "completionEvidence">): TaskCompletionEvidenceBadge | undefined {
+  const evidence = task.completionEvidence;
+  if (!evidence?.landed) return undefined;
+  if (evidence.verificationStatus === "failed") return { label: "Verification failed", title: "Required post-merge verification failed; the landed commit is retained.", testId: "verification-failed" };
+  if (evidence.verificationStatus === "pending") return { label: "Verification pending", title: "Required post-merge verification is still running.", testId: "verification-pending" };
+  if (evidence.verificationStatus === "stale") return { label: "Verification stale", title: "Verification evidence does not match the current candidate or settings.", testId: "verification-stale" };
+  if (evidence.verificationStatus === "unavailable") return { label: "Verification unavailable", title: "Required verification evidence is missing or unavailable.", testId: "verification-unavailable" };
+  if (evidence.advisoryFailureStepIds.length > 0) return { label: "Verification warning", title: "Advisory post-merge verification reported findings.", testId: "verification-advisory" };
+  return undefined;
+}
+
 export interface RunningOptionalGateBadge {
   workflowStepId: string;
   /** Full step name for titles / a11y. */
@@ -302,7 +324,10 @@ export function getRunningOptionalGateBadge(
     };
   }
 
-  if (!(columnFlags ? isReviewColumnRole(columnFlags, task.column) : REVIEW_LANE_COLUMNS.has(task.column))) return undefined;
+  const runningResult = task.workflowStepResults?.find((result) => result.workflowStepId === workflowStepId);
+  // FNXC:CompletionEvidence 2026-09-09-04:24: Post-merge gates can run in a complete-trait lane;
+  // their running evidence remains visible there rather than being suppressed by review-lane chrome.
+  if (runningResult?.phase !== "post-merge" && !(columnFlags ? isReviewColumnRole(columnFlags, task.column) : REVIEW_LANE_COLUMNS.has(task.column))) return undefined;
   /*
   FNXC:TaskCardOptionalGateBadge 2026-08-25-02:10:
   Badge whatever review-lane gate is RUNNING, instead of a closed list of three ids. The old test
