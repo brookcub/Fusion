@@ -1432,6 +1432,8 @@ export {
 export { getPostMergeFinalizeBlocker, planConfirmedMergeChecklistReconciliation } from "./merge/confirmed-merge-reconciliation.js";
 export { classifyMergeVerificationEvidence, verificationHash, verificationSettingsHash } from "./merge/verification-evidence.js";
 export type { MergeVerificationEvidence, MergeVerificationCandidateEvidence, VerificationEvidenceReason, VerificationEvidenceStatus } from "./merge/verification-evidence.js";
+export { deriveTaskCompletionEvidence } from "./tasks/task-completion-evidence.js";
+export type { TaskCompletionEvidence, TaskCompletionEvidenceContext, TaskCompletionVerificationStatus } from "./tasks/task-completion-evidence.js";
 export type { ConfirmedMergeChecklistReconciliation } from "./merge/confirmed-merge-reconciliation.js";
 export type { PreMergeApproval, PreMergeApprovalState } from "./merge/pre-merge-approval.js";
 export {

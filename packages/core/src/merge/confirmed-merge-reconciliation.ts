@@ -45,7 +45,9 @@ export function planConfirmedMergeChecklistReconciliation(
       .map((step, index) => step.status === "pending" || step.status === "in-progress" ? index : -1)
       .filter((index) => index >= 0),
     reconciledWorkflowStepIds: (task.workflowStepResults ?? [])
-      .filter((result: WorkflowStepResult) => result.status === "pending")
+      // FNXC:CompletionEvidence 2026-09-09-04:24: Landing reconciliation may retire obsolete
+      // pre-merge work, but it must preserve pending post-merge validation as outstanding proof.
+      .filter((result: WorkflowStepResult) => result.status === "pending" && result.phase !== "post-merge")
       .map((result) => result.workflowStepId),
   };
 }

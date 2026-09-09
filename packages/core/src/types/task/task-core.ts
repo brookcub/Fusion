@@ -31,6 +31,7 @@ import type { InReviewStalledSignal } from "../../tasks/in-review-stalled.js";
 import type { StalePausedReviewSignal } from "../../tasks/stale-paused-review.js";
 import type { StalePausedTodoSignal } from "../../tasks/stale-paused-todo.js";
 import type { TaskExternalBlock } from "../../tasks/task-external-block.js";
+import type { TaskCompletionEvidence } from "../../tasks/task-completion-evidence.js";
 import type { StalledReviewSignal } from "../../tasks/stalled-review-detector.js";
 import type { TaskAgeStalenessSignal } from "../../tasks/task-age-staleness.js";
 import type { PlannerOverseerRuntimeSnapshot } from "../../planner/planner-overseer-state.js";
@@ -1119,6 +1120,11 @@ export interface Task {
   enabledWorkflowSteps?: string[];
   /** Results from workflow step executions (populated after task implementation) */
   workflowStepResults?: WorkflowStepResult[];
+  /**
+   * FNXC:CompletionEvidence 2026-09-09-04:24: Read hydration derives this compact projection from
+   * merge proof and current authorities. It is never persisted as a duplicate completion flag.
+   */
+  completionEvidence?: TaskCompletionEvidence;
   /** Append-only implementation summaries retained independently of replannable steps. */
   stepReports?: TaskStepReport[];
   /** Number of merge retry attempts made for this task (auto-merge conflict recovery) */

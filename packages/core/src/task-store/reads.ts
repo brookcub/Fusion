@@ -33,8 +33,15 @@ import {computeRetrySummary} from "../tasks/retry-summary.js";
 import {TaskNotFoundError} from "../task-store/errors.js";
 import { resolveProjectColumnsForRoles } from "../project-lane-vocabulary.js";
 import { taskProjectScope } from "../postgres/data-layer.js";
+import { deriveTaskCompletionEvidence } from "../tasks/task-completion-evidence.js";
 
 /** Merge storage tiers while preserving primary-source authority and order. */
+/** Keep public task reads honest without persisting a second completion authority. */
+function hydrateCompletionEvidence(task: Task, settings: Parameters<typeof deriveTaskCompletionEvidence>[1]): Task {
+  task.completionEvidence = deriveTaskCompletionEvidence(task, settings);
+  return task;
+}
+
 function mergePrimaryById<T extends { id: string }>(primary: T[], secondary: T[]): T[] {
   const byId = new Map(primary.map((entry) => [entry.id, entry]));
   for (const entry of secondary) {
@@ -252,6 +259,7 @@ export async function getTaskImpl(store: TaskStore, id: string, options?: { acti
       const task = store.rowToTask(store.pgRowToTaskRow(pgRow));
       const now = Date.now();
       const settings = await store.getSettingsFast();
+      hydrateCompletionEvidence(task, settings);
       const mergeQueuedTaskIds = await store.getMergeQueuedTaskIdsAsync();
       /*
       FNXC:WorkflowLifecycle 2026-07-05-15:40:
@@ -461,6 +469,7 @@ export async function listTasksImpl(store: TaskStore, options?: { limit?: number
     const tasks = await Promise.all(filteredRows.map(async (pgRow) => {
       const row = store.pgRowToTaskRow(pgRow);
       const task = store.rowToTask(row);
+      hydrateCompletionEvidence(task, settings);
       const isMergeQueued = mergeQueuedTaskIds.has(task.id);
       /*
       FNXC:WorkflowLifecycle 2026-07-05-15:40:
@@ -692,6 +701,7 @@ export async function listTasksModifiedSinceImpl(store: TaskStore, since: string
     }
     const tasks = pageRows.map((pgRow) => {
       const task = store.rowToTask(store.pgRowToTaskRow(pgRow));
+      hydrateCompletionEvidence(task, settings);
       const isMergeQueued = mergeQueuedTaskIds.has(task.id);
       /*
       FNXC:WorkflowLifecycle 2026-07-05-15:40:
@@ -837,6 +847,7 @@ export async function searchTasksImpl(store: TaskStore, query: string, options?:
     const searchPassIrCache = new Map<string, WorkflowIr>();
     const tasks = await Promise.all(pgRows.map(async (pgRow) => {
       const task = store.rowToTask(store.pgRowToTaskRow(pgRow));
+      hydrateCompletionEvidence(task, settings);
       const isMergeQueued = mergeQueuedTaskIds.has(task.id);
       /*
       FNXC:WorkflowLifecycle 2026-07-05-15:40:

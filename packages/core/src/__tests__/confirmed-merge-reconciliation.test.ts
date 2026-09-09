@@ -53,7 +53,14 @@ describe("planConfirmedMergeChecklistReconciliation with an incomplete row", () 
     ).toEqual({ skippedStepIndexes: [], reconciledWorkflowStepIds: [] });
   });
 
-  it("still reconciles pending workflow step results when steps are absent", () => {
+  it("preserves pending post-merge work after landing", () => {
+    expect(planConfirmedMergeChecklistReconciliation({
+      steps: [],
+      workflowStepResults: [{ workflowStepId: "post-merge-verification", phase: "post-merge", status: "pending" }],
+    } as never)).toEqual({ skippedStepIndexes: [], reconciledWorkflowStepIds: [] });
+  });
+
+  it("still reconciles pending pre-merge workflow step results when steps are absent", () => {
     expect(
       planConfirmedMergeChecklistReconciliation({
         workflowStepResults: [{ workflowStepId: "code-review", status: "pending" }],
