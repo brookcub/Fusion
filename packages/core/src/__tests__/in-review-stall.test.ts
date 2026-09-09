@@ -78,13 +78,22 @@ describe("countRecentIdenticalStallEntries", () => {
     ]), { code: "merge-blocker", reason })).toBe(3);
   });
 
-  it("stops at first non-stall entry and only counts the suffix", () => {
+  it("counts matching stalls across unrelated recovery diagnostics", () => {
     expect(countRecentIdenticalStallEntries(task([
       { timestamp: "2026-05-12T11:56:00.000Z", action: `In-review stall surfaced [merge-blocker]: ${reason}` },
-      { timestamp: "2026-05-12T11:57:00.000Z", action: "something else" },
+      { timestamp: "2026-05-12T11:57:00.000Z", action: "[recovery] already-merged rejected FN-4110 candidate=abc owner=unknown reason=ownership-unverifiable" },
       { timestamp: "2026-05-12T11:58:00.000Z", action: `In-review stall surfaced [merge-blocker]: ${reason}` },
+      { timestamp: "2026-05-12T11:59:00.000Z", action: "[recovery] already-merged rejected FN-4110 candidate=abc owner=unknown reason=ownership-unverifiable" },
+      { timestamp: "2026-05-12T12:00:00.000Z", action: `In-review stall surfaced [merge-blocker]: ${reason}` },
+    ]), { code: "merge-blocker", reason })).toBe(3);
+  });
+
+  it("keeps unrelated non-recovery diagnostics as an episode boundary", () => {
+    expect(countRecentIdenticalStallEntries(task([
+      { timestamp: "2026-05-12T11:57:00.000Z", action: `In-review stall surfaced [merge-blocker]: ${reason}` },
+      { timestamp: "2026-05-12T11:58:00.000Z", action: "[recovery] branch ownership probe completed" },
       { timestamp: "2026-05-12T11:59:00.000Z", action: `In-review stall surfaced [merge-blocker]: ${reason}` },
-    ]), { code: "merge-blocker", reason })).toBe(2);
+    ]), { code: "merge-blocker", reason })).toBe(1);
   });
 
   it("stops counting on different code", () => {

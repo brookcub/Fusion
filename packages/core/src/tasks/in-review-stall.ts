@@ -198,6 +198,15 @@ export function classifyProviderError(error: string): ProviderErrorClassificatio
   return "unknown";
 }
 
+/*
+FNXC:MergeRecoveryReporting 2026-09-09-03:59:
+Ownership-evidence rejection diagnostics can interleave with the same unresolved stall on every
+maintenance pass. They explain why recovery was refused, not progress or a new stall episode, so
+skip only that established diagnostic while counting repeated stalls; any other entry remains an
+intentional episode boundary.
+*/
+const ALREADY_MERGED_REJECTION_LOG_PREFIX = "[recovery] already-merged rejected ";
+
 export function countRecentIdenticalStallEntries(
   task: Pick<Task, "log">,
   signal: Pick<InReviewStallSignal, "code" | "reason">,
@@ -207,6 +216,9 @@ export function countRecentIdenticalStallEntries(
   let count = 0;
 
   for (const entry of reversed) {
+    if (entry.action.startsWith(ALREADY_MERGED_REJECTION_LOG_PREFIX)) {
+      continue;
+    }
     if (!entry.action.startsWith(IN_REVIEW_STALL_LOG_PREFIX)) {
       break;
     }

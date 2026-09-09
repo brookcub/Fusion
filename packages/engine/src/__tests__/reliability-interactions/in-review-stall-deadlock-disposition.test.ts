@@ -115,6 +115,51 @@ describe("reliability interactions: in-review stall deadlock disposition", () =>
     manager.stop();
   });
 
+  it("FUSI-010: ownership rejection diagnostics do not reset terminal stall reporting", async () => {
+    const reason = "task is marked 'failed': merge retry budget exhausted";
+    const task = {
+      id: "FUSI-010-INTERLEAVED",
+      column: "in-review",
+      paused: false,
+      userPaused: false,
+      status: "failed",
+      error: "merge retry budget exhausted",
+      branch: "fusion/fusi-010-interleaved",
+      worktree: "/tmp/fusi-010-interleaved",
+      mergeDetails: {},
+      mergeRetries: 0,
+      steps: [{ name: "implementation", status: "done" }],
+      workflowStepResults: [],
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      log: [
+        { timestamp: "2026-01-01T00:01:00.000Z", action: `In-review stall surfaced [merge-blocker]: ${reason}` },
+        { timestamp: "2026-01-01T00:02:00.000Z", action: "[recovery] already-merged rejected FUSI-010-INTERLEAVED candidate=unverified owner=unknown reason=ownership-unverifiable" },
+        { timestamp: "2026-01-01T00:03:00.000Z", action: `In-review stall surfaced [merge-blocker]: ${reason}` },
+        { timestamp: "2026-01-01T00:04:00.000Z", action: "[recovery] already-merged rejected FUSI-010-INTERLEAVED candidate=unverified owner=unknown reason=ownership-unverifiable" },
+      ],
+    } as any satisfies Task;
+
+    const store = createStore(task);
+    const manager = new SelfHealingManager(store, { rootDir: "/tmp/repo" });
+
+    vi.setSystemTime(new Date("2026-01-01T00:10:00.000Z"));
+    expect(await manager.surfaceInReviewStalls()).toBe(1);
+
+    expect(task.paused).toBe(true);
+    expect(task.pausedReason).toBe("in-review-stall-deadlock");
+    expect(task.status).toBe("failed");
+    expect(task.steps).toEqual([{ name: "implementation", status: "done" }]);
+    expect(task.log.filter((entry: { action: string }) => entry.action.startsWith("In-review stall auto-disposed [merge-blocker]:"))).toHaveLength(1);
+    expect(task.log.filter((entry: { action: string }) => entry.action.startsWith("In-review stall surfaced [merge-blocker]:"))).toHaveLength(2);
+
+    const logCount = task.log.length;
+    vi.setSystemTime(new Date("2026-01-01T00:20:00.000Z"));
+    expect(await manager.surfaceInReviewStalls()).toBe(0);
+    expect(task.log).toHaveLength(logCount);
+
+    manager.stop();
+  });
+
   it("FN-6113: terminal provider errors dispose in a single stall cycle", async () => {
     const task = {
       id: "FN-6113-TERMINAL",
