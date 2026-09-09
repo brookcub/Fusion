@@ -47,6 +47,7 @@ import {
   resolveAffectedPackages,
 } from "./test-changed.mjs";
 import { deriveBudgetMs, runWithWatchdog } from "./lib/run-vitest-watchdog.mjs";
+import { resolvePnpmCommand } from "./lib/pnpm-command.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
@@ -350,16 +351,16 @@ export async function runStep(step, { spawnFn = spawn, log = console.log, errLog
   log(`\n[verify:fast] -> ${step.label}`);
   log(`[verify:fast]    ${step.command} ${step.args.join(" ")}  (budget ${Math.round(budgetMs / 1000)}s)`);
   const startedAt = Date.now();
+  const resolved = resolvePnpmCommand(step.command, step.args);
   const { code, signal, timedOut } = await runWithWatchdog({
-    command: step.command,
-    args: step.args,
+    command: resolved.command,
+    args: resolved.args,
     env: process.env,
     cwd,
     budgetMs,
     label: step.label,
     log: errLog,
     spawn: spawnFn,
-    shell: process.platform === "win32" && step.command === "pnpm",
   });
   const elapsedS = ((Date.now() - startedAt) / 1000).toFixed(1);
   if (timedOut || signal || code !== 0) {

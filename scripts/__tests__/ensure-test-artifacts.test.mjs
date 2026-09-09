@@ -17,12 +17,12 @@ import {
 const ENGINE_ENTRY = REQUIRED_BUILD_PACKAGES.find((pkg) => pkg.name === "@fusion/engine");
 const posixPath = (value) => String(value).replaceAll("\\", "/");
 
-test("runArtifactBuild uses the Windows pnpm.cmd compatibility path", () => {
+test("runArtifactBuild uses literal argv without a Windows command shell", () => {
   let options = null;
   runArtifactBuild("pnpm", ["--version"], "/repo", {
     spawnFn: (_command, _args, received) => { options = received; return { status: 0 }; },
   });
-  assert.equal(options.shell, process.platform === "win32");
+  assert.equal(options.shell, undefined);
 });
 
 /**

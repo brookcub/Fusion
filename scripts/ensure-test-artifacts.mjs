@@ -3,6 +3,7 @@
 import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { resolvePnpmCommand } from "./lib/pnpm-command.mjs";
 import {
   computeContentHash,
   defaultGitRunner,
@@ -346,10 +347,10 @@ export function runArtifactBuild(
     readdirFn = readdirSync,
   } = {},
 ) {
-  const result = spawnFn(command, args, {
+  const resolved = resolvePnpmCommand(command, args);
+  const result = spawnFn(resolved.command, resolved.args, {
     cwd,
     stdio: "inherit",
-    shell: process.platform === "win32" && command === "pnpm",
   });
   if (result.status !== 0) {
     const filterCommand = `${command} ${args.join(" ")}`;
