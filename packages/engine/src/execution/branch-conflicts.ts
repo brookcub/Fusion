@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { promisify } from "node:util";
 import { resolveIntegrationBranch } from "../merge/integration-branch.js";
@@ -128,37 +128,44 @@ async function revParse(repoDir: string, ref: string): Promise<string> {
 }
 
 async function runGitArgs(repoDir: string, args: string[]): Promise<string> {
+  return (await runGitArgsRaw(repoDir, args)).trim();
+}
+
+async function runGitArgsRaw(repoDir: string, args: string[]): Promise<string> {
   const { stdout } = await execFileAsync("git", args, {
     cwd: repoDir, encoding: "utf-8", timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER,
     windowsHide: true,
   });
-  return stdout.trim();
+  return stdout;
 }
 
 async function patchIdForCommit(repoDir: string, sha: string): Promise<string> {
-  const patch = await runGitArgs(repoDir, ["show", sha]);
+  const patch = await runGitArgsRaw(repoDir, ["show", sha]);
   return await new Promise<string>((resolve, reject) => {
-    const child = spawn("git", ["patch-id", "--stable"], {
-      cwd: repoDir, windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
+    const child = execFile("git", ["patch-id", "--stable"], {
+      cwd: repoDir, encoding: "utf-8", timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, windowsHide: true,
+    }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(stdout.trim());
     });
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => child.kill(), GIT_TIMEOUT_MS);
-    child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
-    child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
-    child.once("error", (error) => { clearTimeout(timer); reject(error); });
-    child.once("close", (code) => {
-      clearTimeout(timer);
-      if (code === 0) resolve(stdout.trim());
-      else reject(new Error(`git patch-id failed (${code ?? "signal"}): ${stderr.trim()}`));
-    });
+    if (!child.stdin) {
+      reject(new Error("git patch-id stdin unavailable"));
+      return;
+    }
+    child.stdin.once("error", reject);
     child.stdin.end(patch);
   });
 }
 
 async function patchIdsForRef(repoDir: string, ref: string): Promise<string[]> {
   const commits = (await runGitArgs(repoDir, ["rev-list", ref])).split("\n").filter(Boolean);
-  return Promise.all(commits.map((sha) => patchIdForCommit(repoDir, sha)));
+  const patchIds: string[] = [];
+  for (const sha of commits) {
+    // Preserve the bounded historical scan contract: main can contain many
+    // commits, so never fan out two child processes per commit at once.
+    patchIds.push(await patchIdForCommit(repoDir, sha));
+  }
+  return patchIds;
 }
 
 async function branchExists(repoDir: string, branch: string): Promise<boolean> {
