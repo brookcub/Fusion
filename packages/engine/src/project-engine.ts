@@ -2252,10 +2252,13 @@ export class ProjectEngine {
         // Live surface cleared — allow a fresh skip log if work goes live again later.
         this.plannerLiveRetrySkipLogDedup.delete(`${task.id}::${decision.watchedStage ?? "executor"}`);
         /* FNXC:WorkflowResolvedColumns 2026-07-30-22:20: census-invisible moveTask DESTINATION — a call argument, not a comparison. */
-        await moveTaskToContainedBackwardTarget(store, task.id, "self-healing-stranded-recovery", {
+        const retryMove = await moveTaskToContainedBackwardTarget(store, task.id, "self-healing-stranded-recovery", {
           preserveProgress: true,
           moveSource: "engine",
         }, task.column);
+        // A contained refusal is not a dispatched retry. Do not emit a pending
+        // intervention or spend the controller's bounded retry budget for it.
+        if (!retryMove.moved) return false;
         // FN-7551: the attempt just dispatched — record it as attemptCount + 1
         // (decision.attemptCount is the count BEFORE this dispatch).
         await this.emitOverseerInterventionSafe(() =>
