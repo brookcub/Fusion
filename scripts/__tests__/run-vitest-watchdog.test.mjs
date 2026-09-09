@@ -411,3 +411,21 @@ test("runWithWatchdog native Job reaps descendants when its parent is cancelled"
     await assertDescendantGone(identity);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("native Job refuses user work when cancellation arrived during setup", { skip: process.platform !== "win32" }, () => {
+  const directory = mkdtempSync(join(tmpdir(), "watchdog cancelled setup "));
+  const marker = join(directory, "must-not-exist");
+  const cancel = join(directory, "cancel");
+  const outcome = join(directory, "outcome.json");
+  const args = Buffer.from(JSON.stringify(["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)},'unexpected')`])).toString("base64");
+  try {
+    writeFileSync(cancel, "cancel");
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-File",
+      resolve(import.meta.dirname, "../lib/run-owned-windows-command.ps1"),
+      "-Executable", process.execPath, "-ArgumentsBase64", args, "-TimeoutMs", "1000",
+      "-CancelFile", cancel, "-OutcomeFile", outcome], { encoding: "utf8", timeout: 10_000, windowsHide: true });
+    assert.equal(result.status, 125);
+    assert.deepEqual(JSON.parse(readFileSync(outcome, "utf8")), { outcome: "cancelled", jobEmpty: true, exitCode: 125 });
+    assert.equal(existsSync(marker), false);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});

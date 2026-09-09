@@ -123,6 +123,7 @@ import {
 import { canStartNextMergeBody } from "./merge/merge-reclaim-policy.js";
 import { clearOwnedMergeStamp } from "./merge/clear-orphaned-merge-stamp.js";
 import {
+  getVerificationQueueSnapshot,
   registerProjectVerificationLimit,
   unregisterProjectVerificationLimit,
 } from "./concurrency/verification-concurrency.js";
@@ -2433,6 +2434,11 @@ export class ProjectEngine {
    */
   getAutomationSubsystemHealth(): AutomationSubsystemHealth {
     return { ...this.automationSubsystemHealth };
+  }
+
+  /** Live process ownership, scoped to this project; never reconstructed from old logs. */
+  getVerificationQueueSnapshot(): ReturnType<typeof getVerificationQueueSnapshot> {
+    return getVerificationQueueSnapshot(this.config.projectId);
   }
 
   /** Get the RoutineStore (if initialized). */

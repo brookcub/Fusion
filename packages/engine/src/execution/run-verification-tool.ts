@@ -23,9 +23,10 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { isAbsolute, join, relative } from "node:path";
 import { Type, type Static } from "@earendil-works/pi-ai";
 import type { SandboxBackend, SandboxPolicy, SandboxStreamingResult } from "../sandbox/types.js";
+import { NativeSandboxBackend } from "../sandbox/native.js";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { executorLog } from "../logger.js";
-import { withVerificationSlot } from "../concurrency/verification-concurrency.js";
+import { withVerificationSlot, type VerificationSlotReceipt } from "../concurrency/verification-concurrency.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -639,6 +640,10 @@ export interface RunVerificationOptions {
   bypassVerificationSlot?: boolean;
   /** Optional abort signal — cancels while queued for a verification slot and during the command. */
   signal?: AbortSignal;
+  /** Sanitized identity for process-local queue diagnostics. */
+  taskId?: string;
+  projectId?: string;
+  onVerificationState?: (receipt: VerificationSlotReceipt) => void | Promise<void>;
   /** Explicit task-lane backend; native preserves the supervisor path. */
   sandboxBackend?: SandboxBackend;
   sandboxPolicy?: SandboxPolicy;
@@ -664,16 +669,22 @@ export async function runVerificationCommand(
   if (opts.bypassVerificationSlot) {
     return runVerificationCommandUnlocked(opts);
   }
-  return withVerificationSlot(() => runVerificationCommandUnlocked(opts), opts.signal);
+  return withVerificationSlot(() => runVerificationCommandUnlocked(opts), {
+    signal: opts.signal, taskId: opts.taskId ?? "unknown", projectId: opts.projectId,
+    ownerKind: "verification-tool", onState: opts.onVerificationState,
+  });
 }
 
 async function runVerificationCommandUnlocked(
   opts: RunVerificationOptions,
 ): Promise<VerificationResult> {
-  const { command, cwd, timeoutMs, expectFailure = false, onHeartbeat, onLine, sandboxBackend, sandboxPolicy } = opts;
+  opts.signal?.throwIfAborted();
+  const { command, cwd, timeoutMs, expectFailure = false, onHeartbeat, onLine, sandboxPolicy } = opts;
+  const sandboxBackend = opts.sandboxBackend ?? (process.platform === "win32" ? new NativeSandboxBackend() : undefined);
   if (sandboxBackend) {
     await sandboxBackend.prepare(sandboxPolicy ?? { allowNetwork: true });
-    return runSandboxedVerificationCommand({ command, cwd, timeoutMs, expectFailure, onHeartbeat, sandboxBackend, signal: opts.signal });
+    opts.signal?.throwIfAborted();
+    return runSandboxedVerificationCommand({ command, cwd, timeoutMs, expectFailure, onHeartbeat, onLine, sandboxBackend, signal: opts.signal });
   }
   const startMs = Date.now();
   const warnings: string[] = [];
@@ -699,6 +710,7 @@ async function runVerificationCommandUnlocked(
     const child = supervised.child;
 
     let timedOut = false;
+    let aborted = false;
     let killed = false;
     let settled = false;
 
@@ -739,6 +751,19 @@ async function runVerificationCommandUnlocked(
       }, SIGKILL_GRACE_MS);
     }, timeoutMs);
 
+    const onAbort = () => {
+      if (settled || aborted) return;
+      aborted = true;
+      clearTimeout(hardTimer);
+      if (killTimer) clearTimeout(killTimer);
+      killVerificationProcess(supervised, "SIGTERM");
+      killTimer = setTimeout(() => {
+        if (!settled) { killed = true; killVerificationProcess(supervised, "SIGKILL"); }
+      }, SIGKILL_GRACE_MS);
+    };
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+    if (opts.signal?.aborted) onAbort();
+
     // ── stdout ───────────────────────────────────────────────────────────────
     let stdoutRemainder = "";
     child.stdout?.on("data", (chunk: Buffer) => {
@@ -773,6 +798,7 @@ async function runVerificationCommandUnlocked(
     child.on("close", (code, signal) => {
       if (settled) return;
       settled = true;
+      opts.signal?.removeEventListener("abort", onAbort);
       clearInterval(quietTimer);
       clearTimeout(hardTimer);
       if (killTimer) clearTimeout(killTimer);
@@ -790,8 +816,8 @@ async function runVerificationCommandUnlocked(
       exit to success=true, allowing a failed test gate to appear green in agent tool history.
       Preserve expectation testing as a separate dimension without corrupting exit truth.
       */
-      const success = zeroExit;
-      const expectedFailureObserved = expectFailure && !timedOut && exitCode !== null && exitCode !== 0;
+      const success = zeroExit && !aborted;
+      const expectedFailureObserved = expectFailure && !timedOut && !aborted && exitCode !== null && exitCode !== 0;
       const expectationMet = expectFailure ? expectedFailureObserved : success;
 
       if (!success && !timedOut) {
@@ -827,6 +853,7 @@ async function runVerificationCommandUnlocked(
     child.on("error", (err) => {
       if (settled) return;
       settled = true;
+      opts.signal?.removeEventListener("abort", onAbort);
       clearInterval(quietTimer);
       clearTimeout(hardTimer);
       if (killTimer) clearTimeout(killTimer);
@@ -881,17 +908,25 @@ function sandboxOutcomeToResult(
 }
 
 /** Keep task-tool verification on the selected backend's streaming process path. */
-async function runSandboxedVerificationCommand(opts: Pick<RunVerificationOptions, "command" | "cwd" | "timeoutMs" | "expectFailure" | "onHeartbeat" | "signal"> & { sandboxBackend: SandboxBackend }): Promise<VerificationResult> {
+async function runSandboxedVerificationCommand(opts: Pick<RunVerificationOptions, "command" | "cwd" | "timeoutMs" | "expectFailure" | "onHeartbeat" | "onLine" | "signal"> & { sandboxBackend: SandboxBackend }): Promise<VerificationResult> {
   const startedAt = Date.now();
-  opts.onHeartbeat();
-  const result = await opts.sandboxBackend.runStreaming(opts.command, {
+  // FNXC:VerificationObservation 2026-09-09-12:49: Activity sinks cannot own command execution or cleanup.
+  const observe = (callback: () => unknown): void => {
+    try { void Promise.resolve(callback()).catch(() => undefined); } catch { /* Best effort. */ }
+  };
+  observe(opts.onHeartbeat);
+  const quietTimer = setInterval(() => observe(opts.onHeartbeat), QUIET_HEARTBEAT_INTERVAL_MS);
+  try {
+    const result = await opts.sandboxBackend.runStreaming(opts.command, {
     cwd: opts.cwd,
     timeout: opts.timeoutMs,
     maxBuffer: MAX_OUTPUT_BYTES,
     signal: opts.signal,
     env: { COREPACK_ENABLE_DOWNLOAD_PROMPT: "0" },
-  });
-  return sandboxOutcomeToResult(opts.command, opts.cwd, startedAt, opts.expectFailure === true, result);
+    onOutput: (_stream, chunk) => { observe(opts.onHeartbeat); observe(() => opts.onLine?.(chunk)); },
+    });
+    return sandboxOutcomeToResult(opts.command, opts.cwd, startedAt, opts.expectFailure === true, result);
+  } finally { clearInterval(quietTimer); }
 }
 
 // ---------------------------------------------------------------------------
@@ -911,6 +946,8 @@ export interface CreateRunVerificationToolOpts {
   sandboxBackend?: SandboxBackend;
   sandboxPolicy?: SandboxPolicy;
   taskId: string;
+  projectId?: string;
+  onVerificationState?: (receipt: VerificationSlotReceipt) => void | Promise<void>;
   /** Called on every output line AND on synthetic quiet-interval heartbeats. */
   recordActivity: () => void;
   /** Project-level default timeout budget in milliseconds. Values <= 0 disable the override and preserve legacy per-scope defaults. */
@@ -972,7 +1009,9 @@ export function createRunVerificationTool(
     execute: async function execute(
       _toolCallId: string,
       params: Static<typeof runVerificationParams>,
+      signal?: AbortSignal,
     ): ReturnType<NonNullable<ToolDefinition["execute"]>> {
+      signal?.throwIfAborted();
       /*
       FNXC:WorkspaceVerification 2026-08-22-22:49:
       A workspace command without an explicit target verifies every repository with a fresh
@@ -984,13 +1023,14 @@ export function createRunVerificationTool(
       const currentWorkspaceRepos = resolveWorkspaceRepos
         ? await resolveWorkspaceRepos()
         : workspaceRepos;
+      signal?.throwIfAborted();
       if (currentWorkspaceRepos?.length && !params.repo && !params.cwd) {
         const modifiedRepos = currentWorkspaceRepos.filter((entry) => entry.modified === true).sort((a, b) => a.repo.localeCompare(b.repo));
         if (modifiedRepos.length === 0) {
           return { content: [{ type: "text" as const, text: "No modified workspace repositories require verification." }], details: { success: true, repositories: [] } };
         }
         const results = [];
-        for (const repo of modifiedRepos) results.push(await execute(_toolCallId, { ...params, repo: repo.repo }));
+        for (const repo of modifiedRepos) results.push(await execute(_toolCallId, { ...params, repo: repo.repo }, signal));
         const repositoryResults = results as Array<{ content: Array<{ type: "text"; text: string }>; details: { success?: boolean } }>;
         const success = repositoryResults.every((result) => result.details.success === true);
         return {
@@ -1096,10 +1136,19 @@ export function createRunVerificationTool(
       );
 
       // ── Run ───────────────────────────────────────────────────────────────
-      onVerificationStart?.(timeoutMs);
       const result = await (async () => {
         try {
           return await runVerificationCommand({
+            taskId,
+            projectId: opts.projectId,
+            signal,
+            // FNXC:VerificationQueue 2026-09-09-12:19: Queue admission and
+            // command execution are distinct phases. Preserve the tool's abort
+            // signal through workspace fan-out and the actual backend command.
+            onVerificationState: (receipt) => {
+              if (receipt.state === "running") onVerificationStart?.(timeoutMs);
+              return opts.onVerificationState?.(receipt);
+            },
             command: effectiveCommand,
             cwd: resolvedCwd,
             timeoutMs,
@@ -1109,7 +1158,7 @@ export function createRunVerificationTool(
             sandboxPolicy,
           });
         } finally {
-          onVerificationEnd?.();
+          try { onVerificationEnd?.(); } catch { /* observational only */ }
         }
       })();
 

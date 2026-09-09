@@ -4,6 +4,39 @@ import { runVerificationCommand } from "../execution/run-verification-tool.js";
 import type { SandboxBackend, SandboxStreamingResult } from "../sandbox/types.js";
 
 describe("sandbox verification exit truth", () => {
+  it("isolates throwing, rejecting and hung activity observers through execution and cleanup", async () => {
+    vi.useFakeTimers();
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+    const heartbeat = vi.fn()
+      .mockImplementationOnce(() => { throw new Error("observer throw"); })
+      .mockImplementationOnce(() => Promise.reject(new Error("observer reject")))
+      .mockImplementation(() => new Promise(() => {}));
+    const onLine = vi.fn(() => { throw new Error("line observer throw"); });
+    const backend = {
+      prepare: async () => {},
+      runStreaming: vi.fn(async (optionsCommand, options) => {
+        expect(optionsCommand).toBe("echo fixture");
+        options.onOutput("stdout", "fixture\n");
+        started();
+        await gate;
+        return { outcome: "success", stdout: "fixture\n", stderr: "", bufferOverflow: false };
+      }),
+    } as unknown as SandboxBackend;
+    try {
+      const pending = runVerificationCommand({ command: "echo fixture", cwd: tmpdir(), timeoutMs: 120_000,
+        onHeartbeat: heartbeat, onLine, sandboxBackend: backend });
+      await startedPromise;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(heartbeat).toHaveBeenCalledTimes(3);
+      expect(onLine).toHaveBeenCalledOnce();
+      release();
+      await expect(pending).resolves.toMatchObject({ success: true, stdout: "fixture\n" });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { release(); vi.useRealTimers(); }
+  });
   it.each([
     ["zero", { outcome: "success" }, false, true, true, false],
     ["unexpected zero", { outcome: "success" }, true, true, false, false],

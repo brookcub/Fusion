@@ -1,5 +1,7 @@
 import { superviseSpawn } from "@fusion/core";
 
+import { runWindowsOwnedCommand } from "./windows-owned-command.js";
+
 import type {
   SandboxBackend,
   SandboxCapabilities,
@@ -29,6 +31,7 @@ export class NativeSandboxBackend implements SandboxBackend {
   }
 
   async run(command: string, options: SandboxRunOptions): Promise<SandboxRunResult> {
+    if (process.platform === "win32") return runWindowsOwnedCommand(command, options);
     if (options.signal?.aborted) {
       return {
         stdout: "",
@@ -143,6 +146,24 @@ export class NativeSandboxBackend implements SandboxBackend {
         stdout: "",
         stderr: "",
       };
+    }
+
+    if (process.platform === "win32") {
+      const result = await runWindowsOwnedCommand(command, {
+        cwd: options.cwd,
+        timeoutMs: options.timeout,
+        maxBuffer: options.maxBuffer,
+        signal: options.signal,
+        env: { ...process.env, COREPACK_ENABLE_DOWNLOAD_PROMPT: "0", ...options.env },
+        onOutput: options.onOutput,
+      }, false);
+      const output = { stdout: result.stdout, stderr: result.stderr };
+      // Cleanup uncertainty takes precedence over cancellation or a zero exit.
+      if (result.spawnError) return { ...output, outcome: "spawn-error", error: result.spawnError };
+      if (result.aborted) return { ...output, outcome: "aborted", phase: "mid-flight" };
+      if (result.timedOut) return { ...output, outcome: "timeout", timeoutMs: options.timeout };
+      if (result.exitCode === 0) return { ...output, outcome: "success", bufferOverflow: result.bufferExceeded };
+      return { ...output, outcome: "non-zero-exit", exitCode: result.exitCode, signal: result.signal };
     }
 
     return await new Promise((resolve) => {

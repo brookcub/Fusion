@@ -1022,6 +1022,16 @@ export const registerProjectRoutes: ApiRouteRegistrar = (ctx) => {
           activeTaskCount,
           inFlightAgentCount,
           totalTasksCompleted,
+          /*
+          FNXC:VerificationQueue 2026-09-09-12:16:
+          Queued checks must be distinguishable from a stalled task. Read the
+          slot owner's current process snapshot, not a historical pending receipt.
+          An absent engine is unknown (null), never a fabricated empty queue.
+          */
+          verificationQueue: (
+            options?.engineManager?.getEngine(req.params.id)
+            ?? (options?.engine?.getProjectId() === req.params.id ? options.engine : undefined)
+          )?.getVerificationQueueSnapshot?.() ?? null,
         };
       });
 

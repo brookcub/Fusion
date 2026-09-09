@@ -5,7 +5,7 @@
 import type { TaskStore, AgentRole } from "@fusion/core";
 import { resolveSandboxBackend } from "../sandbox/index.js";
 import type { SandboxBackend, SandboxRunStreamingOptions, SandboxStreamingResult } from "../sandbox/types.js";
-import { withVerificationSlot } from "../concurrency/verification-concurrency.js";
+import { withVerificationSlot, resolveVerificationProjectId } from "../concurrency/verification-concurrency.js";
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -399,7 +399,15 @@ export async function runVerificationCommand(
         timeoutMsOverride,
         backend,
       ),
-    signal,
+    {
+      signal,
+      taskId,
+      projectId: resolveVerificationProjectId(store),
+      ownerKind: (agentLabel ?? "merger") === "merger" ? "merger" : agentLabel === "executor" ? "executor" : "mission",
+      // Queue receipts deliberately contain no command/output/task prose. Do not
+      // await a diagnostic write on the admission path.
+      onState: (receipt) => { void store.logEntry(taskId, `[verification-queue] state=${receipt.state}; owner=${receipt.ownerKind}; attempt=${receipt.attemptId}`).catch(() => {}); },
+    },
   );
 }
 

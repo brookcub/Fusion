@@ -158,6 +158,7 @@ import { evaluateSpecStaleness, getPromptPath } from "../execution/spec-stalenes
 import { StepSessionExecutor } from "../execution/step-session-executor.js";
 import { isResearchToolSurfaceEnabled } from "../execution/tool-availability.js";
 import { summarizeVerificationOutput } from "../execution/verification-utils.js";
+import { resolveVerificationProjectId } from "../concurrency/verification-concurrency.js";
 import { buildAgentPersona } from "./agent-binding-pure.js";
 import { releaseExternalExecutionActiveWorktree } from "./active-worktrees.js";
 import { evaluateImplicitCompletionRefusal } from "./completion-predicates.js";
@@ -2099,6 +2100,9 @@ export async function runImplementation(
           sandboxPolicy: resolveSessionSandboxPolicy(sessionBoundary, settings),
           taskId: task.id,
           recordActivity: () => stuckDetector?.recordActivity(task.id),
+          projectId: resolveVerificationProjectId(deps.store),
+          onVerificationState: async (receipt) => { await deps.store.logEntry(task.id,
+            `[verification-queue] state=${receipt.state}; owner=${receipt.ownerKind}; attempt=${receipt.attemptId}; outcome=${receipt.outcome ?? "pending"}`); },
           verificationCommandTimeoutMs: settings.verificationCommandTimeoutMs,
           onVerificationStart: (timeoutMs) => stuckDetector?.beginVerification(task.id, timeoutMs),
           onVerificationEnd: () => stuckDetector?.endVerification(task.id),

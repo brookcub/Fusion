@@ -100,6 +100,50 @@ vi.mock("node:child_process", async () => {
   return { execSync: execSyncFn, exec: execFn, execFile: execFileFn, spawn: spawnFn };
 });
 
+// Merger fixtures deliberately model configured commands through execSync.  Do
+// not route them into the Windows Job helper: that helper correctly requires a
+// real native receipt, which a synthetic child_process mock cannot provide.
+// This explicit test backend preserves the existing command success/failure
+// and abort observations at the SandboxBackend boundary.
+vi.mock("../sandbox/index.js", async () => {
+  const { execSync } = await import("node:child_process");
+  return {
+    resolveSandboxBackend: () => ({
+      capabilities: () => ({
+        id: "custom" as const,
+        supportsNetworkPolicy: false,
+        supportsFilesystemPolicy: false,
+        supportsStreaming: true,
+        platform: "any" as const,
+      }),
+      prepare: async () => {},
+      run: async () => { throw new Error("run is not used by merger command fixtures"); },
+      runStreaming: async (command: string, options: { signal?: AbortSignal }) => {
+        if (options.signal?.aborted) {
+          return { outcome: "aborted" as const, phase: "pre-start" as const, stdout: "", stderr: "" };
+        }
+        try {
+          const output = execSync(command, { stdio: ["pipe", "pipe", "pipe"] });
+          if (options.signal?.aborted) {
+            return { outcome: "aborted" as const, phase: "mid-flight" as const, stdout: output?.toString?.() ?? "", stderr: "" };
+          }
+          return { outcome: "success" as const, stdout: output?.toString?.() ?? "", stderr: "", bufferOverflow: false };
+        } catch (error) {
+          const failure = error as { stdout?: unknown; stderr?: unknown; status?: unknown; code?: unknown };
+          return {
+            outcome: "non-zero-exit" as const,
+            stdout: failure.stdout?.toString?.() ?? "",
+            stderr: failure.stderr?.toString?.() ?? "",
+            exitCode: typeof failure.status === "number" ? failure.status : typeof failure.code === "number" ? failure.code : 1,
+            signal: null,
+          };
+        }
+      },
+      dispose: async () => {},
+    }),
+  };
+});
+
 vi.mock("node:fs", () => ({
   existsSync: vi.fn().mockReturnValue(true),
   readFileSync: vi.fn(),
