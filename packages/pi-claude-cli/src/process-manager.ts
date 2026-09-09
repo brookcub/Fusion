@@ -7,9 +7,19 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { writeFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+
+const systemPromptFiles = new WeakMap<ChildProcess, string>();
+
+/** Keep explicit native CLI/subscription requests off inherited direct-API auth. */
+export function buildNativeClaudeEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(source).filter(([key]) =>
+    !["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"].includes(key.toUpperCase()),
+  ));
+}
 
 function debugLog(message: string): void {
   if (process.env.PI_CLAUDE_CLI_DEBUG !== "1") return;
@@ -56,13 +66,14 @@ export function buildClaudeSpawnArgs(
 
   if (systemPrompt) {
     // Write system prompt to a temp file to avoid ENAMETOOLONG on Windows.
-    // Claude CLI's --append-system-prompt accepts a file path or literal text.
+    // FNXC:ClaudePromptOwnership 2026-09-09-06:10: concurrent requests share a
+    // Fusion PID, not a prompt file. Exclusive creation prevents overwrites.
     const tmpFile = join(
       tmpdir(),
-      `pi-claude-cli-sysprompt-${process.pid}.txt`,
+      `pi-claude-cli-sysprompt-${process.pid}-${randomUUID()}.txt`,
     );
-    writeFileSync(tmpFile, systemPrompt, "utf-8");
-    args.push("--append-system-prompt", tmpFile);
+    writeFileSync(tmpFile, systemPrompt, { encoding: "utf-8", flag: "wx" });
+    args.push("--append-system-prompt-file", tmpFile);
   }
 
   if (options?.effort) {
@@ -95,10 +106,20 @@ export function spawnClaude(
     newSessionId: options?.newSessionId,
   });
 
-  const proc = spawn("claude", args, {
-    stdio: ["pipe", "pipe", "pipe"],
-    cwd: options?.cwd ?? process.cwd(),
-  });
+  const promptFileIndex = args.indexOf("--append-system-prompt-file");
+  const promptFile = promptFileIndex >= 0 ? args[promptFileIndex + 1] : undefined;
+  let proc: ChildProcess;
+  try {
+    proc = spawn("claude", args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      cwd: options?.cwd ?? process.cwd(),
+      env: buildNativeClaudeEnv(),
+    });
+  } catch (error) {
+    if (promptFile) removeOwnedPromptFile(promptFile);
+    throw error;
+  }
+  if (promptFile) systemPromptFiles.set(proc, promptFile);
 
   debugLog(`spawnClaude: pid=${proc.pid} model=${modelId}`);
 
@@ -109,9 +130,16 @@ export function spawnClaude(
  * Clean up the temp system prompt file created by spawnClaude.
  * Safe to call multiple times or when no file exists.
  */
-export function cleanupSystemPromptFile(): void {
+export function cleanupSystemPromptFile(proc: ChildProcess): void {
+  const promptFile = systemPromptFiles.get(proc);
+  if (!promptFile) return;
+  systemPromptFiles.delete(proc);
+  removeOwnedPromptFile(promptFile);
+}
+
+function removeOwnedPromptFile(promptFile: string): void {
   try {
-    unlinkSync(join(tmpdir(), `pi-claude-cli-sysprompt-${process.pid}.txt`));
+    unlinkSync(promptFile);
   } catch {
     // File doesn't exist or already deleted — ignore
   }
@@ -227,7 +255,7 @@ function runClaudeProbe(args: string[], timeoutMs = 5000): Promise<number> {
   return new Promise((resolve) => {
     let proc: ChildProcess;
     try {
-      proc = spawn("claude", args, { stdio: "ignore" });
+      proc = spawn("claude", args, { stdio: "ignore", env: buildNativeClaudeEnv() });
     } catch {
       resolve(127);
       return;

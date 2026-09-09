@@ -40,6 +40,7 @@ vi.mock("node:os", () => ({
 import { spawn } from "node:child_process";
 import {
   spawnClaude,
+  buildNativeClaudeEnv,
   buildClaudeSpawnArgs,
   writeUserMessage,
   cleanupProcess,
@@ -133,18 +134,19 @@ describe("spawnClaude", () => {
     expect(options.cwd).toBe("/custom/path");
   });
 
-  it("writes system prompt to temp file and passes path via --append-system-prompt", () => {
+  it("writes system prompt to an exclusive temp file and passes the file flag", () => {
     spawnClaude("claude-sonnet-4-5-20250929", "You are a helpful assistant.");
     const args = (spawn as any).mock.calls[0][1] as string[];
-    const expectedTmpFile = `/mock-tmp/pi-claude-cli-sysprompt-${process.pid}.txt`;
+    const expectedTmpFile = mocks.writeFileSync.mock.calls[0][0];
 
     expect(mocks.writeFileSync).toHaveBeenCalledWith(
       expectedTmpFile,
       "You are a helpful assistant.",
-      "utf-8",
+      { encoding: "utf-8", flag: "wx" },
     );
-    expect(args).toContain("--append-system-prompt");
-    const idx = args.indexOf("--append-system-prompt");
+    expect(args).toContain("--append-system-prompt-file");
+    expect(args).not.toContain("--append-system-prompt");
+    const idx = args.indexOf("--append-system-prompt-file");
     expect(args[idx + 1]).toContain("pi-claude-cli-sysprompt-");
     expect(args[idx + 1]).toBe(expectedTmpFile);
   });
@@ -153,16 +155,17 @@ describe("spawnClaude", () => {
     spawnClaude("claude-sonnet-4-5-20250929", "You are a helpful assistant.");
 
     expect(mocks.writeFileSync).toHaveBeenCalledWith(
-      `/mock-tmp/pi-claude-cli-sysprompt-${process.pid}.txt`,
+      expect.stringContaining(`pi-claude-cli-sysprompt-${process.pid}-`),
       "You are a helpful assistant.",
-      "utf-8",
+      { encoding: "utf-8", flag: "wx" },
     );
   });
 
-  it("does not include --append-system-prompt when no system prompt", () => {
+  it("does not include a system prompt flag when no system prompt", () => {
     spawnClaude("claude-sonnet-4-5-20250929");
     const args = (spawn as any).mock.calls[0][1] as string[];
     expect(args).not.toContain("--append-system-prompt");
+    expect(args).not.toContain("--append-system-prompt-file");
   });
 
   it("returns the spawned ChildProcess", () => {
@@ -224,7 +227,7 @@ describe("effort flag", () => {
     });
     const args = (spawn as any).mock.calls[0][1] as string[];
 
-    expect(args).toContain("--append-system-prompt");
+    expect(args).toContain("--append-system-prompt-file");
     expect(args).not.toContain("--effort");
   });
 });
@@ -538,7 +541,7 @@ describe("mcp-config flag", () => {
     });
     const args = (spawn as any).mock.calls[0][1] as string[];
 
-    expect(args).toContain("--append-system-prompt");
+    expect(args).toContain("--append-system-prompt-file");
     expect(args).toContain("--effort");
     expect(args).not.toContain("--mcp-config");
     expect(args).not.toContain("--permission-prompt-tool");
@@ -728,6 +731,94 @@ describe("resume session flag", () => {
   });
 });
 
+describe("native child auth and prompt ownership", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.writeFileSync.mockReset();
+    mocks.unlinkSync.mockReset();
+    mocks.tmpdir.mockReturnValue("/mock-tmp");
+  });
+  afterEach(() => vi.unstubAllEnvs());
+
+  function setAuthFixture() {
+    vi.stubEnv("ANTHROPIC_API_KEY", "test-direct-key");
+    vi.stubEnv("ANTHROPIC_AUTH_TOKEN", "test-direct-bearer");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "test-subscription-token");
+    vi.stubEnv("CLAUDE_CONFIG_DIR", "/test-native-config");
+  }
+  function expectNativeAuthEnv(env: NodeJS.ProcessEnv) {
+    expect(env).toBeDefined();
+    expect(env).not.toBe(process.env);
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("test-subscription-token");
+    expect(env.CLAUDE_CONFIG_DIR).toBe("/test-native-config");
+    expect(env.PATH).toBe(process.env.PATH);
+    expect(process.env.ANTHROPIC_API_KEY).toBe("test-direct-key");
+    expect(process.env.ANTHROPIC_AUTH_TOKEN).toBe("test-direct-bearer");
+  }
+
+  it("keeps native subscription auth without inheriting direct API auth or changing the parent", () => {
+    setAuthFixture();
+    spawnClaude("claude-opus-4-8");
+    expectNativeAuthEnv(vi.mocked(spawn).mock.calls[0][2]!.env!);
+  });
+
+  it("strips direct auth regardless of environment key casing", () => {
+    const source = { anthropic_api_key: "test-key", Anthropic_Auth_Token: "test-bearer", CLAUDE_CONFIG_DIR: "/fixture" };
+    expect(buildNativeClaudeEnv(source)).toEqual({ CLAUDE_CONFIG_DIR: "/fixture" });
+    expect(source.anthropic_api_key).toBe("test-key");
+  });
+
+  it("uses the same isolated auth environment for the native auth probe", async () => {
+    setAuthFixture();
+    const pending = validateCliAuthAsync();
+    const proc = vi.mocked(spawn).mock.results[0].value;
+    proc.emit("exit", 0);
+    expect(await pending).toBe(true);
+    expectNativeAuthEnv(vi.mocked(spawn).mock.calls[0][2]!.env!);
+  });
+
+  it("keeps concurrent prompt contents separate and only deletes the requesting child's file", () => {
+    const files = new Map<string, string>();
+    mocks.writeFileSync.mockImplementation((path: string, content: string) => files.set(path, content));
+    mocks.unlinkSync.mockImplementation((path: string) => files.delete(path));
+    const first = spawnClaude("claude-opus-4-8", "first fixture prompt");
+    const second = spawnClaude("claude-opus-4-8", "second fixture prompt");
+    const firstPath = mocks.writeFileSync.mock.calls[0][0];
+    const secondPath = mocks.writeFileSync.mock.calls[1][0];
+    expect(firstPath).not.toBe(secondPath);
+    expect(files.get(firstPath)).toBe("first fixture prompt");
+    expect(files.get(secondPath)).toBe("second fixture prompt");
+    cleanupSystemPromptFile(first);
+    expect(files.has(firstPath)).toBe(false);
+    expect(files.get(secondPath)).toBe("second fixture prompt");
+    cleanupSystemPromptFile(first);
+    expect(mocks.unlinkSync).toHaveBeenCalledTimes(1);
+    cleanupSystemPromptFile(second);
+    expect(files.size).toBe(0);
+    cleanupSystemPromptFile(first);
+    cleanupSystemPromptFile(second);
+    expect(mocks.unlinkSync).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not let a no-prompt child unlink another child's prompt", () => {
+    spawnClaude("claude-opus-4-8", "fixture prompt");
+    const noPrompt = spawnClaude("claude-opus-4-8");
+    cleanupSystemPromptFile(noPrompt);
+    expect(mocks.unlinkSync).not.toHaveBeenCalled();
+  });
+
+  it("cleans only the newly owned prompt on synchronous spawn failure", () => {
+    const first = spawnClaude("claude-opus-4-8", "first fixture prompt");
+    vi.mocked(spawn).mockImplementationOnce(() => { throw new Error("spawn failed"); });
+    expect(() => spawnClaude("claude-opus-4-8", "failed fixture prompt")).toThrow("spawn failed");
+    expect(mocks.unlinkSync).toHaveBeenCalledExactlyOnceWith(mocks.writeFileSync.mock.calls[1][0]);
+    cleanupSystemPromptFile(first);
+    expect(mocks.unlinkSync).toHaveBeenLastCalledWith(mocks.writeFileSync.mock.calls[0][0]);
+  });
+});
+
 describe("cleanupSystemPromptFile", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -737,18 +828,21 @@ describe("cleanupSystemPromptFile", () => {
   });
 
   it("deletes the temp file when it exists", () => {
-    cleanupSystemPromptFile();
+    const proc = spawnClaude("claude-opus-4-8", "fixture prompt");
+    const promptFile = mocks.writeFileSync.mock.calls[0][0];
+    cleanupSystemPromptFile(proc);
 
     expect(mocks.unlinkSync).toHaveBeenCalledWith(
-      `/mock-tmp/pi-claude-cli-sysprompt-${process.pid}.txt`,
+      promptFile,
     );
   });
 
   it("does not throw when file does not exist", () => {
+    const proc = spawnClaude("claude-opus-4-8", "fixture prompt");
     mocks.unlinkSync.mockImplementation(() => {
       throw new Error("ENOENT");
     });
 
-    expect(() => cleanupSystemPromptFile()).not.toThrow();
+    expect(() => cleanupSystemPromptFile(proc)).not.toThrow();
   });
 });

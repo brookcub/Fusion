@@ -8,6 +8,9 @@ vi.mock("node:child_process", () => ({
     const proc = new EventEmitter();
     const stdin = { write: vi.fn(), end: vi.fn() };
     const stdout = new PassThrough();
+    // Native ChildProcess close follows stdout EOF; the provider must wait for
+    // its exit status instead of treating readline closure as success.
+    stdout.on("end", () => queueMicrotask(() => proc.emit("close", 0, null)));
     const stderr = new EventEmitter();
     (proc as any).stdin = stdin;
     (proc as any).stdout = stdout;
@@ -481,11 +484,10 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
     await vi.advanceTimersByTimeAsync(100);
 
     const mockStream = MockAssistantMessageEventStream.mock.instances[0];
-    const doneEvent = mockStream._events.find(
-      (e: any) => e.type === "done" && e.message,
+    const errorEvent = mockStream._events.find(
+      (e: any) => e.type === "error" && e.error,
     );
-    expect(doneEvent).toBeDefined();
-    expect(doneEvent.message.content).toBeDefined();
+    expect(errorEvent.error).toMatchObject({ stopReason: "error", errorMessage: "Rate limit exceeded" });
     expect(mockStream.end).toHaveBeenCalled();
   });
 
@@ -1160,7 +1162,7 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
   });
 
   describe("subprocess error handling", () => {
-    it("pushes done event when subprocess emits error (e.g. spawn failure)", async () => {
+    it("pushes an AssistantMessage error when subprocess emits error (e.g. spawn failure)", async () => {
       const model = mockModels[0] as any;
       const context = {
         messages: [{ role: "user", content: "Hello" }],
@@ -1177,11 +1179,10 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
       await vi.advanceTimersByTimeAsync(100);
 
       const mockStream = MockAssistantMessageEventStream.mock.instances[0];
-      const doneEvent = mockStream._events.find(
-        (e: any) => e.type === "done" && e.message,
+      const errorEvent = mockStream._events.find(
+        (e: any) => e.type === "error" && e.error,
       );
-      expect(doneEvent).toBeDefined();
-      expect(doneEvent.message.content).toBeDefined();
+      expect(errorEvent.error).toMatchObject({ stopReason: "error", errorMessage: "spawn ENOENT" });
       expect(mockStream.end).toHaveBeenCalled();
     });
 
@@ -1202,11 +1203,10 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
       await vi.advanceTimersByTimeAsync(100);
 
       const mockStream = MockAssistantMessageEventStream.mock.instances[0];
-      const doneEvent = mockStream._events.find(
-        (e: any) => e.type === "done" && e.message,
+      const errorEvent = mockStream._events.find(
+        (e: any) => e.type === "error" && e.error,
       );
-      expect(doneEvent).toBeDefined();
-      expect(doneEvent.message.content).toBeDefined();
+      expect(errorEvent.error).toMatchObject({ stopReason: "error", errorMessage: expect.stringContaining("code 1") });
       expect(mockStream.end).toHaveBeenCalled();
     });
 
@@ -1228,11 +1228,10 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
       await vi.advanceTimersByTimeAsync(100);
 
       const mockStream = MockAssistantMessageEventStream.mock.instances[0];
-      const doneEvent = mockStream._events.find(
-        (e: any) => e.type === "done" && e.message,
+      const errorEvent = mockStream._events.find(
+        (e: any) => e.type === "error" && e.error,
       );
-      expect(doneEvent).toBeDefined();
-      expect(doneEvent.message.content).toBeDefined();
+      expect(errorEvent.error).toMatchObject({ stopReason: "error", errorMessage: expect.stringContaining("segfault in libfoo.so") });
     });
 
     it.each([
@@ -1417,11 +1416,10 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
       await vi.advanceTimersByTimeAsync(1_800_000);
 
       const mockStream = MockAssistantMessageEventStream.mock.instances[0];
-      const doneEvent = mockStream._events.find(
-        (e: any) => e.type === "done" && e.message,
+      const errorEvent = mockStream._events.find(
+        (e: any) => e.type === "error" && e.error,
       );
-      expect(doneEvent).toBeDefined();
-      expect(doneEvent.message.content).toBeDefined();
+      expect(errorEvent.error).toMatchObject({ stopReason: "error", errorMessage: expect.stringContaining("timed out") });
       expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
 
       // Clean up - end stdout so readline closes
@@ -1467,11 +1465,10 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
       // Advance 10 more seconds (1800s since last line) -- NOW should timeout
       await vi.advanceTimersByTimeAsync(10_000);
 
-      const doneEvent2 = mockStream._events.find(
-        (e: any) => e.type === "done" && e.message,
+      const errorEvent = mockStream._events.find(
+        (e: any) => e.type === "error" && e.error,
       );
-      expect(doneEvent2).toBeDefined();
-      expect(doneEvent2.message.content).toBeDefined();
+      expect(errorEvent.error).toMatchObject({ stopReason: "error", errorMessage: expect.stringContaining("timed out") });
 
       // Clean up
       proc.stdout.end();
