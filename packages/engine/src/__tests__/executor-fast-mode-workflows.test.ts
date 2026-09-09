@@ -7,7 +7,7 @@
 // injection surface (fn_review_step is deleted in both modes) vs mandatory fn_task_done.
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import "./executor-test-helpers.js";
-import { FAST_LANE_STEP_NAME, getBuiltinWorkflow } from "@fusion/core";
+import { FAST_LANE_STEP_NAME, getBuiltinWorkflow, TaskStore } from "@fusion/core";
 import { TaskExecutor } from "../executor.js";
 import { resolveExternalExecutionCheckoutRoute } from "../execution/external-execution-checkout.js";
 import { WorkflowGraphTaskRunner } from "../workflows/workflow-graph-task-runner.js";
@@ -122,6 +122,53 @@ describe("fast mode workflow/runtime invariants", () => {
       expect(run).toHaveBeenCalledTimes(1);
     } finally {
       // Prototype spy: restore even on failure so it cannot leak into sibling runner tests.
+      run.mockRestore();
+    }
+  });
+
+  it("forwards a class-prototype settings reader into the strict foreach settlement runner seam", async () => {
+    const settings = { autoMerge: false, experimentalFeatures: { workflowGraphExecutor: true } };
+    class PrototypeSettingsStore {
+      calls = 0;
+      getSettings() { this.calls++; return Promise.resolve(settings); }
+    }
+    // FNXC:ForeachCheckpointSettlement 2026-09-09-14:13: TaskStore exposes
+    // getSettings on its prototype, so the runner adapter must retain it.
+    expect(Object.getOwnPropertyDescriptor(TaskStore.prototype, "getSettings")?.value).toBeTypeOf("function");
+    const backing = new PrototypeSettingsStore();
+    const store = Object.assign(backing, createMockStore()) as any;
+    delete store.getSettings;
+    expect(Object.hasOwn(store, "getSettings")).toBe(false);
+    expect(store.getSettings).toBe(backing.getSettings);
+    store.getTask.mockImplementation(async (id: string) => ({ ...task(), id }));
+    const selected = { workflowId: "WF-prototype-settings", stepIds: [] };
+    store.getTaskWorkflowSelectionAsync = vi.fn(async () => selected);
+    store.getWorkflowDefinition = vi.fn(async () => ({
+      id: selected.workflowId,
+      name: "Prototype settings",
+      ir: {
+        version: "v1",
+        name: "Prototype settings",
+        nodes: [{ id: "start", kind: "start" }, { id: "end", kind: "end" }],
+        edges: [{ from: "start", to: "end" }],
+      },
+    }));
+    const executor = new TaskExecutor(store, "/tmp/test");
+    expect(Object.hasOwn(store, "getSettings")).toBe(false);
+    let runnerStore: { getSettings?: () => Promise<unknown> } | undefined;
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run").mockImplementation(async function () {
+      runnerStore = (this as any).deps.store;
+      return { disposition: "completed", outcome: "success", visitedNodeIds: ["start"] } as never;
+    });
+    try {
+      await expect((executor as any).executeWorkflowGraph(task())).resolves.toBeUndefined();
+      expect(run).toHaveBeenCalledTimes(1);
+      expect(Object.hasOwn(runnerStore, "getSettings")).toBe(true);
+      expect(runnerStore?.getSettings).toBeTypeOf("function");
+      const callsBeforeAdapterRead = backing.calls;
+      await expect(runnerStore?.getSettings?.()).resolves.toEqual(settings);
+      expect(backing.calls).toBe(callsBeforeAdapterRead + 1);
+    } finally {
       run.mockRestore();
     }
   });

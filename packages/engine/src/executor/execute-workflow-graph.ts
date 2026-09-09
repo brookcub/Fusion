@@ -862,6 +862,13 @@ export async function executeWorkflowGraph(
             (await deps.store.getWorkflowDefinition?.(id))
               ?? (id === "builtin:coding" ? getBuiltinWorkflow("builtin:coding") : undefined),
           getTask: (taskId: string) => deps.store.getTask(taskId),
+          /*
+          FNXC:ForeachCheckpointSettlement 2026-09-09-14:13:
+          TaskStore exposes getSettings on its class prototype, so object spread
+          drops the authoritative pause reader needed by strict foreach settlement.
+          Forward it explicitly rather than treating a missing reader as safe.
+          */
+          getSettings: () => deps.store.getSettings(),
         },
         runId: resolvedRunId,
         isLiveSharedBranchMember: (nodeTask) =>
