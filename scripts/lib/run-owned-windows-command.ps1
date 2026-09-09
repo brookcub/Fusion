@@ -3,12 +3,13 @@ $ErrorActionPreference = 'Stop'
 # FNXC:TaskLogRegression 2026-09-06-13:47: Assign suspended children to a
 # kill-on-close native job before they execute. A timeout owns descendants,
 # including detached Vitest forks, and returns only after the job is empty.
-Add-Type -TypeDefinition @'
+Add-Type -ReferencedAssemblies 'System.Web.Extensions' -TypeDefinition @'
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Web.Script.Serialization;
 public static class RegressionJob {
  [StructLayout(LayoutKind.Sequential)] struct BasicLimits { public long a,b; public uint flags; public UIntPtr c,d; public uint e; public UIntPtr f; public uint g,h; }
  [StructLayout(LayoutKind.Sequential)] struct Counters { public ulong a,b,c,d,e,f; }
@@ -33,6 +34,12 @@ public static class RegressionJob {
    var text = new StringBuilder("\""); int slashes=0;
    foreach (char c in value) { if(c=='\\') { slashes++; continue; } if(c=='\"') { text.Append('\\',slashes*2+1); text.Append(c); } else { text.Append('\\',slashes); text.Append(c); } slashes=0; }
    text.Append('\\',slashes*2); return text.Append('"').ToString();
+ }
+ public static int RunEncoded(string executable, string argumentsBase64, int timeout) {
+   string json=Encoding.UTF8.GetString(Convert.FromBase64String(argumentsBase64));
+   string[] args=new JavaScriptSerializer().Deserialize<string[]>(json);
+   if(args==null) throw new ArgumentException("arguments must decode to an array");
+   return Run(executable,args,timeout);
  }
  public static int Run(string executable, string[] args, int timeout) {
    if(timeout<1) return 124;
@@ -66,7 +73,8 @@ public static class RegressionJob {
 }
 '@
 try {
-  $decoded = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($ArgumentsBase64)) | ConvertFrom-Json
   $application = (Get-Command $Executable -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
-  exit [RegressionJob]::Run($application, [string[]]$decoded, $TimeoutMs)
-} catch { [Console]::Error.WriteLine('owned command setup or shutdown failed'); exit 125 }
+  # Preserve exact argv in the Base64 JSON until the native method decodes it;
+  # PowerShell therefore cannot enumerate or rebind individual arguments.
+  exit [RegressionJob]::RunEncoded($application, $ArgumentsBase64, $TimeoutMs)
+} catch { [Console]::Error.WriteLine("owned command setup or shutdown failed: $($_.Exception.Message)"); exit 125 }

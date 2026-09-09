@@ -2,9 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { spawn as realSpawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createConnection } from "node:net";
+import { join, resolve } from "node:path";
 
 import {
   CLASS_BUDGET_BANDS,
@@ -256,18 +256,66 @@ test("runWithWatchdog: passes cwd through to spawn when provided", async () => {
   assert.equal(capturedOpts.cwd, "/tmp/repo-root");
 });
 
-test("runWithWatchdog preserves real argv containing spaces and metacharacters", async () => {
-  const root = mkdtempSync(join(tmpdir(), "watchdog argv & "));
+test("runWithWatchdog preserves real argv containing spaces and metacharacters", { skip: process.platform !== "win32" }, async () => {
+  // The native Job child inherits the system token; use the machine temp root
+  // rather than a per-profile ACL so this remains a real Job-path test.
+  const root = mkdtempSync(join(process.env.SystemDrive ?? "C:\\", "tmp", "watchdog argv & "));
   const output = join(root, "received args.json");
-  const fixture = join(root, "argv fixture &.mjs");
+  const fixture = resolve(import.meta.dirname, "fixtures", "native-job-argv.mjs");
   const args = [fixture, output, "space value", "literal & value"];
   try {
-    writeFileSync(fixture, "import {writeFileSync} from 'node:fs'; writeFileSync(process.argv[2], JSON.stringify(process.argv.slice(3)));\n");
     const result = await runWithWatchdog({
       command: process.execPath, args, budgetMs: 10_000, label: "argv-roundtrip", log: () => {},
-      spawn: realSpawn,
+      spawn: realSpawn, windowsJob: true,
     });
     assert.equal(result.code, 0);
     assert.deepEqual(JSON.parse(readFileSync(output, "utf8")), ["space value", "literal & value"]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+async function waitForIdentity(path, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) throw new Error("descendant identity was not written");
+    await new Promise((done) => setTimeout(done, 20));
+  }
+  return JSON.parse(readFileSync(path, "utf8"));
+}
+
+async function assertDescendantGone(identity) {
+  assert.throws(() => process.kill(identity.pid, 0), { code: "ESRCH" });
+  const refused = await new Promise((done) => {
+    const socket = createConnection({ host: "127.0.0.1", port: identity.port });
+    const finish = (value) => { socket.destroy(); done(value); };
+    socket.on("connect", () => finish(false));
+    socket.on("error", (error) => finish(error.code === "ECONNREFUSED"));
+    socket.setTimeout(500, () => finish(false));
+  });
+  assert.equal(refused, true);
+}
+
+test("runWithWatchdog native Job reaps a child and detached grandchild on timeout", { skip: process.platform !== "win32" }, async () => {
+  const root = mkdtempSync(join(process.env.SystemDrive ?? "C:\\", "tmp", "watchdog job timeout "));
+  const identityPath = join(root, "identity.json");
+  const descendant = `const net=require('node:net'),fs=require('node:fs');const server=net.createServer();server.listen(0,'127.0.0.1',()=>fs.writeFileSync(process.argv[1],JSON.stringify({pid:process.pid,port:server.address().port})));`;
+  const parent = `const{spawn}=require('node:child_process');spawn(process.execPath,['-e',${JSON.stringify(descendant)},${JSON.stringify(identityPath)}],{detached:true,windowsHide:true,stdio:'ignore'});setInterval(()=>{},1000);`;
+  try {
+    const result = await runWithWatchdog({ command: process.execPath, args: ["-e", parent], budgetMs: 700, label: "job-timeout", log: () => {}, spawn: realSpawn, windowsJob: true });
+    assert.equal(result.code, TIMEOUT_EXIT_CODE);
+    await assertDescendantGone(await waitForIdentity(identityPath));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("runWithWatchdog native Job reaps descendants when its parent is cancelled", { skip: process.platform !== "win32" }, async () => {
+  const root = mkdtempSync(join(process.env.SystemDrive ?? "C:\\", "tmp", "watchdog job cancel "));
+  const identityPath = join(root, "identity.json");
+  const descendant = `const net=require('node:net'),fs=require('node:fs');const server=net.createServer();server.listen(0,'127.0.0.1',()=>fs.writeFileSync(process.argv[1],JSON.stringify({pid:process.pid,port:server.address().port})));`;
+  const parent = `const{spawn}=require('node:child_process');spawn(process.execPath,['-e',${JSON.stringify(descendant)},${JSON.stringify(identityPath)}],{detached:true,windowsHide:true,stdio:'ignore'});setInterval(()=>{},1000);`;
+  try {
+    const running = runWithWatchdog({ command: process.execPath, args: ["-e", parent], budgetMs: 10_000, graceMs: 100, label: "job-cancel", log: () => {}, spawn: realSpawn, windowsJob: true });
+    const identity = await waitForIdentity(identityPath);
+    process.emit("SIGHUP");
+    await running;
+    await assertDescendantGone(identity);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

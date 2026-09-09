@@ -28,6 +28,8 @@
  */
 
 const MINUTE = 60_000;
+import { spawn as nodeSpawn } from "node:child_process";
+import { resolve as resolvePath } from "node:path";
 import { resolvePnpmCommand } from "./pnpm-command.mjs";
 
 /**
@@ -187,6 +189,9 @@ export function captureHangDiagnostics({ label, command, args, budgetMs, started
  * @param {(signal: string) => void} [opts.killGroup] injected group-signaller
  *   (defaults to a process-group `process.kill(-pid)` with child.kill fallback);
  *   override in tests so signals are captured instead of hitting real groups.
+ * @param {boolean} [opts.windowsJob] use the lightweight native Job wrapper.
+ *   The default only enables it for Node's real spawn; fake-child unit tests
+ *   retain their portable process-group model.
  */
 export function runWithWatchdog({
   command,
@@ -201,13 +206,22 @@ export function runWithWatchdog({
   spawn,
   now = () => Date.now(),
   killGroup = null,
+  windowsJob = process.platform === "win32" && spawn === nodeSpawn,
 }) {
   if (typeof spawn !== "function") {
     throw new Error("runWithWatchdog requires an injected `spawn` function");
   }
 
-  return new Promise((resolve, reject) => {
+  return new Promise((finish, reject) => {
     const resolvedCommand = resolvePnpmCommand(command, args);
+    const nativeWindowsJob = windowsJob;
+    const launchCommand = nativeWindowsJob ? "powershell.exe" : resolvedCommand.command;
+    const launchArgs = nativeWindowsJob ? [
+      "-NoProfile", "-NonInteractive", "-File", resolvePath(import.meta.dirname, "run-owned-windows-command.ps1"),
+      "-Executable", resolvedCommand.command,
+      "-ArgumentsBase64", Buffer.from(JSON.stringify(resolvedCommand.args)).toString("base64"),
+      "-TimeoutMs", String(Math.max(1, Math.floor(budgetMs))),
+    ] : resolvedCommand.args;
     const startedAt = now();
     let lastHeartbeatAt = null;
     let timedOut = false;
@@ -217,8 +231,10 @@ export function runWithWatchdog({
 
     // process-supervisor-allowlist: foreground wrapper signals the whole vitest
     // process group on death/timeout; not a background daemon.
-    const child = spawn(resolvedCommand.command, resolvedCommand.args, {
-      detached: true,
+    const child = spawn(launchCommand, launchArgs, {
+      // The native helper owns a Job Object; a detached console group adds no
+      // containment and can break inherited-handle startup for its child.
+      detached: !nativeWindowsJob,
       stdio: "inherit",
       env,
       ...(cwd ? { cwd } : {}),
@@ -231,6 +247,17 @@ export function runWithWatchdog({
     heartbeat.unref?.();
 
     function defaultSignalGroup(signal) {
+      // On Windows the PowerShell helper owns the Job handle. Terminating that
+      // wrapper closes its kill-on-close Job and reaps every descendant; a
+      // negative PID is not a Windows process-group contract.
+      if (nativeWindowsJob) {
+        try {
+          child.kill("SIGTERM");
+        } catch (error) {
+          if (!(error instanceof Error) || !('code' in error) || error.code !== "ESRCH") throw error;
+        }
+        return;
+      }
       try {
         process.kill(-child.pid, signal);
         return;
@@ -260,8 +287,11 @@ export function runWithWatchdog({
       forceKillTimer.unref?.();
     }
 
+    // The native helper owns this same deadline and returns only after its Job
+    // is empty. A second outer timer could kill that helper before it proves
+    // descendant cleanup.
     const watchdog =
-      Number.isFinite(budgetMs) && budgetMs > 0
+      !nativeWindowsJob && Number.isFinite(budgetMs) && budgetMs > 0
         ? setTimeout(() => {
             timedOut = true;
             diagnostics = captureHangDiagnostics({
@@ -322,7 +352,7 @@ export function runWithWatchdog({
       if (settled) return;
       settled = true;
       cleanup();
-      resolve({
+      finish({
         code: timedOut ? TIMEOUT_EXIT_CODE : code,
         signal: timedOut ? null : signal,
         timedOut,
