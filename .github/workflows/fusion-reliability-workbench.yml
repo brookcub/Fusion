@@ -5,10 +5,8 @@ on:
   push:
     branches: [codex/fusion-upstream-reliability]
     paths: [.github/workflows/fusion-reliability-workbench.yml]
-
 permissions:
   contents: read
-
 jobs:
   dependencies:
     runs-on: ubuntu-latest
@@ -19,18 +17,30 @@ jobs:
           ref: ef1069a295c91f671491c78ccb184e1926325458
           persist-credentials: false
       - uses: ./.github/actions/setup-node-pnpm
-      - name: Export Linux test dependencies without credentials or application state
+      - name: Export partitioned Linux test dependencies
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/fusion-test-workspace"
-          git show -s --format='%H %T %P' HEAD > "$RUNNER_TEMP/fusion-test-workspace/commit.txt"
           find . -name node_modules -type d -prune -print0 > "$RUNNER_TEMP/dependency-paths"
-          tar --null -T "$RUNNER_TEMP/dependency-paths" -czf "$RUNNER_TEMP/fusion-test-workspace/dependencies.tar.gz"
-          sha256sum "$RUNNER_TEMP/fusion-test-workspace/dependencies.tar.gz" > "$RUNNER_TEMP/fusion-test-workspace/SHA256SUMS"
+          tar --null -T "$RUNNER_TEMP/dependency-paths" -czf "$RUNNER_TEMP/dependencies.tar.gz"
+          split -b 250M -d "$RUNNER_TEMP/dependencies.tar.gz" "$RUNNER_TEMP/fusion-test-workspace/dependencies.part"
+          sha256sum "$RUNNER_TEMP/dependencies.tar.gz"
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: fusion-linux-test-dependencies
-          path: ${{ runner.temp }}/fusion-test-workspace
+          name: fusion-linux-dependencies-00
+          path: ${{ runner.temp }}/fusion-test-workspace/dependencies.part00
           retention-days: 1
           if-no-files-found: error
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: fusion-linux-dependencies-01
+          path: ${{ runner.temp }}/fusion-test-workspace/dependencies.part01
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: fusion-linux-dependencies-02
+          path: ${{ runner.temp }}/fusion-test-workspace/dependencies.part02
+          retention-days: 1
+          if-no-files-found: warn
