@@ -61,10 +61,11 @@ failures that genuinely require it.
 | Windows portability | LF/CRLF source-text assumptions still caused pilot test failure. Audit assertions, argv boundaries, worktree isolation and child ownership. |
 | Development latency | Release preparation took roughly 26 minutes in a prior run. Candidate adds incremental plugin builds and removes a duplicate dashboard build; end-to-end improvement is not measured yet. |
 
-The pilot's three committed task branches and their additional local changes
-remain local in this publication. They are not represented as completed or
-fully included in this audit snapshot. Do not infer their success from a commit
-message. The latest recorded pilot reached three in-flight cards, failed its
+Publication update: the ticket branches and substantive local follow-up edits
+are now included in the publication set described in
+[LOCAL-FIX-PUBLICATION.md](LOCAL-FIX-PUBLICATION.md). They remain separate from
+this audit branch and are not represented as completed or qualified. Do not
+infer their success from a commit message. The latest recorded pilot reached three in-flight cards, failed its
 acceptance check, and was paused afterward; it did not prove three verified
 merges. Current stopped state follows reboot, not a newly diagnosed crash.
 
