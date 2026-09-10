@@ -10,36 +10,14 @@ permissions:
   contents: read
 
 jobs:
-  integrate:
+  dependencies:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v7.0.1
         with:
-          fetch-depth: 200
+          ref: ef1069a295c91f671491c78ccb184e1926325458
           persist-credentials: false
-      - name: Merge pinned upstream with reviewed conflict resolutions
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name 'Fusion integration'
-          git config user.email 'noreply@openai.com'
-          git fetch --no-tags --depth=200 https://github.com/Runfusion/Fusion.git 1a0b95ba1ca6750a20d8d64cebcafbdf141cb4bb
-          git branch upstream-snapshot 1a0b95ba1ca6750a20d8d64cebcafbdf141cb4bb
-          git merge --no-commit --no-ff upstream-snapshot || test "$(git ls-files -u | wc -l)" -gt 0
-          python .github/fusion-integration-resolve.py
-          git commit -m 'Merge upstream through 1a0b95ba, consolidating recovery ownership and retaining Windows repairs'
-      - name: Publish only the isolated integration branch
-        shell: bash
-        env:
-          INTEGRATION_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          auth=$(printf 'x-access-token:%s' "$INTEGRATION_TOKEN" | base64 -w0)
-          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin HEAD:refs/heads/codex/fusion-upstream-reliability
-          unset auth INTEGRATION_TOKEN
       - uses: ./.github/actions/setup-node-pnpm
       - name: Export Linux test dependencies without credentials or application state
         shell: bash
