@@ -24,6 +24,7 @@ import {
   Search,
   Settings,
   Sparkles,
+  StickyNote,
   Target,
   Workflow,
   Zap,
@@ -54,7 +55,9 @@ interface SidebarNavEntry {
   icon: ComponentType<LucideProps>;
   testId: string;
   badge?: number;
+  badgeLabel?: string;
   dot?: "pending" | "online";
+  dotLabel?: string;
   onSelect: () => void;
 }
 
@@ -109,6 +112,8 @@ export interface LeftSidebarNavProps {
   onNewTask?: (workflowId?: string | null) => void;
   onOpenSettings?: () => void;
   mailboxUnreadCount?: number;
+  recommendationUnreadCount?: number;
+  artifactUnreadCount?: number;
   mailboxPendingApprovalCount?: number;
   chatHasUnreadResponse?: boolean;
   /*
@@ -127,6 +132,8 @@ export interface LeftSidebarNavProps {
   onSelectProject?: (project: ProjectInfo) => void;
   onViewAllProjects?: () => void;
   footerVisible?: boolean;
+  /** Removes general History navigation when Alpha relocates it to complete columns. */
+  alphaUpdatesEnabled?: boolean;
 }
 
 function formatCount(count: number): string {
@@ -163,6 +170,8 @@ export function LeftSidebarNav({
   onNewTask,
   onOpenSettings,
   mailboxUnreadCount = 0,
+  recommendationUnreadCount = 0,
+  artifactUnreadCount = 0,
   mailboxPendingApprovalCount = 0,
   chatHasUnreadResponse = false,
   planningNeedsInput = false,
@@ -171,6 +180,7 @@ export function LeftSidebarNav({
   showAgentsTab = false,
   showSkillsTab = false,
   footerVisible = false,
+  alphaUpdatesEnabled = false,
 }: LeftSidebarNavProps) {
   const { t } = useTranslation("app");
   const [sidebarWidth, setSidebarWidth] = useState(readStoredSidebarWidth);
@@ -283,7 +293,7 @@ export function LeftSidebarNav({
 
   /*
   FNXC:Navigation 2026-06-22-12:00:
-  Single explicit sidebar order (top to bottom): dashboard, board, list, History, graph, planning, missions, agents, chat, mailbox, goals, compound, automation, import, workflows, insight, research, ideation, documents (Artifacts), skills, memory, evals, then any remaining plugin views in their sorted order.
+  Single explicit sidebar order (top to bottom): dashboard, board, list, History, graph, planning, missions, agents, chat, mailbox, recommendations, skills, memory, Artifacts, goals, automation, import, workflows, insight, research, ideation, evals, then any remaining plugin views in their sorted order.
 
   Dev Server is intentionally absent: it moved to the right dock. Secrets and Todos remain omitted (they live in the right dock / mobile More-sheet / Header overflow).
 
@@ -322,15 +332,15 @@ export function LeftSidebarNav({
       testId: "sidebar-nav-list",
       onSelect: () => onChangeView("list"),
     },
-    {
+    ...(!alphaUpdatesEnabled ? [{
       id: "patchnode",
       label: t("nav.patchnode", getDashboardViewLabel("patchnode")),
-      view: "patchnode",
+      view: "patchnode" as TaskView,
       isActive: view === "patchnode",
       icon: History,
       testId: "sidebar-nav-patchnode",
       onSelect: () => onChangeView("patchnode"),
-    },
+    }] : []),
     ...(graphPluginEntry ? [mapPluginEntry(graphPluginEntry)] : []),
     /*
     FNXC:Navigation 2026-06-23-01:30:
@@ -390,9 +400,22 @@ export function LeftSidebarNav({
       dot: view !== "mailbox" && mailboxPendingApprovalCount > 0 ? "pending" : view !== "mailbox" && mailboxUnreadCount > 0 ? "online" : undefined,
       onSelect: () => onChangeView("mailbox"),
     },
+    {
+      id: "recommendations",
+      label: t("nav.recommendations", getDashboardViewLabel("recommendations")),
+      view: "recommendations",
+      isActive: view === "recommendations",
+      icon: Lightbulb,
+      testId: "sidebar-nav-recommendations",
+      badge: recommendationUnreadCount > 0 ? recommendationUnreadCount : undefined,
+      badgeLabel: t("nav.recommendationsUnreadAriaLabel", "{{count}} new recommendations", { count: recommendationUnreadCount }),
+      dot: view !== "recommendations" && recommendationUnreadCount > 0 ? "online" : undefined,
+      dotLabel: t("nav.recommendationsUnreadDotAriaLabel", "New recommendations"),
+      onSelect: () => onChangeView("recommendations"),
+    },
     /*
-    FNXC:Navigation 2026-06-22-00:50:
-    Skills and Memory sit directly after Mailbox (still flag-gated by showSkillsTab / memoryView).
+    FNXC:Navigation 2026-09-06-03:16:
+    Recommendations sits directly after Mailbox as its dedicated notice destination. Skills and Memory follow it with their existing feature gates.
     */
     ...(showSkillsTab
       ? [{ id: "skills", label: t("header.skillsView", getDashboardViewLabel("skills")), view: "skills" as TaskView, isActive: view === "skills", icon: Zap, testId: "sidebar-nav-skills", onSelect: () => onChangeView("skills") }]
@@ -411,7 +434,20 @@ export function LeftSidebarNav({
       isActive: view === "documents",
       icon: FileText,
       testId: "sidebar-nav-documents",
+      badge: artifactUnreadCount > 0 ? artifactUnreadCount : undefined,
+      badgeLabel: t("nav.artifactsUnreadAriaLabel", "{{count}} new artifacts", { count: artifactUnreadCount }),
+      dot: view !== "documents" && artifactUnreadCount > 0 ? "online" : undefined,
+      dotLabel: t("nav.artifactsUnreadDotAriaLabel", "New artifacts"),
       onSelect: () => onChangeView("documents"),
+    },
+    {
+      id: "notes",
+      label: t("nav.notes", getDashboardViewLabel("notes")),
+      view: "notes",
+      isActive: view === "notes",
+      icon: StickyNote,
+      testId: "sidebar-nav-notes",
+      onSelect: () => onChangeView("notes"),
     },
     ...(experimentalFeatures?.goalsView
       ? [{ id: "goals", label: t("header.goalsView", getDashboardViewLabel("goalsView")), view: "goalsView" as TaskView, isActive: view === "goalsView", icon: Target, testId: "sidebar-nav-goals", onSelect: () => onChangeView("goalsView") }]
@@ -483,10 +519,16 @@ export function LeftSidebarNav({
       >
         <span className="left-sidebar-nav__icon-wrap">
           <Icon size={16} />
-          {entry.dot ? <span className={`status-dot status-dot--${entry.dot} left-sidebar-nav__dot`} aria-hidden="true" /> : null}
+          {entry.dot ? (
+            <span
+              className={`status-dot status-dot--${entry.dot} left-sidebar-nav__dot`}
+              aria-hidden={entry.dotLabel ? undefined : "true"}
+              aria-label={entry.dotLabel}
+            />
+          ) : null}
         </span>
         <span className="left-sidebar-nav__label">{entry.label}</span>
-        {entry.badge ? <span className="btn-badge left-sidebar-nav__badge">{formatCount(entry.badge)}</span> : null}
+        {entry.badge ? <span className="btn-badge left-sidebar-nav__badge" aria-label={entry.badgeLabel}>{formatCount(entry.badge)}</span> : null}
       </button>
     );
   };

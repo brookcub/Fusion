@@ -4,6 +4,8 @@ import {
   type Task,
   type TaskDetail,
   type WorkflowStep,
+  ALPHA_UPDATES_FLAG,
+  isExperimentalFeatureEnabled,
 } from "@fusion/core";
 import { Header, useViewportMode } from "./components/Header";
 import { TaskDetailContent } from "./components/TaskDetailModal";
@@ -74,6 +76,7 @@ import { ShellProvider } from "./context/ShellContext";
 import { RetryWarningProvider } from "./context/RetryWarningContext";
 import { CostBadgeProvider } from "./context/CostBadgeContext";
 import { ChatMessageLayoutProvider } from "./context/ChatMessageLayoutContext";
+import { ChatSubmitOnEnterProvider } from "./context/ChatSubmitOnEnterContext";
 import { ShellHostProvider, useShellHostContext } from "./context/ShellHostContext";
 import { useShellConnection } from "./hooks/useShellConnection";
 import { useStashOrphanCount } from "./hooks/useStashOrphanCount";
@@ -139,6 +142,7 @@ export const TASK_DETAIL_FLOATING_GEOMETRY_KEY = "floating-window:task-detail";
 
 const AgentsView = lazy(() => import("./components/AgentsView").then((m) => ({ default: m.AgentsView })));
 const DocumentsView = lazy(() => import("./components/DocumentsView").then((m) => ({ default: m.DocumentsView })));
+const NotesView = lazy(() => import("./components/NotesView").then((m) => ({ default: m.NotesView })));
 const InsightsView = lazy(() => import("./components/InsightsView").then((m) => ({ default: m.InsightsView })));
 const ResearchView = lazy(() => import("./components/ResearchView").then((m) => ({ default: m.ResearchView })));
 const EvalsView = lazy(() => import("./components/EvalsView").then((m) => ({ default: m.EvalsView })));
@@ -183,6 +187,7 @@ function prefetchLazyViews() {
   idle(() => {
     void import("./components/AgentsView");
     void import("./components/DocumentsView");
+    void import("./components/NotesView");
     void import("./components/InsightsView");
     void import("./components/ResearchView");
     void import("./components/EvalsView");
@@ -599,20 +604,26 @@ function AppInner() {
   already follows. They keep the legacy fallback.
   */
   const { boardWorkflows: footerBoardWorkflows } = useBoardWorkflows({ projectId: currentProject?.id });
-  const resolveTaskColumnFlagsForActivity = useCallback((task: Task) => {
+  const resolveTaskWorkflowId = useCallback((task: Task) => {
     if (isRemote || !footerBoardWorkflows) return undefined;
-    const workflowId = footerBoardWorkflows.taskWorkflowIds[task.id] ?? footerBoardWorkflows.defaultWorkflowId;
+    return footerBoardWorkflows.taskWorkflowIds[task.id] ?? footerBoardWorkflows.defaultWorkflowId;
+  }, [footerBoardWorkflows, isRemote]);
+
+  const resolveTaskColumnFlagsForActivity = useCallback((task: Task) => {
+    if (!footerBoardWorkflows) return undefined;
+    const workflowId = resolveTaskWorkflowId(task);
     return footerBoardWorkflows.workflows
       .find((workflow) => workflow.id === workflowId)
       ?.columns.find((column) => column.id === task.column)?.flags;
-  }, [footerBoardWorkflows, isRemote]);
+  }, [footerBoardWorkflows, resolveTaskWorkflowId]);
 
-  const { tasks, isStale, createTask, moveTask, pauseTask, unpauseTask, deleteTask, mergeTask, retryTask, bypassReview, resetTask, updateTask, duplicateTask, archiveTask, unarchiveTask, revertTask, archiveAllDone, loadArchivedTasks, loadMoreArchivedTasks, changeArchivedSortMode, archivedSortMode, archivedHasMore, archivedLoadingMore, ingestCreatedTasks, lastFetchTimeMs } = useTasks(
+  const { tasks, isStale, createTask, moveTask, pauseTask, unpauseTask, deleteTask, mergeTask, retryTask, bypassReview, resetTask, updateTask, duplicateTask, revertTask, loadMoreCurrentTasks, retryCurrentTasksPagination, currentTasksTotal, currentTasksHasMore, currentTasksLoadingMore, currentTasksPaginationError, currentTasksProgressKey, loadMoreCompletedTasks, retryCompletedTasksPagination, completedSortMode, changeCompletedSortMode, completedCounts, completedHasMore, completedLoadingMore, completedPaginationError, completedProgressKey, ingestCreatedTasks, lastFetchTimeMs } = useTasks(
     {
       ...(currentProject ? { projectId: currentProject.id } : {}),
       searchQuery: searchQuery || undefined,
       sseEnabled: taskSseEnabled,
       resolveColumnFlags: resolveTaskColumnFlagsForActivity,
+      resolveWorkflowId: resolveTaskWorkflowId,
     }
   );
   const footerTasks = isRemote && remoteData.tasks.length > 0 ? remoteData.tasks : tasks;
@@ -852,7 +863,14 @@ function AppInner() {
   useMobileViewportRestoreReset(isMobile);
 
   // App-level mailbox/chat unread state (used for header/mobile nav badges)
-  const { mailboxUnreadCount, mailboxPendingApprovalCount, setMailboxUnreadCount } = useMailboxUnread(currentProject?.id);
+  const {
+    mailboxUnreadCount,
+    recommendationUnreadCount,
+    artifactUnreadCount,
+    mailboxPendingApprovalCount,
+    setMailboxUnreadCount,
+    markCategorySeen: onMarkCategorySeen,
+  } = useMailboxUnread(currentProject?.id);
   const { chatHasUnreadResponse } = useChatUnreadBadge(currentProject?.id, { taskView, quickChatOpen });
   const { stashOrphanCount } = useStashOrphanCount(currentProject?.id);
   const [showGitHubStarPrompt, setShowGitHubStarPrompt] = useState(false);
@@ -962,6 +980,7 @@ function AppInner() {
     dashboardKeyboardShortcuts,
     dismissModalsOnOutsideClick,
     quickAddSubmitOnEnter,
+    chatSubmitOnEnter,
     skipConfirmationDialogs,
     maxTotalRetriesBeforeFail,
     prAuthAvailable,
@@ -983,6 +1002,7 @@ function AppInner() {
     togglePlanAutoApprove,
     refresh: refreshAppSettings,
   } = useAppSettings(currentProject?.id);
+  const [alphaMenuOpenRequest, setAlphaMenuOpenRequest] = useState(0);
 
   const taskPopupsVisibleOnCurrentView = useCallback((originTaskView?: TaskView) => isTaskPopupVisibleForView({
     taskPopupsBoardListOnly,
@@ -1037,6 +1057,8 @@ function AppInner() {
   const researchEnabled = experimentalFeatures.researchView === true;
   const evalsEnabled = experimentalFeatures.evalsView === true;
   const ideationEnabled = experimentalFeatures.ideationView === true;
+  /* FNXC:AlphaUpdates 2026-09-09-18:24: Resolve the global Alpha boundary once per settings refresh so every shell surface switches together without mutating saved mobile navigation preferences. */
+  const alphaUpdatesEnabled = isExperimentalFeatureEnabled({ experimentalFeatures }, ALPHA_UPDATES_FLAG);
   /*
   FNXC:Navigation 2026-06-19-00:00:
   Experimental left sidebar navigation replaces the Header view shortcuts with a persistent sidebar on non-mobile project screens, while mobile continues to use the bottom navigation bar as the only primary navigation surface.
@@ -1675,7 +1697,7 @@ function AppInner() {
 
   // Props for the extracted <MainContent> switch (see components/dashboard/MainContent.tsx).
   // Every value is passed by its App name; the switch renders the same subtrees as before.
-  const rightDock = useRightDockController({ active: rightDockActive, projectId: currentProject?.id, addToast, columnFlagsByTaskId: footerColumnFlagsByTaskId, settingsLoaded, researchReadinessVersion, goalAnchorId, tasks: isRemote && remoteData.tasks.length > 0 ? remoteData.tasks : tasks, workflowSteps, subscribePluginEvents, openDetailTask, openTaskPopup: popOutTaskDetailForCurrentView, onOpenSessionInNewWindow: openSessionInNewWindow, openMobileTasksInPopup, openFileInBrowser, onUpdateTask: updateTask, onDeleteTask: deleteTask, onArchiveTask: archiveTask, onRevertTask: revertTask, onMergeTask: mergeTask, onRetryTask: retryTask, onOpenChatWithPrefill: openChatWithPrefill, onPauseTask: pauseTask, onUnpauseTask: unpauseTask, onBypassReview: bypassReview, onResetTask: resetTask, onDuplicateTask: duplicateTask, onTaskUpdated: (task: Task) => ingestCreatedTasks([task]), openSettings: (section?: string) => openSettingsWithNav(section as SectionId), onOpenUsage: openUsageWithNav, onOpenActivityLog: openActivityLogWithNav, onOpenGitHubImport: openGitHubImportWithNav, onOpenGitManager: openGitManagerWithNav, onOpenSchedules: openSchedulesWithNav, onSendSelectionToTask: modalManager.openNewTaskWithDescription, onCreateTaskFromInsight: handleInsightTaskCreate, onNavigateToMission: handleOpenMission, onTaskCreated: (task: Task) => ingestCreatedTasks([task]), prAuthAvailable, autoMerge, taskDetailChatFirst, visibilityOptions: { experimentalFeatures: { insights: insightsEnabled, memoryView: memoryEnabled, devServerView: devServerEnabled, researchView: researchEnabled, evalsView: evalsEnabled, goalsView: goalsEnabled }, showSkillsTab: skillsEnabled, pluginDashboardViews }, footerVisible: executorFooterVisible });
+  const rightDock = useRightDockController({ active: rightDockActive, projectId: currentProject?.id, addToast, columnFlagsByTaskId: footerColumnFlagsByTaskId, settingsLoaded, researchReadinessVersion, goalAnchorId, tasks: isRemote && remoteData.tasks.length > 0 ? remoteData.tasks : tasks, workflowSteps, subscribePluginEvents, openDetailTask, openTaskPopup: popOutTaskDetailForCurrentView, onOpenSessionInNewWindow: openSessionInNewWindow, openMobileTasksInPopup, openFileInBrowser, onUpdateTask: updateTask, onDeleteTask: deleteTask, onRevertTask: revertTask, onMergeTask: mergeTask, onRetryTask: retryTask, onOpenChatWithPrefill: openChatWithPrefill, onPauseTask: pauseTask, onUnpauseTask: unpauseTask, onBypassReview: bypassReview, onResetTask: resetTask, onDuplicateTask: duplicateTask, onTaskUpdated: (task: Task) => ingestCreatedTasks([task]), openSettings: (section?: string) => openSettingsWithNav(section as SectionId), onOpenUsage: openUsageWithNav, onOpenActivityLog: openActivityLogWithNav, onOpenGitHubImport: openGitHubImportWithNav, onOpenGitManager: openGitManagerWithNav, onOpenSchedules: openSchedulesWithNav, onSendSelectionToTask: modalManager.openNewTaskWithDescription, onCreateTaskFromInsight: handleInsightTaskCreate, onNavigateToMission: handleOpenMission, onTaskCreated: (task: Task) => ingestCreatedTasks([task]), prAuthAvailable, autoMerge, taskDetailChatFirst, visibilityOptions: { experimentalFeatures: { insights: insightsEnabled, memoryView: memoryEnabled, devServerView: devServerEnabled, researchView: researchEnabled, evalsView: evalsEnabled, goalsView: goalsEnabled }, showSkillsTab: skillsEnabled, pluginDashboardViews }, footerVisible: executorFooterVisible });
 
   /*
   FNXC:OpenTasksInRightSidebar 2026-06-28-00:00:
@@ -1808,6 +1830,9 @@ function AppInner() {
     onSendAsReport: handleSendChatMessageAsReport,
     onOpenChatWithPrefill: openChatWithPrefill,
     setMailboxUnreadCount,
+    recommendationUnreadCount,
+    artifactUnreadCount,
+    onMarkCategorySeen,
     setMissionTargetId,
     setMissionResumeSessionId,
     setMilestoneSliceResumeSessionId,
@@ -1856,17 +1881,24 @@ function AppInner() {
     globalPaused,
     updateTask,
     retryTask,
-    archiveTask,
-    unarchiveTask,
     revertTask,
     deleteTask,
-    archiveAllDone,
-    loadArchivedTasks,
-    loadMoreArchivedTasks,
-    changeArchivedSortMode,
-    archivedSortMode,
-    archivedHasMore,
-    archivedLoadingMore,
+    loadMoreCurrentTasks,
+    currentTasksTotal,
+    currentTasksHasMore,
+    currentTasksLoadingMore,
+    currentTasksPaginationError,
+    currentTasksProgressKey,
+    retryCurrentTasksPagination,
+    loadMoreCompletedTasks,
+    completedCounts,
+    completedHasMore,
+    completedLoadingMore,
+    completedPaginationError,
+    completedProgressKey,
+    retryCompletedTasksPagination,
+    completedSortMode,
+    changeCompletedSortMode,
     searchQuery,
     availableModels,
     favoriteProviders,
@@ -1898,6 +1930,7 @@ function AppInner() {
     CommandCenter,
     DevServerView,
     DocumentsView,
+    NotesView,
     EvalsView,
     GoalsView,
     PatchnodeView,
@@ -1972,6 +2005,7 @@ function AppInner() {
   return (
     <ConfirmDialogProvider skipConfirmations={skipConfirmationDialogs}>
       <ChatMessageLayoutProvider value={chatMessageLayout}>
+      <ChatSubmitOnEnterProvider value={chatSubmitOnEnter}>
       <ModalDismissPreferenceProvider enabled={dismissModalsOnOutsideClick}>
         <QuickAddSubmitOnEnterProvider enabled={quickAddSubmitOnEnter}>
       <NavigationHistoryProvider value={{ pushNav, replaceCurrent, removeNav }}>
@@ -1994,6 +2028,8 @@ function AppInner() {
         onOpenActivityLog={openActivityLogWithNav}
         onOpenMailbox={() => handleTaskViewChange("mailbox")}
         mailboxUnreadCount={mailboxUnreadCount}
+        recommendationUnreadCount={recommendationUnreadCount}
+        artifactUnreadCount={artifactUnreadCount}
         mailboxPendingApprovalCount={mailboxPendingApprovalCount}
         chatHasUnreadResponse={chatHasUnreadResponse}
         stashOrphanCount={stashOrphanCount}
@@ -2021,6 +2057,8 @@ function AppInner() {
         onViewAllProjects={handleViewAllProjects}
         projectId={currentProject?.id}
         mobileNavEnabled={isMobile}
+        alphaUpdatesEnabled={alphaUpdatesEnabled}
+        onOpenAlphaMenu={() => setAlphaMenuOpenRequest((request) => request + 1)}
         leftSidebarNavActive={sidebarActive}
         rightDockAvailable={rightDockActive}
         rightDockOpen={rightDock.open}
@@ -2067,7 +2105,9 @@ function AppInner() {
             onChangeView={handleTaskViewChange}
             onNewTask={openNewTaskWithNav}
             onOpenSettings={openSettingsWithNav}
-                mailboxUnreadCount={mailboxUnreadCount}
+            mailboxUnreadCount={mailboxUnreadCount}
+            recommendationUnreadCount={recommendationUnreadCount}
+            artifactUnreadCount={artifactUnreadCount}
             mailboxPendingApprovalCount={mailboxPendingApprovalCount}
             chatHasUnreadResponse={chatHasUnreadResponse}
             planningNeedsInput={planningNeedsInput}
@@ -2088,6 +2128,7 @@ function AppInner() {
             onSelectProject={handleSelectProject}
             onViewAllProjects={handleViewAllProjects}
             footerVisible={executorFooterVisible}
+            alphaUpdatesEnabled={alphaUpdatesEnabled}
           />
         )}
         <div
@@ -2165,10 +2206,14 @@ function AppInner() {
         modalOpen={modalManager.anyModalOpen}
         keyboardOpen={mobileNavKeyboardOpen}
         mobileNavPrimaryItems={mobileNavPrimaryItems}
+        alphaUpdatesEnabled={alphaUpdatesEnabled}
+        alphaMenuOpenRequest={alphaMenuOpenRequest}
         onOpenSettings={openSettingsWithNav}
         onOpenActivityLog={openActivityLogWithNav}
         onOpenMailbox={() => handleTaskViewChange("mailbox")}
         mailboxUnreadCount={mailboxUnreadCount}
+        recommendationUnreadCount={recommendationUnreadCount}
+        artifactUnreadCount={artifactUnreadCount}
         mailboxPendingApprovalCount={mailboxPendingApprovalCount}
         chatHasUnreadResponse={chatHasUnreadResponse}
         stashOrphanCount={stashOrphanCount}
@@ -2386,7 +2431,7 @@ function AppInner() {
         onRefinementCreated={(task) => ingestCreatedTasks([task])}
         onPlanningMode={openPlanningWithInitialPlanWithNav}
         onOpenChatWithPrefill={openChatWithPrefill}
-        taskOperations={{ moveTask, deleteTask, mergeTask, archiveTask, revertTask, retryTask, pauseTask, unpauseTask, bypassReview, resetTask, duplicateTask }}
+        taskOperations={{ moveTask, deleteTask, mergeTask, revertTask, retryTask, pauseTask, unpauseTask, bypassReview, resetTask, duplicateTask }}
         deepLink={{ handleDetailClose }}
         settings={{ prAuthAvailable, autoMerge, openTasksInRightSidebar, openMobileTasksInPopup, taskPopupsBoardListOnly, showCostBadgeOnCards, taskDetailChatFirst, chatMessageLayout, themeMode, colorTheme, dashboardFontScalePct, shadcnCustomColors, resolvedThemeMode, setThemeMode, setColorTheme, setDashboardFontScalePct, setShadcnCustomColors, setQuickChatButtonModeImmediate, setChatMessageLayoutImmediate, setOpenTasksInRightSidebarImmediate, setOpenMobileTasksInPopupImmediate, setTaskPopupsBoardListOnlyImmediate, setShowCostBadgeOnCardsImmediate, setTaskDetailChatFirstImmediate, setMobileNavPrimaryItemsImmediate }}
         onSettingsClose={handleSettingsCloseWithNav}
@@ -2419,6 +2464,7 @@ function AppInner() {
       </NavigationHistoryProvider>
         </QuickAddSubmitOnEnterProvider>
       </ModalDismissPreferenceProvider>
+      </ChatSubmitOnEnterProvider>
       </ChatMessageLayoutProvider>
     </ConfirmDialogProvider>
   );

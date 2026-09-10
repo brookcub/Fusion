@@ -417,8 +417,8 @@ export function buildMarkStuckAbortedDeps(host: any): any {
     ]),
     ...facadeMethods(host, [
       "resolveResumeLanes", "getWorktreePath", "terminateAllChildren",
-      "awaitAbortInFlightTaskWork", "clearPausedAborted", "resetStepsIfWorkLost",
-      "hasActiveWorktreeBinding", "getRunContextFor",
+      "prepareAbortInFlightTaskWork", "clearPausedAborted", "resetStepsIfWorkLost",
+      "hasActiveWorktreeBinding",
     ]),
     ensureWorkspaceConfig: withWorkspaceResolver(host),
     reexecuteTaskInPlace: async (taskId: string) => {
@@ -1524,14 +1524,6 @@ export function buildDisposeStoreLifecycleDisposersDeps(host: any): any {
     clearTaskMoveDisposer: () => {
       host.unregisterTaskMoveDisposer?.();
       host.unregisterTaskMoveDisposer = undefined;
-    },
-    clearArchiveWorktreeDisposer: () => {
-      host.unregisterArchiveWorktreeDisposer?.();
-      host.unregisterArchiveWorktreeDisposer = undefined;
-    },
-    clearArchiveWorkspaceWorktreeDisposer: () => {
-      host.unregisterArchiveWorkspaceWorktreeDisposer?.();
-      host.unregisterArchiveWorkspaceWorktreeDisposer = undefined;
     },
   };
 }

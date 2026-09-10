@@ -1165,7 +1165,7 @@ describe("aiMergeTask — conditional worktree cleanup", () => {
   });
 
   it("does NOT remove worktree when another task references the same path", async () => {
-    const worktreePath = "/tmp/root";
+    const worktreePath = "/tmp/root/.worktrees/fn-050";
     const store = createMockStore(
       { id: "FN-050", worktree: worktreePath },
       [
@@ -1185,7 +1185,7 @@ describe("aiMergeTask — conditional worktree cleanup", () => {
   });
 
   it("removes worktree when no other task references it", async () => {
-    const worktreePath = "/tmp/root";
+    const worktreePath = "/tmp/root/.worktrees/fn-050";
     const store = createMockStore(
       { id: "FN-050", worktree: worktreePath },
       [
@@ -1203,7 +1203,7 @@ describe("aiMergeTask — conditional worktree cleanup", () => {
   });
 
   it("clears task.worktree/branch after the worktree is removed", async () => {
-    const worktreePath = "/tmp/root";
+    const worktreePath = "/tmp/root/.worktrees/fn-050";
     const store = createMockStore(
       { id: "FN-050", worktree: worktreePath },
       [
@@ -1226,7 +1226,7 @@ describe("aiMergeTask — conditional worktree cleanup", () => {
   });
 
   it("always deletes the branch regardless of worktree sharing", async () => {
-    const worktreePath = "/tmp/root";
+    const worktreePath = "/tmp/root/.worktrees/fn-050";
     const store = createMockStore(
       { id: "FN-050", worktree: worktreePath },
       [
@@ -1246,7 +1246,7 @@ describe("aiMergeTask — conditional worktree cleanup", () => {
   });
 
   it("result.worktreeRemoved is false when worktree is retained", async () => {
-    const worktreePath = "/tmp/root";
+    const worktreePath = "/tmp/root/.worktrees/fn-050";
     const store = createMockStore(
       { id: "FN-050", worktree: worktreePath },
       [
@@ -1823,7 +1823,7 @@ describe("aiMergeTask — empty squash merge (branch already merged via dep)", (
       return Buffer.from("");
     });
 
-    const store = createMockStore();
+    const store = createMockStore({ worktree: "/tmp/root/.worktrees/fn-050" });
     const result = await aiMergeTask(store, "/tmp/root", "FN-050");
 
     // Branch should be deleted

@@ -1,7 +1,9 @@
 import { readFileSync } from "fs";
 import { resolve } from "path";
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { Header } from "../Header";
 import { MobileNavBar } from "../MobileNavBar";
 import { MOBILE_NAV_SELECTABLE_ITEMS } from "../../../../core/src/board/mobile-nav-primary-items";
 import { MOBILE_MEDIA_QUERY } from "../../hooks/useViewportMode";
@@ -9,6 +11,9 @@ import { readAppFile } from "../../test/cssFixture";
 
 vi.mock("../../api", () => ({
   fetchScripts: vi.fn(),
+  normalizeScriptCatalog: (value: Record<string, string> | Array<{ name: string; command: string; description?: string }>) => Array.isArray(value)
+    ? value
+    : Object.entries(value).map(([name, command]) => ({ name, command })),
 }));
 
 import { fetchScripts } from "../../api";
@@ -40,6 +45,26 @@ function extractRuleBlock(css: string, selector: string): string {
 
 function getRenderedMobileTabs(container: HTMLElement): HTMLElement[] {
   return Array.from(container.querySelectorAll<HTMLElement>(".mobile-nav-bar > .mobile-nav-tab"));
+}
+
+function AlphaMobileShellHarness() {
+  const [menuToggleRequest, setMenuToggleRequest] = useState(0);
+  return (
+    <>
+      <Header
+        view="board"
+        mobileNavEnabled
+        alphaUpdatesEnabled
+        onOpenAlphaMenu={() => setMenuToggleRequest((request) => request + 1)}
+        onOpenUsage={() => undefined}
+      />
+      <MobileNavBar
+        {...createDefaultProps()}
+        alphaUpdatesEnabled
+        alphaMenuOpenRequest={menuToggleRequest}
+      />
+    </>
+  );
 }
 
 function expectUniformMobileNavColumns(container: HTMLElement, expectedTabCount: number) {
@@ -111,6 +136,8 @@ const createDefaultProps = () => ({
   onOpenActivityLog: vi.fn(),
   onOpenMailbox: vi.fn(),
   mailboxUnreadCount: 0,
+  recommendationUnreadCount: 0,
+  artifactUnreadCount: 0,
   mailboxPendingApprovalCount: 0,
   onOpenGitManager: vi.fn(),
   onOpenWorkflowEditor: vi.fn(),
@@ -137,6 +164,54 @@ describe("MobileNavBar", () => {
     vi.useRealTimers();
   });
 
+  it("renders the fixed icon-only Alpha pill and opens its complementary menu from the header request", () => {
+    const { container, rerender } = render(
+      <MobileNavBar
+        {...createDefaultProps()}
+        alphaUpdatesEnabled
+        alphaMenuOpenRequest={0}
+        mobileNavPrimaryItems={["patchnode", "tasks", "tasks"]}
+      />,
+    );
+
+    expect(getRenderedMobileTabs(container).map((tab) => tab.dataset.testid)).toEqual([
+      "mobile-nav-tab-command-center",
+      "mobile-nav-tab-tasks",
+      "mobile-nav-tab-planning",
+      "mobile-nav-tab-chat",
+      "mobile-nav-tab-mailbox",
+    ]);
+    expect(container.querySelectorAll(".mobile-nav-tab-label")).toHaveLength(0);
+    expect(screen.queryByTestId("mobile-nav-tab-list")).toBeNull();
+    expect(screen.queryByTestId("mobile-nav-tab-more")).toBeNull();
+
+    rerender(
+      <MobileNavBar
+        {...createDefaultProps()}
+        alphaUpdatesEnabled
+        alphaMenuOpenRequest={1}
+        mobileNavPrimaryItems={["patchnode", "tasks", "tasks"]}
+      />,
+    );
+    expect(screen.getByTestId("mobile-more-item-list")).toHaveTextContent("List");
+    expect(screen.queryByTestId("mobile-more-item-patchnode")).toBeNull();
+    expect(screen.queryByTestId("mobile-more-item-tasks")).toBeNull();
+    expect(screen.getAllByTestId("mobile-more-item-agents")).toHaveLength(1);
+  });
+
+  it("toggles the shared Alpha menu through two successive header hamburger clicks", () => {
+    render(<AlphaMobileShellHarness />);
+
+    const hamburger = screen.getByTestId("alpha-mobile-menu-trigger");
+    fireEvent.click(hamburger);
+    expect(screen.getByTestId("mobile-more-item-list")).toBeInTheDocument();
+    expect(screen.getByTestId("mobile-more-item-usage")).toBeInTheDocument();
+    expect(screen.queryByTestId("mobile-header-usage-btn")).toBeNull();
+
+    fireEvent.click(hamburger);
+    expect(screen.queryByTestId("mobile-more-item-list")).toBeNull();
+  });
+
   it("renders eight top-level tab buttons including dedicated List and keeps skills in More when showSkillsTab is true", () => {
     render(<MobileNavBar {...createDefaultProps()} showSkillsTab={true} />);
 
@@ -153,6 +228,31 @@ describe("MobileNavBar", () => {
 
     fireEvent.click(screen.getByTestId("mobile-nav-tab-more"));
     expect(screen.getByTestId("mobile-more-item-skills")).toBeDefined();
+  });
+
+  it("shows recommendation and artifact badges in primary tabs and the More sheet", () => {
+    const primary = render(
+      <MobileNavBar
+        {...createDefaultProps()}
+        recommendationUnreadCount={7}
+        artifactUnreadCount={120}
+        mobileNavPrimaryItems={["recommendations", "documents"]}
+      />,
+    );
+    expect(screen.getByTestId("mobile-nav-tab-recommendations").querySelector(".mobile-nav-tab-badge")).toHaveTextContent("7");
+    expect(screen.getByTestId("mobile-nav-tab-documents").querySelector(".mobile-nav-tab-badge")).toHaveTextContent("99+");
+    primary.unmount();
+
+    render(
+      <MobileNavBar
+        {...createDefaultProps()}
+        recommendationUnreadCount={7}
+        artifactUnreadCount={120}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("mobile-nav-tab-more"));
+    expect(screen.getByTestId("mobile-more-item-recommendations").querySelector(".mobile-more-item-badge")).toHaveTextContent("7");
+    expect(screen.getByTestId("mobile-more-item-documents").querySelector(".mobile-more-item-badge")).toHaveTextContent("99+");
   });
 
   it("promotes Planning and routes demoted Missions to More without an empty tab", () => {
@@ -1217,6 +1317,21 @@ describe("MobileNavBar", () => {
         expect(screen.getByTestId("mobile-more-script-item-build")).toBeDefined();
         expect(screen.getByTestId("mobile-more-script-item-test")).toBeDefined();
       });
+    });
+
+    it("shows descriptions with command fallback and runs spaced Unicode names exactly", async () => {
+      vi.mocked(fetchScripts).mockResolvedValue([
+        { name: "Build production", command: "pnpm build", description: "Production bundle" },
+        { name: "Déployer 🚀", command: "pnpm deploy" },
+      ]);
+      const props = createDefaultProps();
+      render(<MobileNavBar {...props} />);
+      fireEvent.click(screen.getByTestId("mobile-nav-tab-more"));
+      fireEvent.click(screen.getByTestId("mobile-more-terminal-split-toggle"));
+      expect(await screen.findByText("Production bundle")).toBeInTheDocument();
+      expect(screen.getByText("pnpm deploy")).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("mobile-more-script-item-Build production"));
+      expect(props.onRunScript).toHaveBeenCalledWith("Build production", "pnpm build");
     });
 
     it("clicking a script item calls onRunScript and closes sheet", async () => {
