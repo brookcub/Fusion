@@ -1,0 +1,40 @@
+name: Fusion reliability workbench
+
+# Temporary integration workbench; removed from the final PR tree.
+on:
+  push:
+    branches: [codex/fusion-upstream-reliability]
+    paths: [.github/workflows/fusion-reliability-workbench.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  source-snapshots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: 851bb61c4ef26940675565cf84488481cfff1f94
+          fetch-depth: 200
+          persist-credentials: false
+      - name: Export pinned public source trees (no runtime or credentials)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=200 https://github.com/Runfusion/Fusion.git 1a0b95ba1ca6750a20d8d64cebcafbdf141cb4bb
+          mkdir -p "$RUNNER_TEMP/fusion-snapshots"
+          git archive --format=tar 12d270bae76b1d306db51aee3a23de6108ae6fb6 | gzip > "$RUNNER_TEMP/fusion-snapshots/base.tar.gz"
+          git archive --format=tar 851bb61c4ef26940675565cf84488481cfff1f94 | gzip > "$RUNNER_TEMP/fusion-snapshots/candidate.tar.gz"
+          git archive --format=tar 1a0b95ba1ca6750a20d8d64cebcafbdf141cb4bb | gzip > "$RUNNER_TEMP/fusion-snapshots/upstream.tar.gz"
+          for ref in 12d270bae76b1d306db51aee3a23de6108ae6fb6 851bb61c4ef26940675565cf84488481cfff1f94 1a0b95ba1ca6750a20d8d64cebcafbdf141cb4bb; do
+            git show -s --format='%H %T %P' "$ref"
+          done > "$RUNNER_TEMP/fusion-snapshots/commits.txt"
+          sha256sum "$RUNNER_TEMP/fusion-snapshots/"*.tar.gz > "$RUNNER_TEMP/fusion-snapshots/SHA256SUMS"
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: fusion-pinned-source-snapshots
+          path: ${{ runner.temp }}/fusion-snapshots
+          retention-days: 1
+          if-no-files-found: error
