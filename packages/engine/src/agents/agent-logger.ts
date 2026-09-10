@@ -18,6 +18,8 @@ export interface AgentLoggerUsageContext {
   nodeId?: string | null;
   /** The agent id producing the activity, when known. */
   agentId?: string | null;
+  /** FNXC:MergeReviewRouting 2026-09-09-23:56: Bounded merger sub-role retained in tool telemetry when present. */
+  role?: "merge-mutation" | "merge-review";
 }
 
 /** Default byte threshold before an automatic flush. */
@@ -382,7 +384,8 @@ export class AgentLogger {
         provider: ctx.provider ?? null,
         toolName,
         category: categorizeToolName(toolName),
-        ...(meta !== undefined && { meta }),
+        // FNXC:MergeReviewRouting 2026-09-09-23:56: Merger sub-roles identify the authoritative lane that issued tool telemetry. Merge caller metadata is supplementary and must not be able to relabel that lane.
+        ...((meta !== undefined || ctx.role !== undefined) && { meta: { ...(meta ?? {}), ...(ctx.role ? { role: ctx.role } : {}) } }),
       });
       // Swallow async rejections too so a Promise-returning store stays fail-soft.
       void Promise.resolve(maybePromise).catch((err) => {
