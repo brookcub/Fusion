@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 
 import type { Settings } from "@fusion/core";
-import { mergeEffectiveSettings } from "../project/effective-settings.js";
+import { mergeEffectiveSettings, mergeEffectiveSettingsStrict } from "../project/effective-settings.js";
 
 const PROJECT = "proj-1";
 
@@ -124,5 +124,75 @@ describe("mergeEffectiveSettings (engine entry merge, U3/KTD-3)", () => {
     // selection/project throw; the merge stays behavior-inert for the base values.
     expect(merged.workflowStepTimeoutMs).toBe(900_000);
     expect(merged.executionProvider).toBe("project-anthropic");
+  });
+
+  it("keeps the ordinary merge fail-soft but refuses a merge-review fallback after a value-read failure", async () => {
+    const store = makeStore({ workflowId: "builtin:coding" });
+    store.getWorkflowSettingValues = vi.fn(() => {
+      throw new Error("postgres://reviewer:secret@db.example/workflow_settings");
+    });
+    const base = { ...baseSettings(), executionProvider: "global-spark", executionModelId: "spark" } as unknown as Settings;
+
+    expect((await mergeEffectiveSettings(store as any, { id: "t1" }, base)).executionProvider).toBe("global-spark");
+    await expect(mergeEffectiveSettingsStrict(store as any, { id: "t1" }, base))
+      .rejects.toThrow("workflow setting values");
+    await mergeEffectiveSettingsStrict(store as any, { id: "t1" }, base).catch((error: Error) => {
+      expect(error.message).not.toContain("postgres://reviewer:secret");
+      expect(error.name).toBe("WorkflowSettingsAuthorityReadError");
+    });
+  });
+
+  it.each([
+    ["task selection", () => {
+      const store = makeStore({ workflowId: "builtin:coding" });
+      store.getTaskWorkflowSelection = vi.fn(() => { throw new Error("selection backend unavailable"); });
+      return store;
+    }],
+    ["project identity", () => {
+      const store = makeStore({ workflowId: "builtin:coding" });
+      store.getWorkflowSettingsProjectId = vi.fn(() => "");
+      return store;
+    }],
+    ["workflow definition", () => {
+      const store = makeStore({ workflowId: "wf-review" });
+      store.getWorkflowDefinition = vi.fn(async () => { throw new Error("definition backend unavailable"); });
+      return store;
+    }],
+    ["workflow definition", () => makeStore({ workflowId: "wf-missing" })],
+    ["workflow setting values", () => {
+      const store = makeStore({ workflowId: "builtin:coding" });
+      store.getWorkflowSettingValues = vi.fn(() => { throw new Error("values backend unavailable"); });
+      return store;
+    }],
+    ["workflow setting values", () => {
+      const store = makeStore({ workflowId: "builtin:coding" });
+      store.getWorkflowSettingValues = vi.fn(() => Promise.reject(new Error("values backend unavailable")) as any);
+      return store;
+    }],
+    ["default workflow", () => {
+      const store = makeStore({ workflowId: "builtin:coding" });
+      (store as any).getDefaultWorkflowId = vi.fn(async () => { throw new Error("default backend unavailable"); });
+      return store;
+    }],
+    ["workflow prompt overrides", () => {
+      const store = makeStore({ workflowId: "builtin:coding" });
+      (store as any).getWorkflowPromptOverrides = vi.fn(() => { throw new Error("prompt override backend unavailable"); });
+      return store;
+    }],
+  ])("strict merge refuses fallback after %s read failure", async (stage, makeFailingStore) => {
+    await expect(mergeEffectiveSettingsStrict(
+      makeFailingStore() as any,
+      { id: "t1" },
+      baseSettings(),
+    )).rejects.toThrow(stage);
+  });
+
+  it("strict merge accepts a genuinely absent selection as the built-in default", async () => {
+    const merged = await mergeEffectiveSettingsStrict(
+      makeStore({}) as any,
+      { id: "selectionless" },
+      baseSettings(),
+    );
+    expect(merged.workflowStepTimeoutMs).toBe(900_000);
   });
 });

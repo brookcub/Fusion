@@ -666,6 +666,23 @@ async function reconcileAiMergeReviewPolicy(store: TaskStore, taskId: string): P
   return false;
 }
 
+/** FNXC:MergeReviewRouting 2026-09-09-23:56: Bind the just-resolved session route before any reviewer can dispatch. */
+async function assertReviewSessionPolicyReceipt(
+  store: TaskStore,
+  taskId: string,
+  task: Task,
+  reviewerPolicySha256: string,
+): Promise<void> {
+  const state = task.aiMergeReviewReconciliation;
+  if (!state || state.reviewerPolicySha256 === reviewerPolicySha256) return;
+  const refreshed = { ...state, reviewerPolicySha256, consecutiveCleanApprovals: 0 };
+  await store.updateTaskAtomic(taskId, (live) => {
+    if (JSON.stringify(live.aiMergeReviewReconciliation) !== JSON.stringify(state)) return undefined;
+    return { aiMergeReviewReconciliation: refreshed };
+  });
+  throw new AiMergeReviewPolicyChangedError();
+}
+
 function makeReviewAgent(store: TaskStore, settings: Settings, taskId: string, options: MergerOptions, audit: RunAuditor) {
   return async (cwd: string, prompt: string): Promise<string> => {
     // The reviewer uses the project's validator/reviewer model lane (the same
@@ -675,6 +692,7 @@ function makeReviewAgent(store: TaskStore, settings: Settings, taskId: string, o
     if (!task) throw new Error("Merge reviewer task authority unavailable");
     // FNXC:MergeReviewerModel 2026-09-06-05:12: Task-scoped reviewer model, credential and thinking choices must reach merge review just as they reach ordinary code review; project defaults are fallbacks, not overrides.
     const route = await resolveMergeReviewSelection(store, task);
+    await assertReviewSessionPolicyReceipt(store, taskId, task, route.reviewerPolicySha256);
     let captured = "";
     const logger = new AgentLogger({
       store,
