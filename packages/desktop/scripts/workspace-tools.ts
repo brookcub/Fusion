@@ -118,10 +118,16 @@ export async function buildDashboardRuntimePlugins(): Promise<void> {
   await Promise.all(DASHBOARD_RUNTIME_PLUGIN_PACKAGES.map((relativePath) => buildPackage(relativePath)));
 }
 
-export async function buildDashboard(): Promise<void> {
+export async function buildDashboard({ includeClient = true }: { includeClient?: boolean } = {}): Promise<void> {
   const dashboardRoot = resolve(workspaceRoot, "packages", "dashboard");
   await buildDashboardRuntimePlugins();
-  await runWorkspaceBin("vite", ["build"], dashboardRoot);
+  /*
+   * FNXC:DesktopBuild 2026-09-09-23:56:
+   * Desktop immediately builds its own clean file:// client. Do not first
+   * compile an ordinary client that that step will delete. Standalone callers
+   * retain the complete web build by default; server/plugin freshness is unchanged.
+   */
+  if (includeClient) await runWorkspaceBin("vite", ["build"], dashboardRoot);
   await runWorkspaceBin("tsc", [], dashboardRoot);
   // FNXC:DesktopBuild 2026-07-01-11:45:
   // Desktop release and test paths call this helper directly instead of the dashboard package script, so copy the Node-read registry manifest beside server dist here as the shared build invariant.

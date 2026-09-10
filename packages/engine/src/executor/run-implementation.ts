@@ -159,6 +159,7 @@ import { StepSessionExecutor } from "../execution/step-session-executor.js";
 import { isResearchToolSurfaceEnabled } from "../execution/tool-availability.js";
 import { summarizeVerificationOutput } from "../execution/verification-utils.js";
 import { resolveVerificationProjectId } from "../concurrency/verification-concurrency.js";
+import { recoveryIsHeld } from "./recovery-pause-guard.js";
 import { buildAgentPersona } from "./agent-binding-pure.js";
 import { releaseExternalExecutionActiveWorktree } from "./active-worktrees.js";
 import { evaluateImplicitCompletionRefusal } from "./completion-predicates.js";
@@ -169,7 +170,6 @@ import {
 import { buildExecutionPrompt } from "./execution-prompt.js";
 import { resolveReboundColumnFor, resolveTerminalColumnsFor } from "./lifecycle-columns.js";
 import { recoverAbortedStepSessionInPlace } from "./recover-aborted-step-session.js";
-import { recoveryIsHeld } from "./recovery-pause-guard.js";
 import { detectPendingReviewBlock } from "./pending-review-block.js";
 import { detectPseudoPause } from "./pseudo-pause.js";
 import { isInvalidAssistantContinuationErrorMessage } from "./requeue-loop.js";
@@ -441,9 +441,10 @@ export async function runImplementation(
     // TaskExecutor instances in the same process (e.g., engine restart race,
     // multi-project hybrid runtime, etc.). This is `executingTaskLock` in
     // active-session-registry.ts, a module-level Set.
-    const claimed = executingTaskLock.tryClaim(task.id);
+    const executionLease = executingTaskLock.claim(task.id);
+    const claimed = executionLease !== null;
     executorLog.debug(`execute() called for ${task.id} (claimed=${claimed}, perInstanceExecuting=${deps.executing.has(task.id)})`);
-    if (!claimed) {
+    if (!executionLease) {
       // FNXC:GlobalConcurrencyControls 2026-07-15-02:55: graph fallback may have re-registered a pre-held slot; drop it when this process cannot claim the executor lock.
       if (dropPreHeldExecutorSlot(task.id)) deps.options.semaphore?.release();
       return;
@@ -458,7 +459,7 @@ export async function runImplementation(
     if (task.deletedAt) {
       executorLog.warn(`${task.id}: refusing execute — task is soft-deleted`);
       deps.executing.delete(task.id);
-      executingTaskLock.release(task.id);
+      executingTaskLock.release(task.id, executionLease);
       if (dropPreHeldExecutorSlot(task.id)) deps.options.semaphore?.release();
       return;
     }
@@ -466,7 +467,7 @@ export async function runImplementation(
     if (await deps.maybeDispatchWorkflowWorkEngine(task)) {
       executorLog.log(`${task.id}: workflow work engine claimed execution`);
       deps.executing.delete(task.id);
-      executingTaskLock.release(task.id);
+      executingTaskLock.release(task.id, executionLease);
       // FNXC:GlobalConcurrencyControls 2026-07-15-02:55: work-engine ownership never take()s the legacy handoff registration — release the reserved global slot.
       if (dropPreHeldExecutorSlot(task.id)) deps.options.semaphore?.release();
       return;
@@ -485,7 +486,7 @@ export async function runImplementation(
       executorLog.debug(`${task.id}: skipping execute — agent ${deferralPrincipalId} has active heartbeat run (allowParallelExecution=false)`);
       // Release the slot we just claimed — we never actually ran.
       deps.executing.delete(task.id);
-      executingTaskLock.release(task.id);
+      executingTaskLock.release(task.id, executionLease);
       // FNXC:GlobalConcurrencyControls 2026-07-15-02:55: heartbeat defer must free any re-registered pre-held global slot so capacity is not stranded until the next dispatch.
       if (dropPreHeldExecutorSlot(task.id)) deps.options.semaphore?.release();
       return;
@@ -512,7 +513,7 @@ export async function runImplementation(
       const message = `Persisted external execution checkout is invalid: ${externalExecutionRoute.reason ?? "unknown error"}`;
       await deps.store.logEntry(task.id, message, undefined, deps.getRunContextFor(task.id));
       deps.executing.delete(task.id);
-      executingTaskLock.release(task.id);
+      executingTaskLock.release(task.id, executionLease);
       if (dropPreHeldExecutorSlot(task.id)) deps.options.semaphore?.release();
       throw new Error(message);
     }
@@ -637,7 +638,7 @@ export async function runImplementation(
     if (task.column === preflightWipLane && task.mergeDetails?.mergeConfirmed === true) {
       if (await deps.finalizeMergeConfirmedWorkflowGraphTask(task.id, "execute-preflight")) {
         deps.executing.delete(task.id);
-        executingTaskLock.release(task.id);
+        executingTaskLock.release(task.id, executionLease);
         if (dropPreHeldExecutorSlot(task.id)) deps.options.semaphore?.release();
         return;
       }
@@ -676,7 +677,7 @@ export async function runImplementation(
     // the finally block so deps.executing is cleared first (prevents re-dispatch race).
     // true = requeue to todo, false = budget exhausted (already marked failed).
     let stuckRequeue: boolean | null = null;
-    let pendingSingleSessionResume = false;
+    let pendingInPlaceResume = false;
     const implementationAbortSignal = deps.activeWorkflowGraphAbortControllers.get(task.id)?.signal;
     let staleAssistantContinuationRequeue = false;
     let taskDone = false;
@@ -695,7 +696,7 @@ export async function runImplementation(
       is the answer main settled on in `branch-group-ops.ts` (#2720) and it is reused here rather than
       re-derived.
 
-      MEMBERSHIP and unioned with the legacy trio, because a workflow may declare more than one complete or
+      MEMBERSHIP and unioned with the legacy review/completion pair, because a workflow may declare more than one Complete or
       review lane and `resolveWorkflowIrForTask` yields the BUILT-IN IR for a missing workflow rather than
       throwing — without the union a degraded renamed board treats a finished blocker as unmet and the
       dependent never runs.
@@ -708,15 +709,15 @@ export async function runImplementation(
       const satisfiedByDep = new Map<string, ReadonlySet<string>>();
       for (const depId of task.dependencies) {
         if (satisfiedByDep.has(depId)) continue;
-        const satisfied = new Set<string>(["done", "in-review", "archived"]);
+        const satisfied = new Set<string>(["done", "in-review"]);
         try {
           const depIr = await resolveWorkflowIrForTask(deps.store, depId, depIrCache);
           if (depIr) {
-            for (const flag of ["complete", "archived", "mergeOrchestration", "mergeBlocker", "humanReview"] as const) {
+            for (const flag of ["complete", "mergeOrchestration", "mergeBlocker", "humanReview"] as const) {
               for (const id of columnsWithFlag(depIr, flag)) satisfied.add(id);
             }
           }
-        } catch { /* degraded: the legacy trio */ }
+        } catch { /* degraded: the legacy pair */ }
         satisfiedByDep.set(depId, satisfied);
       }
       const unmetDeps = task.dependencies.filter((depId) => {
@@ -1351,80 +1352,91 @@ export async function runImplementation(
           taskEnv,
           // FNXC:StepLifecycle 2026-07-22-09:53: Await the dependency-aware store projection before session allocation so a rejected out-of-order start cannot execute while its persisted step remains pending.
           onStepStart: async (stepIndex) => {
-            try {
-              const startResult = await deps.store.startStep(
-                task.id,
-                stepIndex,
-                stepProjectionOptions,
-              );
-              if (!startResult.accepted) {
-                executorLog.warn(
-                  `${task.id}: step ${stepIndex} start was rejected (${startResult.disposition}); persisted status is ` +
-                  `${startResult.task.steps?.[stepIndex]?.status ?? "missing"}`,
+            /*
+            FNXC:StuckSessionOwnership 2026-09-07-18:08:
+            Step-session callbacks can outlive terminateAllSessions. Their ownership check and every
+            awaited writer therefore occupy one FIFO turn; forced invalidation either waits for the
+            complete projection or wins first and prevents the callback from writing anything.
+            */
+            const projection = await executingTaskLock.runIfOwner(executionLease, async () => {
+              try {
+                const startResult = await deps.store.startStep(
+                  task.id,
+                  stepIndex,
+                  stepProjectionOptions,
                 );
+                if (!startResult.accepted) {
+                  executorLog.warn(
+                    `${task.id}: step ${stepIndex} start was rejected (${startResult.disposition}); persisted status is ` +
+                    `${startResult.task.steps?.[stepIndex]?.status ?? "missing"}`,
+                  );
+                  return false;
+                }
+                deps.options.stuckTaskDetector?.recordProgress(task.id);
+              } catch (err) {
+                executorLog.warn(`${task.id}: failed to update step ${stepIndex} status to in-progress: ${err}`);
                 return false;
               }
-              deps.options.stuckTaskDetector?.recordProgress(task.id);
-            } catch (err) {
-              executorLog.warn(`${task.id}: failed to update step ${stepIndex} status to in-progress: ${err}`);
-              return false;
-            }
+            });
+            return projection.executed ? projection.value : false;
           },
           onStepComplete: async (stepIndex, result) => {
-            /*
-            FNXC:StepCompletionOrdering 2026-08-29-06:46:
-            A fire-and-forget updateStep was the only production writer able to resolve after
-            `Task marked done by agent`: StepSessionExecutor returned while this callback's promise
-            remained outstanding. Completion writers already mark all non-terminal steps before their
-            marker, and fresh/resumed executor markers precede in-session writes; awaiting this
-            projection preserves that durable ordering.
-            */
-            // FNXC:EngineDiagnostics 2026-07-26-10:05: per-step success is expected bookkeeping (incl. foreach instances); failures stay at log.
-            if (result.success) {
-              executorLog.debug(`${task.id}: step ${stepIndex} succeeded (${result.retries} retries)`);
-            } else {
-              executorLog.log(`${task.id}: step ${stepIndex} failed (${result.retries} retries)`);
-            }
-            try {
-              await deps.store.updateStep(task.id, stepIndex, result.success ? "done" : "skipped", stepProjectionOptions);
-              const safeReason = result.success ? undefined : sanitizeFailureReason(result.error);
-              if (!result.success) {
-                void emitProactiveStatus(
-                  deps.store,
-                  task.id,
-                  buildStepFailureMessage(stepIndex, detail.steps[stepIndex]?.name, safeReason!),
-                  "executor",
-                  safeReason,
-                );
+            await executingTaskLock.runIfOwner(executionLease, async () => {
+              /*
+              FNXC:StepCompletionOrdering 2026-08-29-06:46:
+              A fire-and-forget updateStep was the only production writer able to resolve after
+              `Task marked done by agent`: StepSessionExecutor returned while this callback's promise
+              remained outstanding. Completion writers already mark all non-terminal steps before their
+              marker, and fresh/resumed executor markers precede in-session writes; awaiting this
+              projection preserves that durable ordering.
+              */
+              // FNXC:EngineDiagnostics 2026-07-26-10:05: per-step success is expected bookkeeping (incl. foreach instances); failures stay at log.
+              if (result.success) {
+                executorLog.debug(`${task.id}: step ${stepIndex} succeeded (${result.retries} retries)`);
+              } else {
+                executorLog.log(`${task.id}: step ${stepIndex} failed (${result.retries} retries)`);
               }
-            } catch (err) {
-              executorLog.warn(`${task.id}: failed to update step ${stepIndex} status: ${err}`);
-            }
+              try {
+                await deps.store.updateStep(task.id, stepIndex, result.success ? "done" : "skipped", stepProjectionOptions);
+                const safeReason = result.success ? undefined : sanitizeFailureReason(result.error);
+                if (!result.success) {
+                  await emitProactiveStatus(
+                    deps.store,
+                    task.id,
+                    buildStepFailureMessage(stepIndex, detail.steps[stepIndex]?.name, safeReason!),
+                    "executor",
+                    safeReason,
+                  );
+                }
+              } catch (err) {
+                executorLog.warn(`${task.id}: failed to update step ${stepIndex} status: ${err}`);
+              }
 
-            if (!result.tokenUsage) {
-              return;
-            }
+              if (!result.tokenUsage) {
+                return;
+              }
 
-            const previousStepTokenUsage = accumulatedStepTokenUsage;
-            accumulatedStepTokenUsage = accumulateTokenUsageImpl(accumulatedStepTokenUsage, result.tokenUsage);
-            if (accumulatedStepTokenUsage) {
-              // FNXC:TokenAnalytics 2026-06-19-15:55: Step-scoped token writes now carry the producing session model so workflow-step sessions contribute their exact deltas to per-model analytics instead of relying on the last central session snapshot.
-              accumulatedStepTokenUsage = tokenUsageWithModelSnapshotImpl(accumulatedStepTokenUsage, undefined, previousStepTokenUsage, result.tokenUsage, accumulatedStepTokenUsage.lastUsedAt, { provider: result.tokenUsage.modelProvider, id: result.tokenUsage.modelId });
-            }
-            tokenUsageRecordedSteps.add(stepIndex);
-            if (!accumulatedStepTokenUsage) {
-              return;
-            }
+              const previousStepTokenUsage = accumulatedStepTokenUsage;
+              accumulatedStepTokenUsage = accumulateTokenUsageImpl(accumulatedStepTokenUsage, result.tokenUsage);
+              if (accumulatedStepTokenUsage) {
+                // FNXC:TokenAnalytics 2026-06-19-15:55: Step-scoped token writes now carry the producing session model so workflow-step sessions contribute their exact deltas to per-model analytics instead of relying on the last central session snapshot.
+                accumulatedStepTokenUsage = tokenUsageWithModelSnapshotImpl(accumulatedStepTokenUsage, undefined, previousStepTokenUsage, result.tokenUsage, accumulatedStepTokenUsage.lastUsedAt, { provider: result.tokenUsage.modelProvider, id: result.tokenUsage.modelId });
+              }
+              tokenUsageRecordedSteps.add(stepIndex);
+              if (!accumulatedStepTokenUsage) {
+                return;
+              }
 
-            deps.persistTaskTokenUsage(task.id, accumulatedStepTokenUsage).catch((err: unknown) => {
-              executorLog.warn(`${task.id}: failed to persist token usage on step ${stepIndex} complete: ${err}`);
+              try {
+                await deps.persistTaskTokenUsage(task.id, accumulatedStepTokenUsage);
+              } catch (err: unknown) {
+                executorLog.warn(`${task.id}: failed to persist token usage on step ${stepIndex} complete: ${err}`);
+              }
             });
           },
         });
         stepExecutorRef.current = stepExecutor;
         deps.setActiveStepExecutor(task.id, stepExecutor, worktreePath, createSeenSteeringIds(detail));
-
-        let pendingInPlaceResume = false;
 
         const stepWork = async () => {
           const results = await stepExecutor.executeAll();
@@ -1854,44 +1866,24 @@ export async function runImplementation(
             deps.options.onError?.(task, err instanceof Error ? err : new Error(errorMessage));
           }
         } finally {
-          deps.executing.delete(task.id);
-          executingTaskLock.release(task.id);
-          deps.loopRecoveryState.delete(task.id);
-          // Wrap cleanup in try/catch so activeStepExecutors.delete() always runs.
-          // If cleanup() throws, the executor continues to clean up the in-memory map
-          // and requeue logic without leaking the reference.
-          try {
-            await stepExecutor.cleanup();
-          } catch (cleanupErr) {
-            executorLog.warn(`StepSessionExecutor cleanup failed for ${task.id}: ${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`);
-          }
-          deps.deleteActiveStepExecutor(task.id);
-
           /*
-          FNXC:StuckSessionRecovery 2026-08-28-07:48:
-          A dead step session is disposed, then the same task is re-dispatched without changing its
-          column, workflow node, current step, worktree, branch, or completed-step progress.
-
-          FNXC:LifecycleContainment 2026-09-04-03:27:
-          Global and engine pauses defer all WIP re-dispatch to the unpause owner, including when
-          stuck-session recovery wins over an aborted-session recovery in this finally block.
+          FNXC:StuckSessionOwnership 2026-09-07-17:15:
+          StepSessionExecutor cleanup removes deterministic parallel worktrees and their registry
+          bindings, so it is task-keyed destructive cleanup rather than local object disposal. Keep
+          its complete asynchronous settlement in the attempt FIFO: an invalidated attempt skips it,
+          while forced invalidation waits for cleanup that already entered before publishing a successor.
           */
-          if (stuckRequeue === true) {
-            const latestTask = await deps.store.getTask(task.id);
-            const settings = await deps.store.getSettings();
-            if (!latestTask.paused && !latestTask.userPaused && !settings.globalPause && !settings.enginePaused) {
-              await deps.store.updateTask(task.id, { status: null, error: null });
-              await deps.store.logEntry(task.id, "Stuck step session disposed — resuming the same node and step in place");
-              await deps.reexecuteTaskInPlace(task.id);
+          const stepCleanupResult = await executingTaskLock.runIfOwner(executionLease, async () => {
+            try {
+              await stepExecutor.cleanup();
+            } catch (cleanupErr) {
+              executorLog.warn(`StepSessionExecutor cleanup failed for ${task.id}: ${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`);
             }
-            stuckRequeue = null;
-          } else if (pendingInPlaceResume) {
-            const latestTask = await deps.store.getTask(task.id);
-            const settings = await deps.store.getSettings();
-            if (!latestTask.paused && !latestTask.userPaused && !settings.globalPause && !settings.enginePaused) {
-              await deps.reexecuteTaskInPlace(task.id);
-            }
-            pendingInPlaceResume = false;
+            deps.loopRecoveryState.delete(task.id);
+            deps.deleteActiveStepExecutor(task.id);
+          });
+          if (!stepCleanupResult.executed) {
+            executorLog.log(`${task.id}: ignored stale step-session cleanup after forced resume`);
           }
         }
         // Step-session path handled completely — return before outer catch/finally
@@ -2558,6 +2550,14 @@ export async function runImplementation(
             await promptWithFallback(session, agentPrompt);
           }
 
+          /*
+          FNXC:StuckSessionOwnership 2026-09-07-17:45:
+          A forced replacement can settle an old prompt while invalidation is pending or after a successor
+          is active. The complete post-prompt continuation therefore runs as one owner-fenced asynchronous
+          section: ownership validation, token/log persistence, recovery decisions, and completion writers
+          remain indivisible with respect to invalidation. The callback does not reacquire this FIFO.
+          */
+          const continuationResult = await executingTaskLock.runIfOwner(executionLease, async () => {
           // Re-raise errors that pi-coding-agent swallowed after exhausting retries.
           // session.prompt() resolves normally even when retries are exhausted —
           // the error is stored on session.state.error instead of being thrown.
@@ -2630,7 +2630,8 @@ export async function runImplementation(
             return;
           }
 
-          // Keep paused work in its current lane and checkout. This fires when session.dispose() causes the
+          // If paused during execution, move to todo so the scheduler can resume
+          // after unpause. This path fires when session.dispose() causes the
           // prompt to resolve gracefully instead of throwing.
           if (deps.pausedAborted.has(task.id)) {
             if (deps.userCanceledTaskIds.has(task.id)) {
@@ -2670,10 +2671,14 @@ export async function runImplementation(
               await deps.persistTokenUsage(task.id);
               return;
             } else {
-              await deps.store.logEntry(task.id, "Execution paused — checkout and progress preserved in place");
-              pendingSingleSessionResume = (await recoverAbortedStepSessionInPlace(
-                deps, task.id, "graceful-pause-abort",
-              )) === "resumed-in-place";
+              /*
+              FNXC:LifecycleContainment 2026-09-07-17:45:
+              Engine pause, timeout, and cleanup aborts can make session.prompt resolve normally instead
+              of rejecting. That graceful shape has the same in-place contract as the exception shape:
+              preserve WIP, progress, and checkout state rather than rebounding automatically to Hold.
+              */
+              executorLog.log(`${task.id} paused (graceful session exit) — preserving the current lifecycle role for in-place resume`);
+              await deps.store.logEntry(task.id, "Execution interrupted — session state preserved for in-place resume");
             }
             return;
           }
@@ -3107,23 +3112,17 @@ export async function runImplementation(
               deps.options.onError?.(task, new Error(errorMessage));
             }
           }
+          });
+          if (!continuationResult.executed) {
+            executorLog.log(`${task.id}: ignored stale agent-session continuation after forced resume`);
+          }
         } finally {
           clearInterval(verificationRequestTimer);
           if (leaseRenewalTimer) {
             clearInterval(leaseRenewalTimer);
           }
-          deps.deleteActiveSession(task.id);
-          stuckDetector?.untrackTask(task.id);
           await agentLogger.flush();
-          await deps.persistTokenUsage(task.id, session).catch((err: unknown) => {
-            const msg = err instanceof Error ? err.message : String(err);
-            executorLog.warn(`${task.id}: failed to persist final single-session token usage before dispose: ${msg}`);
-          });
-          deps.tokenUsageBaselines.delete(task.id);
-          resetSessionTokenBaseline(session);
-          session.dispose();
-          // Terminate all spawned child agents when parent session ends
-          await deps.terminateAllChildren(task.id);
+
           /*
            * Clear session file when task completes or fails (not when paused —
            * the file is preserved so unpause can resume the conversation).
@@ -3135,13 +3134,33 @@ export async function runImplementation(
            * card back here for remediation in the same worktree, and that round should continue the
            * conversation instead of re-deriving the change from scratch. See the flag's declaration for
            * why this is scoped to the handoff exits rather than to every non-terminal exit.
+           *
+           * FNXC:StuckSessionOwnership 2026-09-07-16:46:
+           * Active-session deletion, task-keyed detector/baseline cleanup, child termination, and final
+           * persistence are one owner-fenced async section. A stale session still disposes its local
+           * object below, but cannot mutate or remove state installed by the resumed attempt.
            */
-          if (!wasPaused && !handedOffForReview && !deps.pausedAborted.has(task.id)) {
-            deps.store.updateTask(task.id, { sessionFile: null }).catch((err: unknown) => {
+          const sessionCleanupResult = await executingTaskLock.runIfOwner(executionLease, async () => {
+            deps.deleteActiveSession(task.id);
+            stuckDetector?.untrackTask(task.id);
+            await deps.persistTokenUsage(task.id, session).catch((err: unknown) => {
               const msg = err instanceof Error ? err.message : String(err);
-              executorLog.warn(`${task.id} failed to clear sessionFile: ${msg}`);
+              executorLog.warn(`${task.id}: failed to persist final single-session token usage before dispose: ${msg}`);
             });
+            deps.tokenUsageBaselines.delete(task.id);
+            await deps.terminateAllChildren(task.id);
+            if (!wasPaused && !handedOffForReview && !deps.pausedAborted.has(task.id)) {
+              await deps.store.updateTask(task.id, { sessionFile: null }).catch((err: unknown) => {
+                const msg = err instanceof Error ? err.message : String(err);
+                executorLog.warn(`${task.id} failed to clear sessionFile: ${msg}`);
+              });
+            }
+          });
+          if (!sessionCleanupResult.executed) {
+            executorLog.log(`${task.id}: ignored stale agent-session cleanup after forced resume`);
           }
+          resetSessionTokenBaseline(session);
+          session.dispose();
           // Invoke plugin onAgentRunEnd hook (fire-and-forget)
           void deps.options.pluginRunner?.invokeHookSafe("onAgentRunEnd", task.id);
         }
@@ -3207,13 +3226,9 @@ export async function runImplementation(
       if (agentDispatchedRotation) agentRotationEvent?.recordOutcome("rotation-succeeded");
     } catch (err: unknown) {
       const { message: errorMessage, detail: errorDetail, stack: errorStack } = formatError(err);
-      // FNXC:RecoveryPause 2026-09-09-05:12: A late abort may outlive both runtime markers; durable pause wins over transient-error cleanup.
-      if (await recoveryIsHeld(deps.store, task.id)) {
-        executorLog.debug(`${task.id}: late implementation failure held in place by authoritative control`);
-        return;
-      }
+      if (!executingTaskLock.owns(executionLease) || await recoveryIsHeld(deps.store, task.id)) return;
       if (implementationAbortSignal?.aborted) {
-        pendingSingleSessionResume = (await recoverAbortedStepSessionInPlace(
+        pendingInPlaceResume = (await recoverAbortedStepSessionInPlace(
           deps, task.id, "pause-abort",
         )) === "resumed-in-place";
         return;
@@ -3328,6 +3343,7 @@ export async function runImplementation(
         // Task finished successfully (just already moved), so call onComplete
         deps.signalTaskComplete(task);
       } else if (deps.pausedAborted.has(task.id)) {
+        const pausedCleanupResult = await executingTaskLock.runIfOwner(executionLease, async () => {
         // Task was paused mid-execution — clean up worktree and move to todo
         if (deps.userCanceledTaskIds.has(task.id)) {
           deps.clearPausedAborted(task.id);
@@ -3379,11 +3395,23 @@ export async function runImplementation(
           await deps.persistTokenUsage(task.id);
           return;
         } else {
-          // Pause is not disposal authority: dirty bytes, binding, branch, and lane survive.
-          await deps.store.logEntry(task.id, "Execution paused — checkout and progress preserved in place");
-          pendingSingleSessionResume = (await recoverAbortedStepSessionInPlace(
-            deps, task.id, "pause-abort",
-          )) === "resumed-in-place";
+          /*
+          FNXC:LifecycleContainment 2026-09-07-16:46:
+          Engine pause, timeout, and cleanup aborts repair execution in the current lifecycle role.
+          The operator hard-cancel branch above observes the user-owned move that already occurred;
+          this engine-owned branch must not remove the checkout or rebound WIP to Hold.
+          */
+          executorLog.log(`${task.id} paused — preserving the current lifecycle role for in-place resume`);
+          await deps.store.logEntry(
+            task.id,
+            "Execution interrupted — session state preserved for in-place resume",
+            undefined,
+            deps.getRunContextFor(task.id),
+          );
+        }
+        });
+        if (!pausedCleanupResult.executed) {
+          executorLog.log(`${task.id}: ignored stale paused-session unwind after forced resume`);
         }
       } else if (deps.stuckAborted.has(task.id)) {
         // Task was killed by stuck task detector — defer requeue to finally block
@@ -3903,6 +3931,7 @@ export async function runImplementation(
         deps.options.onError?.(task, err instanceof Error ? err : new Error(errorMessage));
       }
     } finally {
+      const unwindCleanupResult = await executingTaskLock.runIfOwner(executionLease, async () => {
       /*
       FNXC:ExternalExecutionCheckout 2026-08-10-03:13:
       External checkouts remain operator-owned and are never removed by Fusion, but every run exit must clear their in-memory active-worktree ownership before any awaited teardown or executor-lock release. This prevents teardown errors from retaining a phantom holder and prevents an old run from deleting a successor run's binding.
@@ -3955,7 +3984,6 @@ export async function runImplementation(
       if (dropPreHeldExecutorSlot(task.id)) deps.options.semaphore?.release();
 
       deps.executing.delete(task.id);
-      executingTaskLock.release(task.id);
       // Clear run context at end of execute() lifecycle
       deps.currentRunContexts.delete(task.id);
       // U5 (R6) leak guard: effectiveColumnAgentByTask is set() in the outer execute()
@@ -3989,6 +4017,11 @@ export async function runImplementation(
           deps.branchConflictErrorCount.delete(task.id);
         }
       }
+      executingTaskLock.release(task.id, executionLease);
+      });
+      if (!unwindCleanupResult.executed) {
+        executorLog.log(`${task.id}: ignored stale implementation unwind after forced resume`);
+      } else {
 
       // Requeue stale assistant-continuation sessions AFTER deps.executing is cleared.
       // Moving the task while the execution guard is still held can cause the scheduler's
@@ -4001,8 +4034,8 @@ export async function runImplementation(
         FNXC:ExecutorSessionRecovery 2026-07-14-06:34:
         Release the stale run's activeWorktrees slot before releasing the executor lock. Once the lock is open, the fresh retry may install its own slot while moveTask dispatches; deleting afterward would erase the new run's capacity and liveness tracking.
         */
-        const cleanupClaimed = executingTaskLock.tryClaim(task.id);
-        if (!cleanupClaimed) {
+        const cleanupLease = executingTaskLock.claim(task.id);
+        if (!cleanupLease) {
           executorLog.debug(`${task.id} stale assistant-continuation requeue skipped — a fresh executor already claimed the task`);
         } else {
           let cleanupLockHeld = true;
@@ -4019,7 +4052,7 @@ export async function runImplementation(
               if (latestTask.column !== continuationReboundColumn) {
                 deps.markGraphExecuteSelfRequeued(task.id);
                 deps.activeWorktrees.delete(task.id);
-                executingTaskLock.release(task.id);
+                executingTaskLock.release(task.id, cleanupLease);
                 cleanupLockHeld = false;
                 await deps.store.moveTask(task.id, continuationReboundColumn, { preserveResumeState: true });
               } else {
@@ -4034,7 +4067,7 @@ export async function runImplementation(
             executorLog.error(`Failed to requeue stale assistant-continuation task ${task.id}: ${errorMessage}`);
           } finally {
             if (cleanupLockHeld) {
-              executingTaskLock.release(task.id);
+              executingTaskLock.release(task.id, cleanupLease);
             }
           }
         }
@@ -4052,12 +4085,23 @@ export async function runImplementation(
           deps.userCanceledTaskIds.delete(task.id);
           await deps.store.logEntry(task.id, "Execution canceled by user — leaving task under manual control");
         } else {
-          const latestTask = await deps.store.getTask(task.id);
-          if (!latestTask.paused && !latestTask.userPaused) {
+          const [latestTask, latestSettings] = await Promise.all([
+            deps.store.getTask(task.id),
+            deps.store.getSettings(),
+          ]);
+          if (!latestTask.paused && !latestTask.userPaused && !latestSettings.globalPause && !latestSettings.enginePaused) {
             await deps.store.updateTask(task.id, { status: null, error: null });
             await deps.store.logEntry(task.id, "Stuck agent session disposed — resuming the same node and step in place");
             await deps.reexecuteTaskInPlace(task.id);
           }
+        }
+      } else if (pendingInPlaceResume) {
+        const [latestTask, latestSettings] = await Promise.all([
+          deps.store.getTask(task.id),
+          deps.store.getSettings(),
+        ]);
+        if (!latestTask.paused && !latestTask.userPaused && !latestSettings.globalPause && !latestSettings.enginePaused) {
+          await deps.reexecuteTaskInPlace(task.id);
         }
       }
 
@@ -4069,13 +4113,7 @@ export async function runImplementation(
        * path above has run, then bootstrap one new executor session. A Set plus
        * resumingUnpaused makes duplicate task updates idempotent.
        */
-      if (pendingSingleSessionResume) {
-        const latestTask = await deps.store.getTask(task.id);
-        const settings = await deps.store.getSettings();
-        if (!latestTask.paused && !latestTask.userPaused && !settings.globalPause && !settings.enginePaused) {
-          await deps.reexecuteTaskInPlace(task.id);
-        }
-      }
       await deps.resumeApprovalAfterUnwindIfNeeded(task.id);
+      }
     }
 }

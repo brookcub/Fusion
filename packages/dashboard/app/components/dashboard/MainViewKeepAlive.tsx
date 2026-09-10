@@ -39,6 +39,7 @@ function renderBoardSubtree(props: MainContentProps, active: boolean) {
     handleDismissCapacityRisk,
     filteredBoardTasks,
     currentProject,
+    isRemote,
     maxConcurrent,
     maxWorktrees,
     showWorktreeGrouping,
@@ -64,18 +65,25 @@ function renderBoardSubtree(props: MainContentProps, active: boolean) {
     resetTask,
     duplicateTask,
     mergeTask,
-    archiveTask,
-    unarchiveTask,
     revertTask,
     modalManager,
     deleteTask,
-    archiveAllDone,
-    loadArchivedTasks,
-    loadMoreArchivedTasks,
-    archivedSortMode,
-    changeArchivedSortMode,
-    archivedHasMore,
-    archivedLoadingMore,
+    loadMoreCurrentTasks,
+    currentTasksTotal,
+    currentTasksHasMore,
+    currentTasksLoadingMore,
+    currentTasksPaginationError,
+    currentTasksProgressKey,
+    retryCurrentTasksPagination,
+    loadMoreCompletedTasks,
+    completedCounts,
+    completedHasMore,
+    completedLoadingMore,
+    completedPaginationError,
+    completedProgressKey,
+    retryCompletedTasksPagination,
+    completedSortMode,
+    changeCompletedSortMode,
     searchQuery,
     availableModels,
     handleOpenDetailWithTab,
@@ -91,6 +99,8 @@ function renderBoardSubtree(props: MainContentProps, active: boolean) {
     openCreateWorkflowWithNav,
     sidebarActive,
     isMobile,
+    experimentalFeatures,
+    handleChangeTaskView,
   } = props;
 
   return (
@@ -126,18 +136,25 @@ function renderBoardSubtree(props: MainContentProps, active: boolean) {
         onResetTask={resetTask}
         onDuplicateTask={duplicateTask}
         onMergeTask={mergeTask}
-        onArchiveTask={archiveTask}
-        onUnarchiveTask={unarchiveTask}
         onRevertTask={revertTask}
         onReviseTask={(task) => modalManager.openNewTaskWithDescription(task.description)}
         onDeleteTask={deleteTask}
-        onArchiveAllDone={archiveAllDone}
-        onLoadArchivedTasks={loadArchivedTasks}
-        onLoadMoreArchivedTasks={loadMoreArchivedTasks}
-        archivedSortMode={archivedSortMode}
-        onArchivedSortModeChange={changeArchivedSortMode}
-        archivedHasMore={archivedHasMore}
-        archivedLoadingMore={archivedLoadingMore}
+        onLoadMoreCurrentTasks={isRemote ? undefined : loadMoreCurrentTasks}
+        currentTasksTotal={isRemote ? undefined : currentTasksTotal}
+        currentTasksHasMore={isRemote ? false : currentTasksHasMore}
+        currentTasksLoadingMore={isRemote ? false : currentTasksLoadingMore}
+        currentTasksPaginationError={isRemote ? null : currentTasksPaginationError}
+        currentTasksProgressKey={isRemote ? undefined : currentTasksProgressKey}
+        onRetryCurrentTasks={isRemote ? undefined : retryCurrentTasksPagination}
+        onLoadMoreCompletedTasks={isRemote ? undefined : loadMoreCompletedTasks}
+        completedCounts={isRemote ? undefined : completedCounts}
+        completedHasMore={isRemote ? false : completedHasMore}
+        completedLoadingMore={isRemote ? false : completedLoadingMore}
+        completedPaginationError={isRemote ? null : completedPaginationError}
+        completedProgressKey={isRemote ? undefined : completedProgressKey}
+        onRetryCompletedTasks={isRemote ? undefined : retryCompletedTasksPagination}
+        completedSortMode={completedSortMode}
+        onCompletedSortModeChange={changeCompletedSortMode}
         searchQuery={searchQuery}
         availableModels={availableModels}
         onOpenDetailWithTab={handleOpenDetailWithTab}
@@ -152,6 +169,8 @@ function renderBoardSubtree(props: MainContentProps, active: boolean) {
         onOpenWorkflowEditor={openWorkflowEditorWithNav}
         onCreateWorkflow={openCreateWorkflowWithNav}
         workflowControlsInHeader={sidebarActive || isMobile}
+        alphaUpdatesEnabled={experimentalFeatures.alphaUpdates === true}
+        onOpenHistory={() => handleChangeTaskView("patchnode")}
         active={active}
       />
     </PageErrorBoundary>
@@ -171,7 +190,6 @@ function renderListSubtree(props: MainContentProps, active: boolean) {
     modalManager,
     pauseTask,
     unpauseTask,
-    archiveTask,
     revertTask,
     mergeTask,
     resetTask,
@@ -190,6 +208,12 @@ function renderListSubtree(props: MainContentProps, active: boolean) {
     handleToggleFavorite,
     handleToggleModelFavorite,
     searchQuery,
+    loadMoreCurrentTasks,
+    currentTasksHasMore,
+    currentTasksLoadingMore,
+    currentTasksPaginationError,
+    currentTasksProgressKey,
+    retryCurrentTasksPagination,
     lastFetchTimeMs,
     prAuthAvailable,
     autoMerge,
@@ -214,7 +238,6 @@ function renderListSubtree(props: MainContentProps, active: boolean) {
         onReviseTask={(task) => modalManager.openNewTaskWithDescription(task.description)}
         onPauseTask={pauseTask}
         onUnpauseTask={unpauseTask}
-        onArchiveTask={archiveTask}
         onRevertTask={revertTask}
         onMergeTask={mergeTask}
         onResetTask={resetTask}
@@ -233,6 +256,12 @@ function renderListSubtree(props: MainContentProps, active: boolean) {
         onToggleFavorite={handleToggleFavorite}
         onToggleModelFavorite={handleToggleModelFavorite}
         searchQuery={searchQuery}
+        onLoadMoreCurrentTasks={isRemote ? undefined : loadMoreCurrentTasks}
+        currentTasksHasMore={isRemote ? false : currentTasksHasMore}
+        currentTasksLoadingMore={isRemote ? false : currentTasksLoadingMore}
+        currentTasksPaginationError={isRemote ? null : currentTasksPaginationError}
+        currentTasksProgressKey={isRemote ? undefined : currentTasksProgressKey}
+        onRetryCurrentTasks={isRemote ? undefined : retryCurrentTasksPagination}
         lastFetchTimeMs={lastFetchTimeMs}
         prAuthAvailable={prAuthAvailable}
         autoMerge={autoMerge}

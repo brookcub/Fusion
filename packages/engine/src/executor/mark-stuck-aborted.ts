@@ -1,7 +1,7 @@
 /**
  * FNXC:CodeOrganization 2026-08-03-10:55:
  * markStuckAborted peeled from TaskExecutor (U4).
- * Stuck-kill signal + bounded failure park if executor never unwinds.
+ * Stuck-kill signal + bounded force-requeue if executor never unwinds.
  *
  * FNXC:WorkflowLifecycleColumns 2026-07-30-21:40 (fleet): force-requeue skips when task left WIP.
  * FNXC:Workspace 2026-06-21-22:30: F8 — observability for multi-worktree skip.
@@ -9,7 +9,8 @@
  */
 import type { TaskStore } from "@fusion/core";
 import { executorLog } from "../logger.js";
-import { recoveryIsHeld } from "./recovery-pause-guard.js";
+import { executingTaskLock } from "../agents/active-session-registry.js";
+import type { PreparedAbortInFlightTaskWork } from "./await-abort-in-flight.js";
 
 export type MarkStuckAbortedDeps = {
   store: TaskStore;
@@ -18,10 +19,13 @@ export type MarkStuckAbortedDeps = {
   executing: Set<string>;
   loopRecoveryState: Map<string, unknown>;
   terminateAllChildren: (taskId: string) => Promise<void>;
-  awaitAbortInFlightTaskWork: (taskId: string, reason: string) => Promise<void>;
+  prepareAbortInFlightTaskWork: (
+    taskId: string,
+    reason: string,
+    options: { deferTaskKeyedClaims: true },
+  ) => PreparedAbortInFlightTaskWork;
   clearPausedAborted: (taskId: string) => void;
   reexecuteTaskInPlace: (taskId: string) => Promise<void>;
-  getRunContextFor: (taskId: string) => { runId: string } | undefined;
 };
 
 export function markStuckAborted(
@@ -37,38 +41,83 @@ export function markStuckAborted(
     );
   }
   deps.stuckAborted.set(taskId, true);
+  const executionLease = executingTaskLock.currentLease(taskId);
 
   /*
   FNXC:StuckSessionRecovery 2026-08-28-07:48:
-  If disposal cannot unwind the old executor, preserve its ownership and all progress.
-  A late predecessor must never dispose a successor's session or checkout.
+  If disposal cannot unwind the old executor, force-release only its runtime ownership. Preserve
+  column, node, step, worktree, branch, and progress, then re-dispatch the same task in place.
+
+  FNXC:StuckSessionRecovery 2026-09-07-16:46:
+  The ownership publication also re-reads global and engine pause controls inside the critical
+  section. A paused engine retains the in-place continuation but must not dispatch its successor
+  until the ordinary unpause owner resumes execution.
+
+  FNXC:StuckSessionRecovery 2026-09-07-17:15:
+  Reserve forced invalidation in the attempt FIFO before synchronously interrupting its runtime.
+  Abort settlement and every task-keyed cleanup remain in that reservation; only after invalidation
+  publishes may reexecuteTaskInPlace let a successor claim the task.
   */
   if (deps.executing.has(taskId)) {
-    const ownerRunId = deps.getRunContextFor(taskId)?.runId;
-    const stillOwned = () => Boolean(ownerRunId && deps.getRunContextFor(taskId)?.runId === ownerRunId && deps.executing.has(taskId));
-    const UNWIND_GRACE_MS = 60_000;
+    const FORCE_RESUME_GRACE_MS = 60_000;
     setTimeout(async () => {
-      if (!stillOwned()) return;
+      if (!deps.executing.has(taskId) || !executionLease) return;
       try {
-        if (await recoveryIsHeld(deps.store, taskId) || !stillOwned()) return;
-        await deps.terminateAllChildren(taskId);
-        if (await recoveryIsHeld(deps.store, taskId) || !stillOwned()) return;
-        await deps.awaitAbortInFlightTaskWork(taskId, "stuck-session unwind timeout; preserving predecessor ownership");
-        if (await recoveryIsHeld(deps.store, taskId) || !stillOwned()) return;
-        /* FNXC:RecoveryPause 2026-09-09-05:16:
-         * Session disposal is not graph completion. Keep this run's ownership
-         * and abort markers until its own finally settles; never start a successor
-         * whose children could be killed by the predecessor's late cleanup.
-         */
-        await deps.store.updateTask(taskId, {
-          status: "failed", paused: true, pausedReason: "stuck-cleanup-incomplete",
-          error: "STUCK_CLEANUP_INCOMPLETE: predecessor execution has not settled; stop the owning instance before resuming",
+        const invalidated = await executingTaskLock.invalidateWithSignal(
+          executionLease,
+          () => deps.prepareAbortInFlightTaskWork(
+            taskId,
+            "forced in-place resume after stuck-session unwind timeout",
+            { deferTaskKeyedClaims: true },
+          ),
+          async (preparedAbort) => {
+          await preparedAbort.complete().catch((error: unknown) => {
+            executorLog.warn(`${taskId}: abort settlement failed during forced stuck resume: ${error instanceof Error ? error.message : String(error)}`);
+          });
+          await deps.terminateAllChildren(taskId).catch((error: unknown) => {
+            executorLog.warn(`${taskId}: child cleanup failed during forced stuck resume: ${error instanceof Error ? error.message : String(error)}`);
+          });
+          const [latestTask, latestSettings] = await Promise.all([
+            deps.store.getTask(taskId).catch((error: unknown) => {
+              executorLog.warn(`${taskId}: task control read failed during forced stuck resume: ${error instanceof Error ? error.message : String(error)}`);
+              return undefined;
+            }),
+            deps.store.getSettings().catch((error: unknown) => {
+              executorLog.warn(`${taskId}: settings control read failed during forced stuck resume: ${error instanceof Error ? error.message : String(error)}`);
+              return undefined;
+            }),
+          ]);
+          deps.executing.delete(taskId);
+          deps.stuckAborted.delete(taskId);
+          deps.loopRecoveryState.delete(taskId);
+          // Missing control evidence refuses dispatch, while invalidation still publishes in the FIFO.
+          if (!latestTask || !latestSettings) return false;
+          if (latestTask.paused || latestTask.userPaused || latestTask.deletedAt) return false;
+          deps.clearPausedAborted(taskId);
+          try {
+            await deps.store.updateTask(taskId, { status: null, error: null });
+          } catch (error: unknown) {
+            executorLog.warn(`${taskId}: resume-state publication failed during forced stuck resume: ${error instanceof Error ? error.message : String(error)}`);
+            return false;
+          }
+          if (latestSettings.globalPause || latestSettings.enginePaused) {
+            await deps.store.logEntry(taskId, "Forced stuck-session ownership invalidated — continuation preserved until engine execution resumes").catch((error: unknown) => {
+              executorLog.warn(`${taskId}: forced-resume pause log failed: ${error instanceof Error ? error.message : String(error)}`);
+            });
+            return false;
+          }
+          await deps.store.logEntry(taskId, "Forced stuck-session ownership invalidated — resuming the same node and step in place").catch((error: unknown) => {
+            executorLog.warn(`${taskId}: forced-resume success log failed: ${error instanceof Error ? error.message : String(error)}`);
+          });
+          return true;
         });
-        await deps.store.logEntry(taskId, "Stuck-session cleanup remains incomplete — ownership and progress retained; no successor dispatched");
+        if (invalidated.executed && invalidated.value === true) {
+          await deps.reexecuteTaskInPlace(taskId);
+        }
       } catch (error: unknown) {
         executorLog.error(`Failed to force-resume stuck task ${taskId}: ${error instanceof Error ? error.message : String(error)}`);
       }
-    }, UNWIND_GRACE_MS);
+    }, FORCE_RESUME_GRACE_MS);
   }
   
 }

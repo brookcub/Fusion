@@ -35,7 +35,6 @@ import { useTaskDiffStats } from "../hooks/useTaskDiffStats";
 import { useAgentsMapCache } from "../hooks/useAgentsMapCache";
 import { useLiveTimeTicker } from "../hooks/useLiveTimeTicker";
 import {
-  isArchivedColumnRole,
   isCompleteColumnRole,
   isFieldEditableColumnRole,
   isPreImplementationColumnRole,
@@ -98,6 +97,14 @@ type TaskWithBranchProgress = Task & { branchProgress?: BranchProgressEntry[] };
 
 // ── Mission title caching ───────────────────────────────────────────────────
 
+/*
+FNXC:TaskCardLayout 2026-09-09-16:03:
+Mission and agent identifiers are only unique inside a project. Their first-paint label caches must therefore use the same `(projectId, id)` identity as the authoritative requests, so switching projects can never paint or reuse another project's enrichment.
+*/
+function getTaskCardEntityCacheKey(id: string, projectId?: string): string {
+  return JSON.stringify([projectId ?? null, id]);
+}
+
 const missionTitleCache = new Map<string, string>();
 
 /** @internal Test helper to reset the mission title cache between tests */
@@ -106,12 +113,13 @@ export function __test_clearMissionTitleCache(): void {
 }
 
 async function getMissionTitle(missionId: string, projectId?: string): Promise<string> {
-  const cached = missionTitleCache.get(missionId);
+  const cacheKey = getTaskCardEntityCacheKey(missionId, projectId);
+  const cached = missionTitleCache.get(cacheKey);
   if (cached) return cached;
 
   try {
     const mission = await fetchMission(missionId, projectId);
-    missionTitleCache.set(missionId, mission.title);
+    missionTitleCache.set(cacheKey, mission.title);
     return mission.title;
   } catch {
     return missionId;
@@ -128,23 +136,34 @@ function abbreviateMissionTitle(title: string): string {
 // ── Assigned agent name caching ─────────────────────────────────────────────
 
 const agentNameCache = new Map<string, string>();
+const agentNameInflight = new Map<string, Promise<string>>();
 
 /** @internal Test helper to reset the assigned agent cache between tests */
 export function __test_clearAgentNameCache(): void {
   agentNameCache.clear();
+  agentNameInflight.clear();
 }
 
 async function getAgentName(agentId: string, projectId?: string): Promise<string> {
-  const cached = agentNameCache.get(agentId);
+  const cacheKey = getTaskCardEntityCacheKey(agentId, projectId);
+  const cached = agentNameCache.get(cacheKey);
   if (cached) return cached;
+  const existing = agentNameInflight.get(cacheKey);
+  if (existing) return existing;
 
-  try {
-    const agent = await fetchAgent(agentId, projectId);
-    agentNameCache.set(agentId, agent.name);
-    return agent.name;
-  } catch {
-    return agentId;
-  }
+  const request = (async () => {
+    try {
+      const agent = await fetchAgent(agentId, projectId);
+      agentNameCache.set(cacheKey, agent.name);
+      return agent.name;
+    } catch {
+      return agentId;
+    }
+  })().finally(() => {
+    agentNameInflight.delete(cacheKey);
+  });
+  agentNameInflight.set(cacheKey, request);
+  return request;
 }
 
 // ── Workflow-effective planner-oversight-level caching ─────────────────────
@@ -242,6 +261,59 @@ function abbreviateBadge(text: string, max: number): string {
   return text.slice(0, max - 3) + "...";
 }
 
+export interface TaskCardStructuralProjection {
+  filesChangedCount?: number;
+  hasFilesRegion: boolean;
+  hasMissionRegion: boolean;
+  hasAgentRegion: boolean;
+  hasOversightRegion: boolean;
+}
+
+function countDistinctPaths(paths: readonly string[] | undefined): number | undefined {
+  if (!paths) return undefined;
+  return new Set(paths.filter((path) => path.trim().length > 0)).size;
+}
+
+/**
+ * Projects every asynchronously enriched card region from first-paint data.
+ *
+ * FNXC:TaskCardLayout 2026-09-09-15:21:
+ * A local request, cache read, or viewport observer belongs to the current Task snapshot and must
+ * never create or remove a card region after first paint. Mission and agent requests may replace
+ * their identifier labels, while diff stats may refine a known positive count in place. Only a new
+ * authoritative Task snapshot or a revisioned/timestamped live event may change card structure.
+ */
+export function deriveTaskCardStructuralProjection(
+  task: Task,
+  roles: { isWip: boolean; isReview: boolean; isComplete: boolean },
+): TaskCardStructuralProjection {
+  let filesChangedCount: number | undefined;
+  if (roles.isWip || roles.isReview) {
+    filesChangedCount = countDistinctPaths(task.modifiedFiles);
+  } else if (roles.isComplete) {
+    const landedCount = countDistinctPaths(task.mergeDetails?.landedFiles);
+    const recordedCount = typeof task.mergeDetails?.filesChanged === "number"
+      ? Math.max(0, task.mergeDetails.filesChanged)
+      : undefined;
+    filesChangedCount = task.mergeDetails?.landedFilesAttributionRestricted === true
+      ? landedCount === undefined
+        ? undefined
+        : recordedCount === undefined
+          ? landedCount
+          : Math.min(landedCount, recordedCount)
+      : recordedCount ?? landedCount;
+  }
+
+  const hasTaskOversightOverride = isPlannerOversightLevelValue(task.plannerOversightLevel);
+  return {
+    filesChangedCount,
+    hasFilesRegion: typeof filesChangedCount === "number" && filesChangedCount > 0,
+    hasMissionRegion: Boolean(task.missionId),
+    hasAgentRegion: Boolean(task.assignedAgentId),
+    hasOversightRegion: hasTaskOversightOverride && task.plannerOversightLevel !== "off",
+  };
+}
+
 /*
  * FNXC:PlannerOversight 2026-07-04-00:00:
  * Short card-badge labels + CSS modifier suffixes for each non-"off" effective
@@ -258,6 +330,19 @@ const OVERSIGHT_BADGE_MODIFIER: Record<Exclude<PlannerOversightLevel, "off">, st
   steer: "steer",
   autonomous: "autonomous",
 };
+
+const EMPTY_AGENT_NAME_MAP = new Map<string, { name?: string | null }>();
+
+function haveEqualAgentNames(
+  left: ReadonlyMap<string, { name?: string | null }>,
+  right: ReadonlyMap<string, { name?: string | null }>,
+): boolean {
+  if (left.size !== right.size) return false;
+  for (const [agentId, agent] of left) {
+    if (agent.name !== right.get(agentId)?.name) return false;
+  }
+  return true;
+}
 
 function getResolvedAgentNameFromMap(
   agentId: string | undefined,
@@ -334,13 +419,12 @@ const ACTIVE_MERGE_STATUSES = new Set(
   [...ACTIVE_STATUSES].filter((status) => ["merging", "merging-pr", "merging-fix", "reviewing", "landing"].includes(status)),
 );
 
-const COLUMN_PROGRESS_COLOR_MAP: Record<Column, string> = {
+const COLUMN_PROGRESS_COLOR_MAP: Partial<Record<Column, string>> = {
   triage: "var(--triage)",
   todo: "var(--todo)",
   "in-progress": "var(--in-progress)",
   "in-review": "var(--in-review)",
   done: "var(--done)",
-  archived: "var(--text-muted)",
 };
 
 const TIME_INDICATOR_COLUMNS = new Set<ColumnId>([
@@ -691,9 +775,13 @@ export function PlanApprovalNotice({
   if (isTaskExternallyBlocked(task) || !awaitingApproval) return null;
 
   const replanCap = isReviewBudgetExhaustedApproval(task);
+  /*
+  FNXC:PlanApproval 2026-09-05-22:04:
+  Board and List rows are slim and never carry prompt, so a client prompt gate makes the enabled primary action silently fail after a reload. The approve-plan endpoint owns status, column, and PROMPT.md validation; its refusal is shown through this notice's error toast.
+  */
   const approve = async (event: React.MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
-    if (!task.prompt || isApproving) return;
+    if (isApproving) return;
     setIsApproving(true);
     try {
       const updated = await approvePlan(task.id, projectId);
@@ -723,7 +811,7 @@ export function PlanApprovalNotice({
             : t("tasks.planApproval.copy", "Review the plan before implementation starts.")}
         </span>
         <span className="plan-approval-notice__actions">
-          <button type="button" className="btn btn-primary btn-sm" onClick={(event) => void approve(event)} disabled={!task.prompt || isApproving}>
+          <button type="button" className="btn btn-primary btn-sm" onClick={(event) => void approve(event)} disabled={isApproving}>
             {isApproving ? t("tasks.planApproval.approving", "Approving...") : t("tasks.planApproval.approve", "Approve")}
           </button>
         </span>
@@ -751,15 +839,6 @@ interface TaskCardProps {
     id: string,
     updates: { title?: string; description?: string; dependencies?: string[]; dismissNearDuplicate?: boolean; githubTracking?: { enabled?: boolean } }
   ) => Promise<Task>;
-  onArchiveTask?: (id: string, options?: { removeLineageReferences?: boolean }) => Promise<Task>;
-  onUnarchiveTask?: (id: string) => Promise<Task>;
-  /*
-  FNXC:TaskRevert 2026-07-05-00:00 (FN-7525):
-  Threaded alongside onArchiveTask/onUnarchiveTask; the source task's column
-  is never mutated by the caller as a side effect. Absent when the parent
-  does not support revert (undefined -> no button rendered, mirroring the
-  onArchiveTask guard).
-  */
   onRevertTask?: (id: string, body?: RevertTaskOptions) => Promise<RevertTaskResult>;
   /** Resolution action for a successfully reverted task. */
   onReviseTask?: (task: Task) => void;
@@ -986,8 +1065,6 @@ function areTaskCardPropsEqual(previous: TaskCardProps, next: TaskCardProps): bo
     previous.onOpenGroupModal === next.onOpenGroupModal &&
     previous.addToast === next.addToast &&
     previous.onUpdateTask === next.onUpdateTask &&
-    previous.onArchiveTask === next.onArchiveTask &&
-    previous.onUnarchiveTask === next.onUnarchiveTask &&
     previous.onRevertTask === next.onRevertTask &&
     previous.onDeleteTask === next.onDeleteTask &&
     previous.onPauseTask === next.onPauseTask &&
@@ -1133,8 +1210,6 @@ function TaskCardComponent({
   addToast,
   globalPaused,
   onUpdateTask,
-  onArchiveTask,
-  onUnarchiveTask,
   onRevertTask,
   onDeleteTask,
   onReviseTask,
@@ -1223,7 +1298,11 @@ function TaskCardComponent({
   const isWipColumn = isWipColumnRole(taskColumnFlags, task.column);
   const isReviewColumn = isReviewColumnRole(taskColumnFlags, task.column);
   const isCompleteColumn = isCompleteColumnRole(taskColumnFlags, task.column);
-  const isArchivedColumn = isArchivedColumnRole(taskColumnFlags, task.column);
+  const structuralProjection = deriveTaskCardStructuralProjection(task, {
+    isWip: isWipColumn,
+    isReview: isReviewColumn,
+    isComplete: isCompleteColumn,
+  });
 
   /*
   FNXC:WorkflowResolvedColumns 2026-07-31-03:15:
@@ -1250,8 +1329,8 @@ function TaskCardComponent({
     isWipColumn ||
     (isIntakeColumn && task.steps.some(s => s.status === "done" || s.status === "skipped"))
   );
-  const [missionTitle, setMissionTitle] = useState<string | null>(null);
-  const [agentName, setAgentName] = useState<string | null>(null);
+  const [missionTitleResolution, setMissionTitleResolution] = useState<{ key: string; title: string } | null>(null);
+  const [agentNameResolution, setAgentNameResolution] = useState<{ key: string; name: string } | null>(null);
   const [contextMenuPosition, setContextMenuPosition] = useState<{ x: number; y: number } | null>(null);
   const [isRetrying, setIsRetrying] = useState(false);
   const [isPrCreateOpen, setIsPrCreateOpen] = useState(false);
@@ -1300,6 +1379,29 @@ function TaskCardComponent({
   const [isInViewport, setIsInViewport] = useState(false);
   const { badgeUpdates, subscribeToBadge, unsubscribeFromBadge } = useBadgeWebSocket(projectId);
   const { agentsMap } = useAgentsMapCache(projectId);
+  const observedAgentsMapRef = useRef(agentsMap);
+  const [scopedAgentsMap, setScopedAgentsMap] = useState<{
+    projectId: string | undefined;
+    agentsMap: ReadonlyMap<string, { name?: string | null }>;
+  } | null>(() => projectId === undefined ? { projectId, agentsMap } : null);
+  const isAgentsMapCurrent = scopedAgentsMap !== null && scopedAgentsMap.projectId === projectId;
+  const agentsMapForCurrentProject = scopedAgentsMap !== null && scopedAgentsMap.projectId === projectId
+    ? scopedAgentsMap.agentsMap
+    : EMPTY_AGENT_NAME_MAP;
+  /*
+  FNXC:TaskCardLayout 2026-09-09-16:37:
+  useAgentsMapCache replaces its project-scoped state in an effect, so its first render after a project switch or remount can still expose the prior project's map. TaskCard must ignore that transitional map for both ownership and provenance; only the new map identity published by the hook after its project effect may become the current project's synchronous enrichment source.
+  */
+  useEffect(() => {
+    const previousAgentsMap = observedAgentsMapRef.current;
+    observedAgentsMapRef.current = agentsMap;
+    if (previousAgentsMap === agentsMap) return;
+    setScopedAgentsMap((previous) => previous !== null
+      && previous.projectId === projectId
+      && haveEqualAgentNames(previous.agentsMap, agentsMap)
+      ? previous
+      : { projectId, agentsMap });
+  }, [agentsMap, projectId]);
   const { confirm, confirmWithSelect } = useConfirm();
   const retryWarningThreshold = useRetryWarning();
   const costBadge = useCostBadge();
@@ -1332,55 +1434,52 @@ function TaskCardComponent({
   }, [task.id, task.description]);
 
 
-  // Fetch mission title when missionId is set
+  const missionResolutionKey = task.missionId
+    ? getTaskCardEntityCacheKey(task.missionId, projectId)
+    : undefined;
+  const missionTitle = task.missionId
+    ? missionTitleCache.get(missionResolutionKey!)
+      ?? (missionTitleResolution?.key === missionResolutionKey ? missionTitleResolution?.title ?? null : null)
+    : null;
+
+  // Fetch mission title when missionId is set. The keyed result cannot leak across project A → B → A switches.
   useEffect(() => {
-    if (!task.missionId) {
-      setMissionTitle(null);
-      return;
-    }
+    if (!task.missionId || !missionResolutionKey || missionTitleCache.has(missionResolutionKey)) return;
 
-    // Check cache synchronously first
-    const cached = missionTitleCache.get(task.missionId);
-    if (cached) {
-      setMissionTitle(cached);
-      return;
-    }
-
+    const key = missionResolutionKey;
     let cancelled = false;
     void getMissionTitle(task.missionId, projectId).then((title) => {
-      if (!cancelled) setMissionTitle(title);
+      if (!cancelled) setMissionTitleResolution({ key, title });
     });
     return () => { cancelled = true; };
-  }, [task.missionId, projectId]);
+  }, [task.missionId, missionResolutionKey, projectId]);
 
-  // Fetch assigned agent name when assignedAgentId is set
+  const agentResolutionKey = task.assignedAgentId
+    ? getTaskCardEntityCacheKey(task.assignedAgentId, projectId)
+    : undefined;
+  // Fetch assigned agent name when assignedAgentId is set. Render-time cache reads preserve first-paint labels.
   useEffect(() => {
-    if (!task.assignedAgentId) {
-      setAgentName(null);
-      return;
-    }
+    if (!task.assignedAgentId || !agentResolutionKey || !isAgentsMapCurrent) return;
 
-    const cachedFromMap = getResolvedAgentNameFromMap(task.assignedAgentId, agentsMap);
+    const cachedFromMap = getResolvedAgentNameFromMap(task.assignedAgentId, agentsMapForCurrentProject);
     if (cachedFromMap) {
-      agentNameCache.set(task.assignedAgentId, cachedFromMap);
-      setAgentName(cachedFromMap);
+      agentNameCache.set(agentResolutionKey, cachedFromMap);
+      setAgentNameResolution((previous) => previous?.key === agentResolutionKey && previous.name === cachedFromMap
+        ? previous
+        : { key: agentResolutionKey, name: cachedFromMap });
       return;
     }
 
-    const cached = agentNameCache.get(task.assignedAgentId);
-    if (cached) {
-      setAgentName(cached);
-      return;
-    }
+    const cached = agentNameCache.get(agentResolutionKey);
+    if (cached) return;
 
-    setAgentName(null);
-
+    const key = agentResolutionKey;
     let cancelled = false;
     void getAgentName(task.assignedAgentId, projectId).then((name) => {
-      if (!cancelled) setAgentName(name);
+      if (!cancelled) setAgentNameResolution({ key, name });
     });
     return () => { cancelled = true; };
-  }, [agentsMap, task.assignedAgentId, projectId]);
+  }, [agentsMapForCurrentProject, isAgentsMapCurrent, task.assignedAgentId, agentResolutionKey, projectId]);
 
   /*
    * FNXC:PlannerOversight 2026-07-17-15:50:
@@ -1397,6 +1496,13 @@ function TaskCardComponent({
   const workflowOversightCacheKey = workflowIdForOversight
     ? getWorkflowOversightCacheKey(workflowIdForOversight, projectId)
     : undefined;
+  const initialWorkflowRevisionByKeyRef = useRef(new Map<string, number>());
+  if (workflowIdForOversight && workflowOversightCacheKey && !initialWorkflowRevisionByKeyRef.current.has(workflowOversightCacheKey)) {
+    initialWorkflowRevisionByKeyRef.current.set(
+      workflowOversightCacheKey,
+      getWorkflowSettingValuesRevision(workflowIdForOversight, projectId),
+    );
+  }
   const [workflowOversightState, setWorkflowOversightState] = useState<WorkflowOversightResolution>({ level: undefined, resolved: false });
   useEffect(() => {
     if (!workflowIdForOversight || !workflowOversightCacheKey) {
@@ -1443,6 +1549,12 @@ function TaskCardComponent({
     : { level: undefined, resolved: false };
   const workflowOversightEffectiveLevel = currentWorkflowOversightState.level;
   const workflowOversightResolved = currentWorkflowOversightState.resolved;
+  const workflowOversightHasLiveRevision = Boolean(
+    workflowIdForOversight
+    && workflowOversightCacheKey
+    && getWorkflowSettingValuesRevision(workflowIdForOversight, projectId)
+      > (initialWorkflowRevisionByKeyRef.current.get(workflowOversightCacheKey) ?? 0),
+  );
 
   // Auto-focus and auto-resize description textarea when entering edit mode
   useEffect(() => {
@@ -1798,7 +1910,6 @@ function TaskCardComponent({
    */
   const showNearDuplicateChip = Boolean(task.sourceMetadata?.nearDuplicateOf)
     && task.sourceMetadata?.nearDuplicateDismissed !== true
-    && !isArchivedColumn
     && !isCompleteColumn
     && nearDuplicateCanonicalInactive !== true;
   /**
@@ -1827,23 +1938,26 @@ function TaskCardComponent({
    * FNXC:TaskRevert 2026-07-16-00:00:
    * FN-8066 makes the source-task revert marker visible only in its completed
    * surfaces. TaskCard serves both board and list views, so this one predicate
-   * preserves the done/archived invariant without adding a view-specific badge.
+   * preserves the Done invariant without adding a view-specific badge.
    */
   const showRevertedChip = isTaskReverted(task.sourceMetadata)
-    && (isCompleteColumn || isArchivedColumn);
+    && isCompleteColumn;
   const branchMetadata = useMemo(() => getVisibleTaskCardBranches(task), [task.id, task.branch, task.baseBranch]);
   const hasBranchMetadata = Boolean(branchMetadata.branch || branchMetadata.baseBranch);
   const isAgentCreated = isAgentCreatedTask(task);
-  const sourceAgentName = getSourceAgentName(task, agentsMap);
+  const sourceAgentName = getSourceAgentName(task, agentsMapForCurrentProject);
   const agentCreatedVisibleLabel = sourceAgentName
     ? t("tasks.createdByAgentShort", "by {{name}}", { name: abbreviateBadge(sourceAgentName, 15) })
     : t("tasks.agentLabel", "Agent");
   const agentCreatedTitle = sourceAgentName
     ? t("tasks.createdByAgentNamed", "Created by agent: {{name}}", { name: sourceAgentName })
     : t("tasks.createdByAgent", "Created by agent");
-  const assignedAgentNameFromMap = getResolvedAgentNameFromMap(task.assignedAgentId, agentsMap);
-  const assignedAgentNameFromCache = task.assignedAgentId ? agentNameCache.get(task.assignedAgentId) ?? null : null;
-  const resolvedAssignedAgentName = assignedAgentNameFromMap ?? assignedAgentNameFromCache ?? agentName;
+  const assignedAgentNameFromMap = getResolvedAgentNameFromMap(task.assignedAgentId, agentsMapForCurrentProject);
+  const assignedAgentNameFromCache = agentResolutionKey ? agentNameCache.get(agentResolutionKey) ?? null : null;
+  const assignedAgentNameFromRequest = agentResolutionKey && agentNameResolution?.key === agentResolutionKey
+    ? agentNameResolution.name
+    : null;
+  const resolvedAssignedAgentName = assignedAgentNameFromMap ?? assignedAgentNameFromCache ?? assignedAgentNameFromRequest;
   const assignedAgentBadgeLabel = resolvedAssignedAgentName ?? task.assignedAgentId ?? "";
   const isAgentNameLoading = Boolean(task.assignedAgentId && !resolvedAssignedAgentName);
   const shouldShowCreatedAgentBadge = isAgentCreated && !(
@@ -2059,17 +2173,12 @@ function TaskCardComponent({
 
   const lifecycleDates = useMemo(() => {
     const created = formatCompactLifecycleDate(task.createdAt, locale, new Date(lifecycleNowMs));
-    const completionSource = task.executionCompletedAt
-      ?? (isArchivedColumn ? task.archivedAt : undefined);
-    const completed = (isCompleteColumn || isArchivedColumn)
+    const completionSource = task.executionCompletedAt ?? task.archivedAt;
+    const completed = isCompleteColumn
       ? formatCompactLifecycleDate(completionSource, locale, new Date(lifecycleNowMs))
       : null;
     return { created, completed };
   /*
-  FNXC:WorkflowResolvedColumns 2026-07-31-08:20:
-  `isCompleteColumn` AND `isArchivedColumn` BELONG IN THIS LIST — both derive from the async
-  `taskColumnFlags` prop, and the completion date is gated on them.
-
   The board resolves workflow traits after first paint, so the first computation runs with the flags
   undefined and the role helpers fall back to the legacy ids. On a renamed board that answers false,
   `completed` is null, and the "Completed <date>" line never renders. When the flags arrive nothing in
@@ -2083,7 +2192,7 @@ function TaskCardComponent({
 
   A default board hides it: `column === "done"` is already true before the flags land.
   */
-  }, [task.createdAt, task.executionCompletedAt, task.archivedAt, task.column, locale, lifecycleNowMs, isCompleteColumn, isArchivedColumn]);
+  }, [task.createdAt, task.executionCompletedAt, task.archivedAt, task.column, locale, lifecycleNowMs, isCompleteColumn]);
 
   const liveBadgeData = badgeUpdates.get(`${projectId ?? "default"}:${task.id}`);
 
@@ -2122,6 +2231,13 @@ function TaskCardComponent({
     () => task.steps.map((s) => `${s.name}:${s.status}`).join("|"),
     [task.steps],
   );
+  const activeSnapshotVersion = useMemo(
+    () => JSON.stringify([
+      task.updatedAt ?? null,
+      [...new Set(task.modifiedFiles ?? [])].sort(),
+    ]),
+    [task.updatedAt, task.modifiedFiles],
+  );
   const mergeSignature = useMemo(() => {
     if (!isCompleteColumn) {
       return undefined;
@@ -2145,7 +2261,7 @@ function TaskCardComponent({
   }, [task.column, task.mergeDetails?.landedFiles?.length, task.mergeDetails?.filesChanged, isCompleteColumn]);
 
   // Viewport-gated diff stats fetching - only fetch when card is visible
-  const { stats: diffStats, loading: diffLoading } = useTaskDiffStats(
+  const { stats: diffStats } = useTaskDiffStats(
     task.id,
     task.column,
     task.mergeDetails?.commitSha,
@@ -2157,6 +2273,7 @@ function TaskCardComponent({
       columnFlags: taskColumnFlags,
       worktree: task.worktree,
       stepVersion: isActiveColumn ? stepVersion : undefined,
+      snapshotVersion: isActiveColumn ? activeSnapshotVersion : undefined,
       mergeSignature,
       pollIntervalMs: isActiveColumn ? 30_000 : undefined,
     },
@@ -2261,7 +2378,7 @@ function TaskCardComponent({
   );
   const isInheritedDefaultOversightLevel =
     !hasTaskOversightOverride && effectiveOversightLevel === DEFAULT_PLANNER_OVERSIGHT_LEVEL;
-  const showOversightBadge =
+  const showOversightBadge = (structuralProjection.hasOversightRegion || workflowOversightHasLiveRevision) &&
     (hasTaskOversightOverride || workflowOversightResolved) &&
     effectiveOversightLevel !== "off" &&
     !isInheritedDefaultOversightLevel;
@@ -2320,7 +2437,7 @@ function TaskCardComponent({
   */
   const startTargetColumn: ColumnId = useMemo(() => {
     const next = taskMoveColumns?.find(
-      (c) => c.id !== task.column && !c.flags?.intake && !c.flags?.archived && !c.flags?.hiddenFromBoard,
+      (c) => c.id !== task.column && !c.flags?.intake && !c.flags?.hiddenFromBoard,
     );
     return (next?.id ?? "todo") as ColumnId;
   }, [taskMoveColumns, task.column]);
@@ -2424,60 +2541,17 @@ function TaskCardComponent({
     }
   }, [addToast, onUpdateTask, task.id]);
 
-  const handleArchiveClick = useCallback((e: React.MouseEvent<HTMLButtonElement>) => {
-    e.stopPropagation();
-    if (!onArchiveTask) return;
-
-    void onArchiveTask(task.id).then(() => {
-      addToast(t("tasks.archived", "Archived {{taskId}}", { taskId: task.id }), "success");
-    }).catch(async (err) => {
-      const lineageConflict = extractLineageDeleteConflict(err);
-      if (!lineageConflict || lineageConflict.lineageChildIds.length === 0) {
-        addToast(t("tasks.archiveFailed", "Failed to archive {{taskId}}: {{error}}", { taskId: task.id, error: getErrorMessage(err) }), "error");
-        return;
-      }
-
-      const confirmed = await confirm({
-        title: t("tasks.forceDeleteTitle", "Force Delete Task"),
-        message:
-          t("tasks.archiveLineageConflict", "{{taskId}} has lineage children ({{children}}) that reference it as a source parent.\n\nArchive anyway by unlinking these references first?", { taskId: task.id, children: lineageConflict.lineageChildIds.join(", ") }),
-        danger: true,
-      });
-      if (!confirmed) {
-        return;
-      }
-
-      try {
-        await onArchiveTask(task.id, { removeLineageReferences: true });
-        addToast(t("tasks.archivedUnlinked", "Archived {{taskId}} after unlinking lineage references", { taskId: task.id }), "success");
-      } catch (retryErr) {
-        addToast(t("tasks.archiveFailed", "Failed to archive {{taskId}}: {{error}}", { taskId: task.id, error: getErrorMessage(retryErr) }), "error");
-      }
-    });
-  }, [addToast, confirm, onArchiveTask, task.id]);
-
-  const handleUnarchiveClick = useCallback((e: React.MouseEvent<HTMLButtonElement>) => {
-    e.stopPropagation();
-    if (!onUnarchiveTask) return;
-
-    void onUnarchiveTask(task.id).then(() => {
-      addToast(t("tasks.unarchived", "Unarchived {{taskId}}", { taskId: task.id }), "success");
-    }).catch((err) => {
-      addToast(t("tasks.unarchiveFailed", "Failed to unarchive {{taskId}}: {{error}}", { taskId: task.id, error: getErrorMessage(err) }), "error");
-    });
-  }, [addToast, onUnarchiveTask, task.id]);
 
   /*
   FNXC:TaskRevert 2026-07-05-00:00 (FN-7525):
   Revertable guard: a card is only offered a Revert affordance when it sits in
-  done/archived AND it has a landed commit to revert. Absent `mergeDetails` (no
+  Done and it has a landed commit to revert. Absent `mergeDetails` (no
   merge ever recorded, e.g. a no-op/no-commits-expected task) means there is
   nothing to revert — treat it as not-revertable rather than erroring at click
   time. This mirrors the parent FN-7501 issue's "undo a change" framing: only
   tasks that actually changed the tree are revertable.
   */
-  const isRevertable = (isCompleteColumn || isArchivedColumn)
-    && Boolean(task.mergeDetails?.commitSha);
+  const isRevertable = isCompleteColumn && Boolean(task.mergeDetails?.commitSha);
 
   /*
   FNXC:TaskRevert 2026-07-05-00:00 (FN-7525):
@@ -2693,17 +2767,9 @@ function TaskCardComponent({
     }
   }, [addToast, confirm, onDeleteTask, t, task.githubTracking?.enabled, task.githubTracking?.issue, task.id, task.issueInfo?.url, task.sourceIssue, task.sourceMetadata]);
 
-  const handleTaskActionArchive = useCallback(() => {
-    handleArchiveClick({ stopPropagation() {} } as React.MouseEvent<HTMLButtonElement>);
-  }, [handleArchiveClick]);
-
   const handleTaskActionDelete = useCallback(() => {
     void handleDeleteClick({ stopPropagation() {} } as React.MouseEvent<HTMLButtonElement>);
   }, [handleDeleteClick]);
-
-  const handleTaskActionUnarchive = useCallback(() => {
-    handleUnarchiveClick({ stopPropagation() {} } as React.MouseEvent<HTMLButtonElement>);
-  }, [handleUnarchiveClick]);
 
   const handleTaskActionRetry = useCallback(async () => {
     if (!onRetryTask || isRetrying) return;
@@ -2804,7 +2870,7 @@ function TaskCardComponent({
   Board context menus must receive the project merge strategy, not infer pull-request mode from existing PR data, so manual PR projects show Start PR Review before the PR entity is created.
 
   FNXC:BoardCardActions 2026-06-30-12:42:
-  Workflow-column card menus must use the task's workflow column flags and ordered column list instead of legacy column literals. Custom complete or archived lanes are terminal for Reset/Pause, while custom active lanes still expose neighbor move targets.
+  Workflow-column card menus must use the task's workflow column flags and ordered column list instead of legacy column literals. Custom complete lanes are terminal for Reset/Pause, while custom active lanes still expose neighbor move targets.
 
   FNXC:BoardCardActions 2026-06-30-13:02:
   Manual pull-request projects need a distinct Start PR Review callback from direct Merge & Close so context menus open PrCreateModal instead of calling the merge endpoint.
@@ -2856,7 +2922,6 @@ function TaskCardComponent({
     onResetTask,
     effectiveAutoMerge,
     mergeStrategy,
-    handleTaskActionArchive,
     handleTaskActionCheckPrStatus,
     handleTaskActionDelete,
     handleTaskActionEnableGithubTracking,
@@ -2866,7 +2931,6 @@ function TaskCardComponent({
     handleTaskActionReset,
     handleTaskActionRetry,
     handleTaskActionTogglePause,
-    handleTaskActionUnarchive,
     isPaused,
     onDeleteTask,
     onMergeTask,
@@ -2882,24 +2946,17 @@ function TaskCardComponent({
     task.prInfo,
   ]);
   const contextMenuActions = useMemo<TaskMenuItemDescriptor[]>(() => {
-    if (!onDeleteTask && !onArchiveTask && !onUnarchiveTask && !onRevertTask && !onDuplicateTask && !onRetryTask && !onResetTask && !onPauseTask && !onUnpauseTask && !onMergeTask && !onPlanningMode && !onOpenRefine && !onUpdateTask) {
+    if (!onDeleteTask && !onRevertTask && !onDuplicateTask && !onRetryTask && !onResetTask && !onPauseTask && !onUnpauseTask && !onMergeTask && !onPlanningMode && !onOpenRefine && !onUpdateTask) {
       return [];
     }
     const actions: TaskMenuItemDescriptor[] = [...taskActionMenuModel.actions];
-    if (isCompleteColumn && onArchiveTask) {
-      actions.push({ id: "archive", label: t("tasks.archive", "Archive"), onSelect: handleTaskActionArchive });
-    }
-    if (isArchivedColumn && onUnarchiveTask) {
-      actions.push({ id: "unarchive", label: t("tasks.unarchive", "Unarchive"), onSelect: handleTaskActionUnarchive });
-    }
     /*
     FNXC:TaskRevert 2026-07-05-00:00 (FN-7525):
-    Context-menu Revert entry for done/archived, mirroring the archive/unarchive
-    entries above. Disabled (rather than omitted) when the task lacks a landed
+    Context-menu Revert entry for completed work. Disabled (rather than omitted) when the task lacks a landed
     commit to revert, so the menu communicates WHY the affordance is inert
     instead of silently hiding it.
     */
-    if ((isCompleteColumn || isArchivedColumn) && onRevertTask) {
+    if (isCompleteColumn && onRevertTask) {
       actions.push({
         id: "revert",
         label: t("tasks.revert", "Revert"),
@@ -2911,7 +2968,7 @@ function TaskCardComponent({
       actions.push({ id: taskActionMenuModel.reviewAction.id, label: taskActionMenuModel.reviewAction.label, disabled: taskActionMenuModel.reviewAction.disabled, onSelect: taskActionMenuModel.reviewAction.onSelect });
     }
     return actions.filter((action) => "items" in action || action.tone === "note" || action.disabled === true || Boolean(action.onSelect));
-  }, [handleTaskActionArchive, handleTaskActionRevert, handleTaskActionUnarchive, isRevertable, onArchiveTask, onDeleteTask, onDuplicateTask, onMergeTask, onPlanningMode, onOpenRefine, onPauseTask, onResetTask, onRetryTask, onRevertTask, onUnarchiveTask, onUnpauseTask, onUpdateTask, t, task.column, taskActionMenuModel.actions, taskActionMenuModel.reviewAction]);
+  }, [handleTaskActionRevert, isCompleteColumn, isRevertable, onDeleteTask, onDuplicateTask, onMergeTask, onPlanningMode, onOpenRefine, onPauseTask, onResetTask, onRetryTask, onRevertTask, onUnpauseTask, onUpdateTask, taskActionMenuModel.actions, taskActionMenuModel.reviewAction]);
   const hasContextMenuActions = contextMenuActions.length > 0;
 
   const closeContextMenu = useCallback(() => {
@@ -3130,85 +3187,31 @@ function TaskCardComponent({
   const cardClass = `card${queued ? " queued" : ""}${isAgentActive ? " agent-active" : ""}${isFailed ? " failed" : ""}${isPaused ? " paused" : ""}${isExternalBlocked ? " external-blocked" : ""}${isAwaitingApproval ? " awaiting-approval plan-approval-hold" : ""}${isAwaitingInput ? " awaiting-input" : ""}${fileDragOver ? " file-drop-target" : ""}${isEditing ? " card-editing" : ""}${isSaving ? " card-saving" : ""}`;
 
   const filesChangedButton = (() => {
-    if (isWipColumn) {
-      const activeDiffCount = diffStats?.filesChanged;
-      const fallbackCount =
-        activeDiffCount == null
-          ? task.modifiedFiles?.length
-          : undefined;
-      const displayCount = activeDiffCount ?? fallbackCount;
-      if (displayCount == null || displayCount === 0) {
-        return null;
-      }
-
-      return (
-        <button
-          type="button"
-          className="card-session-files"
-          onClick={handleOpenFiles}
-          disabled={!onOpenDetailWithTab}
-        >
-          <Folder size={12} />
-          <span>{t("tasks.filesChanged", "{{count}} file changed", { count: displayCount, defaultValue_one: "{{count}} file changed", defaultValue_other: "{{count}} files changed" })}</span>
-        </button>
-      );
+    if (!structuralProjection.hasFilesRegion || structuralProjection.filesChangedCount === undefined) {
+      return null;
     }
 
-    if (isReviewColumn) {
-      const reviewDiffCount = diffStats?.filesChanged;
-      const fallbackCount =
-        reviewDiffCount == null
-          ? task.modifiedFiles?.length
-          : undefined;
-      const displayCount = reviewDiffCount ?? fallbackCount;
-      if (displayCount == null || displayCount === 0) {
-        return null;
-      }
-
-      return (
-        <button
-          type="button"
-          className="card-session-files"
-          onClick={handleOpenFiles}
-          disabled={!onOpenDetailWithTab}
-        >
-          <Folder size={12} />
-          <span>{t("tasks.filesChanged", "{{count}} file changed", { count: displayCount, defaultValue_one: "{{count}} file changed", defaultValue_other: "{{count}} files changed" })}</span>
-        </button>
-      );
-    }
-
-    if (isCompleteColumn) {
-      // Done cards only display committed diff counts from authoritative lineage
-      // stats or recorded landed files; transient execution-touched files are not shown.
-      let displayCount: number | undefined;
-      if (diffStats) {
-        const landed = task.mergeDetails?.landedFiles;
-        const restricted = task.mergeDetails?.landedFilesAttributionRestricted === true;
-        displayCount = (restricted && Array.isArray(landed))
-          ? Math.min(diffStats.filesChanged, landed.length)
-          : diffStats.filesChanged;
-      } else if (diffLoading) {
-        displayCount = task.mergeDetails?.filesChanged ?? undefined;
+    // A same-snapshot diff may refine a known positive label, but zero/error cannot retract its region.
+    let displayCount = structuralProjection.filesChangedCount;
+    if (diffStats && diffStats.filesChanged > 0) {
+      if (isCompleteColumn && task.mergeDetails?.landedFilesAttributionRestricted === true) {
+        displayCount = Math.min(displayCount, diffStats.filesChanged);
       } else {
-        displayCount = task.mergeDetails?.landedFiles?.length;
-      }
-      if (displayCount != null && displayCount > 0) {
-        return (
-          <button
-            type="button"
-            className="card-session-files"
-            onClick={handleOpenFiles}
-            disabled={!onOpenDetailWithTab}
-          >
-            <Folder size={12} />
-            <span>{t("tasks.filesChanged", "{{count}} file changed", { count: displayCount, defaultValue_one: "{{count}} file changed", defaultValue_other: "{{count}} files changed" })}</span>
-          </button>
-        );
+        displayCount = diffStats.filesChanged;
       }
     }
 
-    return null;
+    return (
+      <button
+        type="button"
+        className="card-session-files"
+        onClick={handleOpenFiles}
+        disabled={!onOpenDetailWithTab}
+      >
+        <Folder size={12} />
+        <span>{t("tasks.filesChanged", "{{count}} file changed", { count: displayCount, defaultValue_one: "{{count}} file changed", defaultValue_other: "{{count}} files changed" })}</span>
+      </button>
+    );
   })();
 
   const chipFarRight = showsTimeIndicator
@@ -3497,9 +3500,7 @@ function TaskCardComponent({
   const hasHeaderActions = Boolean(isAwaitingInput && onOpenDetailWithTab)
     || Boolean(canEdit)
     || Boolean(isIntakeColumn && onDeleteTask)
-    || Boolean(isCompleteColumn && onArchiveTask)
-    || Boolean(isArchivedColumn && onUnarchiveTask)
-    || Boolean((isCompleteColumn || isArchivedColumn) && onRevertTask && isRevertable)
+    || Boolean(isCompleteColumn && onRevertTask && isRevertable)
     || Boolean(task.size)
     || hasContextMenuActions;
 
@@ -3991,42 +3992,7 @@ function TaskCardComponent({
               <Trash2 size={12} />
             </button>
           )}
-          {isArchivedColumn && onUnarchiveTask && (
-            <button
-              className="card-unarchive-btn"
-              onClick={handleUnarchiveClick}
-              title={t("tasks.unarchiveTask", "Unarchive task")}
-              aria-label={t("tasks.unarchiveTask", "Unarchive task")}
-            >
-              {t("tasks.unarchive", "Unarchive")}
-            </button>
-          )}
           {/*
-          FNXC:TaskRevert 2026-07-05-00:00 (FN-7525):
-          Inline Revert affordance for archived cards (parent FN-7501). Rendered
-          only when the task actually has a landed commit to revert (`isRevertable`)
-          — omitted (not disabled) here to avoid an empty button shell on cards with
-          nothing to revert, matching the "omit inline / disable in menu" split called
-          out in the task spec. Done cards use the FN-7839 actions dropdown above.
-          Reuses `card-archive-btn`'s tokenized styling via a shared class so no new
-          one-off CSS/colors are introduced.
-          */}
-          {isArchivedColumn && onRevertTask && isRevertable && (
-            <button
-              className="card-archive-btn card-revert-btn"
-              onClick={handleRevertClick}
-              title={t("tasks.revertTask", "Revert this task's changes")}
-              aria-label={t("tasks.revertTask", "Revert this task's changes")}
-            >
-              {t("tasks.revert", "Revert")}
-            </button>
-          )}
-          {/*
-          FNXC:BoardCardActions 2026-07-15-00:00 (FN-8035):
-          Done-card Archive and Revert are consolidated into this single three-dot TaskContextMenu;
-          do not add a duplicate inline Actions dropdown. The menu model preserves both handlers and
-          keeps Revert disabled when no landed commit is available.
-
           FNXC:TaskCardMenu 2026-07-10-12:00:
           Visible entry point for the card's action menu (Edit/Delete/Review/New chat/Interventions…)
           — previously right-click/long-press only and therefore undiscoverable. Opens the same

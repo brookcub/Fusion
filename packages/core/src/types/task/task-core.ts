@@ -44,6 +44,12 @@ import type {
   WorkflowTransitionNotificationMarker,
 } from "./task-log.js";
 
+/** Engine-owned planning retry evidence. */
+export type TaskPlanningFailureState = {
+  specLockUnavailable?: { sourceHash: string; reason: string; sections: string[]; at: string; attempt: number | null };
+  lifecycleLockTransport?: { message: string; at: string; attempt: number | null };
+};
+
 export interface MergeDetails {
   /** FNXC:MergeEvidence 2026-09-06-06:00: Engine-owned check receipts bind review evidence to exact candidates, not agent-log history. No command text or output is duplicated here. */
   verificationReceipts?: Array<{
@@ -804,6 +810,8 @@ export interface AiMergeReviewReconciliation {
   integrationTipSha: string;
   candidateSha?: string;
   candidateTreeSha?: string;
+  /** FNXC:MergeReviewRouting 2026-09-09-23:56: SHA-256 of the resolved reviewer route that produced approval evidence. */
+  reviewerPolicySha256?: string;
   findings: AiMergeReviewFinding[];
   consecutiveCleanApprovals: number;
   correctivePasses: number;
@@ -892,6 +900,12 @@ export interface Task {
    * overlap waits retain their separate queue state.
    */
   externalBlock?: TaskExternalBlock;
+  /**
+   * FNXC:TriagePlanningState 2026-09-07-19:49:
+   * FN-9273 keeps engine planning retry evidence outside workflow-validated customFields.
+   * Workflows reject planning.* fields, which previously discarded the retry-hold update.
+   */
+  planningFailure?: TaskPlanningFailureState;
   /**
    * FNXC:TaskActivity 2026-07-28-12:00:
    * Dashboard-only signal from a fresh planner agent-log SSE entry. It is never
@@ -1198,7 +1212,7 @@ export interface Task {
   /** Number of bounded recovery retry attempts for transient executor/triage failures.
    *  Distinct from `mergeRetries` (merge-conflict-specific). Incremented by the
    *  recovery-policy module on each recoverable failure; cleared when work restarts
-   *  cleanly or reaches a terminal column (in-review, done, archived). */
+   *  cleanly, reaches review/Complete, or becomes a deleted/historical sentinel row. */
   recoveryRetryCount?: number;
   /** FNXC:WorkspaceContention 2026-08-23-06:40: Durable owner-local retry budget for holdForSessionContention; manual retry, clean completion, and exhausted waits reset it. */
   sessionContentionHoldCount?: number;

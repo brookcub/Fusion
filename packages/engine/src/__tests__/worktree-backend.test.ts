@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import {
   ActiveSessionWorktreeRemovalError,
   classifyWorktreeRemovalContent,
+  isRegenerableScratchDirectory,
   InvalidPostLandingProofUsageError,
   NativeWorktreeBackend,
   WorktrunkOperationError,
@@ -17,6 +18,7 @@ const {
   execMock,
   execFileMock,
   accessMock,
+  readdirMock,
   rmMock,
   chmodMock,
   existsSyncMock,
@@ -36,6 +38,7 @@ const {
     execMock: mock,
     execFileMock,
     accessMock: vi.fn(),
+    readdirMock: vi.fn(),
     rmMock: vi.fn(),
     chmodMock: vi.fn(),
     existsSyncMock: vi.fn(),
@@ -56,7 +59,7 @@ vi.mock("node:fs/promises", () => ({
   // Existing backend command fixtures contain no links. Native junction/refusal
   // behavior is exercised separately with real Git and external byte sentinels.
   lstat: vi.fn(async () => ({ isSymbolicLink: () => false, isDirectory: () => true })),
-  readdir: vi.fn(async () => []),
+  readdir: readdirMock,
   unlink: vi.fn(),
 }));
 vi.mock("../execution/branch-conflicts.js", () => ({
@@ -104,8 +107,26 @@ describe("classifyWorktreeRemovalContent", () => {
     { name: "classifies a modified tracked file as deliverable", porcelain: " M tracked.ts\n", expected: "deliverable" },
     { name: "does not let ignored entries mask an untracked file", porcelain: "!! node_modules/\n?? untracked.txt\n", expected: "deliverable" },
     { name: "classifies an unmerged file as deliverable", porcelain: "!! dist/\nUU conflicted.ts\n", expected: "deliverable" },
-  ])("$name", ({ porcelain, expected }) => {
-    expect(classifyWorktreeRemovalContent(porcelain)).toBe(expected);
+    { name: "classifies proven top-level Fusion scratch as regenerable", porcelain: "!! .fusion/\n", options: { provenScratchRootEntries: new Set([".fusion"]) }, expected: "regenerable-ignored" },
+    { name: "preserves Fusion scratch without proof", porcelain: "!! .fusion/\n", expected: "ignored-only" },
+    { name: "preserves nested Fusion scratch even when root is proven", porcelain: "!! packages/core/.fusion/\n", options: { provenScratchRootEntries: new Set([".fusion"]) }, expected: "ignored-only" },
+    { name: "preserves quoted Fusion scratch", porcelain: '!! ".fusion/"\n', options: { provenScratchRootEntries: new Set([".fusion"]) }, expected: "ignored-only" },
+    { name: "preserves mixed proven scratch and env file", porcelain: "!! .fusion/\n!! .env\n", options: { provenScratchRootEntries: new Set([".fusion"]) }, expected: "ignored-only" },
+    { name: "does not let proven scratch mask an untracked file", porcelain: "!! .fusion/\n?? wip.txt\n", options: { provenScratchRootEntries: new Set([".fusion"]) }, expected: "deliverable" },
+  ])("$name", ({ porcelain, options, expected }) => {
+    expect(classifyWorktreeRemovalContent(porcelain, options)).toBe(expected);
+  });
+});
+
+describe("isRegenerableScratchDirectory", () => {
+  it.each([
+    ["allows the build cache child", ".fusion", ["cache"], true],
+    ["refuses an unexpected child", ".fusion", ["tasks"], false],
+    ["refuses mixed children", ".fusion", ["cache", "tasks"], false],
+    ["allows an empty scratch directory", ".fusion", [], true],
+    ["refuses an unknown root", ".other", ["cache"], false],
+  ])("%s", (_name, entryName, childNames, expected) => {
+    expect(isRegenerableScratchDirectory(entryName, childNames)).toBe(expected);
   });
 });
 
@@ -114,6 +135,8 @@ beforeEach(() => {
   execFileMock.mockReset();
   execFileMock.mockResolvedValue({ stdout: "", stderr: "" });
   accessMock.mockReset();
+  readdirMock.mockReset();
+  readdirMock.mockResolvedValue([]);
   rmMock.mockReset();
   rmMock.mockResolvedValue(undefined as never);
   chmodMock.mockReset();
@@ -1083,6 +1106,29 @@ describe("removeWorktree", () => {
     });
   });
 
+  it("removes proven Fusion scratch and audits it as regenerable", async () => {
+    execFileMock.mockResolvedValueOnce({ stdout: "!! .fusion/\n", stderr: "" });
+    readdirMock.mockResolvedValueOnce(["cache"]);
+    execMock.mockResolvedValueOnce({ stdout: "", stderr: "" });
+    const audit = { git: vi.fn().mockResolvedValue(undefined) } as any;
+
+    await expect(removeWorktree({
+      rootDir: "/repo",
+      worktreePath: "/repo/.worktrees/fn-9276",
+      settings: {},
+      audit,
+      taskId: "FN-9276",
+      reason: RemovalReason.PoolPrune,
+    })).resolves.toMatchObject({ removed: true });
+
+    expect(audit.git).toHaveBeenCalledWith({
+      type: "worktree:removal-discarded-regenerable-content",
+      target: "/repo/.worktrees/fn-9276",
+      metadata: { taskId: "FN-9276", reason: RemovalReason.PoolPrune, entryCount: 1 },
+    });
+    expect(audit.git).not.toHaveBeenCalledWith(expect.objectContaining({ type: "worktree:removal-preserved" }));
+  });
+
   it("preserves non-regenerable ignored content without landing proof and audits it", async () => {
     execFileMock.mockResolvedValueOnce({ stdout: "!! .env\n", stderr: "" });
     const audit = { git: vi.fn().mockResolvedValue(undefined) } as any;
@@ -1451,6 +1497,41 @@ describe("removeWorktree", () => {
       name: "ActiveSessionWorktreeRemovalError",
       details: expect.objectContaining({ taskId: "FN-2" }),
     });
+  });
+
+  it("does not let task-deletion force bypass an executor session", async () => {
+    activeSessionRegistry.registerPath("/repo/.worktrees/fn-1", {
+      taskId: "FN-1",
+      kind: "executor",
+      ownerKey: "FN-1/executor",
+    });
+
+    await expect(removeWorktree({
+      rootDir: "/repo",
+      worktreePath: "/repo/.worktrees/fn-1",
+      settings: {},
+      reason: RemovalReason.TaskDeletion,
+      taskId: "FN-1",
+      force: true,
+    })).rejects.toBeInstanceOf(ActiveSessionWorktreeRemovalError);
+  });
+
+  it("accepts only the matching task-deletion cleanup reservation", async () => {
+    execMock.mockResolvedValue({ stdout: "", stderr: "" });
+    activeSessionRegistry.registerPath("/repo/.worktrees/fn-1", {
+      taskId: "FN-1",
+      kind: "task-deletion-cleanup",
+      ownerKey: "deleted-task-cleanup:FN-1",
+    });
+
+    await expect(removeWorktree({
+      rootDir: "/repo",
+      worktreePath: "/repo/.worktrees/fn-1",
+      settings: {},
+      reason: RemovalReason.TaskDeletion,
+      taskId: "FN-1",
+      force: true,
+    })).resolves.toMatchObject({ removed: true });
   });
 
   it("keeps pre-FN-5346 behavior when defensive owner hints are omitted", async () => {

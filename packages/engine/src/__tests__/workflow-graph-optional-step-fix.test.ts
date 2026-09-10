@@ -8,7 +8,7 @@ import type { Task } from "@fusion/core";
 
 import { TaskExecutor } from "../executor.js";
 import { MAX_RECOVERY_RETRIES } from "../healing/recovery-policy.js";
-import { createMockStore, resetExecutorMocks } from "./executor-test-helpers.js";
+import { createMockStore, resetExecutorMocks, setMockSettings } from "./executor-test-helpers.js";
 
 function task(overrides: Partial<Task> = {}): Task {
   return {
@@ -32,6 +32,31 @@ function task(overrides: Partial<Task> = {}): Task {
     ...overrides,
   } as Task;
 }
+
+/*
+FNXC:SharedBranchMemberHold 2026-09-09-07:19:
+FN-8910 narrowed remediation admission to an operator-authored task-level Off. Project Off
+remains a merge-boundary policy, while remediation must reopen every non-user-held task regardless
+of shared-branch membership or project setting.
+*/
+const remediationHoldCases = ["user", "mission", "legacy-stamp", undefined].flatMap((autoMergeProvenance) =>
+  [false, true, undefined].flatMap((autoMerge) =>
+    [true, false].flatMap((projectAutoMerge) =>
+      [
+        { label: "shared group", branchContext: { assignmentMode: "shared", groupId: "BG-1" } },
+        { label: "shared blank group", branchContext: { assignmentMode: "shared", groupId: "" } },
+        { label: "standalone", branchContext: undefined },
+      ].map(({ label, branchContext }) => ({
+        label,
+        autoMerge,
+        autoMergeProvenance,
+        projectAutoMerge,
+        branchContext,
+        held: autoMerge === false && autoMergeProvenance === "user",
+      })),
+    ),
+  ),
+);
 
 const reviseInfo = {
   stepName: "Code Review",
@@ -92,6 +117,22 @@ function repeatedPlanReviewResult(attemptCount: number): NonNullable<Task["workf
 describe("TaskExecutor pre-merge optional-step fix seam", () => {
   beforeEach(() => {
     resetExecutorMocks();
+  });
+
+  it("overlays mock settings without replacing executor defaults", async () => {
+    const store = createMockStore();
+
+    setMockSettings(store, { autoMerge: true });
+
+    await expect(store.getSettings()).resolves.toMatchObject({
+      autoMerge: true,
+      maxConcurrent: 2,
+      maxPostReviewFixes: DEFAULT_MAX_POST_REVIEW_FIXES,
+      experimentalFeatures: {
+        workflowColumns: false,
+        workflowGraphExecutor: false,
+      },
+    });
   });
 
   it("retries a missing required artifact in place without consuming review revision budget", async () => {
@@ -418,24 +459,35 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
     expect(store.updateTask).toHaveBeenCalledWith(liveTask.id, expect.objectContaining({ status: "needs-replan" }), undefined);
   });
 
-  it("holds only user-held tasks during project-Off Plan Review remediation", async () => {
-    for (const overrides of [
-      { autoMerge: false, autoMergeProvenance: "user" as const },
-    ]) {
-      const store = createMockStore();
-      const liveTask = task({ column: "in-progress", status: null, ...overrides });
-      store.getTask.mockResolvedValue(liveTask);
-      const executor = new TaskExecutor(store, "/tmp/test");
+  it.each(remediationHoldCases)("applies the remediation hold only for user Off: $label", async ({
+    autoMerge,
+    autoMergeProvenance,
+    projectAutoMerge,
+    branchContext,
+    held,
+  }) => {
+    const store = createMockStore();
+    const liveTask = task({
+      column: "in-progress",
+      status: null,
+      autoMerge,
+      autoMergeProvenance,
+      branchContext,
+    });
+    store.getTask.mockResolvedValue(liveTask);
+    setMockSettings(store, { autoMerge: projectAutoMerge });
+    const executor = new TaskExecutor(store, "/tmp/test");
 
-      await expect((executor as any).requestPreMergeOptionalStepFix(liveTask.id, liveTask, {
-        stepName: "Plan Review",
-        feedback: "Revise the task specification.",
-        phase: "pre-merge",
-        status: "failed",
-        verdict: "REVISE",
-        nodeId: "plan-review",
-      })).resolves.toBe(false);
+    await expect((executor as any).requestPreMergeOptionalStepFix(liveTask.id, liveTask, {
+      stepName: "Plan Review",
+      feedback: "Revise the task specification.",
+      phase: "pre-merge",
+      status: "failed",
+      verdict: "REVISE",
+      nodeId: "plan-review",
+    })).resolves.toBe(!held);
 
+    if (held) {
       expect(store.moveTask).not.toHaveBeenCalled();
       expect(store.updateTask).not.toHaveBeenCalled();
       expect(store.logEntry).toHaveBeenCalledWith(
@@ -444,24 +496,9 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
         expect.stringContaining("operator-authored task-level auto-merge Off"),
         undefined,
       );
+    } else {
+      expect(store.moveTask).toHaveBeenCalledOnce();
     }
-  });
-
-  it("remediates a mission-policy shared member when project auto-merge is On", async () => {
-    const store = createMockStore();
-    const liveTask = task({
-      branchContext: { assignmentMode: "shared", groupId: "BG-1" },
-      autoMerge: false,
-      autoMergeProvenance: "mission",
-    });
-    store.getTask.mockResolvedValue(liveTask);
-    store.getSettings.mockResolvedValue({ autoMerge: true });
-    const executor = new TaskExecutor(store, "/tmp/test");
-    const sendBack = vi.spyOn(executor as any, "sendTaskBackForFix").mockResolvedValue(undefined);
-
-    await expect((executor as any).requestPreMergeOptionalStepFix(liveTask.id, liveTask, reviseInfo)).resolves.toBe(true);
-
-    expect(sendBack).toHaveBeenCalledOnce();
   });
 
   it("does not hard-cancel the graph that performs its own Plan Review replan move", async () => {
@@ -897,9 +934,21 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
 
   it("returns a finding-less graph-owned Code Review REVISE to execution with a deterministic Fix step", async () => {
     const store = createMockStore();
-    const liveTask = task({ postReviewFixCount: 0, log: [] });
+    const liveTask = task({
+      postReviewFixCount: 0,
+      log: [],
+      workflowStepResults: [{
+        workflowStepId: "code-review",
+        workflowStepName: "Code Review",
+        phase: "pre-merge",
+        status: "failed",
+        verdict: "REVISE",
+        output: reviseInfo.feedback,
+        completedAt: new Date().toISOString(),
+      }],
+    });
     store.getTask.mockResolvedValue(liveTask);
-    store.getSettings.mockResolvedValue({ maxPostReviewFixes: 3 });
+    setMockSettings(store, { maxPostReviewFixes: 3 });
     (store as any).updateTaskAtomic = vi.fn(async (_id: string, callback: (current: Task) => Partial<Task> | null) => {
       const patch = callback(liveTask);
       if (patch) Object.assign(liveTask, patch);
@@ -929,11 +978,10 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
         workflowStepName: "Code Review",
         phase: "pre-merge",
         status: "failed",
-        output: "Fix the review finding.",
         verdict: "REVISE",
+        output: "Fix the review finding.",
       }],
     });
-    store.getTask.mockResolvedValue(liveTask);
     const executor = new TaskExecutor(store, "/tmp/test");
     const sendBack = vi.spyOn(executor as any, "sendTaskBackForFix").mockResolvedValue(undefined);
 
@@ -948,30 +996,36 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
     );
   });
 
-  it("does not recover user-held tasks during project-Off failed-step recovery", async () => {
-    for (const overrides of [
-      { autoMerge: false, autoMergeProvenance: "user" as const },
-    ]) {
-      const store = createMockStore();
-      const liveTask = task({
-        column: "in-review",
-        ...overrides,
-        workflowStepResults: [{
-          workflowStepId: "code-review",
-          workflowStepName: "Code Review",
-          phase: "pre-merge",
-          status: "failed",
-          output: "Fix the review finding.",
-          verdict: "REVISE",
-        }],
-      });
-      const executor = new TaskExecutor(store, "/tmp/test");
-      const sendBack = vi.spyOn(executor as any, "sendTaskBackForFix");
+  it.each(remediationHoldCases)("recovers failed review steps unless user Off holds remediation: $label", async ({
+    autoMerge,
+    autoMergeProvenance,
+    projectAutoMerge,
+    branchContext,
+    held,
+  }) => {
+    const store = createMockStore();
+    const liveTask = task({
+      column: "in-review",
+      autoMerge,
+      autoMergeProvenance,
+      branchContext,
+      workflowStepResults: [{
+        workflowStepId: "code-review",
+        workflowStepName: "Code Review",
+        phase: "pre-merge",
+        status: "failed",
+        verdict: "REVISE",
+        output: "Fix the review finding.",
+      }],
+    });
+    setMockSettings(store, { autoMerge: projectAutoMerge });
+    const executor = new TaskExecutor(store, "/tmp/test");
+    const sendBack = vi.spyOn(executor as any, "sendTaskBackForFix").mockResolvedValue(undefined);
 
-      await expect(executor.recoverFailedPreMergeWorkflowStep(liveTask)).resolves.toBe(false);
+    await expect(executor.recoverFailedPreMergeWorkflowStep(liveTask)).resolves.toBe(!held);
 
-      expect(sendBack).not.toHaveBeenCalled();
-    }
+    if (held) expect(sendBack).not.toHaveBeenCalled();
+    else expect(sendBack).toHaveBeenCalledOnce();
   });
 
   it("keeps the retry presentation aligned with the next attempt during failed-step recovery", async () => {
@@ -984,13 +1038,12 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
         workflowStepName: "Code Review",
         phase: "pre-merge",
         status: "failed",
-        output: "Fix the review finding.",
         verdict: "REVISE",
+        output: "Fix the review finding.",
         completedAt: new Date().toISOString(),
       }],
     });
-    store.getTask.mockResolvedValue(liveTask);
-    store.getSettings.mockResolvedValue({ maxPostReviewFixes: 3 });
+    setMockSettings(store, { maxPostReviewFixes: 3, codeReviewMaxRevisions: "unbounded" });
     const executor = new TaskExecutor(store, "/tmp/test");
     const sendBack = vi.spyOn(executor as any, "sendTaskBackForFix").mockResolvedValue(undefined);
 
@@ -1004,10 +1057,11 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
       expect.any(String),
       true,
       false,
-      { attempt: 4, max: 3 },
+      { attempt: 4, max: undefined },
       undefined,
       true,
       "reopen-trailing",
+      expect.objectContaining({ revisionKey: "code-review", maxRevisions: "unbounded" }),
     );
   });
 
@@ -1031,35 +1085,32 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
         workflowStepName: "Code Review",
         phase: "pre-merge",
         status: "failed",
-        output: "Fix the review finding.",
         verdict: "REVISE",
+        output: "Fix the review finding.",
         findings,
         completedAt: new Date().toISOString(),
       }],
     });
-    store.getTask.mockResolvedValue(liveTask);
-    store.getSettings.mockResolvedValue({ maxPostReviewFixes: 3 });
+    setMockSettings(store, { maxPostReviewFixes: 3 });
     const executor = new TaskExecutor(store, "/tmp/test");
     const sendBack = vi.spyOn(executor as any, "sendTaskBackForFix").mockResolvedValue(undefined);
 
     await expect(executor.recoverFailedPreMergeWorkflowStep(liveTask)).resolves.toBe(true);
 
     expect(sendBack).toHaveBeenCalledWith(
-      await store.getTask(liveTask.id),
+      liveTask,
       liveTask.worktree,
       "Fix the review finding.",
       "Code Review",
       expect.any(String),
       true,
       false,
-      undefined,
+      expect.anything(),
       findings,
       true,
-      "none",
+      "reopen-trailing",
+      expect.objectContaining({ revisionKey: "code-review", maxRevisions: 3 }),
     );
-    expect((await store.getTask(liveTask.id)).steps).toContainEqual(expect.objectContaining({
-      status: "pending", remediation: expect.objectContaining({ findingId: "f-blocking", gate: "Code Review" }),
-    }));
   });
 
   /*
@@ -1081,8 +1132,8 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
         workflowStepName: "Code Review",
         phase: "pre-merge",
         status: "failed",
-        output: "Fix the review finding.",
         verdict: "REVISE",
+        output: "Fix the review finding.",
         completedAt: new Date().toISOString(),
       }],
     });
