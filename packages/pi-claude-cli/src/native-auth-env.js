@@ -1,3 +1,5 @@
+import process from "node:process";
+
 /**
  * Native Claude CLI/subscription child-auth policy. This pure module is also
  * bundled into dashboard probes so status and execution have one authority.
