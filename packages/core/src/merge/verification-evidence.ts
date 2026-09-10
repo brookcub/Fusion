@@ -14,6 +14,7 @@ export type VerificationEvidenceReason =
   | "malformed-receipt"
   | "ambiguous-workspace-candidate"
   | "failed-check"
+  | "current-pass"
   | "not-run";
 
 export type MergeVerificationCandidateEvidence = {
@@ -46,10 +47,11 @@ const hex40 = (value: unknown): value is string => typeof value === "string" && 
 const hex64 = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/i.test(value);
 
 /**
- * FNXC:VerificationEvidence 2026-09-09-03:59:
+ * FNXC:VerificationEvidence 2026-09-09-16:00:
  * Receipt truth is derived from the exact landed candidate and effective settings. A failed
  * current command remains failed; identity drift is stale; absent or still-running proof is
- * unavailable. This pure authority deliberately does not infer workflow policy or persist state.
+ * unavailable. A current pass has its own actionable reason rather than borrowing the not-run
+ * diagnostic. This pure authority deliberately does not infer workflow policy or persist state.
  */
 export function classifyMergeVerificationEvidence(
   task: Pick<Task, "mergeDetails"> | null | undefined,
@@ -112,7 +114,7 @@ export function classifyMergeVerificationEvidence(
       if (receipt.outcome === "not-run" && checks.length === 0 && configuredCommands.length === 0) {
         return { ...result, status: "not-run" as const, reason: "not-run" as const };
       }
-      if (receipt.outcome === "passed" && checks.length > 0) return { ...result, status: "passed" as const, reason: "not-run" as const };
+      if (receipt.outcome === "passed" && checks.length > 0) return { ...result, status: "passed" as const, reason: "current-pass" as const };
       return { repository, candidateSha: candidateSha!, status: "unavailable", reason: "malformed-receipt" };
     }),
   };

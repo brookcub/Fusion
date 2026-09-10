@@ -218,7 +218,8 @@ describe("executor workflow-step model resolution", () => {
           completedAt: "2026-09-06T06:00:01Z", outcome: "passed",
           checks: [{ type: "test", commandSha256: verificationHash(settings.testCommand), exitCode: 0 }] }] } },
     });
-    expect(captured.systemPrompt).toContain(`"candidateSha":"${sha}","evidence":"passed"`);
+    expect(captured.systemPrompt).toContain(`"candidateSha":"${sha}"`);
+    expect(captured.systemPrompt).toContain('"status":"passed","reason":"current-pass"');
     expect(captured.systemPrompt).toContain('"exitCode":0');
   });
 

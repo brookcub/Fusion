@@ -30,7 +30,6 @@ function runProbe(command: string, args: string[], deadline: number, env: NodeJS
     let settled = false;
     let stdout = "";
     let outputBytes = 0;
-    let timer: ReturnType<typeof setTimeout> | undefined;
     let child: ReturnType<typeof spawn>;
     const finish = (result: CommandResult) => {
       if (settled) return;
@@ -42,13 +41,13 @@ function runProbe(command: string, args: string[], deadline: number, env: NodeJS
       finish({ ok: false, stdout: "", reason });
       try { child.kill("SIGKILL"); } catch { /* already gone */ }
     };
+    const timer = setTimeout(() => failAndKill("Probe timed out"), remaining);
     try {
       child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], env });
     } catch {
       finish({ ok: false, stdout: "", reason: "Probe could not start" });
       return;
     }
-    timer = setTimeout(() => failAndKill("Probe timed out"), remaining);
     const receive = (chunk: Buffer | string, isStdout: boolean) => {
       if (settled) return;
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);

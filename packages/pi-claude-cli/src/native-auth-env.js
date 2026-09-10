@@ -4,7 +4,7 @@
  * @param {NodeJS.ProcessEnv} [source]
  * @returns {NodeJS.ProcessEnv}
  */
-export function buildNativeClaudeEnv(source = process.env) {
+export function buildNativeClaudeEnv(source = globalThis.process.env) {
   return Object.fromEntries(Object.entries(source).filter(([key]) =>
     !["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"].includes(key.toUpperCase()),
   ));
