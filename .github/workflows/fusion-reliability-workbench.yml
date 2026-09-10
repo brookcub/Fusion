@@ -11,6 +11,8 @@ jobs:
   source:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      GIT_LFS_SKIP_SMUDGE: "1"
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -21,7 +23,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/integrated-source"
-          git archive --format=tar HEAD | gzip > "$RUNNER_TEMP/integrated-source/source.tar.gz"
+          git -c filter.lfs.process= -c filter.lfs.smudge= -c filter.lfs.required=false archive --format=tar HEAD | gzip > "$RUNNER_TEMP/integrated-source/source.tar.gz"
           git ls-tree -rz HEAD > "$RUNNER_TEMP/integrated-source/tree-manifest"
           git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/integrated-source/identity.txt"
           sha256sum "$RUNNER_TEMP/integrated-source/source.tar.gz" > "$RUNNER_TEMP/integrated-source/SHA256SUMS"
