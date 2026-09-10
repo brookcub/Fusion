@@ -804,6 +804,8 @@ export interface AiMergeReviewReconciliation {
   integrationTipSha: string;
   candidateSha?: string;
   candidateTreeSha?: string;
+  /** FNXC:MergeReviewRouting 2026-09-09-23:56: SHA-256 of the resolved reviewer route that produced approval evidence. */
+  reviewerPolicySha256?: string;
   findings: AiMergeReviewFinding[];
   consecutiveCleanApprovals: number;
   correctivePasses: number;

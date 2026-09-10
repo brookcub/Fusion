@@ -36,6 +36,7 @@ import { commitIdentityArgs, resolveCommitIdentity } from "../git-identity.js";
  * the orchestrator accepts injectable agent functions for the same reason.
  */
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { realpathSync, readdirSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
@@ -56,6 +57,7 @@ import {
   resolvePersistAgentThinkingLog,
   resolveTaskMergeTarget,
   resolveMergerFallbackModel,
+  resolveValidatorFallbackModel,
   resolveContainedBackwardTarget,
   resolveTerminalColumns,
   resolveWorkflowIrForTask,
@@ -74,6 +76,7 @@ import {
 } from "@fusion/core";
 import { selectUserCommentsForAgentContext } from "../agents/agent-user-comments.js";
 import { resolveTaskWorkingBranch } from "../worktree/worktree-names.js";
+import { mergeEffectiveSettings } from "../project/effective-settings.js";
 import { resolveIntegrationBranch } from "./integration-branch.js";
 import { captureMergeContentDescriptor } from "./merge-content-capture.js";
 import { probeReviewDiffFingerprint } from "../worktree/review-diff-fingerprint.js";
@@ -91,7 +94,7 @@ import {
   isMergeAbortedError,
   type MergeWriteFence,
 } from "./merge-write-fence.js";
-import { createResolvedAgentSession, resolveMergerSessionModel, resolveMergerThinkingLevel, resolveMergerFallbackThinkingLevel, resolveValidatorSessionModel, resolveValidatorThinkingLevel } from "../agents/agent-session-helpers.js";
+import { createResolvedAgentSession, resolveMergerSessionModel, resolveMergerThinkingLevel, resolveMergerFallbackThinkingLevel, resolveValidatorSessionModel, resolveValidatorThinkingLevel, resolveValidatorFallbackThinkingLevel } from "../agents/agent-session-helpers.js";
 import { promptWithFallback } from "../pi.js";
 import { AgentLogger } from "../agents/agent-logger.js";
 import { attachAgentUsageTelemetry, emitAgentSessionStart } from "../agents/agent-usage-telemetry.js";
@@ -357,6 +360,10 @@ async function recoverApprovedPreexistingAiMergeWorktree(
   const selected = recoverableCandidates[0];
   throwIfAborted(signal, taskId);
   if (!selected.alreadyLanded) {
+    if (!(await reconcileAiMergeReviewPolicy(store, taskId))) {
+      await log("AI merge: preserved approved candidate but its reviewer policy changed or lacks a receipt — fresh approval is required before landing");
+      throw new AiMergeReviewPolicyChangedError();
+    }
     if (!task) throw new Error(`AI merge task ${taskId} disappeared before recovery squash gates`);
     await enforceAiMergeSquashGates({ store, task, taskId, mergeRoot: selected.mergeRoot, branch, tipSha: selected.tipSha, squashSha: selected.squashSha, audit, log, repoRel: ctx.repoRel, repoKeys: ctx.repoKeys });
     const assertVerified = await verifyAiMergeCandidate({ store, taskId, mergeRoot: selected.mergeRoot, branch, tipSha: selected.tipSha, squashSha: selected.squashSha, signal, log });
@@ -374,6 +381,9 @@ async function recoverApprovedPreexistingAiMergeWorktree(
       assertMergeGateStillOpen: async () => {
         await assertMergeGateStillOpen(ctx, repoRootDir, ctx.repoRel);
         await assertVerified();
+        if (!(await reconcileAiMergeReviewPolicy(store, taskId))) {
+          throw new AiMergeReviewPolicyChangedError();
+        }
       },
     });
     if (land.outcome !== "advanced") return null;
@@ -541,7 +551,7 @@ function makeMutatingAgent(store: TaskStore, settings: Settings, taskId: string,
         ? (_id: string, name: string) => options.onAgentTool?.(name)
         : undefined,
     });
-    { attachAgentUsageTelemetry(logger, { store, agentId: task?.assignedAgentId ?? null, taskId, nodeId: task?.effectiveNodeId ?? task?.nodeId ?? null, model: model.modelId ?? null, provider: model.provider ?? null, lane: "merger" }); }
+    { attachAgentUsageTelemetry(logger, { store, agentId: task?.assignedAgentId ?? null, taskId, nodeId: task?.effectiveNodeId ?? task?.nodeId ?? null, model: model.modelId ?? null, provider: model.provider ?? null, lane: "merger", role: "merge-mutation" }); }
 
     const { session } = await createResolvedAgentSession({
       sessionPurpose: "merger",
@@ -566,7 +576,7 @@ function makeMutatingAgent(store: TaskStore, settings: Settings, taskId: string,
       mcpServers: (await resolveMcpServersForStore(store)).servers,
       taskId,
     });
-    emitAgentSessionStart({ store, agentId: task?.assignedAgentId ?? null, taskId, nodeId: task?.effectiveNodeId ?? task?.nodeId ?? null, model: model.modelId ?? null, provider: model.provider ?? null, lane: "merger" });
+    emitAgentSessionStart({ store, agentId: task?.assignedAgentId ?? null, taskId, nodeId: task?.effectiveNodeId ?? task?.nodeId ?? null, model: model.modelId ?? null, provider: model.provider ?? null, lane: "merger", role: "merge-mutation" });
     options.onSession?.(session);
     try {
       await withRateLimitRetry(async () => {
@@ -581,6 +591,81 @@ function makeMutatingAgent(store: TaskStore, settings: Settings, taskId: string,
   };
 }
 
+function resolveMergeReviewSessionRoute(task: Task, settings: Settings) {
+  const model = resolveValidatorSessionModel(
+    task.validatorModelProvider,
+    task.validatorModelId,
+    settings,
+    undefined,
+    task.validatorCredentialInstanceId,
+  );
+  const fallback = resolveValidatorFallbackModel(settings);
+  return {
+    model,
+    fallback,
+    defaultThinkingLevel: resolveValidatorThinkingLevel(task.validatorThinkingLevel, settings),
+    fallbackThinkingLevel: resolveValidatorFallbackThinkingLevel(task.validatorThinkingLevel, settings),
+  };
+}
+
+/** FNXC:MergeReviewRouting 2026-09-09-23:56: A policy receipt change retains the candidate and requires a bounded fresh-review attempt. */
+class AiMergeReviewPolicyChangedError extends Error {
+  constructor() {
+    super("AI merge reviewer policy changed; fresh approval is required before landing");
+    this.name = "AiMergeReviewPolicyChangedError";
+  }
+}
+
+/** FNXC:MergeReviewRouting 2026-09-09-23:56: A candidate that no longer proves task/tip identity cannot be reused. */
+class AiMergeReviewCandidateInvalidError extends Error {
+  constructor() {
+    super("AI merge recorded review candidate is no longer valid; explicit repair is required");
+    this.name = "AiMergeReviewCandidateInvalidError";
+  }
+}
+
+/** FNXC:MergeReviewRouting 2026-09-09-23:56: A candidate read failure is unknown, so its receipt stays preserved for an explicit retry. */
+class AiMergeReviewCandidateUnverifiableError extends Error {
+  constructor() {
+    super("AI merge recorded review candidate could not be verified; preserving it for explicit retry");
+    this.name = "AiMergeReviewCandidateUnverifiableError";
+  }
+}
+
+/** FNXC:MergeReviewRouting 2026-09-09-23:56: Resolve the policy used for a merge-review session and durable approval binding. */
+async function resolveMergeReviewSelection(store: TaskStore, task: Task) {
+  /*
+  FNXC:MergeReviewRouting 2026-09-09-23:56:
+  Merge review is a validation operation, even though its mutating sibling stays on the merger lane.
+  Resolve the persisted workflow overlay before the canonical validator resolvers so task override >
+  workflow > global and test-mode behavior agree with ordinary review. The policy receipt carries
+  only provider/model/thinking plus credential reference ids, never credential values.
+  */
+  const settings = await store.getSettings();
+  const effectiveSettings = await mergeEffectiveSettings(store, task, settings);
+  const route = resolveMergeReviewSessionRoute(task, effectiveSettings);
+  const reviewerPolicySha256 = createHash("sha256").update(JSON.stringify({
+    primary: [route.model.provider ?? null, route.model.modelId ?? null, route.model.credentialInstanceId ?? null, route.defaultThinkingLevel ?? null],
+    fallback: [route.fallback.provider ?? null, route.fallback.modelId ?? null, route.fallback.credentialInstanceId ?? null, route.fallbackThinkingLevel ?? null],
+  })).digest("hex");
+  return { ...route, effectiveSettings, reviewerPolicySha256 };
+}
+
+/** FNXC:MergeReviewRouting 2026-09-09-23:56: Return false after atomically replacing stale/legacy approval evidence with a fresh receipt. */
+async function reconcileAiMergeReviewPolicy(store: TaskStore, taskId: string): Promise<boolean> {
+  const task = await store.getTask(taskId);
+  const state = task?.aiMergeReviewReconciliation;
+  if (!task || !state) return false;
+  const selection = await resolveMergeReviewSelection(store, task);
+  if (state.reviewerPolicySha256 === selection.reviewerPolicySha256) return true;
+  const refreshed = { ...state, reviewerPolicySha256: selection.reviewerPolicySha256, consecutiveCleanApprovals: 0 };
+  await store.updateTaskAtomic(taskId, (live) => {
+    if (JSON.stringify(live.aiMergeReviewReconciliation) !== JSON.stringify(state)) return undefined;
+    return { aiMergeReviewReconciliation: refreshed };
+  });
+  return false;
+}
+
 function makeReviewAgent(store: TaskStore, settings: Settings, taskId: string, options: MergerOptions, audit: RunAuditor) {
   return async (cwd: string, prompt: string): Promise<string> => {
     // The reviewer uses the project's validator/reviewer model lane (the same
@@ -589,16 +674,7 @@ function makeReviewAgent(store: TaskStore, settings: Settings, taskId: string, o
     const task = await store.getTask(taskId);
     if (!task) throw new Error("Merge reviewer task authority unavailable");
     // FNXC:MergeReviewerModel 2026-09-06-05:12: Task-scoped reviewer model, credential and thinking choices must reach merge review just as they reach ordinary code review; project defaults are fallbacks, not overrides.
-    const validator = resolveValidatorSessionModel(task?.validatorModelProvider, task?.validatorModelId, settings, undefined, task?.validatorCredentialInstanceId);
-    const model = validator.provider && validator.modelId ? validator : resolveMergerSessionModel(settings, undefined, task);
-    // FNXC:Settings-MergerModel 2026-07-16-00:00: review merger retries share the dedicated merger fallback provider/model and thinking lane.
-    const mergerFallbackModel = resolveMergerFallbackModel(settings);
-    // FNXC:Settings-ThinkingLevel 2026-07-10-00:00: The review agent's model falls back
-    // between the validator lane and the merger default lane, so its thinking level
-    // must follow the same lane it actually resolved a model from.
-    const reviewThinkingLevel = validator.provider && validator.modelId
-      ? resolveValidatorThinkingLevel(task?.validatorThinkingLevel, settings)
-      : resolveMergerThinkingLevel(settings, task?.mergerThinkingLevel);
+    const route = await resolveMergeReviewSelection(store, task);
     let captured = "";
     const logger = new AgentLogger({
       store,
@@ -613,7 +689,7 @@ function makeReviewAgent(store: TaskStore, settings: Settings, taskId: string, o
         ? (_id: string, name: string) => options.onAgentTool?.(name)
         : undefined,
     });
-    { attachAgentUsageTelemetry(logger, { store, agentId: task?.assignedAgentId ?? null, taskId, nodeId: task?.effectiveNodeId ?? task?.nodeId ?? null, model: model.modelId ?? null, provider: model.provider ?? null, lane: "merger" }); }
+    { attachAgentUsageTelemetry(logger, { store, agentId: task?.assignedAgentId ?? null, taskId, nodeId: task?.effectiveNodeId ?? task?.nodeId ?? null, model: route.model.modelId ?? null, provider: route.model.provider ?? null, lane: "merger", role: "merge-review" }); }
 
     const { session } = await createResolvedAgentSession({
       sessionPurpose: "merger",
@@ -628,20 +704,20 @@ function makeReviewAgent(store: TaskStore, settings: Settings, taskId: string, o
       onThinking: logger.onThinking,
       onToolStart: logger.onToolStart,
       onToolEnd: logger.onToolEnd,
-      defaultProvider: model.provider,
-      defaultModelId: model.modelId,
-      ...(model.credentialInstanceId ? { credentialInstanceId: model.credentialInstanceId } : {}),
-      fallbackProvider: mergerFallbackModel.provider,
-      fallbackModelId: mergerFallbackModel.modelId,
-      fallbackThinkingLevel: resolveMergerFallbackThinkingLevel(settings, task?.mergerThinkingLevel),
-      defaultThinkingLevel: reviewThinkingLevel,
+      defaultProvider: route.model.provider,
+      defaultModelId: route.model.modelId,
+      ...(route.model.credentialInstanceId ? { credentialInstanceId: route.model.credentialInstanceId } : {}),
+      fallbackProvider: route.fallback.provider,
+      fallbackModelId: route.fallback.modelId,
+      fallbackThinkingLevel: route.fallbackThinkingLevel,
+      defaultThinkingLevel: route.defaultThinkingLevel,
       runAuditor: audit,
-      settings,
+      settings: route.effectiveSettings,
       // FNXC:McpConfig 2026-06-25-22:48: The production merge reviewer receives the same materialized MCP set as the mutating merge agent, preserving all-lane forwarding without logging server contents.
       mcpServers: (await resolveMcpServersForStore(store)).servers,
       taskId,
     });
-    emitAgentSessionStart({ store, agentId: task?.assignedAgentId ?? null, taskId, nodeId: task?.effectiveNodeId ?? task?.nodeId ?? null, model: model.modelId ?? null, provider: model.provider ?? null, lane: "merger" });
+    emitAgentSessionStart({ store, agentId: task?.assignedAgentId ?? null, taskId, nodeId: task?.effectiveNodeId ?? task?.nodeId ?? null, model: route.model.modelId ?? null, provider: route.model.provider ?? null, lane: "merger", role: "merge-review" });
     options.onSession?.(session);
     try {
       await withRateLimitRetry(async () => {
@@ -1069,11 +1145,22 @@ export async function landOneRepo(
   // one task share the `fusion-ai-merge-<taskId>-` prefix, so a prune rooted at a
   // shared root could reap a sibling repo's live clean room. Rooting it at
   // repoRootDir keeps each repo's prune to its own temp roots.
-  try {
-    const pruned = await pruneExistingAiMergeWorktrees(taskId, repoRootDir, audit, log, settings);
-    if (pruned > 0) await log(`AI merge: pruned ${pruned} pre-existing worktree(s) for ${taskId}`);
-  } catch (err: unknown) {
-    await log(`AI merge: pre-merge prune failed: ${getErrorMessage(err)}`);
+  const preservedCandidate = (await store.getTask(taskId))?.aiMergeReviewReconciliation?.candidateSha;
+  if (preservedCandidate) {
+    /*
+    FNXC:MergeReviewRouting 2026-09-09-23:56:
+    A policy-change refusal leaves a candidate clean room recoverable for its next explicit review.
+    Do not let the ordinary stale-worktree prune erase that evidence before the resumed attempt can
+    re-verify the same candidate; a successful landing remains responsible for normal cleanup.
+    */
+    await log(`AI merge: retaining recorded review candidate ${short(preservedCandidate)} for fresh policy approval`);
+  } else {
+    try {
+      const pruned = await pruneExistingAiMergeWorktrees(taskId, repoRootDir, audit, log, settings);
+      if (pruned > 0) await log(`AI merge: pruned ${pruned} pre-existing worktree(s) for ${taskId}`);
+    } catch (err: unknown) {
+      await log(`AI merge: pre-merge prune failed: ${getErrorMessage(err)}`);
+    }
   }
   let advanceRetries = 0;
   // Structured reconciliation state is read by mergeAndReview; task logs are not a fallback authority.
@@ -1102,6 +1189,7 @@ export async function landOneRepo(
     // 1. Clean-room worktree at the integration tip.
     let mergeRoot: string | undefined;
     let worktreeAdded = false;
+    let preserveReviewCandidate = false;
     let failureStage: MergeFailureStage = "clean-room";
     const registeredMergePaths = new Set<string>();
     const registerMergeRoot = (pathToRegister: string): void => {
@@ -1261,20 +1349,11 @@ export async function landOneRepo(
 
       // 2 + 3. Merge + review loop (corrective passes).
       failureStage = "merge-review";
-      let reviewResult: Awaited<ReturnType<typeof mergeAndReview>>;
-      try {
-        reviewResult = await mergeAndReview({
-          mergeRoot, branch, integrationBranch, tipSha, taskTitle, includeTaskId, trailers, taskId,
-          maxPasses, mergeAgent, reviewAgent, audit, log, setStatus, store, signal,
-          initialPriorReasons: outstandingReviewReasons,
-        });
-      } catch (error) {
-        if (error instanceof AiMergeReviewReconciliationInvalidatedError) {
-          await log("AI merge: reconciliation episode changed during review — rebuilding from current source and integration identities");
-          continue;
-        }
-        throw error;
-      }
+      const reviewResult = await mergeAndReview({
+        mergeRoot, branch, integrationBranch, tipSha, taskTitle, includeTaskId, trailers, taskId,
+        maxPasses, mergeAgent, reviewAgent, audit, log, setStatus, store, signal,
+        initialPriorReasons: outstandingReviewReasons,
+      });
       const squashSha = reviewResult.squashSha;
       outstandingReviewReasons = reviewResult.priorReasons;
 
@@ -1335,6 +1414,9 @@ export async function landOneRepo(
         assertMergeGateStillOpen: async () => {
           await assertMergeGateStillOpen(ctx, repoRootDir, ctx.repoRel);
           await assertVerified();
+          if (!(await reconcileAiMergeReviewPolicy(store, taskId))) {
+            throw new AiMergeReviewPolicyChangedError();
+          }
         },
         onWorkspaceRepublish: async (observedTargetSha) => {
           await log(`AI merge (workspace): re-observed remote ${workspaceFence?.remote ?? "target"} at ${short(observedTargetSha ?? "absent")} before publishing ${integrationBranch}`);
@@ -1353,13 +1435,26 @@ export async function landOneRepo(
       await log(`AI merge: advanced ${integrationBranch} → ${short(squashSha)} (local checkout: ${landed.localSync})`);
       return { outcome: "landed", squashSha, localSync: landed.localSync, tipSha, integrationBranch, dependencySyncDecision };
     } catch (error) {
+      if (error instanceof AiMergeReviewPolicyChangedError) {
+        preserveReviewCandidate = true;
+        await log("AI merge: reviewer policy changed; preserved the reviewed candidate and stopped before landing for a fresh approval attempt");
+        throw error;
+      }
+      if (error instanceof AiMergeReviewReconciliationInvalidatedError) {
+        if (advanceRetries < MAX_CONCURRENT_ADVANCE_RETRIES) {
+          advanceRetries++;
+          await log(`AI merge: source, integration, or review state changed during reconciliation — rebuilding (retry ${advanceRetries}/${MAX_CONCURRENT_ADVANCE_RETRIES})`);
+          continue;
+        }
+        throw new Error(`AI merge reconciliation changed for ${taskId} after ${advanceRetries} bounded rebuild attempt(s); explicit retry required`);
+      }
       reportMergeFailure(error, failureStage, (message) => aiMergeLog.error(message));
       throw error;
     } finally {
       for (const registeredPath of registeredMergePaths) {
         activeSessionRegistry.unregisterPath(registeredPath);
       }
-      if (mergeRoot) {
+      if (mergeRoot && !preserveReviewCandidate) {
         await cleanupAiMergeWorktree({ taskId, mergeRoot, projectRootDir: repoRootDir, worktreeAdded, audit, log });
       }
     }
@@ -1821,6 +1916,7 @@ export async function runAiMerge(
 
   const maxPasses = Math.max(0, Math.trunc(settings.merger?.maxReviewPasses ?? 3));
   const mergeAgent = deps.mergeAgent ?? makeMutatingAgent(store, settings, taskId, options, audit, buildMergeSystemPrompt(settings.agentPrompts));
+  // FNXC:MergeReviewRouting 2026-09-09-23:56: Mutation keeps merger settings while review resolves effective validator settings at its point of use.
   const reviewAgent = deps.reviewAgent ?? makeReviewAgent(store, settings, taskId, options, audit);
   const stashResolveAgent = deps.stashResolveAgent ?? makeMutatingAgent(store, settings, taskId, options, audit, buildStashResolveSystemPrompt());
   const includeTaskId = settings.includeTaskIdInCommit !== false;
@@ -3424,11 +3520,18 @@ async function mergeAndReview(input: {
 }): Promise<{ squashSha: string | null; priorReasons: string[] }> {
   const { mergeRoot, branch, integrationBranch, tipSha, taskTitle, includeTaskId, trailers, taskId, maxPasses, mergeAgent, reviewAgent, audit, log, setStatus, store, signal } = input;
   const current = await store.getTask(taskId);
+  if (!current) throw new Error(`AI merge task ${taskId} disappeared before review routing`);
+  const initialReviewSelection = await resolveMergeReviewSelection(store, current);
   const sourceSha = await git(["rev-parse", "--verify", branch], mergeRoot);
   let state: NonNullable<Task["aiMergeReviewReconciliation"]> | undefined = current?.aiMergeReviewReconciliation;
+  let policyReceiptChanged = false;
   if (!state || state.sourceSha !== sourceSha || state.integrationTipSha !== tipSha) {
     const legacy = boundBlockingReviewReasons(input.initialPriorReasons ?? []);
-    state = { sourceSha, integrationTipSha: tipSha, findings: legacy.map((text, index) => ({ id: `legacy-${index + 1}`, text, disposition: "pending" as const })), consecutiveCleanApprovals: 0, correctivePasses: 0 };
+    state = { sourceSha, integrationTipSha: tipSha, reviewerPolicySha256: initialReviewSelection.reviewerPolicySha256, findings: legacy.map((text, index) => ({ id: `legacy-${index + 1}`, text, disposition: "pending" as const })), consecutiveCleanApprovals: 0, correctivePasses: 0 };
+  } else if (state.reviewerPolicySha256 !== initialReviewSelection.reviewerPolicySha256) {
+    // FNXC:MergeReviewRouting 2026-09-09-23:56: Policy changes and legacy receipts need two new approvals, not destructive reconciliation.
+    state = { ...state, reviewerPolicySha256: initialReviewSelection.reviewerPolicySha256, consecutiveCleanApprovals: 0 };
+    policyReceiptChanged = true;
   }
   let needsMerge = !state.candidateSha;
   let persistedState = current?.aiMergeReviewReconciliation;
@@ -3440,24 +3543,60 @@ async function mergeAndReview(input: {
     });
     persistedState = next;
   };
+  if (policyReceiptChanged) await persistState(persistedState, state);
+  if (state.candidateSha) {
+    /*
+    FNXC:MergeReviewRouting 2026-09-09-23:56:
+    A resumed policy review must inspect and potentially land the candidate that earned the prior
+    findings, not quietly construct a second implementation from the source branch. Validate its
+    durable identity in this clean room, then put HEAD on that exact candidate for the reviewer.
+    */
+    let candidateTreeSha: string;
+    let candidateCommit: string;
+    let candidateBase: string;
+    try {
+      candidateTreeSha = await git(["rev-parse", `${state.candidateSha}^{tree}`], mergeRoot);
+      candidateCommit = await git(["show", "-s", "--format=%s%x1f%b", state.candidateSha], mergeRoot);
+      candidateBase = await git(["merge-base", tipSha, state.candidateSha], mergeRoot);
+    } catch {
+      throw new AiMergeReviewCandidateUnverifiableError();
+    }
+    const [subject = "", body = ""] = candidateCommit.split("\x1f");
+    const candidateOwnsTask = getCommitTaskOwnership(taskId, current.lineageId, subject, body).owned;
+    const candidateBuildsOnTip = candidateBase === tipSha;
+    if ((state.candidateTreeSha && candidateTreeSha !== state.candidateTreeSha) || !candidateOwnsTask || !candidateBuildsOnTip) {
+      throw new AiMergeReviewCandidateInvalidError();
+    }
+    await git(["checkout", "--detach", state.candidateSha], mergeRoot);
+  }
   const assertCurrentEpisodeIdentity = async (): Promise<void> => {
     const expectedState = state;
     if (!expectedState) throw new AiMergeReviewReconciliationInvalidatedError();
     const liveTask = await store.getTask(taskId);
-    const liveBranch = liveTask?.branch ?? branch;
+    if (!liveTask) throw new AiMergeReviewReconciliationInvalidatedError();
+    const liveReviewSelection = await resolveMergeReviewSelection(store, liveTask);
+    const liveBranch = liveTask.branch ?? branch;
     const liveSourceSha = await git(["rev-parse", "--verify", liveBranch], mergeRoot);
     const liveTipSha = await git(["rev-parse", "--verify", `refs/heads/${integrationBranch}`], mergeRoot);
     if (
       liveBranch !== branch
       || liveSourceSha !== expectedState.sourceSha
       || liveTipSha !== expectedState.integrationTipSha
-      || !sameState(liveTask?.aiMergeReviewReconciliation, expectedState)
+      || !sameState(liveTask.aiMergeReviewReconciliation, expectedState)
     ) {
       await store.updateTaskAtomic(taskId, (currentTask) => {
         if (!sameState(currentTask.aiMergeReviewReconciliation, expectedState)) return undefined;
         return { aiMergeReviewReconciliation: null, mergeRetries: undefined };
       });
       throw new AiMergeReviewReconciliationInvalidatedError();
+    }
+    if (liveReviewSelection.reviewerPolicySha256 !== expectedState.reviewerPolicySha256) {
+      const refreshed = { ...expectedState, reviewerPolicySha256: liveReviewSelection.reviewerPolicySha256, consecutiveCleanApprovals: 0 };
+      await store.updateTaskAtomic(taskId, (currentTask) => {
+        if (!sameState(currentTask.aiMergeReviewReconciliation, expectedState)) return undefined;
+        return { aiMergeReviewReconciliation: refreshed };
+      });
+      throw new AiMergeReviewPolicyChangedError();
     }
   };
   while (true) {

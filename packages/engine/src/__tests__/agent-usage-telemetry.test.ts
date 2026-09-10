@@ -30,4 +30,41 @@ describe("agent usage telemetry", () => {
     expect(emitUsageEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: "session_start", category: AGENT_SESSION_USAGE_CATEGORY, meta: { lane: "reviewer", ephemeral: false, runId: "run-1" } }));
     expect(() => attachAgentUsageTelemetry(null, { store, lane: "reviewer" })).not.toThrow();
   });
+
+  /*
+  FNXC:MergerTelemetryRole 2026-09-10-00:19:
+  Merge mutation and merge review share the historical merger lane, but operators need the authoritative sub-role on both session and tool usage rows.
+  A caller without that new sub-role must retain the exact legacy metadata shape.
+  */
+  it.each(["merge-mutation", "merge-review"] as const)("emits %s on its merger session and tool rows", (role) => {
+    const emitUsageEvent = vi.fn().mockResolvedValue(undefined);
+    const store = { emitUsageEvent } as unknown as TaskStore;
+    const logger = new AgentLogger({ taskId: "FN-MERGE-ROLE", appendLog: vi.fn().mockResolvedValue(undefined) });
+    const context = { store, lane: "merger" as const, role, agentId: "merger", taskId: "FN-MERGE-ROLE", nodeId: "merge-node", model: "merge-model", provider: "merge-provider" };
+
+    attachAgentUsageTelemetry(logger, context);
+    emitAgentSessionStart(context);
+    logger.onToolStart("Read", { path: "private-diff" });
+    logger.onToolEnd("Read", false, "private-result");
+
+    const events = emitUsageEvent.mock.calls.map(([event]) => event);
+    expect(events.find((event) => event.kind === "session_start")).toMatchObject({ meta: { lane: "merger", role } });
+    expect(events.find((event) => event.kind === "tool_call")).toMatchObject({ meta: { role } });
+    expect(events.find((event) => event.kind === "tool_result")).toMatchObject({ meta: { role } });
+  });
+
+  it("preserves no-role merger usage metadata exactly as before", () => {
+    const emitUsageEvent = vi.fn().mockResolvedValue(undefined);
+    const store = { emitUsageEvent } as unknown as TaskStore;
+    const logger = new AgentLogger({ taskId: "FN-MERGE-LEGACY", appendLog: vi.fn().mockResolvedValue(undefined) });
+    const context = { store, lane: "merger" as const, agentId: "merger", taskId: "FN-MERGE-LEGACY" };
+
+    attachAgentUsageTelemetry(logger, context);
+    emitAgentSessionStart(context);
+    logger.onToolStart("Read", { path: "private-path" });
+
+    const [session, tool] = emitUsageEvent.mock.calls.map(([event]) => event);
+    expect(session.meta).toEqual({ lane: "merger" });
+    expect(tool).not.toHaveProperty("meta");
+  });
 });

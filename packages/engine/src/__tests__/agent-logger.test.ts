@@ -949,6 +949,24 @@ describe("AgentLogger", () => {
     });
 
     /*
+     * FNXC:MergerTelemetryRole 2026-09-10-00:19:
+     * Tool metadata is supplementary. The merger session's resolved sub-role remains authoritative,
+     * so a caller-provided metadata object cannot relabel a mutation row as review.
+     */
+    it("does not allow tool metadata to spoof the resolved merger role", () => {
+      const store = createUsageStore();
+      const logger = new AgentLogger({ store, taskId: "FN-UE-MERGE", agent: "merger" });
+      logger.setUsageContext({ model: "m", provider: "p", nodeId: "n", agentId: "a", role: "merge-mutation" });
+
+      (logger as any).emitToolUsageEvent("tool_call", "Read", { role: "merge-review", outcome: "fixture" });
+
+      expect(store.emitUsageEvent).toHaveBeenCalledWith(expect.objectContaining({
+        kind: "tool_call",
+        meta: { role: "merge-mutation", outcome: "fixture" },
+      }));
+    });
+
+    /*
      * FNXC:Telemetry 2026-06-16-05:47:
      * Prove the fail-soft telemetry contract: a throwing store.emitUsageEvent must never break
      * onToolStart/onToolEnd, and tool logging (appendAgentLog) must still proceed. Covers both a

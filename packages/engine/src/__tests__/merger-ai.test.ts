@@ -2,7 +2,8 @@ import { describe, it, expect, vi, afterAll } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 const createResolvedAgentSessionMock = vi.hoisted(() => vi.fn());
 vi.mock("../agents/agent-session-helpers.js", async (importOriginal) => {
@@ -61,7 +62,8 @@ afterAll(() => {
   }
 });
 
-function git(cwd: string, args: string): string {
+function git(cwd: string, args: string | string[]): string {
+  if (Array.isArray(args)) return execFileSync("git", args, { cwd, encoding: "utf-8" }).trim();
   return execSync(`git ${args}`, { cwd, encoding: "utf-8" }).trim();
 }
 
@@ -117,6 +119,7 @@ function makeStore(
   taskOverrides: Record<string, unknown> = {},
   settingsOverrides: Record<string, unknown> = {},
   branchGroup?: any,
+  workflowValues?: Record<string, unknown>,
 ) {
   const task: any = {
     id: "FN-1",
@@ -168,6 +171,13 @@ function makeStore(
     listTasksByBranchGroup: vi.fn(async () => [task]),
     recordRunAuditEvent: vi.fn(),
   };
+  if (workflowValues) {
+    // FNXC:MergeReviewRouting 2026-09-09-23:56: Exercise the persisted-workflow seam used by workflow-step reviewer routing.
+    store.getTaskWorkflowSelection = vi.fn(() => ({ workflowId: "builtin:coding", stepIds: [] }));
+    store.getWorkflowDefinition = vi.fn(async () => undefined);
+    store.getWorkflowSettingValues = vi.fn(() => workflowValues);
+    store.getWorkflowSettingsProjectId = vi.fn(() => "merger-model-routing-test");
+  }
   return { store, task, emitted, logs, group };
 }
 
@@ -344,7 +354,7 @@ describe("runAiMerge", () => {
         git(dir, "checkout -q fusion/fn-1");
         writeFileSync(join(dir, "after-review.txt"), "new source identity\n");
         git(dir, "add after-review.txt");
-        git(dir, "commit -q -m 'feat: source moved during review'");
+        git(dir, ["commit", "-q", "-m", "feat: source moved during review"]);
         git(dir, "checkout -q main");
       }
       return "REVIEW_VERDICT: approve";
@@ -358,6 +368,29 @@ describe("runAiMerge", () => {
     expect(result.merged).toBe(true);
     expect(reviewAgent).toHaveBeenCalledTimes(3);
     expect(git(dir, "show main:after-review.txt")).toContain("new source identity");
+  });
+
+  it("stops after the bounded reconciliation rebuild budget when source identity keeps changing", async () => {
+    const { dir } = initRepoWithBranch({ branch: "fusion/fn-1" });
+    const mainBefore = git(dir, "rev-parse main");
+    const { store } = makeStore(dir);
+    let change = 0;
+    const mergeAgent = realMergeAgent("fusion/fn-1");
+    const reviewAgent = vi.fn(async () => {
+      change++;
+      git(dir, "checkout -q fusion/fn-1");
+      writeFileSync(join(dir, `reconciliation-${change}.txt`), `source ${change}\n`);
+      git(dir, ["add", `reconciliation-${change}.txt`]);
+      git(dir, ["commit", "-q", "-m", `feat: source identity ${change}`]);
+      git(dir, "checkout -q main");
+      return "REVIEW_VERDICT: approve";
+    });
+
+    await expect(runAiMerge(store, dir, "FN-1", { manual: true }, { mergeAgent, reviewAgent }))
+      .rejects.toThrow("after 3 bounded rebuild attempt(s)");
+    expect(reviewAgent).toHaveBeenCalledTimes(4);
+    expect(mergeAgent).toHaveBeenCalledTimes(4);
+    expect(git(dir, "rev-parse main")).toBe(mainBefore);
   });
 
   it("passes explicit still-present findings to a corrective merger", async () => {
@@ -537,7 +570,7 @@ describe("runAiMerge", () => {
         git(dir, `checkout -q ${branch}`);
         writeFileSync(join(dir, "post-landing.txt"), "new work after recorded landing\n");
         git(dir, "add post-landing.txt");
-        git(dir, "commit -q -m 'feat: post-landing work'");
+        git(dir, ["commit", "-q", "-m", "feat: post-landing work"]);
         git(dir, "checkout -q main");
       }
     });
@@ -551,7 +584,7 @@ describe("runAiMerge", () => {
     expect(result.merged).toBe(true);
     expect(mergeAgent).toHaveBeenCalledOnce();
     expect(reviewAgent).toHaveBeenCalled();
-    expect(readFileSync(join(dir, "post-landing.txt"), "utf-8")).toBe("new work after recorded landing\n");
+    expect(readFileSync(join(dir, "post-landing.txt"), "utf-8").replace(/\r\n/g, "\n")).toBe("new work after recorded landing\n");
     expect(store.recordRunAuditEvent).toHaveBeenCalledWith(
       expect.objectContaining({ mutationType: "merge:ai-clean-room" }),
     );
@@ -657,7 +690,11 @@ describe("runAiMerge", () => {
         sourceSha: git(dir, `rev-parse ${branch}`),
         integrationTipSha: mainBefore,
         candidateSha: strandedSha,
-        candidateTreeSha: git(strandedRoot, "rev-parse HEAD^{tree}"),
+        candidateTreeSha: git(strandedRoot, ["rev-parse", "HEAD^{tree}"]),
+        reviewerPolicySha256: createHash("sha256").update(JSON.stringify({
+          primary: [null, null, null, null],
+          fallback: [null, null, null, null],
+        })).digest("hex"),
         findings: [],
         consecutiveCleanApprovals: 2,
         correctivePasses: 0,
@@ -678,6 +715,34 @@ describe("runAiMerge", () => {
     expect(git(dir, "status --porcelain")).toBe("");
     expect(mergeAgent).not.toHaveBeenCalled();
     expect(logs.some((line) => line.includes("recovered approved pre-existing clean-room commit"))).toBe(true);
+  });
+
+  it("does not treat a legacy policy-less approval as recovery authority", async () => {
+    const branch = "fusion/fn-1";
+    const { dir } = initRepoWithBranch({ branch });
+    const mainBefore = git(dir, "rev-parse main");
+    const aiMergeRoot = resolveAiMergeRootPath(dir, undefined);
+    mkdirSync(aiMergeRoot, { recursive: true });
+    const strandedRoot = mkdtempSync(join(aiMergeRoot, "fusion-ai-merge-fn-1-"));
+    tracked.add(strandedRoot);
+    git(dir, ["worktree", "add", "--detach", strandedRoot, mainBefore]);
+    execFileSync("git", ["merge", "--squash", branch], { cwd: strandedRoot, stdio: "pipe" });
+    execFileSync("git", ["add", "-A"], { cwd: strandedRoot, stdio: "pipe" });
+    execFileSync("git", ["commit", "-q", "-m", "FN-1: legacy review candidate", "-m", "Fusion-Task-Id: FN-1"], { cwd: strandedRoot, stdio: "pipe" });
+    const candidateSha = git(strandedRoot, "rev-parse HEAD");
+    const { store, task } = makeStore(dir, {
+      aiMergeReviewReconciliation: {
+        sourceSha: git(dir, `rev-parse ${branch}`), integrationTipSha: mainBefore,
+        candidateSha, candidateTreeSha: git(strandedRoot, ["rev-parse", "HEAD^{tree}"]),
+        findings: [], consecutiveCleanApprovals: 2, correctivePasses: 0,
+      },
+    });
+
+    await expect(runAiMerge(store, dir, "FN-1", { manual: true }, { mergeAgent: realMergeAgent(branch) }))
+      .rejects.toThrow("fresh approval is required");
+    expect(git(dir, "rev-parse main")).toBe(mainBefore);
+    expect(task.aiMergeReviewReconciliation?.candidateSha).toBe(candidateSha);
+    expect(task.aiMergeReviewReconciliation?.consecutiveCleanApprovals).toBe(0);
   });
 
   it("backfills custom AI-merge co-author trailer and respects commitAuthorEnabled false", async () => {
@@ -760,6 +825,126 @@ describe("runAiMerge", () => {
     } finally {
       createResolvedAgentSessionMock.mockReset();
     }
+  });
+
+  it.each([
+    {
+      name: "uses persisted workflow validator primary, fallback, and effort ahead of global defaults",
+      task: {},
+      workflowValues: {
+        validatorProvider: "pi-claude-cli", validatorModelId: "claude-opus-4-8", validatorThinkingLevel: "high",
+        validatorFallbackProvider: "openai-codex", validatorFallbackModelId: "gpt-5.6-sol", validatorFallbackThinkingLevel: "medium",
+      },
+      settings: { validatorGlobalProvider: "openai-codex", validatorGlobalModelId: "gpt-5.3-codex-spark", validatorGlobalThinkingLevel: "low" },
+      expected: {
+        defaultProvider: "pi-claude-cli", defaultModelId: "claude-opus-4-8", defaultThinkingLevel: "high",
+        fallbackProvider: "openai-codex", fallbackModelId: "gpt-5.6-sol", fallbackThinkingLevel: "medium",
+      },
+    },
+    {
+      name: "keeps a complete task validator override above persisted workflow defaults",
+      task: { validatorModelProvider: "task-provider", validatorModelId: "task-model", validatorCredentialInstanceId: "task-credential", validatorThinkingLevel: "low" },
+      workflowValues: { validatorProvider: "pi-claude-cli", validatorModelId: "claude-opus-4-8", validatorThinkingLevel: "high" },
+      settings: { validatorGlobalProvider: "openai-codex", validatorGlobalModelId: "gpt-5.3-codex-spark" },
+      expected: { defaultProvider: "task-provider", defaultModelId: "task-model", credentialInstanceId: "task-credential", defaultThinkingLevel: "low" },
+    },
+    {
+      name: "keeps test mode authoritative over persisted workflow validator settings",
+      task: {},
+      workflowValues: { validatorProvider: "pi-claude-cli", validatorModelId: "claude-opus-4-8", validatorThinkingLevel: "high" },
+      settings: { testMode: true, validatorGlobalProvider: "openai-codex", validatorGlobalModelId: "gpt-5.3-codex-spark" },
+      expected: { defaultProvider: "mock", defaultModelId: "scripted" },
+    },
+  ])("merge reviewer workflow model selection: $name", async ({ task, workflowValues, settings, expected }) => {
+    const { dir } = initRepoWithBranch();
+    const { store } = makeStore(dir, task, settings, undefined, workflowValues);
+    createResolvedAgentSessionMock.mockReset();
+    createResolvedAgentSessionMock.mockImplementation(async (opts: any) => ({ session: {
+      prompt: async () => { opts.onText?.("REVIEW_VERDICT: approve"); },
+      dispose: vi.fn(),
+      getSessionStats: vi.fn(() => ({ tokens: { input: 1, output: 1 } })),
+    } }));
+    try {
+      await runAiMerge(store, dir, "FN-1", { manual: true }, { mergeAgent: realMergeAgent("fusion/fn-1") });
+      expect(createResolvedAgentSessionMock).toHaveBeenCalledTimes(2);
+      for (const [options] of createResolvedAgentSessionMock.mock.calls) {
+        expect(options).toMatchObject(expected);
+      }
+      const reviewSessionStarts = store.emitUsageEvent.mock.calls
+        .map(([event]: any[]) => event)
+        .filter((event: Record<string, unknown>) => event.kind === "session_start");
+      expect(reviewSessionStarts).toHaveLength(2);
+      for (const event of reviewSessionStarts) {
+        expect(event).toMatchObject({
+          provider: expected.defaultProvider,
+          model: expected.defaultModelId,
+          meta: { lane: "merger", role: "merge-review" },
+        });
+      }
+    } finally {
+      createResolvedAgentSessionMock.mockReset();
+    }
+  });
+
+  it("preserves a candidate across a mid-review persisted-policy change and later lands that same candidate", async () => {
+    const { dir } = initRepoWithBranch();
+    const workflowValues: Record<string, unknown> = {
+      validatorProvider: "pi-claude-cli",
+      validatorModelId: "claude-opus-4-8",
+      validatorThinkingLevel: "high",
+    };
+    const { store, task } = makeStore(dir, {}, {
+      validatorGlobalProvider: "openai-codex", validatorGlobalModelId: "gpt-5.3-codex-spark",
+      fallbackProvider: "openai-codex", fallbackModelId: "gpt-5.3-codex-spark",
+    }, undefined, workflowValues);
+    const mergeAgent = realMergeAgent("fusion/fn-1");
+    const firstReview = vi.fn(async () => {
+      // FNXC:MergeReviewRouting 2026-09-09-23:56: Replacing settings mid-review must invalidate stale approval rather than land it.
+      store.getSettings.mockResolvedValue({
+        merger: { mode: "ai", maxReviewPasses: 1 },
+        validatorGlobalProvider: "openai-codex", validatorGlobalModelId: "gpt-5.3-codex-spark",
+        fallbackProvider: "openai-codex", fallbackModelId: "gpt-5.6-sol",
+      });
+      return "REVIEW_VERDICT: approve";
+    });
+
+    await expect(runAiMerge(store, dir, "FN-1", { manual: true }, { mergeAgent, reviewAgent: firstReview }))
+      .rejects.toThrow("fresh approval is required");
+    const preservedCandidate = task.aiMergeReviewReconciliation?.candidateSha;
+    expect(preservedCandidate).toBeTruthy();
+    expect(task.aiMergeReviewReconciliation?.consecutiveCleanApprovals).toBe(0);
+    expect(task.aiMergeReviewReconciliation?.correctivePasses).toBe(0);
+    expect(git(dir, "rev-parse main")).not.toBe(preservedCandidate);
+
+    const freshReview = vi.fn(async () => "REVIEW_VERDICT: approve");
+    const resumed = await runAiMerge(store, dir, "FN-1", { manual: true }, { mergeAgent, reviewAgent: freshReview });
+    expect(resumed.commitSha).toBe(preservedCandidate);
+    expect(git(dir, "rev-parse main")).toBe(preservedCandidate);
+    expect(mergeAgent).toHaveBeenCalledTimes(1);
+    expect(freshReview).toHaveBeenCalledTimes(2);
+  });
+
+  it("retains a candidate receipt when candidate verification cannot be observed", async () => {
+    const { dir } = initRepoWithBranch();
+    const state = {
+      sourceSha: git(dir, "rev-parse fusion/fn-1"),
+      integrationTipSha: git(dir, "rev-parse main"),
+      candidateSha: "0000000000000000000000000000000000000000",
+      candidateTreeSha: "0000000000000000000000000000000000000000",
+      findings: [{ id: "finding-1", text: "preserve this history", disposition: "still-present" as const }],
+      consecutiveCleanApprovals: 0,
+      correctivePasses: 1,
+    };
+    const { store, task } = makeStore(dir, { aiMergeReviewReconciliation: state });
+    const mergeAgent = vi.fn(async () => { throw new Error("must not reimplement an unverifiable candidate"); });
+
+    await expect(runAiMerge(store, dir, "FN-1", { manual: true }, { mergeAgent }))
+      .rejects.toThrow("could not be verified");
+    expect(task.aiMergeReviewReconciliation).toMatchObject(state);
+    expect(task.aiMergeReviewReconciliation?.candidateSha).toBe(state.candidateSha);
+    expect(task.aiMergeReviewReconciliation?.candidateTreeSha).toBe(state.candidateTreeSha);
+    expect(mergeAgent).not.toHaveBeenCalled();
+    expect(git(dir, "rev-parse main")).toBe(state.integrationTipSha);
   });
 
   it.each(["unreadable", "missing"])("merge reviewer model selection refuses %s task authority", async (failure) => {
@@ -1235,7 +1420,7 @@ describe("runAiMerge", () => {
     git(dir, `checkout -q ${branch}`);
     rmSync(join(dir, "feature.txt"));
     git(dir, "add -A");
-    git(dir, "commit -q -m 'revert: undo the work (net-zero vs main)'");
+    git(dir, ["commit", "-q", "-m", "revert: undo the work (net-zero vs main)"]);
     git(dir, "checkout -q main");
   }
 
