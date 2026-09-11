@@ -1,0 +1,88 @@
+name: Pass B recovery export
+on:
+  push:
+    branches: [recovery/pass-b-backup-20260911]
+    paths: [.github/workflows/pass-b-backup.yml]
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 24382716a042e5e854f74025c240ba2e4d65f4f3
+          fetch-depth: 8
+          persist-credentials: false
+          lfs: false
+      - name: Verify and export exact public Git data without running product code
+        shell: bash
+        env:
+          GIT_LFS_SKIP_SMUDGE: "1"
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'pass-b-recovered'
+          out.mkdir()
+          def git(*args):
+              return subprocess.check_output(['git', *args])
+          base = 'd9411c95449c9bdbe6c5f50dd4883b975757140e'
+          commits = [
+              '7c29a8fa583fba75abb2bb19dfa461865036385e',
+              '4f915990da818d9e3cf29d5e212792bf265254df',
+              'cceeaeceafabee9c5a8ab8db579116b5d5c443d6',
+              'f38ef6d18839fa0012b0a552fa9d6b4ef4b9e753',
+              '95ad588b57d7a2d7bfe8e7aeb3eeed7b08dd474b',
+              '026edc0d8110483452e364b1157a93f1f0d32448',
+              '24382716a042e5e854f74025c240ba2e4d65f4f3',
+          ]
+          parent = base
+          verified = []
+          raw_dir = out / 'raw-commits'
+          raw_dir.mkdir()
+          for sha in commits:
+              raw = git('cat-file', 'commit', sha)
+              header, message = raw.decode().split('\n\n', 1)
+              parents = [line[7:] for line in header.splitlines() if line.startswith('parent ')]
+              assert parents == [parent], (sha, parents, parent)
+              assert hashlib.sha1(b'commit ' + str(len(raw)).encode() + b'\0' + raw).hexdigest() == sha
+              tree = git('rev-parse', sha + '^{tree}').decode().strip()
+              (raw_dir / (sha + '.txt')).write_bytes(raw)
+              verified.append({'commit': sha, 'tree': tree, 'parent': parent, 'message': message})
+              parent = sha
+          tip = commits[-1]
+          assert git('rev-list', '--count', base + '..' + tip).decode().strip() == '7'
+          assert git('rev-parse', tip + '^{tree}').decode().strip() == 'c64b2f7e74bb39ff28c5d09d65f0a2fa8effddad'
+          (out / 'verified-commits.json').write_text(json.dumps(verified, indent=2))
+          (out / 'candidate-tree.z').write_bytes(git('ls-tree', '-rz', '--full-tree', tip))
+          (out / 'stack.patch').write_bytes(git('diff', '--binary', '--full-index', base, tip))
+          (out / 'patch-series.mbox').write_bytes(git('format-patch', '--stdout', '--binary', base + '..' + tip))
+          (out / 'diff-stat.txt').write_bytes(git('diff', '--stat', base, tip))
+          (out / 'changed-paths.z').write_bytes(git('diff', '--name-only', '-z', base, tip))
+          subprocess.run(['git', 'archive', '--format=zip', '-o', str(out / 'candidate-source.zip'), tip], check=True)
+          git('update-ref', 'refs/heads/recovered-pass-b', tip)
+          subprocess.run(['git', 'bundle', 'create', str(out / 'patch-stack.bundle'), 'refs/heads/recovered-pass-b', '^' + base], check=True)
+          for label, remote in [('fork', 'https://github.com/brookcub/Fusion.git'), ('upstream', 'https://github.com/Runfusion/Fusion.git')]:
+              (out / (label + '-refs.txt')).write_bytes(git('ls-remote', remote,
+                  'refs/heads/main', 'refs/heads/lynco', 'refs/heads/candidate/lynco-pass-b-20260910',
+                  'refs/heads/workbench/pass-b-20260910', 'refs/heads/archive/pass-b-*',
+                  'refs/heads/fusion/fusi-*', 'refs/heads/codex/fusion-upstream-reliability',
+                  'refs/heads/codex/fusion-architecture-audit-20260910'))
+          publication = '27bd147bc889d66c026a0a37b5cee32298481f48'
+          git('fetch', '--no-tags', '--depth=1', 'origin', publication)
+          (out / 'LOCAL-FIX-PUBLICATION.md').write_bytes(git('show', publication + ':LOCAL-FIX-PUBLICATION.md'))
+          records = []
+          for path in sorted(out.rglob('*')):
+              if path.is_file():
+                  records.append(hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + path.relative_to(out).as_posix())
+          (out / 'SHA256SUMS').write_text('\n'.join(records) + '\n')
+          print(json.dumps({'tip': tip, 'tree': verified[-1]['tree'], 'commits_verified': len(verified), 'product_tests_run': False}))
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pass-b-recovered-24382716
+          path: ${{ runner.temp }}/pass-b-recovered
+          retention-days: 30
+          if-no-files-found: error
