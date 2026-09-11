@@ -29,12 +29,18 @@ jobs:
           request=json.loads(pathlib.Path('pass-b/publish.json').read_text())
           branch='candidate/lynco-pass-b-20260910'
           def git(*a,data=None): return s.check_output(['git',*a],input=data)
-          for k in ('parent','tree','commit'):
-              assert re.fullmatch('[0-9a-f]{40}',request[k]),k
-          expected=request['parent']
-          observed=git('ls-remote','origin','refs/heads/'+branch).decode().split()[0]
-          assert observed==expected,('candidate advanced',observed,expected)
-          git('fetch','--no-tags','--depth=1','origin',expected)
+          def sha(v):
+              assert isinstance(v,str) and re.fullmatch('[0-9a-f]{40}',v)
+              return v
+          def path(v):
+              p=pathlib.PurePosixPath(v)
+              assert not p.is_absolute() and '..' not in p.parts and '.git' not in p.parts
+              assert '\0' not in v and str(p)==v
+              return v
+          expected=sha(request['parent'])
+          assert git('ls-remote','origin','refs/heads/'+branch).decode().split()[0]==expected,'candidate advanced'
+          refs={expected}|{sha(f['source_ref']) for f in request.get('files',[]) if 'source_ref' in f}
+          for ref in refs: git('fetch','--no-tags','--depth=1','origin',ref)
           git('config','filter.lfs.process','')
           git('config','filter.lfs.clean','cat')
           git('config','filter.lfs.smudge','cat')
@@ -42,21 +48,40 @@ jobs:
           git('config','core.autocrlf','false')
           git('config','core.hooksPath','/dev/null')
           git('checkout','--detach',expected)
-          patch=request['patch'].encode()
-          assert hashlib.sha256(patch).hexdigest()==request['patch_sha256']
-          git('apply','--check','--index','--binary','-',data=patch)
-          git('apply','--index','--binary','-',data=patch)
+          for f in request.get('files',[]):
+              p=path(f['path'])
+              if f.get('delete'):
+                  git('update-index','--force-remove','--',p)
+                  continue
+              if 'source_ref' in f: data=git('show',f['source_ref']+':'+path(f.get('source_path',p)))
+              else: data=f['content'].encode()
+              if f.get('replacements') or f.get('remove_sections'):
+                  text=data.decode()
+                  for item in f.get('replacements',[]):
+                      assert text.count(item['old'])==item.get('count',1),(p,'replacement count')
+                      text=text.replace(item['old'],item['new'])
+                  for item in f.get('remove_sections',[]):
+                      assert text.count(item['start'])==1 and text.count(item['end'])==1
+                      a=text.index(item['start']);b=text.index(item['end'],a)
+                      text=text[:a]+text[b:]
+                  data=text.encode()
+              blob=git('hash-object','-w','--stdin',data=data).decode().strip()
+              assert blob==sha(f['blob']),(p,'blob mismatch',blob)
+              mode=f.get('mode','100644');assert mode in ('100644','100755','120000')
+              git('update-index','--add','--cacheinfo',mode,blob,p)
+          if request.get('patch'):
+              patch=request['patch'].encode()
+              assert hashlib.sha256(patch).hexdigest()==request['patch_sha256']
+              git('apply','--check','--cached','--binary','-',data=patch)
+              git('apply','--cached','--binary','-',data=patch)
           tree=git('write-tree').decode().strip()
-          assert tree==request['tree'],('tree mismatch',tree,request['tree'])
-          raw=request['raw_commit'].encode()
-          assert raw.startswith('tree '+tree+'\nparent '+expected+'\n'.encode().decode()) if False else True
-          lines=raw.decode().split('\n\n',1)[0].splitlines()
+          assert tree==sha(request['tree']),('tree mismatch',tree)
+          raw=request['raw_commit'].encode();lines=raw.decode().split('\n\n',1)[0].splitlines()
           assert lines[0]=='tree '+tree and lines[1]=='parent '+expected
           assert sum(line.startswith('parent ') for line in lines)==1
           commit=git('hash-object','-t','commit','-w','--stdin',data=raw).decode().strip()
-          assert commit==request['commit'],('commit mismatch',commit)
-          observed=git('ls-remote','origin','refs/heads/'+branch).decode().split()[0]
-          assert observed==expected,('candidate advanced during publication',observed)
+          assert commit==sha(request['commit']),('commit mismatch',commit)
+          assert git('ls-remote','origin','refs/heads/'+branch).decode().split()[0]==expected,'candidate advanced during publication'
           git('push','origin',commit+':refs/heads/'+branch)
           assert git('ls-remote','origin','refs/heads/'+branch).decode().split()[0]==commit
           print('VERIFIED_CANDIDATE_COMMIT='+commit)
