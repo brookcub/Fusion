@@ -1,0 +1,64 @@
+name: Pass B exact patch publication
+on:
+  push:
+    branches: [workbench/pass-b-20260910]
+    paths: [pass-b/publish.json]
+permissions:
+  contents: read
+concurrency:
+  group: pass-b-exact-publication
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 1
+      - name: Verify and publish one exact child of the current candidate
+        shell: bash
+        env:
+          GIT_LFS_SKIP_SMUDGE: "1"
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess as s, json, pathlib, hashlib, re
+          request=json.loads(pathlib.Path('pass-b/publish.json').read_text())
+          branch='candidate/lynco-pass-b-20260910'
+          def git(*a,data=None): return s.check_output(['git',*a],input=data)
+          for k in ('parent','tree','commit'):
+              assert re.fullmatch('[0-9a-f]{40}',request[k]),k
+          expected=request['parent']
+          observed=git('ls-remote','origin','refs/heads/'+branch).decode().split()[0]
+          assert observed==expected,('candidate advanced',observed,expected)
+          git('fetch','--no-tags','--depth=1','origin',expected)
+          git('config','filter.lfs.process','')
+          git('config','filter.lfs.clean','cat')
+          git('config','filter.lfs.smudge','cat')
+          git('config','filter.lfs.required','false')
+          git('config','core.autocrlf','false')
+          git('config','core.hooksPath','/dev/null')
+          git('checkout','--detach',expected)
+          patch=request['patch'].encode()
+          assert hashlib.sha256(patch).hexdigest()==request['patch_sha256']
+          git('apply','--check','--index','--binary','-',data=patch)
+          git('apply','--index','--binary','-',data=patch)
+          tree=git('write-tree').decode().strip()
+          assert tree==request['tree'],('tree mismatch',tree,request['tree'])
+          raw=request['raw_commit'].encode()
+          assert raw.startswith('tree '+tree+'\nparent '+expected+'\n'.encode().decode()) if False else True
+          lines=raw.decode().split('\n\n',1)[0].splitlines()
+          assert lines[0]=='tree '+tree and lines[1]=='parent '+expected
+          assert sum(line.startswith('parent ') for line in lines)==1
+          commit=git('hash-object','-t','commit','-w','--stdin',data=raw).decode().strip()
+          assert commit==request['commit'],('commit mismatch',commit)
+          observed=git('ls-remote','origin','refs/heads/'+branch).decode().split()[0]
+          assert observed==expected,('candidate advanced during publication',observed)
+          git('push','origin',commit+':refs/heads/'+branch)
+          assert git('ls-remote','origin','refs/heads/'+branch).decode().split()[0]==commit
+          print('VERIFIED_CANDIDATE_COMMIT='+commit)
+          print('VERIFIED_CANDIDATE_TREE='+tree)
+          PY
