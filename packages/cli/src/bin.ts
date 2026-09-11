@@ -520,7 +520,7 @@ PR:
 
 Options:
   --project, -P <name>       Target a specific project (bypasses CWD detection)
-  --port, -p <port>          Dashboard/serve port (default: 4040)
+  --port, -p <port>          Dashboard/serve port (dashboard falls back to settings daemonPort, then 4040)
   --host <host>              Serve host (default: 127.0.0.1 — localhost only; pass 0.0.0.0 to expose)
   --token <token>            Dashboard/daemon bearer token. Default: $FUSION_DASHBOARD_TOKEN, $FUSION_DAEMON_TOKEN, or auto-generated.
   --no-auth                  Disable bearer-token auth for dashboard/desktop/serve (local-only; not recommended on 0.0.0.0)
@@ -882,7 +882,9 @@ async function main() {
         const portIdx = args.indexOf("--port");
         const portIdxShort = args.indexOf("-p");
         const pi = portIdx !== -1 ? portIdx : portIdxShort;
-        const port = pi !== -1 ? parseInt(args[pi + 1], 10) : 4040;
+        const explicitPort = pi !== -1 && args[pi + 1]?.trim() ? Number(args[pi + 1]) : pi !== -1 ? Number.NaN : undefined;
+        const { resolveDashboardPort } = await import("./commands/dashboard-port.js");
+        const port = await resolveDashboardPort({ explicitPort });
         const paused = args.includes("--paused");
         const dev = args.includes("--dev");
         const noEngine = args.includes("--no-engine");
