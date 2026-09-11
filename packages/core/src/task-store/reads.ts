@@ -377,13 +377,11 @@ export async function listTasksImpl(store: TaskStore, options?: ListTasksOptions
     const startupMemoEnabled = options?.startupMemo ?? (!store.isWatching && slim);
 
     if (startupMemoEnabled && slim && options?.limit === undefined && options?.offset === undefined) {
-      const memoKey = [
-        includeArchived ? "all" : "active",
-        columnFilter ?? "*",
-        options?.columns?.join(",") ?? "*",
-        options?.excludeColumns?.join(",") ?? "*",
-        options?.sort ?? "created-asc",
-      ].join(":");
+      // Every query dimension belongs to the caller-scoped startup memo key.
+      const memoKey = JSON.stringify([
+        includeArchived, options?.includeDeleted === true, columnFilter ?? null,
+        options?.columns ?? null, options?.excludeColumns ?? null, options?.sort ?? "created-asc",
+      ]);
       const now = Date.now();
       const cached = store.startupSlimListMemo.get(memoKey);
       if (cached && cached.expiresAt > now) {
