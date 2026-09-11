@@ -1,0 +1,13 @@
+{
+  "parent": "4f915990da818d9e3cf29d5e212792bf265254df",
+  "tree": "5a5175dba544a06de2c6fbfe02300d121887d646",
+  "commit": "cceeaeceafabee9c5a8ab8db579116b5d5c443d6",
+  "raw_commit": "tree 5a5175dba544a06de2c6fbfe02300d121887d646\nparent 4f915990da818d9e3cf29d5e212792bf265254df\nauthor Brooklyn Rose Ludlow <22346091+brookcub@users.noreply.github.com> 1789100732 -0700\ncommitter Brooklyn Rose Ludlow <22346091+brookcub@users.noreply.github.com> 1789100732 -0700\n\nfix(engine): yield during guarded merge-worktree removal\n\nLynCo-Patch: F22\nSource: 795f80012036d4ed53533cf2378d2c20195a2b8f\n\nUse asynchronous filesystem removal inside the existing guarded retry helper, both before merging and in the maintenance sweep. Await completion; retain path, age, registration and liveness decisions. No background cleanup service or additional timeout.\n\nTests on pinned upstream d9411c95: 3 responsiveness failures, 49 passing neighboring cases. Same focused suites with the patch: all 52 pass on Linux/Node 22.16.0. This demonstrates the cleanup mechanism, not the cause of every historical HTTP stall.\n\nDelete-when: unpatched upstream yields at both removal boundaries and retains the guarded cleanup regressions.",
+  "files": [
+    {"path":".changeset/responsive-merge-prune.md","source_ref":"795f80012036d4ed53533cf2378d2c20195a2b8f","blob":"57948438f7fdb31ed23a6ed88d4800010311387e"},
+    {"path":"packages/engine/src/__tests__/merger-ai-cleanup.test.ts","source_ref":"795f80012036d4ed53533cf2378d2c20195a2b8f","blob":"f4d0566df2801f10872bf6ea57286a392349f685","remove_sections":[{"start":"  it(\"reports the original merge failure before asynchronous cleanup settles\"","end":"  it(\"runAiMerge calls pre-merge prune"}]},
+    {"path":"packages/engine/src/__tests__/self-healing-tempdir-sweep.test.ts","source_ref":"795f80012036d4ed53533cf2378d2c20195a2b8f","blob":"108fd5285aa4275a1aa4ebb77a2821bd0b96e51e"},
+    {"path":"packages/engine/src/merge/merger-ai-worktree.ts","source_ref":"795f80012036d4ed53533cf2378d2c20195a2b8f","blob":"c46bab6cd53be67ce06d7bdb302bb96727710ed2"},
+    {"path":"packages/engine/src/self-healing.ts","source_ref":"4f915990da818d9e3cf29d5e212792bf265254df","blob":"e2cda8441af5772981633576ed8d7f216dab8ec8","replacements":[{"old":"import { readFile } from \"node:fs/promises\";","new":"import { readFile, rm } from \"node:fs/promises\";"},{"old":"rm: (target, options) => rmSync(target, options),","new":"rm,"}]}
+  ]
+}
