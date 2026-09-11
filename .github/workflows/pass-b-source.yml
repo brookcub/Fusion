@@ -15,51 +15,44 @@ jobs:
           ref: 795f80012036d4ed53533cf2378d2c20195a2b8f
           fetch-depth: 250
           persist-credentials: false
-      - name: Export source without running product or loading credentials
+      - name: Export pinned public code only
         shell: bash
         env:
           GIT_LFS_SKIP_SMUDGE: "1"
         run: |
           set -euo pipefail
-          git fetch --no-tags --depth=250 https://github.com/Runfusion/Fusion.git a9a63bfb652f16498a8bda1fb074bd60e45d4dc2
-          git update-ref refs/heads/export-upstream FETCH_HEAD
-          for sha in 6866203027b5cf3d829c529267f45f8d5e1d176d e83de1cc9f1472d00ded8ae1866b05d0fb26b1e5 f1921f833c9c41e258f0ffc23aa57c48e822defd 01259ca157ad37c044c6d6a6bc1b49c7054ffe26 945b4ac0d5d31409eb52c0cb03d874726c0f5e90; do
-            git fetch --no-tags --depth=250 https://github.com/brookcub/Fusion.git "$sha"
-          done
-          mkdir -p "$RUNNER_TEMP/pass-b"
-          git -c core.autocrlf=false -c filter.lfs.smudge= -c filter.lfs.required=false archive a9a63bfb652f16498a8bda1fb074bd60e45d4dc2 | gzip > "$RUNNER_TEMP/pass-b/upstream.tar.gz"
-          git ls-tree -rz --full-tree a9a63bfb652f16498a8bda1fb074bd60e45d4dc2 > "$RUNNER_TEMP/pass-b/upstream-tree.z"
-          git log --format='%H %s' 1a0b95ba1ca6750a20d8d64cebcafbdf141cb4bb..a9a63bfb652f16498a8bda1fb074bd60e45d4dc2 > "$RUNNER_TEMP/pass-b/upstream-log.txt"
+          git fetch --no-tags --depth=250 https://github.com/Runfusion/Fusion.git d9411c95449c9bdbe6c5f50dd4883b975757140e
+          mkdir -p "$RUNNER_TEMP/pass-b-current"
           python3 - <<'PY'
-          import subprocess as s, json, base64, os, pathlib
-          out=pathlib.Path(os.environ['RUNNER_TEMP'])/'pass-b'
+          import subprocess as s, json, pathlib, os, gzip, base64
+          out=pathlib.Path(os.environ['RUNNER_TEMP'])/'pass-b-current'
           def git(*args): return s.check_output(['git',*args])
-          baseline='0fcaffeaf48ef21c10dfbf70dbe4b5f90423b40f'
-          heads={'fusi007':'6866203027b5cf3d829c529267f45f8d5e1d176d','fusi010':'e83de1cc9f1472d00ded8ae1866b05d0fb26b1e5','fusi013':'f1921f833c9c41e258f0ffc23aa57c48e822defd','fusi017':'01259ca157ad37c044c6d6a6bc1b49c7054ffe26','port':'945b4ac0d5d31409eb52c0cb03d874726c0f5e90'}
-          result={}
-          for name,head in heads.items():
-            base=git('merge-base',baseline,head).decode().strip()
-            files={}
-            for p in git('diff','--name-only','-z',base,head).decode().split('\0'):
-              if not p: continue
-              versions={}
-              for role,ref in [('base',base),('head',head)]:
-                try: versions[role]=base64.b64encode(git('show',ref+':'+p)).decode()
-                except s.CalledProcessError: versions[role]=None
-              files[p]=versions
-            result[name]={'head':head,'base':base,'files':files,'commits':git('log','--format=%H %s',base+'..'+head).decode()}
-            (out/(name+'.patch')).write_bytes(git('diff','--binary',base,head))
-          (out/'extras.json').write_text(json.dumps(result))
-          identities={}
-          for ref in [baseline,'795f80012036d4ed53533cf2378d2c20195a2b8f','1a0b95ba1ca6750a20d8d64cebcafbdf141cb4bb','a9a63bfb652f16498a8bda1fb074bd60e45d4dc2',*heads.values()]:
-            identities[ref]=git('cat-file','commit',ref).decode()
-          (out/'commits.json').write_text(json.dumps(identities))
+          refs={'upstream':'d9411c95449c9bdbe6c5f50dd4883b975757140e','u0':'1a0b95ba1ca6750a20d8d64cebcafbdf141cb4bb','donor':'795f80012036d4ed53533cf2378d2c20195a2b8f','baseline':'0fcaffeaf48ef21c10dfbf70dbe4b5f90423b40f'}
+          for name,ref in refs.items():
+            (out/(name+'-tree.z')).write_bytes(git('ls-tree','-rz','--full-tree',ref))
+            (out/(name+'-commit.txt')).write_bytes(git('cat-file','commit',ref))
+          with gzip.open(out/'upstream.tar.gz','wb') as f:
+            f.write(git('-c','core.autocrlf=false','-c','filter.lfs.smudge=','-c','filter.lfs.required=false','archive',refs['upstream']))
+          changed=git('diff','--name-only','-z',refs['u0'],refs['donor']).decode().split('\0')
+          versions={}
+          for p in changed:
+            if not p: continue
+            record={}
+            for name in ['u0','donor','upstream']:
+              try: record[name]=base64.b64encode(git('show',refs[name]+':'+p)).decode()
+              except s.CalledProcessError: record[name]=None
+            versions[p]=record
+          (out/'local-delta-versions.json').write_text(json.dumps(versions))
+          (out/'local-net.patch').write_bytes(git('diff','--binary',refs['u0'],refs['donor']))
+          (out/'upstream-log.txt').write_bytes(git('log','--format=%H %s',refs['u0']+'..'+refs['upstream']))
+          (out/'local-log.txt').write_bytes(git('log','--format=%H %s',refs['u0']+'..'+refs['donor']))
+          (out/'refs.json').write_text(json.dumps(refs,indent=2))
           PY
-          cd "$RUNNER_TEMP/pass-b"
+          cd "$RUNNER_TEMP/pass-b-current"
           sha256sum * > SHA256SUMS
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: pass-b-pinned-sources
-          path: ${{ runner.temp }}/pass-b
-          retention-days: 3
+          name: pass-b-current-sources
+          path: ${{ runner.temp }}/pass-b-current
+          retention-days: 7
           if-no-files-found: error
