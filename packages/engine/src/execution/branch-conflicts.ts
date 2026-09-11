@@ -1,9 +1,9 @@
-import { exec } from "node:child_process";
+import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { promisify } from "node:util";
 import { resolveIntegrationBranch } from "../merge/integration-branch.js";
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 const FUSION_TASK_ID_TRAILER_KEY = "Fusion-Task-Id";
 const GIT_TIMEOUT_MS = 120_000;
 const GIT_MAX_BUFFER = 10 * 1024 * 1024;
@@ -123,44 +123,78 @@ interface UniqueBranchCommitListResult {
   degraded: boolean;
 }
 
-function quoteShellArg(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
-async function runGit(repoDir: string, command: string): Promise<string> {
-  const { stdout } = await execAsync(command, {
-    cwd: repoDir,
-    encoding: "utf-8",
-    timeout: GIT_TIMEOUT_MS,
-    maxBuffer: GIT_MAX_BUFFER,
-  });
-  return stdout.trim();
-}
-
 async function revParse(repoDir: string, ref: string): Promise<string> {
-  return runGit(repoDir, `git rev-parse --verify ${quoteShellArg(`${ref}^{commit}`)}`);
+  return runGitArgs(repoDir, ["rev-parse", "--verify", `${ref}^{commit}`]);
+}
+
+async function runGitArgs(repoDir: string, args: string[]): Promise<string> {
+  return (await runGitArgsRaw(repoDir, args)).trim();
+}
+
+async function runGitArgsRaw(repoDir: string, args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync("git", args, {
+    cwd: repoDir, encoding: "utf-8", timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER,
+    windowsHide: true,
+  });
+  return stdout;
+}
+
+async function computePatchIds(repoDir: string, patch: string): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    const child = execFile("git", ["patch-id", "--stable"], {
+      cwd: repoDir, encoding: "utf-8", timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, windowsHide: true,
+    }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(stdout.trim());
+    });
+    if (!child.stdin) {
+      reject(new Error("git patch-id stdin unavailable"));
+      return;
+    }
+    child.stdin.once("error", reject);
+    child.stdin.end(patch);
+  });
+}
+
+async function patchIdForCommit(repoDir: string, sha: string): Promise<string> {
+  return computePatchIds(repoDir, await runGitArgsRaw(repoDir, ["show", sha, "--"]));
+}
+
+async function patchIdsForRef(repoDir: string, ref: string): Promise<string[]> {
+  // One bounded history read plus one bounded patch-id process, not two new
+  // children per historical commit. Failure remains unknown, never proof of deletion safety.
+  const patches = await runGitArgsRaw(repoDir, ["log", "--no-merges", "--format=medium", "--patch", "--root", ref, "--"]);
+  return (await computePatchIds(repoDir, patches)).split("\n").filter(Boolean);
+}
+
+async function branchExists(repoDir: string, branch: string): Promise<boolean> {
+  const ref = `refs/heads/${branch}`;
+  await runGitArgs(repoDir, ["check-ref-format", ref]);
+  try {
+    await runGitArgs(repoDir, ["show-ref", "--exists", ref]);
+    return true;
+  } catch (error) {
+    // Only Git's documented negative lookup is absence. Spawn, timeout,
+    // permissions and corrupt-repository failures must never authorize cleanup.
+    if ((error as { code?: unknown; killed?: boolean; signal?: unknown }).code === 2
+      && !(error as { killed?: boolean }).killed && !(error as { signal?: unknown }).signal) return false;
+    throw error;
+  }
 }
 
 async function isAncestor(repoDir: string, sha: string, ref: string): Promise<boolean> {
   try {
-    await execAsync(`git merge-base --is-ancestor ${quoteShellArg(sha)} ${quoteShellArg(ref)}`, {
-      cwd: repoDir,
-      encoding: "utf-8",
-      timeout: GIT_TIMEOUT_MS,
-      maxBuffer: GIT_MAX_BUFFER,
-    });
+    await runGitArgs(repoDir, ["merge-base", "--is-ancestor", sha, ref]);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    if ((error as { code?: unknown }).code === 1) return false;
+    throw error;
   }
 }
 
 async function listStrandedCommits(repoDir: string, startPoint: string, branchName: string): Promise<BranchConflictCommit[]> {
   try {
-    const output = await runGit(
-      repoDir,
-      `git log --reverse --format=%H%x09%s ${quoteShellArg(`${startPoint}..${branchName}`)}`,
-    );
+    const output = await runGitArgs(repoDir, ["log", "--reverse", "--format=%H%x09%s", `${startPoint}..${branchName}`]);
     if (!output) return [];
     return output
       .split("\n")
@@ -178,7 +212,7 @@ async function listStrandedCommits(repoDir: string, startPoint: string, branchNa
 async function resolveBranchComparisonRef(repoDir: string, startPoint: string, branchName: string): Promise<string> {
   try {
     await revParse(repoDir, startPoint);
-    await runGit(repoDir, `git merge-base ${quoteShellArg(startPoint)} ${quoteShellArg(branchName)}`);
+    await runGitArgs(repoDir, ["merge-base", startPoint, branchName]);
     return startPoint;
   } catch {
     const resolved = await resolveIntegrationBranch(repoDir, undefined);
@@ -193,11 +227,8 @@ export async function listUniqueBranchCommits(
 ): Promise<UniqueBranchCommitListResult> {
   const mainRef = await resolveBranchComparisonRef(repoDir, startPoint, branchName);
   try {
-    const comparisonBase = await runGit(repoDir, `git merge-base ${quoteShellArg(mainRef)} ${quoteShellArg(branchName)}`);
-    const cherryOutput = await runGit(
-      repoDir,
-      `git cherry ${quoteShellArg(mainRef)} ${quoteShellArg(branchName)} ${quoteShellArg(comparisonBase)}`,
-    );
+    const comparisonBase = await runGitArgs(repoDir, ["merge-base", mainRef, branchName]);
+    const cherryOutput = await runGitArgs(repoDir, ["cherry", mainRef, branchName, comparisonBase]);
     const plusTokens = cherryOutput
       .split("\n")
       .map((line) => line.trim())
@@ -208,8 +239,8 @@ export async function listUniqueBranchCommits(
     const commits: BranchConflictCommit[] = [];
     for (const token of plusTokens) {
       const [sha, subject] = await Promise.all([
-        runGit(repoDir, `git rev-parse --verify ${quoteShellArg(`${token}^{commit}`)}`).catch(() => token),
-        runGit(repoDir, `git log -1 --format=%s ${quoteShellArg(token)}`).catch(() => ""),
+        revParse(repoDir, token),
+        runGitArgs(repoDir, ["log", "-1", "--format=%s", token]),
       ]);
       commits.push({ sha, subject });
     }
@@ -229,7 +260,8 @@ export async function listUniqueBranchCommits(
 }
 
 async function getWorktreeBranchMap(repoDir: string): Promise<Map<string, string>> {
-  const output = await runGit(repoDir, "git worktree list --porcelain");
+  const output = await runGitArgs(repoDir, ["worktree", "list", "--porcelain"]);
+  if (!output.startsWith("worktree ")) throw new Error("worktree enumeration unavailable");
   const map = new Map<string, string>();
   let currentWorktree: string | null = null;
 
@@ -261,12 +293,7 @@ async function summarizeTaskAttributedCommits(repoDir: string, range: string, ta
   const ownTrailerPattern = new RegExp(`(?:^|\\n)${FUSION_TASK_ID_TRAILER_KEY}: ${escapedTaskId}(?:\\n|$)`);
   const genericSubjectPattern = /^(feat|fix|test|chore|docs|refactor|perf|build)\((FN-\d+)\):/i;
   const genericTrailerPattern = new RegExp(`(?:^|\\n)${FUSION_TASK_ID_TRAILER_KEY}:\\s*(FN-\\d+)(?:\\n|$)`, "i");
-  let output = "";
-  try {
-    output = await runGit(repoDir, `git log --format=%H%x00%s%x00%b ${quoteShellArg(range)}`);
-  } catch {
-    return { ownCount: 0, foreignCount: 0 };
-  }
+  const output = await runGitArgs(repoDir, ["log", "--format=%H%x00%s%x00%b", range]);
   if (!output) return { ownCount: 0, foreignCount: 0 };
 
   const normalizedTaskId = taskId.toUpperCase();
@@ -324,7 +351,7 @@ export async function reportBranchAttribution(
   taskId: string,
 ): Promise<BranchAttributionReport> {
   const report: BranchAttributionReport = { ownTrailed: 0, ownUntrailed: [], foreign: [], unattributed: [] };
-  const output = await runGit(repoDir, `git log --format=%H%x1f%s%x1f%b%x1e ${quoteShellArg(`${baseSha}..${branch}`)}`)
+  const output = await runGitArgs(repoDir, ["log", "--format=%H%x1f%s%x1f%b%x1e", `${baseSha}..${branch}`])
     .catch(() => "");
   if (!output) return report;
   const escapedTaskId = taskId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -372,7 +399,7 @@ export async function branchTipCarriesTaskIdTrailer(
   taskId: string,
 ): Promise<boolean> {
   try {
-    const body = await runGit(repoDir, `git log -1 --pretty=%B ${quoteShellArg(branch)}`);
+    const body = await runGitArgs(repoDir, ["log", "-1", "--pretty=%B", branch]);
     const escaped = taskId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const pattern = new RegExp(`(?:^|\\n)${FUSION_TASK_ID_TRAILER_KEY}: ${escaped}\\s*(?:\\n|$)`);
     return pattern.test(body);
@@ -447,7 +474,7 @@ export async function classifyBootstrapMisbinding(
   input: ClassifyBootstrapMisbindingInput,
 ): Promise<ClassifyBootstrapMisbindingResult> {
   const { repoDir, branchName, baseSha, taskId } = input;
-  const output = await runGit(repoDir, `git log --format=%H%x1f%s%x1f%b ${quoteShellArg(`${baseSha}..${branchName}`)}`)
+  const output = await runGitArgs(repoDir, ["log", "--format=%H%x1f%s%x1f%b", `${baseSha}..${branchName}`])
     .catch(() => "");
   if (!output) {
     return {
@@ -539,10 +566,8 @@ async function classifyForeignCommitsViaPatchId(
   mainRef: string,
   commits: BranchCrossContaminationCommit[],
 ): Promise<ClassifyForeignCommitsResult> {
-  const upstreamPatchIdsOutput = await runGit(
-    repoDir,
-    `git rev-list ${quoteShellArg(mainRef)} | while read c; do git show "$c" | git patch-id --stable; done`,
-  ).catch(() => "");
+  const upstreamPatchIdsOutput = (await patchIdsForRef(repoDir, mainRef).catch(() => []))
+    .join("\n");
 
   const upstreamPatchIds = new Set(
     upstreamPatchIdsOutput
@@ -554,7 +579,7 @@ async function classifyForeignCommitsViaPatchId(
   const alreadyUpstream: BranchCrossContaminationCommit[] = [];
   const unique: BranchCrossContaminationCommit[] = [];
   for (const commit of commits) {
-    const patchIdLine = await runGit(repoDir, `git show ${quoteShellArg(commit.sha)} | git patch-id --stable`).catch(() => "");
+    const patchIdLine = await patchIdForCommit(repoDir, commit.sha).catch(() => "");
     const patchId = patchIdLine.trim().split(" ")[0];
     if (patchId && upstreamPatchIds.has(patchId)) {
       alreadyUpstream.push(commit);
@@ -618,8 +643,8 @@ export async function classifyForeignCommits(
   };
 
   try {
-    const comparisonBase = baseSha || await runGit(repoDir, `git merge-base ${quoteShellArg(mainRef)} ${quoteShellArg(branchName)}`);
-    const output = await runGit(repoDir, `git cherry ${quoteShellArg(mainRef)} ${quoteShellArg(branchName)} ${quoteShellArg(comparisonBase)}`);
+    const comparisonBase = baseSha || await runGitArgs(repoDir, ["merge-base", mainRef, branchName]);
+    const output = await runGitArgs(repoDir, ["cherry", mainRef, branchName, comparisonBase]);
     return await classifyFromCherryOutput(output);
   } catch {
     return classifyForeignCommitsViaPatchId(repoDir, mainRef, foreignCommits);
@@ -653,10 +678,7 @@ export async function classifyMisroutedForeignCommit(
     return { misrouted: false, paths: [] };
   }
 
-  const pathsOutput = await runGit(
-    repoDir,
-    `git diff-tree --root --no-commit-id --name-only -r ${quoteShellArg(sha)}`,
-  ).catch(() => "");
+  const pathsOutput = await runGitArgs(repoDir, ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", sha]).catch(() => "");
   const paths = pathsOutput
     .split("\n")
     .map((line) => line.trim())
@@ -681,22 +703,19 @@ export async function classifyForeignOnlyContamination(
   // merge-base when it is a descendant of the persisted baseSha.
   let effectiveBaseSha = baseSha;
   try {
-    const mergeBaseRaw = await runGit(repoDir, `git merge-base ${quoteShellArg(branchName)} ${quoteShellArg(mainRef)}`);
+    const mergeBaseRaw = await runGitArgs(repoDir, ["merge-base", branchName, mainRef]);
     const liveMergeBase = mergeBaseRaw.trim();
     if (liveMergeBase && liveMergeBase !== baseSha) {
       // Use live merge-base if it is a descendant of baseSha (newer)
-      const ancestryCheck = await runGit(
-        repoDir,
-        `git merge-base --is-ancestor ${quoteShellArg(baseSha)} ${quoteShellArg(liveMergeBase)} && echo yes || echo no`,
-      ).catch(() => "no");
-      if (ancestryCheck.trim() === "yes") {
+      const ancestryCheck = await isAncestor(repoDir, baseSha, liveMergeBase).catch(() => false);
+      if (ancestryCheck) {
         effectiveBaseSha = liveMergeBase;
       }
     }
   } catch {
     // fall back to persisted baseSha on any git failure
   }
-  const persistedRangeOutput = await runGit(repoDir, `git log --format=%H%x1f%s%x1f%b ${quoteShellArg(`${baseSha}..${branchName}`)}`)
+  const persistedRangeOutput = await runGitArgs(repoDir, ["log", "--format=%H%x1f%s%x1f%b", `${baseSha}..${branchName}`])
     .catch(() => "");
   const subjectPattern = /^(feat|fix|test|chore|docs|refactor|perf|build)\((FN-\d+)\):/i;
   const trailerPattern = /(?:^|\n)Fusion-Task-Id:\s*(FN-\d+)\s*(?:\n|$)/i;
@@ -790,31 +809,21 @@ export async function reanchorBranchToBase(
   const previousTipSha = await revParse(repoDir, branchName);
 
   try {
-    await execAsync("git checkout -- .", {
-      cwd: worktreePath,
-      encoding: "utf-8",
-      timeout: GIT_TIMEOUT_MS,
-      maxBuffer: GIT_MAX_BUFFER,
-    });
+    await runGitArgs(worktreePath, ["checkout", "--", "."]);
   } catch {
     // best-effort: worktree may already be clean
   }
 
-  await execAsync("git clean -fd", {
-    cwd: worktreePath,
-    encoding: "utf-8",
-    timeout: GIT_TIMEOUT_MS,
-    maxBuffer: GIT_MAX_BUFFER,
-  });
+  await runGitArgs(worktreePath, ["clean", "-fd"]);
 
   const worktreeHeadSha = await revParse(worktreePath, "HEAD");
   const branchTipSha = previousTipSha;
-  const worktreeHeadBranch = await runGit(worktreePath, "git symbolic-ref --quiet --short HEAD").catch(() => "");
+  const worktreeHeadBranch = await runGitArgs(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(() => "");
 
   if (worktreeHeadSha === baseSha && branchTipSha === baseSha) {
     if (worktreeHeadBranch !== branchName) {
       try {
-        await runGit(worktreePath, `git checkout ${quoteShellArg(branchName)}`);
+        await runGitArgs(worktreePath, ["checkout", branchName]);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (!message.includes("already used by worktree")) {
@@ -829,8 +838,8 @@ export async function reanchorBranchToBase(
     };
   }
 
-  await runGit(worktreePath, `git checkout --detach ${quoteShellArg(baseSha)}`);
-  await runGit(worktreePath, `git checkout -B ${quoteShellArg(branchName)} ${quoteShellArg(baseSha)}`);
+  await runGitArgs(worktreePath, ["checkout", "--detach", baseSha]);
+  await runGitArgs(worktreePath, ["checkout", "-B", branchName, baseSha]);
   await assertCleanBranchAtBase(repoDir, branchName, baseSha, taskId);
 
   return {
@@ -863,29 +872,24 @@ export async function autoRecoverCrossContamination(
   }
 
   const originalTip = await revParse(repoDir, branchName);
-  const commitListOutput = await runGit(repoDir, `git rev-list --reverse ${quoteShellArg(`${baseSha}..${branchName}`)}`)
+  const commitListOutput = await runGitArgs(repoDir, ["rev-list", "--reverse", `${baseSha}..${branchName}`])
     .catch(() => "");
   const commits = commitListOutput.split("\n").map((line) => line.trim()).filter(Boolean);
 
-  await runGit(repoDir, `git checkout --detach ${quoteShellArg(baseSha)}`);
+  await runGitArgs(repoDir, ["checkout", "--detach", baseSha]);
 
   try {
     for (const sha of commits) {
       if (dropSet.has(sha)) continue;
-      await execAsync(`git cherry-pick ${quoteShellArg(sha)}`, {
-        cwd: repoDir,
-        encoding: "utf-8",
-        timeout: GIT_TIMEOUT_MS,
-        maxBuffer: GIT_MAX_BUFFER,
-      });
+      await runGitArgs(repoDir, ["cherry-pick", sha]);
     }
 
     const newTip = await revParse(repoDir, "HEAD");
-    await runGit(repoDir, `git update-ref ${quoteShellArg(`refs/heads/${branchName}`)} ${quoteShellArg(newTip)} ${quoteShellArg(originalTip)}`);
-    await runGit(repoDir, `git checkout ${quoteShellArg(branchName)}`);
+    await runGitArgs(repoDir, ["update-ref", `refs/heads/${branchName}`, newTip, originalTip]);
+    await runGitArgs(repoDir, ["checkout", branchName]);
   } catch (error) {
-    await runGit(repoDir, `git cherry-pick --abort`).catch(() => undefined);
-    await runGit(repoDir, `git checkout ${quoteShellArg(branchName)}`).catch(() => undefined);
+    await runGitArgs(repoDir, ["cherry-pick", "--abort"]).catch(() => undefined);
+    await runGitArgs(repoDir, ["checkout", branchName]).catch(() => undefined);
     throw error;
   }
 
@@ -910,7 +914,8 @@ async function isZeroUniqueCommitBranchViaPatchIdFallback(
   mainRef: string,
 ): Promise<boolean> {
   const range = `${startPoint}..${branchName}`;
-  const branchCommitsOutput = await runGit(repoDir, `git rev-list ${quoteShellArg(range)}`).catch(() => "");
+  // An unreadable range is unknown, never proof of zero unique commits.
+  const branchCommitsOutput = await runGitArgs(repoDir, ["rev-list", range]);
   const branchCommitShas = branchCommitsOutput
     .split("\n")
     .map((line) => line.trim())
@@ -920,10 +925,8 @@ async function isZeroUniqueCommitBranchViaPatchIdFallback(
     return true;
   }
 
-  const upstreamPatchIdsOutput = await runGit(
-    repoDir,
-    `git rev-list ${quoteShellArg(mainRef)} | while read c; do git show "$c" | git patch-id --stable; done`,
-  ).catch(() => "");
+  const upstreamPatchIdsOutput = (await patchIdsForRef(repoDir, mainRef).catch(() => []))
+    .join("\n");
 
   const upstreamPatchIds = new Set(
     upstreamPatchIdsOutput
@@ -937,7 +940,7 @@ async function isZeroUniqueCommitBranchViaPatchIdFallback(
   }
 
   for (const sha of branchCommitShas) {
-    const patchIdLine = await runGit(repoDir, `git show ${quoteShellArg(sha)} | git patch-id --stable`).catch(() => "");
+    const patchIdLine = await patchIdForCommit(repoDir, sha).catch(() => "");
     const patchId = patchIdLine.trim().split(" ")[0];
     if (!patchId || !upstreamPatchIds.has(patchId)) {
       return false;
@@ -958,14 +961,12 @@ export async function inspectBareBranchCollision(
   const startPoint = input.startPoint ?? "HEAD";
 
   try {
-    await runGit(input.repoDir, "git worktree prune");
+    await runGitArgs(input.repoDir, ["worktree", "prune"]);
   } catch {
     // Best-effort: the mapping check below still protects a registered live worktree.
   }
 
-  try {
-    await revParse(input.repoDir, `refs/heads/${input.branchName}`);
-  } catch {
+  if (!await branchExists(input.repoDir, input.branchName)) {
     return { kind: "missing" };
   }
 
@@ -973,7 +974,7 @@ export async function inspectBareBranchCollision(
   let livePath = worktreeMap.get(input.branchName);
   if (livePath && !existsSync(livePath)) {
     try {
-      await runGit(input.repoDir, "git worktree prune");
+      await runGitArgs(input.repoDir, ["worktree", "prune"]);
     } catch {
       // Best-effort: a still-present mapping is not considered live below.
     }
@@ -1061,7 +1062,7 @@ export async function inspectBranchConflict(
   }
 
   try {
-    await runGit(input.repoDir, "git worktree prune");
+    await runGitArgs(input.repoDir, ["worktree", "prune"]);
   } catch {
     // best-effort
   }
@@ -1069,15 +1070,13 @@ export async function inspectBranchConflict(
   let worktreeMap = await getWorktreeBranchMap(input.repoDir);
   let livePath = worktreeMap.get(input.branchName);
 
-  try {
-    await revParse(input.repoDir, `refs/heads/${input.branchName}`);
-  } catch {
+  if (!await branchExists(input.repoDir, input.branchName)) {
     return { kind: "stale-resolved" };
   }
 
   if (livePath && !existsSync(livePath)) {
     try {
-      await runGit(input.repoDir, "git worktree prune");
+      await runGitArgs(input.repoDir, ["worktree", "prune"]);
     } catch {
       // best-effort
     }

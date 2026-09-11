@@ -109,7 +109,10 @@ export async function handleBranchConflict(
 
   if (inspection.kind === "tip-already-merged") {
     if (inspection.livePath) {
-      await deps.cleanupConflictingWorktree(inspection.livePath, error.branchName, task.id);
+      // FNXC:LegacyWorktreePreservation 2026-09-06-01:31: Refusal is binding:
+      // do not clear ownership or prune/delete after cleanup protected a checkout.
+      const cleaned = await deps.cleanupConflictingWorktree(inspection.livePath, error.branchName, task.id);
+      if (!cleaned) return "sticky";
     }
     try {
       await execAsync("git worktree prune", {

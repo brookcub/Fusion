@@ -953,22 +953,33 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
    */
   const acquirePinnedWorktree = async (): Promise<AcquireTaskWorktreeResult> => {
     const derivedPinnedPath = pinnedWorktreePathForTask(task.id, settings, rootDir, workspaceContext);
-    const persistedPathIsManaged = task.worktree
-      && basename(canonicalizePath(task.worktree)) === task.id.toLowerCase()
-      && canonicalizePath(task.worktree) !== canonicalizePath(rootDir)
-      && isInsideWorktreesDir(rootDir, task.worktree, settings, workspaceContext);
-    const pinnedPath = persistedPathIsManaged ? task.worktree! : derivedPinnedPath;
     const resumedBranch = task.branch ?? branchName;
+    // FNXC:LegacyWorktreePreservation 2026-09-06-01:18: Naming policy applies
+    // to new checkouts, not a registered branch-matched assignment already in use.
+    const persistedPathIsManaged = task.worktree
+      && canonicalizePath(task.worktree) !== canonicalizePath(rootDir)
+      && isInsideWorktreesDir(rootDir, task.worktree, settings, workspaceContext)
+      && (basename(canonicalizePath(task.worktree)) === task.id.toLowerCase()
+        || (existsSync(task.worktree)
+          && (await classifyTaskWorktree(rootDir, task.worktree)).ok
+          && await pinnedWorktreeBranchMatches(rootDir, task.worktree, resumedBranch)));
+    const pinnedPath = persistedPathIsManaged ? task.worktree! : derivedPinnedPath;
 
-    if (task.worktree && canonicalizePath(task.worktree) !== canonicalizePath(pinnedPath)) {
-      await audit?.git({
-        type: "worktree:pin-rederived",
-        target: pinnedPath,
-        metadata: { taskId: task.id, previous: task.worktree, derived: pinnedPath, source: "acquire" },
-      });
-      await store.logEntry(task.id, "Re-derived task-pinned worktree path from task id", `${task.worktree} -> ${pinnedPath}`, runContext);
-      await persistWorktreeAssignment({ worktree: pinnedPath });
-    }
+    const previousPath = task.worktree;
+    const recordPinnedResult = async (result: AcquireTaskWorktreeResult): Promise<AcquireTaskWorktreeResult> => {
+      if (previousPath && canonicalizePath(previousPath) !== canonicalizePath(pinnedPath)) {
+        await audit?.git({
+          type: "worktree:pin-rederived",
+          target: pinnedPath,
+          metadata: { taskId: task.id, previous: previousPath, derived: pinnedPath, source: "acquire" },
+        });
+        await store.logEntry(task.id, "Re-derived task-pinned worktree path from task id", `${previousPath} -> ${pinnedPath}`, runContext);
+      }
+      return result;
+    };
+    // FNXC:LegacyWorktreePreservation 2026-09-06-01:18: Publish a replacement
+    // only through successful reuse/create finalization. An attempted reservation
+    // or failed create must not orphan the old checkout for the cleanup sweeper.
 
     const reservation = await acquireWorktreePathReservation({
       canonicalPath: await canonicalizeWorktreePath(pinnedPath),
@@ -1022,7 +1033,7 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
           // FNXC:BranchWriteOrigin 2026-08-28-10:12: warm reuse can adopt an operator-override branch; derive origin (#3523 Greptile P1).
           await persistWorktreeAssignment({ worktree: pinnedPath, branch: resumedBranch, branchWriteOrigin: branchWriteOriginFor(resumedBranch) });
         }
-        return reuseWarmWorktree(pinnedPath, resumedBranch, "existing");
+        return recordPinnedResult(await reuseWarmWorktree(pinnedPath, resumedBranch, "existing"));
       }
       // Invalid / foreign-branch / stale (crash leftover, archive→restore) → reclaim in place: remove the
       // registered worktree (owner probe via removeWorktree) then recreate fresh at the SAME path — never suffix.
@@ -1138,7 +1149,7 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
     }
 
       const created = await createWorktreeImpl(branchName, pinnedPath, task.id, freshStartPoint, allowSiblingBranchRename, true, workingBranch.origin);
-      return await finalizeCreatedWorktree(created, "fresh", "normal");
+      return await recordPinnedResult(await finalizeCreatedWorktree(created, "fresh", "normal"));
     } finally {
       if (reservation.state === "held") await reservation.release();
     }

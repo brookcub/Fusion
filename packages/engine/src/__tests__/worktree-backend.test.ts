@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { resolve } from "node:path";
 import {
   ActiveSessionWorktreeRemovalError,
   classifyWorktreeRemovalContent,
@@ -53,7 +54,14 @@ const {
 
 vi.mock("node:child_process", () => ({ exec: execMock, execFile: execFileMock }));
 vi.mock("node:fs", () => ({ existsSync: existsSyncMock }));
-vi.mock("node:fs/promises", () => ({ access: accessMock, chmod: chmodMock, readdir: readdirMock, rm: rmMock }));
+vi.mock("node:fs/promises", () => ({
+  access: accessMock, chmod: chmodMock, rm: rmMock,
+  // Existing backend command fixtures contain no links. Native junction/refusal
+  // behavior is exercised separately with real Git and external byte sentinels.
+  lstat: vi.fn(async () => ({ isSymbolicLink: () => false, isDirectory: () => true })),
+  readdir: readdirMock,
+  unlink: vi.fn(),
+}));
 vi.mock("../execution/branch-conflicts.js", () => ({
   inspectBranchConflict: vi.fn().mockResolvedValue({ kind: "stale" }),
 }));
@@ -426,7 +434,7 @@ describe("NativeWorktreeBackend", () => {
     });
 
     expect(result).toEqual({ path: "/repo/.worktrees/fn-1", branch: "fusion/fn-1" });
-    expect(tryRemoveStaleLockMock).toHaveBeenCalledWith({ lockPath: "/repo/.git/worktrees/fn-1/index.lock" });
+    expect(tryRemoveStaleLockMock).toHaveBeenCalledWith({ lockPath: resolve("/repo/.git/worktrees/fn-1/index.lock") });
     expect(audit.git).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({ type: "worktree:stale-lock-detected" }),
@@ -600,7 +608,7 @@ describe("NativeWorktreeBackend", () => {
     const backend = new NativeWorktreeBackend({ settings: { worktreesDir: "../{repo}.worktrees" } as any });
     await expect(
       backend.resolveWorktreePath({ rootDir: "/repo/project", worktreeName: "fn-1", branch: "fusion/fn-1" }),
-    ).resolves.toBe("/repo/project.worktrees/fn-1");
+    ).resolves.toBe(resolve("/repo/project.worktrees/fn-1"));
   });
 });
 
@@ -951,7 +959,7 @@ describe("WorktrunkWorktreeBackend", () => {
 
     await expect(
       backend.resolveWorktreePath({ rootDir: "/repo/project", worktreeName: "ignored", branch: "fusion/fn-1" }),
-    ).resolves.toBe("/repo/project.fusion-fn-1");
+    ).resolves.toBe(resolve("/repo/project.fusion-fn-1"));
     expect(execMock).toHaveBeenCalledWith(
       '"worktrunk" "config" "show" "--format" "json"',
       expect.objectContaining({ cwd: "/repo/project", timeout: 5000, maxBuffer: 10485760 }),
@@ -964,7 +972,7 @@ describe("WorktrunkWorktreeBackend", () => {
 
     await expect(
       backend.resolveWorktreePath({ rootDir: "/repo/project", worktreeName: "ignored", branch: "fusion/fn-1" }),
-    ).resolves.toBe("/repo/project/.worktrees/fusion-fn-1");
+    ).resolves.toBe(resolve("/repo/project/.worktrees/fusion-fn-1"));
   });
 
   it("prunes by listing worktrees and removing worktrunk managed entries", async () => {
