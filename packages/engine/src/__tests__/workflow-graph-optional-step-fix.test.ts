@@ -978,15 +978,18 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
         workflowStepName: "Code Review",
         phase: "pre-merge",
         status: "failed",
+        verdict: "REVISE",
         output: "Fix the review finding.",
       }],
     });
     const executor = new TaskExecutor(store, "/tmp/test");
+    const append = vi.spyOn(executor as any, "appendReviewRemediationSteps").mockResolvedValue("appended");
     const sendBack = vi.spyOn(executor as any, "sendTaskBackForFix").mockResolvedValue(undefined);
 
     await expect(executor.recoverFailedPreMergeWorkflowStep(liveTask)).resolves.toBe(true);
 
-    expect(sendBack).toHaveBeenCalledOnce();
+    expect(append).toHaveBeenCalledOnce();
+    expect(sendBack).not.toHaveBeenCalled();
     expect(store.logEntry).not.toHaveBeenCalledWith(
       liveTask.id,
       expect.stringContaining("recovery not scheduled — revision budget"),
@@ -1013,20 +1016,23 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
         workflowStepName: "Code Review",
         phase: "pre-merge",
         status: "failed",
+        verdict: "REVISE",
         output: "Fix the review finding.",
       }],
     });
     setMockSettings(store, { autoMerge: projectAutoMerge });
     const executor = new TaskExecutor(store, "/tmp/test");
+    const append = vi.spyOn(executor as any, "appendReviewRemediationSteps").mockResolvedValue("appended");
     const sendBack = vi.spyOn(executor as any, "sendTaskBackForFix").mockResolvedValue(undefined);
 
     await expect(executor.recoverFailedPreMergeWorkflowStep(liveTask)).resolves.toBe(!held);
 
-    if (held) expect(sendBack).not.toHaveBeenCalled();
-    else expect(sendBack).toHaveBeenCalledOnce();
+    if (held) expect(append).not.toHaveBeenCalled();
+    else expect(append).toHaveBeenCalledOnce();
+    expect(sendBack).not.toHaveBeenCalled();
   });
 
-  it("keeps the retry presentation aligned with the next attempt during failed-step recovery", async () => {
+  it("forwards keyed unbounded retry accounting to the named recovery producer", async () => {
     const store = createMockStore();
     const liveTask = task({
       column: "in-review",
@@ -1036,30 +1042,26 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
         workflowStepName: "Code Review",
         phase: "pre-merge",
         status: "failed",
+        verdict: "REVISE",
         output: "Fix the review finding.",
         completedAt: new Date().toISOString(),
       }],
     });
     setMockSettings(store, { maxPostReviewFixes: 3, codeReviewMaxRevisions: "unbounded" });
     const executor = new TaskExecutor(store, "/tmp/test");
+    const append = vi.spyOn(executor as any, "appendReviewRemediationSteps").mockResolvedValue("appended");
     const sendBack = vi.spyOn(executor as any, "sendTaskBackForFix").mockResolvedValue(undefined);
 
     await expect(executor.recoverFailedPreMergeWorkflowStep(liveTask)).resolves.toBe(true);
 
-    expect(sendBack).toHaveBeenCalledWith(
+    expect(append).toHaveBeenCalledWith(
       liveTask,
-      liveTask.worktree,
-      "Fix the review finding.",
-      "Code Review",
-      expect.any(String),
-      true,
-      false,
-      { attempt: 4, max: undefined },
-      undefined,
-      true,
-      "reopen-trailing",
-      expect.objectContaining({ revisionKey: "code-review", maxRevisions: "unbounded" }),
+      expect.objectContaining({ nodeId: "code-review", verdict: "REVISE", feedback: "Fix the review finding." }),
+      expect.objectContaining({ attemptClaim: expect.objectContaining({
+        revisionKey: "code-review", maxRevisions: "unbounded", expectedWorkflowStepId: "code-review",
+      }) }),
     );
+    expect(sendBack).not.toHaveBeenCalled();
   });
 
   /*
@@ -1082,6 +1084,7 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
         workflowStepName: "Code Review",
         phase: "pre-merge",
         status: "failed",
+        verdict: "REVISE",
         output: "Fix the review finding.",
         findings,
         completedAt: new Date().toISOString(),
@@ -1089,24 +1092,19 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
     });
     setMockSettings(store, { maxPostReviewFixes: 3 });
     const executor = new TaskExecutor(store, "/tmp/test");
+    const append = vi.spyOn(executor as any, "appendReviewRemediationSteps").mockResolvedValue("appended");
     const sendBack = vi.spyOn(executor as any, "sendTaskBackForFix").mockResolvedValue(undefined);
 
     await expect(executor.recoverFailedPreMergeWorkflowStep(liveTask)).resolves.toBe(true);
 
-    expect(sendBack).toHaveBeenCalledWith(
+    expect(append).toHaveBeenCalledWith(
       liveTask,
-      liveTask.worktree,
-      "Fix the review finding.",
-      "Code Review",
-      expect.any(String),
-      true,
-      false,
-      expect.anything(),
-      findings,
-      true,
-      "reopen-trailing",
-      expect.objectContaining({ revisionKey: "code-review", maxRevisions: 3 }),
+      expect.objectContaining({ nodeId: "code-review", verdict: "REVISE", findings }),
+      expect.objectContaining({ attemptClaim: expect.objectContaining({
+        revisionKey: "code-review", maxRevisions: 3, expectedWorkflowStepId: "code-review",
+      }) }),
     );
+    expect(sendBack).not.toHaveBeenCalled();
   });
 
   /*
@@ -1128,6 +1126,7 @@ describe("TaskExecutor pre-merge optional-step fix seam", () => {
         workflowStepName: "Code Review",
         phase: "pre-merge",
         status: "failed",
+        verdict: "REVISE",
         output: "Fix the review finding.",
         completedAt: new Date().toISOString(),
       }],

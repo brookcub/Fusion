@@ -257,6 +257,7 @@ import type {
   RecoverFailedPreMergeStepOutcome,
   ReviewRemediationAttemptDescriptor,
 } from "./executor/recover-failed-pre-merge-step.js";
+import { permitsFailedStepCodeRemediation } from "./executor/recover-failed-pre-merge-step.js";
 
 export {
   extractTaskIdFromTempMergeDir,
@@ -10151,6 +10152,8 @@ export class SelfHealingManager extends SelfHealingGitEvidence {
       };
 
       const candidates = tasks.filter((task) => {
+        const remediationTarget = latestFailedPreMergeStep(task);
+        if (remediationTarget && !permitsFailedStepCodeRemediation(remediationTarget)) return false;
         /* Precomputed above, so this filter stays synchronous. */
         if (!(reviewLanesByTask.get(task.id) ?? new Set(["in-review"])).has(task.column)) return false;
         if (!allowsAutoMergeProcessing(task, settings)) return false;
