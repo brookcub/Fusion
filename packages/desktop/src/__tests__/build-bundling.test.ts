@@ -21,7 +21,8 @@ describe("desktop Electron main bundling", () => {
   it("builds dashboard server artifacts and registry manifest from the desktop release build path", async () => {
     const buildScript = await readDesktopFile("scripts/build.ts");
 
-    expect(buildScript).toContain("buildDashboard()");
+    expect(buildScript).toContain("buildDashboard({ includeClient: false })");
+    expect(buildScript).toContain("await buildDashboardClient()");
     expect(buildScript).toContain("dashboardRegistryManifestSource");
     expect(buildScript).toContain("dashboardRegistryManifestDist");
     expect(buildScript).toContain("await cp(dashboardRegistryManifestSource, dashboardRegistryManifestDist)");
