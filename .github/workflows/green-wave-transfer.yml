@@ -15,58 +15,59 @@ jobs:
         with:
           fetch-depth: 1
           lfs: false
-      - name: Reconstruct and verify exact source objects, then publish owned refs
+      - name: Verify exact Git objects before atomic publication
         shell: bash
         env:
           GIT_LFS_SKIP_SMUDGE: '1'
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import subprocess as s, pathlib, os, json, hashlib, re
-          here=pathlib.Path.cwd(); base='840759dda45e3e5c6ffa7496029553ae81196c30'
+          import subprocess as s,pathlib,os,json,re
+          here=pathlib.Path.cwd();base='840759dda45e3e5c6ffa7496029553ae81196c30'
           def git(*args,cwd=here,data=None):return s.check_output(['git',*args],cwd=cwd,input=data)
           git('fetch','--no-tags','--depth=1','origin',base)
           work=pathlib.Path(os.environ['RUNNER_TEMP'])/'exact-patch-worktree'
           git('worktree','add','--detach',str(work),base)
           records=[];targets={}
           for path in sorted((here/'.github/green-transfer').glob('*.json')):
-            payload=json.loads(path.read_text()); ident=payload['id']; assert re.fullmatch(r'[A-Z0-9]+',ident)
+            payload=json.loads(path.read_text());ident=payload['id'];assert re.fullmatch(r'[A-Z0-9]+',ident)
             parent=base;git('reset','--hard',base,cwd=work)
             for stage in payload['stages']:
               assert stage['phase'] in ('red','green');raw=stage['raw'].encode()
               header=raw.split(b'\n\n',1)[0].decode().splitlines()
               assert [x[7:] for x in header if x.startswith('parent ')]==[parent]
-              for change in stage['changes']:
-                p=pathlib.PurePosixPath(change['path']);assert not p.is_absolute() and '..' not in p.parts and '.git' not in p.parts
-                assert p.parts[0] in ('packages','scripts','.changeset','plugins')
-                dest=work/p;dest.parent.mkdir(parents=True,exist_ok=True)
-                if 'content' in change:
-                  assert not dest.exists();dest.write_bytes(change['content'].encode())
-                else:
-                  text=dest.read_bytes().decode()
-                  for old,new in change['replacements']:
-                    assert text.count(old)==1,(str(p),'replacement mismatch')
-                    text=text.replace(old,new,1)
-                  dest.write_bytes(text.encode())
+              if 'patch' in stage:
+                git('apply','--index','--binary','-',cwd=work,data=stage['patch'].encode())
+              else:
+                for change in stage['changes']:
+                  p=pathlib.PurePosixPath(change['path']);assert not p.is_absolute() and '..' not in p.parts and '.git' not in p.parts
+                  assert p.parts[0] in ('packages','scripts','.changeset','plugins')
+                  dest=work/p;dest.parent.mkdir(parents=True,exist_ok=True)
+                  if 'content' in change:
+                    assert not dest.exists();dest.write_bytes(change['content'].encode())
+                  else:
+                    text=dest.read_bytes().decode()
+                    for old,new in change['replacements']:
+                      assert text.count(old)==1,(str(p),'replacement mismatch');text=text.replace(old,new,1)
+                    dest.write_bytes(text.encode())
               git('add','-A',cwd=work)
+              for name in git('diff','--cached','--name-only','-z',cwd=work).decode().split('\0'):
+                if name:assert name.split('/')[0] in ('packages','scripts','.changeset','plugins')
               tree=git('write-tree',cwd=work).decode().strip();assert tree==stage['tree'],(ident,stage['phase'],tree,stage['tree'])
               sha=git('hash-object','-w','-t','commit','--stdin',cwd=work,data=raw).decode().strip();assert sha==stage['sha']
               git('reset','--hard',sha,cwd=work);parent=sha
               ref='refs/heads/'+('repro/' if stage['phase']=='red' else 'patch/')+ident.lower()+'-20260913'
               targets[ref]=sha;records.append({'id':ident,'phase':stage['phase'],'ref':ref,'sha':sha,'tree':tree})
-          def remote():
-            out=git('ls-remote','origin',*targets).decode().splitlines()
-            return {r:v for v,r in (x.split() for x in out)}
+          def remote():return {r:v for v,r in (x.split() for x in git('ls-remote','origin',*targets).decode().splitlines())}
           existing=remote();missing={r for r in targets if r not in existing}
           assert all(existing.get(r) in (None,base,sha) for r,sha in targets.items()),'concurrent writer'
           if missing:
             git('push','--atomic',*['--force-with-lease='+r+':' for r in sorted(missing)],'origin',*[base+':'+r for r in sorted(missing)])
-            check=remote();assert all(check.get(r)==base for r in missing),'initial ref readback failed'
+            check=remote();assert all(check.get(r)==base for r in missing),'initial readback failed'
           current=remote();pending={r:sha for r,sha in targets.items() if current.get(r)!=sha}
           assert all(current[r]==base for r in pending)
-          if pending:
-            git('push','--atomic',*['--force-with-lease='+r+':'+base for r in pending],'origin',*[sha+':'+r for r,sha in pending.items()])
-          assert remote()==targets,'published ref readback mismatch'
+          if pending:git('push','--atomic',*['--force-with-lease='+r+':'+base for r in pending],'origin',*[sha+':'+r for r,sha in pending.items()])
+          assert remote()==targets,'published ref mismatch'
           out=pathlib.Path(os.environ['RUNNER_TEMP'])/'publication';out.mkdir()
           (out/'verified.json').write_text(json.dumps(records,indent=2)+'\n')
           print(json.dumps({'verified_refs':len(records),'base':base,'product_execution':False}))
