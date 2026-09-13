@@ -377,13 +377,18 @@ export async function listTasksImpl(store: TaskStore, options?: ListTasksOptions
     const startupMemoEnabled = options?.startupMemo ?? (!store.isWatching && slim);
 
     if (startupMemoEnabled && slim && options?.limit === undefined && options?.offset === undefined) {
-      const memoKey = [
-        includeArchived ? "all" : "active",
-        columnFilter ?? "*",
-        options?.columns?.join(",") ?? "*",
-        options?.excludeColumns?.join(",") ?? "*",
+      // Cache only equivalent query policies. Structured arrays cannot collide
+      // with a single custom column containing the old delimiter.
+      const memoKey = JSON.stringify([
+        includeArchived,
+        options?.includeDeleted ?? false,
+        columnFilter ?? null,
+        options?.columns ?? null,
+        options?.excludeColumns ?? null,
         options?.sort ?? "created-asc",
-      ].join(":");
+        options?.afterCreatedAt ?? null,
+        options?.afterId ?? null,
+      ]);
       const now = Date.now();
       const cached = store.startupSlimListMemo.get(memoKey);
       if (cached && cached.expiresAt > now) {
