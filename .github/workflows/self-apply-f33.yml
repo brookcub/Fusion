@@ -25,7 +25,7 @@ jobs:
           old='''        const portIdx = args.indexOf("--port");\n        const portIdxShort = args.indexOf("-p");\n        const pi = portIdx !== -1 ? portIdx : portIdxShort;\n        const port = pi !== -1 ? parseInt(args[pi + 1], 10) : 4040;\n        const paused = args.includes("--paused");\n'''
           new='''        const portIdx = args.indexOf("--port");\n        const portIdxShort = args.indexOf("-p");\n        const pi = portIdx !== -1 ? portIdx : portIdxShort;\n        let port: number;\n        if (pi !== -1) {\n          port = parseInt(args[pi + 1], 10);\n        } else {\n          const { GlobalSettingsStore } = await import("@fusion/core");\n          const settings = await new GlobalSettingsStore().getSettings();\n          port = settings.daemonPort ?? 4040;\n        }\n        const paused = args.includes("--paused");\n'''
           count=s.count(old)
-          if count != 2: raise SystemExit(f'F33 expected dashboard+serve blocks, got {count}')
+          if count != 1: raise SystemExit(f'F33 expected one current dashboard block, got {count}')
           p.write_text(s.replace(old,new,1))
           PY
           git rm .github/workflows/self-apply-f33.yml
