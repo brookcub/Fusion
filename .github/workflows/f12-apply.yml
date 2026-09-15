@@ -29,10 +29,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
         with:
-          fetch-depth: 2
+          fetch-depth: 3
           persist-credentials: true
       - uses: ./.github/actions/setup-node-pnpm
-      - name: Apply exact atomic upsert fence
+      - name: Apply exact atomic upsert fence inside one function
         shell: bash
         run: |
           python3 - <<'PY'
@@ -44,31 +44,38 @@ jobs:
           if text.count(old_import) != 1:
               raise SystemExit(f'expected exactly one drizzle import, saw {text.count(old_import)}')
           text = text.replace(old_import, new_import)
-          old_tail = '''        integratedAt: state.integratedAt ?? null,
-                updatedAt: now,
-              },
-            });
-          }'''
-          new_tail = '''        integratedAt: state.integratedAt ?? null,
-                updatedAt: now,
-              },
-              // A stale same-run writer must not move a terminal step instance back into
-              // pending/in-progress/awaiting-integration. Keep the decision inside the
-              // ON CONFLICT statement so there is no read/write race between processes.
-              setWhere: state.status === "completed" || state.status === "failed"
-                ? sql`true`
-                : notInArray(schema.project.workflowRunStepInstances.status, ["completed", "failed"]),
-            });
-          }'''
-          if text.count(old_tail) != 1:
-              raise SystemExit(f'expected exactly one step-instance upsert tail, saw {text.count(old_tail)}')
-          text = text.replace(old_tail, new_tail)
+
+          start_marker = 'export async function saveWorkflowRunStepInstanceAsyncImpl('
+          end_marker = '\nexport async function loadWorkflowRunStepInstancesAsyncImpl('
+          start = text.find(start_marker)
+          end = text.find(end_marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit('could not isolate saveWorkflowRunStepInstanceAsyncImpl')
+          fn = text[start:end]
+          conflict = '.onConflictDoUpdate({'
+          if fn.count(conflict) != 1:
+              raise SystemExit(f'expected one conflict update in save function, saw {fn.count(conflict)}')
+          tail = '\n      },\n    });\n}'
+          if fn.count(tail) != 1:
+              raise SystemExit(f'expected one terminal set tail in save function, saw {fn.count(tail)}')
+          guarded = '''
+      },
+      // Stale same-run writers may not regress a terminal instance. This predicate
+      // lives in the conflict update itself so competing processes cannot race a
+      // separate read-before-write check.
+      setWhere: state.status === "completed" || state.status === "failed"
+        ? sql`true`
+        : notInArray(schema.project.workflowRunStepInstances.status, ["completed", "failed"]),
+    });
+}'''
+          fn = fn.replace(tail, guarded)
+          text = text[:start] + fn + text[end:]
           p.write_text(text)
           PY
           git diff --check
       - name: Typecheck core
         run: pnpm --filter @fusion/core typecheck
-      - name: Prove PostgreSQL terminal fence
+      - name: Prove PostgreSQL terminal fence and neighboring persistence cases
         run: pnpm --filter @fusion/core exec vitest run src/__tests__/postgres/workflow-step-instance-terminal-fence.pg.test.ts src/__tests__/postgres/workflow-run-step-instances.pg.test.ts --config vitest.pg.config.ts --reporter=verbose
       - name: Commit product-only staging result and remove one-shot workflow
         shell: bash
