@@ -17,6 +17,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # One-shot branch surgery: the resulting product commit removes this workflow.
           python3 - <<'PY'
           from pathlib import Path
           p=Path('packages/cli/src/bin.ts')
