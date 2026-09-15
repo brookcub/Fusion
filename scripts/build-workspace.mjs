@@ -477,9 +477,16 @@ export function runPlannedBuilds(plannedPackages, rootDir, spawnFn = spawnSync, 
 export function recordSuccessfulPackageBuilds(builtPackages, { rootDir, cache, gitFn = defaultGitRunner } = {}) {
   const nextCache = { version: BUILD_CACHE_VERSION, entries: { ...(cache?.entries ?? {}) } };
   let changed = false;
-  const snapshot = createRepoContentSnapshot({ rootDir, gitFn });
+  let snapshot;
   for (const pkg of builtPackages) {
-    const sourceHash = computePackageSourceHash(pkg, rootDir, { gitFn, snapshot });
+    // Certify the input identity captured when this build was planned. If we
+    // re-hash after compilation, a concurrent edit that the compiler never
+    // consumed can be incorrectly marked as already built.
+    let sourceHash = typeof pkg.sourceHash === "string" ? pkg.sourceHash : null;
+    if (sourceHash === null) {
+      snapshot ??= createRepoContentSnapshot({ rootDir, gitFn });
+      sourceHash = computePackageSourceHash(pkg, rootDir, { gitFn, snapshot });
+    }
     if (sourceHash === null) continue;
     nextCache.entries[pkg.name] = { sourceHash, builtAt: new Date().toISOString() };
     changed = true;
