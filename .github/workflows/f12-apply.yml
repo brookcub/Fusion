@@ -1,0 +1,85 @@
+name: F12 atomic terminal-state fence staging
+on:
+  push:
+    branches: [workbench/f12-terminal-fence-apply]
+    paths: [.github/workflows/f12-apply.yml]
+permissions:
+  contents: write
+jobs:
+  apply-and-qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -h localhost -p 5432 -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      FUSION_PG_TEST_URL_BASE: postgresql://postgres:postgres@127.0.0.1:5432
+      PGPASSWORD: postgres
+      FUSION_PG_TEST_SKIP: '0'
+      FUSION_PG_TEST_REQUIRED: '1'
+      FUSION_PG_TEST_SETUP_PARTICIPANT: '1'
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: true
+      - uses: ./.github/actions/setup-node-pnpm
+      - name: Apply exact atomic upsert fence
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('packages/core/src/task-store/branch-and-pr-entities.ts')
+          text = p.read_text()
+          old_import = 'import { and, asc, eq, inArray, isNull, ne, sql } from "drizzle-orm";'
+          new_import = 'import { and, asc, eq, inArray, isNull, ne, notInArray, sql } from "drizzle-orm";'
+          if text.count(old_import) != 1:
+              raise SystemExit(f'expected exactly one drizzle import, saw {text.count(old_import)}')
+          text = text.replace(old_import, new_import)
+          old_tail = '''        integratedAt: state.integratedAt ?? null,
+                updatedAt: now,
+              },
+            });
+          }'''
+          new_tail = '''        integratedAt: state.integratedAt ?? null,
+                updatedAt: now,
+              },
+              // A stale same-run writer must not move a terminal step instance back into
+              // pending/in-progress/awaiting-integration. Keep the decision inside the
+              // ON CONFLICT statement so there is no read/write race between processes.
+              setWhere: state.status === "completed" || state.status === "failed"
+                ? sql`true`
+                : notInArray(schema.project.workflowRunStepInstances.status, ["completed", "failed"]),
+            });
+          }'''
+          if text.count(old_tail) != 1:
+              raise SystemExit(f'expected exactly one step-instance upsert tail, saw {text.count(old_tail)}')
+          text = text.replace(old_tail, new_tail)
+          p.write_text(text)
+          PY
+          git diff --check
+      - name: Typecheck core
+        run: pnpm --filter @fusion/core typecheck
+      - name: Prove PostgreSQL terminal fence
+        run: pnpm --filter @fusion/core exec vitest run src/__tests__/postgres/workflow-step-instance-terminal-fence.pg.test.ts src/__tests__/postgres/workflow-run-step-instances.pg.test.ts --config vitest.pg.config.ts --reporter=verbose
+      - name: Commit product-only staging result and remove one-shot workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$GITHUB_SHA"
+          remote="$(git ls-remote origin refs/heads/workbench/f12-terminal-fence-apply | cut -f1)"
+          test "$remote" = "$expected"
+          git config user.name 'Brooklyn Rose Ludlow'
+          git config user.email '22346091+brookcub@users.noreply.github.com'
+          git rm .github/workflows/f12-apply.yml
+          git add packages/core/src/task-store/branch-and-pr-entities.ts
+          git commit -m 'fix(F12): keep terminal foreach instance state monotonic'
+          git push origin HEAD:refs/heads/workbench/f12-terminal-fence-apply
