@@ -24,7 +24,7 @@ import { WorkflowMovePolicyInput } from "../workflows/workflow-extension-types.j
 import { resolveWorkflowIrById, isTaskTerminalNodeIdAsync} from "../workflows/workflow-ir-resolver.js";
 import { WorkflowSettingDefinition } from "../workflows/workflow-ir-types.js";
 import { resolveTaskLifecycleColumns } from "../workflows/workflow-lifecycle-traits.js";
-import { and, asc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, ne, notInArray, sql } from "drizzle-orm";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -313,6 +313,12 @@ export async function saveWorkflowRunStepInstanceAsyncImpl(
         integratedAt: state.integratedAt ?? null,
         updatedAt: now,
       },
+      // Stale same-run writers may not regress a terminal instance. This predicate
+      // lives in the conflict update itself so competing processes cannot race a
+      // separate read-before-write check.
+      setWhere: state.status === "completed" || state.status === "failed"
+        ? sql`true`
+        : notInArray(schema.project.workflowRunStepInstances.status, ["completed", "failed"]),
     });
 }
 
