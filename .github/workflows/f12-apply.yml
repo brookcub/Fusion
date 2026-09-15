@@ -44,7 +44,6 @@ jobs:
           if text.count(old_import) != 1:
               raise SystemExit(f'expected exactly one drizzle import, saw {text.count(old_import)}')
           text = text.replace(old_import, new_import)
-
           start_marker = 'export async function saveWorkflowRunStepInstanceAsyncImpl('
           end_marker = '\nexport async function loadWorkflowRunStepInstancesAsyncImpl('
           start = text.find(start_marker)
@@ -58,16 +57,14 @@ jobs:
           tail = '\n      },\n    });\n}'
           if fn.count(tail) != 1:
               raise SystemExit(f'expected one terminal set tail in save function, saw {fn.count(tail)}')
-          guarded = '''
-      },
-      // Stale same-run writers may not regress a terminal instance. This predicate
-      // lives in the conflict update itself so competing processes cannot race a
-      // separate read-before-write check.
-      setWhere: state.status === "completed" || state.status === "failed"
-        ? sql`true`
-        : notInArray(schema.project.workflowRunStepInstances.status, ["completed", "failed"]),
-    });
-}'''
+          guarded = ("\n      },\n"
+                     "      // Stale same-run writers may not regress a terminal instance. This predicate\n"
+                     "      // lives in the conflict update itself so competing processes cannot race a\n"
+                     "      // separate read-before-write check.\n"
+                     "      setWhere: state.status === \"completed\" || state.status === \"failed\"\n"
+                     "        ? sql`true`\n"
+                     "        : notInArray(schema.project.workflowRunStepInstances.status, [\"completed\", \"failed\"]),\n"
+                     "    });\n}")
           fn = fn.replace(tail, guarded)
           text = text[:start] + fn + text[end:]
           p.write_text(text)
