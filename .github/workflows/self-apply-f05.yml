@@ -1,0 +1,37 @@
+name: Apply F05 verification outcome fix
+on:
+  push:
+    branches: [patch/f05-20260914]
+    paths: [.github/workflows/self-apply-f05.yml]
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: patch/f05-20260914
+          fetch-depth: 20
+      - name: Apply exact result-settlement repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('packages/engine/src/execution/run-verification-tool.ts')
+          s=p.read_text()
+          old1='''      const exitCode = code ?? null;\n      const durationMs = Date.now() - startMs;\n      const zeroExit = exitCode === 0;\n      const success = expectFailure ? true : zeroExit;\n'''
+          new1='''      const exitCode = code ?? null;\n      const durationMs = Date.now() - startMs;\n      // `success` means the requested verification expectation was satisfied by\n      // an ordinary process exit. Timeout/signal interruption is never an\n      // expected command failure, and backend choice must not change meaning.\n      const ordinaryExit = !timedOut && signal === null && exitCode !== null;\n      const success = ordinaryExit\n        && (expectFailure ? exitCode !== 0 : exitCode === 0);\n'''
+          old2='''  if (result.outcome === "non-zero-exit") {\n    return { success: expectFailure, exitCode: result.exitCode, durationMs, stdout: result.stdout, stderr: result.stderr, timedOut: false, killed: false, command, cwd, warnings: [] };\n  }\n'''
+          new2='''  if (result.outcome === "non-zero-exit") {\n    const ordinaryFailure = result.exitCode !== null\n      && result.exitCode !== 0\n      && result.signal === null;\n    return { success: expectFailure && ordinaryFailure, exitCode: result.exitCode, durationMs, stdout: result.stdout, stderr: result.stderr, timedOut: false, killed: false, command, cwd, warnings: [] };\n  }\n'''
+          if s.count(old1) != 1: raise SystemExit('F05 native target drifted')
+          if s.count(old2) != 1: raise SystemExit('F05 sandbox target drifted')
+          p.write_text(s.replace(old1,new1,1).replace(old2,new2,1))
+          PY
+          git rm .github/workflows/self-apply-f05.yml
+          git config user.name 'Brooklyn Rose Ludlow'
+          git config user.email '22346091+brookcub@users.noreply.github.com'
+          git add packages/engine/src/execution/run-verification-tool.ts
+          git commit -m 'fix(F05): keep interruptions distinct from expected command failure'
+          git push origin HEAD:refs/heads/patch/f05-20260914
