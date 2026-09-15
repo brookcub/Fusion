@@ -570,8 +570,6 @@ export function createTaskDoneTool(
           return { content: [{ type: "text" as const, text: successMessage }], details: {} };
         }
 
-        onDone();
-
         // Mark all pending/in-progress steps as done
         for (let i = 0; i < task.steps.length; i++) {
           if (task.steps[i].status !== "done" && task.steps[i].status !== "skipped") {
@@ -612,6 +610,12 @@ export function createTaskDoneTool(
           // skip-bypass taint so a subsequent auto-promotion path is not blocked.
           bulkCompletionRefusalAt: null,
         });
+
+        // Completion is an acceptance signal for required durable state. Do not
+        // announce it before step/task writes succeed, but also do not make
+        // optional diagnostics or watchdog bookkeeping a new completion veto.
+        onDone();
+
         await store.logEntry(taskId, "Task marked done by agent", undefined, deps.getRunContextFor(taskId));
         const latestTask = await store.getTask(taskId);
         let latestColumn = latestTask.column;
