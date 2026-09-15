@@ -5,7 +5,7 @@ it.each([[0,false],[7,false],[7,true],[0,true]])("the same exit %i and expectFai
  const command=`"${process.execPath}" -e "process.exit(${code})"`;
  const common={command,cwd:tmpdir(),timeoutMs:5000,expectFailure,onHeartbeat:vi.fn()};
  const direct=await runVerificationCommand(common);
- const backend:any={prepare:vi.fn(),runStreaming:vi.fn(async()=>({stdout:"",stderr:"",bufferOverflow:false,...(code===0?{outcome:"success"}:{outcome:"non-zero-exit",exitCode:code})}))};
+ const backend:any={prepare:vi.fn(),runStreaming:vi.fn(async()=>({stdout:"",stderr:"",bufferOverflow:false,...(code===0?{outcome:"success"}:{outcome:"non-zero-exit",exitCode:code,signal:null})}))};
  const sandbox=await runVerificationCommand({...common,sandboxBackend:backend});
  expect(direct.exitCode).toBe(code);expect(sandbox.exitCode).toBe(code);expect(direct.timedOut).toBe(false);
  expect(direct.success,"backend selection must not redefine the same result").toBe(sandbox.success);
