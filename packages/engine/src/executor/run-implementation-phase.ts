@@ -29,8 +29,11 @@ export async function runImplementationPhase(
   task: Task,
   prepared?: PreparedWorktree,
 ): Promise<{ taskDone: boolean; modifiedFiles: string[]; exit?: ImplementationExit }> {
-  let captured: { taskDone: boolean; modifiedFiles: string[]; exit?: ImplementationExit } = { taskDone: false, modifiedFiles: [] };
+  let captured: { taskDone: boolean; modifiedFiles: string[]; exit?: ImplementationExit }> = { taskDone: false, modifiedFiles: [] };
   const graphCompletion: GraphCompletionCallback = (info) => {
+    // A stale/replacement session may report completion after the accepted one.
+    // The graph owns one handoff result; later callbacks cannot rewrite it.
+    if (captured.taskDone) return;
     captured = { ...captured, taskDone: true, modifiedFiles: info.modifiedFiles };
   };
   /* Recorded independently of `graphCompletion`: the out-of-band exits never call it. */
