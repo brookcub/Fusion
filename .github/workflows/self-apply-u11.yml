@@ -1,0 +1,34 @@
+name: Apply U11 build certification fix
+on:
+  push:
+    branches: [patch/u11-20260914]
+    paths: [.github/workflows/self-apply-u11.yml]
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: patch/u11-20260914
+          fetch-depth: 20
+      - name: Apply exact source-identity certification repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('scripts/build-workspace.mjs')
+          s=p.read_text()
+          old='''export function recordSuccessfulPackageBuilds(builtPackages, { rootDir, cache, gitFn = defaultGitRunner } = {}) {\n  const nextCache = { version: BUILD_CACHE_VERSION, entries: { ...(cache?.entries ?? {}) } };\n  let changed = false;\n  const snapshot = createRepoContentSnapshot({ rootDir, gitFn });\n  for (const pkg of builtPackages) {\n    const sourceHash = computePackageSourceHash(pkg, rootDir, { gitFn, snapshot });\n    if (sourceHash === null) continue;\n    nextCache.entries[pkg.name] = { sourceHash, builtAt: new Date().toISOString() };\n    changed = true;\n  }\n  if (changed) writePluginBuildCache(rootDir, nextCache);\n}\n'''
+          new='''export function recordSuccessfulPackageBuilds(builtPackages, { rootDir, cache, gitFn = defaultGitRunner } = {}) {\n  const nextCache = { version: BUILD_CACHE_VERSION, entries: { ...(cache?.entries ?? {}) } };\n  let changed = false;\n  let snapshot;\n  for (const pkg of builtPackages) {\n    // Certify the input identity captured when this build was planned. If we\n    // re-hash after compilation, a concurrent edit that the compiler never\n    // consumed can be incorrectly marked as already built.\n    let sourceHash = typeof pkg.sourceHash === \"string\" ? pkg.sourceHash : null;\n    if (sourceHash === null) {\n      snapshot ??= createRepoContentSnapshot({ rootDir, gitFn });\n      sourceHash = computePackageSourceHash(pkg, rootDir, { gitFn, snapshot });\n    }\n    if (sourceHash === null) continue;\n    nextCache.entries[pkg.name] = { sourceHash, builtAt: new Date().toISOString() };\n    changed = true;\n  }\n  if (changed) writePluginBuildCache(rootDir, nextCache);\n}\n'''
+          if s.count(old) != 1: raise SystemExit('U11 target drifted')
+          p.write_text(s.replace(old,new))
+          PY
+          git rm .github/workflows/self-apply-u11.yml
+          git config user.name 'Brooklyn Rose Ludlow'
+          git config user.email '22346091+brookcub@users.noreply.github.com'
+          git add scripts/build-workspace.mjs
+          git commit -m 'fix(U11): certify the input identity actually admitted to build'
+          git push origin HEAD:refs/heads/patch/u11-20260914
