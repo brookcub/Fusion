@@ -1,0 +1,38 @@
+name: F12 staging apply
+on:
+  push:
+    branches: [staging/f12-apply-20260915]
+    paths: [.github/workflows/f12-staging-apply.yml]
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: staging/f12-apply-20260915
+          fetch-depth: 3
+      - name: Apply one exact monotonic terminal-state clause
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('packages/core/src/task-store/branch-and-pr-entities.ts')
+          text=p.read_text()
+          needle='''      set: {\n        pinnedStepCount: state.pinnedStepCount,\n        currentNodeId: state.currentNodeId ?? null,\n        status: state.status,\n        baselineSha: state.baselineSha ?? null,\n        checkpointId: state.checkpointId ?? null,\n        reworkCount: state.reworkCount ?? 0,\n        branchName: state.branchName ?? null,\n        integratedAt: state.integratedAt ?? null,\n        updatedAt: now,\n      },\n    });'''
+          replacement='''      set: {\n        pinnedStepCount: state.pinnedStepCount,\n        currentNodeId: state.currentNodeId ?? null,\n        status: state.status,\n        baselineSha: state.baselineSha ?? null,\n        checkpointId: state.checkpointId ?? null,\n        reworkCount: state.reworkCount ?? 0,\n        branchName: state.branchName ?? null,\n        integratedAt: state.integratedAt ?? null,\n        updatedAt: now,\n      },\n      // Terminal foreach state is graph-ownership evidence. A delayed writer\n      // from the same run/instance may arrive later, but it cannot reopen work\n      // that has already completed or failed. Terminal incoming writes remain\n      // allowed so terminal metadata such as integratedAt can still advance.\n      setWhere: sql`\n        ${schema.project.workflowRunStepInstances.status} not in ('completed', 'failed')\n        or excluded.status in ('completed', 'failed')\n      `,\n    });'''
+          if text.count(needle) != 1:
+              raise SystemExit(f'expected one target, found {text.count(needle)}')
+          p.write_text(text.replace(needle,replacement))
+          PY
+          changed="$(git diff --name-only)"
+          test "$changed" = "packages/core/src/task-store/branch-and-pr-entities.ts"
+          git diff --check
+          git config user.name 'Brooklyn Rose Ludlow'
+          git config user.email '22346091+brookcub@users.noreply.github.com'
+          git add packages/core/src/task-store/branch-and-pr-entities.ts
+          git commit -m 'fix(F12): keep terminal foreach instance state monotonic'
+          git push origin HEAD:refs/heads/staging/f12-apply-20260915
