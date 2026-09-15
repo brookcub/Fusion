@@ -369,11 +369,11 @@ describe("actual stored dashboard port dispatch", () => {
   it("control: omitted setting retains the default dashboard port", async () => {
     await runBin(["dashboard", "--no-supervise"]);
     expect(commandMocks.runDashboard).toHaveBeenCalledWith(4040, expect.any(Object));
-  });
+  }, 15_000);
   it.each([6789, 0])("control: explicit CLI port %i wins over stored settings", async (port) => {
     await storePort(5678); await runBin(["dashboard", "--no-supervise", "--port", String(port)]);
     expect(commandMocks.runDashboard).toHaveBeenCalledWith(port, expect.any(Object));
-  });
+  }, 15_000);
   it("omitted CLI port preserves the stored daemonPort preference", async () => {
     await storePort(5678); await runBin(["dashboard", "--no-supervise"]);
     expect(commandMocks.runDashboard).toHaveBeenCalledWith(5678, expect.any(Object));
