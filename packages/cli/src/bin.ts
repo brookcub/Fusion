@@ -934,14 +934,7 @@ async function main() {
         const portIdx = args.indexOf("--port");
         const portIdxShort = args.indexOf("-p");
         const pi = portIdx !== -1 ? portIdx : portIdxShort;
-        let port: number;
-        if (pi !== -1) {
-          port = parseInt(args[pi + 1], 10);
-        } else {
-          const { GlobalSettingsStore } = await import("@fusion/core");
-          const settings = await new GlobalSettingsStore().getSettings();
-          port = settings.daemonPort ?? 4040;
-        }
+        const port = pi !== -1 ? parseInt(args[pi + 1], 10) : 4040;
         const paused = args.includes("--paused");
         const interactive = args.includes("--interactive");
         const hostIdx = args.indexOf("--host");
