@@ -778,8 +778,12 @@ async function runVerificationCommandUnlocked(
 
       const exitCode = code ?? null;
       const durationMs = Date.now() - startMs;
-      const zeroExit = exitCode === 0;
-      const success = expectFailure ? true : zeroExit;
+      // `success` means the requested verification expectation was satisfied by
+      // an ordinary process exit. Timeout/signal interruption is never an
+      // expected command failure, and backend choice must not change meaning.
+      const ordinaryExit = !timedOut && signal === null && exitCode !== null;
+      const success = ordinaryExit
+        && (expectFailure ? exitCode !== 0 : exitCode === 0);
 
       if (!success && !timedOut) {
         /*
@@ -845,7 +849,10 @@ function sandboxOutcomeToResult(
     return { success: !expectFailure, exitCode: 0, durationMs, stdout: result.stdout, stderr: result.stderr, timedOut: false, killed: false, command, cwd, warnings: [] };
   }
   if (result.outcome === "non-zero-exit") {
-    return { success: expectFailure, exitCode: result.exitCode, durationMs, stdout: result.stdout, stderr: result.stderr, timedOut: false, killed: false, command, cwd, warnings: [] };
+    const ordinaryFailure = result.exitCode !== null
+      && result.exitCode !== 0
+      && result.signal === null;
+    return { success: expectFailure && ordinaryFailure, exitCode: result.exitCode, durationMs, stdout: result.stdout, stderr: result.stderr, timedOut: false, killed: false, command, cwd, warnings: [] };
   }
   if (result.outcome === "timeout") {
     return { success: false, exitCode: null, durationMs, stdout: result.stdout, stderr: result.stderr, timedOut: true, killed: true, command, cwd, warnings: [] };

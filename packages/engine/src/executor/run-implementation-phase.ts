@@ -20,6 +20,12 @@ type AnyFn = (...args: any[]) => any;
 /** Mirrors TaskExecutor GraphCompletionCallback. */
 export type GraphCompletionCallback = (info: { modifiedFiles: string[] }) => void;
 
+type ImplementationPhaseResult = {
+  taskDone: boolean;
+  modifiedFiles: string[];
+  exit?: ImplementationExit;
+};
+
 export type RunImplementationPhaseDeps = {
   runImplementation: AnyFn;
 };
@@ -28,9 +34,12 @@ export async function runImplementationPhase(
   deps: RunImplementationPhaseDeps,
   task: Task,
   prepared?: PreparedWorktree,
-): Promise<{ taskDone: boolean; modifiedFiles: string[]; exit?: ImplementationExit }> {
-  let captured: { taskDone: boolean; modifiedFiles: string[]; exit?: ImplementationExit } = { taskDone: false, modifiedFiles: [] };
+): Promise<ImplementationPhaseResult> {
+  let captured: ImplementationPhaseResult = { taskDone: false, modifiedFiles: [] };
   const graphCompletion: GraphCompletionCallback = (info) => {
+    // A stale/replacement session may report completion after the accepted one.
+    // The graph owns one handoff result; later callbacks cannot rewrite it.
+    if (captured.taskDone) return;
     captured = { ...captured, taskDone: true, modifiedFiles: info.modifiedFiles };
   };
   /* Recorded independently of `graphCompletion`: the out-of-band exits never call it. */
