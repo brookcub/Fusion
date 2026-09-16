@@ -1,0 +1,266 @@
+name: LynCo F25 shared CLI finalizer builder
+
+on:
+  push:
+    branches: [automation/f25-cli-finalizer-followup-20260916]
+
+permissions:
+  contents: write
+
+env:
+  TARGET_BRANCH: fix/f25-vendored-claude-order-20260916
+  TARGET_SHA: 697724b162f626e40c4614703427b5e260fe96c0
+
+jobs:
+  build-followup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact PR tip
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+
+      - name: Verify branch has not moved
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          remote_sha="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$remote_sha" = "$TARGET_SHA"
+
+      - name: Apply shared finalizer follow-up
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              p = Path(path)
+              text = p.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one anchor, found {count}\nANCHOR:\n{old}")
+              p.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          helper = '''import { reconcileClaudeCliPaths } from "@fusion/core";
+
+export interface CliExtensionPathCandidates {
+  selfExtensionPaths: readonly string[];
+  discoveredExtensionPaths: readonly string[];
+  packageExtensionPaths: readonly string[];
+  claudeCliPaths: readonly string[];
+  droidCliPaths: readonly string[];
+  llamaCppPaths: readonly string[];
+}
+
+/**
+ * Single CLI policy boundary for the extension list handed to pi.
+ *
+ * Command roots may discover candidates differently, but provider precedence
+ * belongs here so dashboard, serve, and daemon cannot drift independently.
+ */
+export function finalizeCliExtensionPaths({
+  selfExtensionPaths,
+  discoveredExtensionPaths,
+  packageExtensionPaths,
+  claudeCliPaths,
+  droidCliPaths,
+  llamaCppPaths,
+}: CliExtensionPathCandidates): string[] {
+  return reconcileClaudeCliPaths(
+    [
+      ...selfExtensionPaths,
+      ...discoveredExtensionPaths,
+      ...packageExtensionPaths,
+      ...claudeCliPaths,
+      ...droidCliPaths,
+      ...llamaCppPaths,
+    ],
+    claudeCliPaths[0] ?? null,
+  );
+}
+'''
+
+          test = '''import { describe, expect, it } from "vitest";
+import { finalizeCliExtensionPaths } from "../extension-paths.js";
+
+const SELF = "/fusion/self-extension.ts";
+const DISCOVERED = "/project/.fusion/extensions/local.ts";
+const PACKAGE = "/packages/unrelated-extension/index.ts";
+const VENDORED = "/fusion/node_modules/@fusion/pi-claude-cli/index.ts";
+const EXTERNAL = "/usr/local/lib/node_modules/pi-claude-cli/index.ts";
+const DROID = "/fusion/node_modules/@fusion/droid-cli/index.ts";
+const LLAMA = "/fusion/node_modules/@fusion/llama-cpp/index.ts";
+
+describe("finalizeCliExtensionPaths", () => {
+  it("applies one Claude precedence policy across the assembled CLI candidates", () => {
+    const result = finalizeCliExtensionPaths({
+      selfExtensionPaths: [SELF],
+      discoveredExtensionPaths: [DISCOVERED],
+      packageExtensionPaths: [PACKAGE, VENDORED, EXTERNAL],
+      claudeCliPaths: [VENDORED],
+      droidCliPaths: [DROID],
+      llamaCppPaths: [LLAMA],
+    });
+
+    expect(result).toEqual([
+      VENDORED,
+      SELF,
+      DISCOVERED,
+      PACKAGE,
+      DROID,
+      LLAMA,
+    ]);
+  });
+
+  it("preserves candidate order when no vendored Claude adapter is enabled", () => {
+    const result = finalizeCliExtensionPaths({
+      selfExtensionPaths: [SELF],
+      discoveredExtensionPaths: [DISCOVERED],
+      packageExtensionPaths: [PACKAGE],
+      claudeCliPaths: [],
+      droidCliPaths: [DROID],
+      llamaCppPaths: [LLAMA],
+    });
+
+    expect(result).toEqual([SELF, DISCOVERED, PACKAGE, DROID, LLAMA]);
+  });
+});
+'''
+
+          helper_path = Path("packages/cli/src/commands/extension-paths.ts")
+          test_path = Path("packages/cli/src/commands/__tests__/extension-paths.test.ts")
+          if helper_path.exists() or test_path.exists():
+              raise SystemExit("shared finalizer files unexpectedly already exist")
+          helper_path.write_text(helper, encoding="utf-8")
+          test_path.write_text(test, encoding="utf-8")
+
+          import_anchor = 'import { resolveSelfExtension } from "./self-extension.js";\n'
+          import_replacement = import_anchor + 'import { finalizeCliExtensionPaths } from "./extension-paths.js";\n'
+          for path in [
+              "packages/cli/src/commands/serve.ts",
+              "packages/cli/src/commands/daemon.ts",
+              "packages/cli/src/commands/dashboard.ts",
+          ]:
+              replace_once(path, import_anchor, import_replacement)
+
+          replace_once(
+              "packages/cli/src/commands/daemon.ts",
+              "  reconcileClaudeCliPaths,\n",
+              "",
+          )
+
+          daemon_old = '''    const reconciledExtensionPaths = reconcileClaudeCliPaths(
+      [...selfExtensionPaths, ...getEnabledPiExtensionPaths(primaryCwd), ...packageExtensionPaths, ...claudeCliPaths],
+      claudeCliPaths[0] ?? null,
+    );
+
+    const extensionsResult = await discoverAndLoadExtensions(
+      [...reconciledExtensionPaths, ...droidCliPaths, ...llamaCppPaths],
+      primaryCwd,
+'''
+          daemon_new = '''    const extensionPaths = finalizeCliExtensionPaths({
+      selfExtensionPaths,
+      discoveredExtensionPaths: getEnabledPiExtensionPaths(primaryCwd),
+      packageExtensionPaths,
+      claudeCliPaths,
+      droidCliPaths,
+      llamaCppPaths,
+    });
+
+    const extensionsResult = await discoverAndLoadExtensions(
+      extensionPaths,
+      primaryCwd,
+'''
+          replace_once("packages/cli/src/commands/daemon.ts", daemon_old, daemon_new)
+
+          serve_old = '''    const extensionsResult = await discoverAndLoadExtensions(
+      [
+        ...selfExtensionPaths,
+        ...getEnabledPiExtensionPaths(primaryCwd),
+        ...packageExtensionPaths,
+        ...claudeCliPaths,
+        ...droidCliPaths,
+        ...llamaCppPaths,
+      ],
+      primaryCwd,
+'''
+          serve_new = '''    const extensionPaths = finalizeCliExtensionPaths({
+      selfExtensionPaths,
+      discoveredExtensionPaths: getEnabledPiExtensionPaths(primaryCwd),
+      packageExtensionPaths,
+      claudeCliPaths,
+      droidCliPaths,
+      llamaCppPaths,
+    });
+
+    const extensionsResult = await discoverAndLoadExtensions(
+      extensionPaths,
+      primaryCwd,
+'''
+          replace_once("packages/cli/src/commands/serve.ts", serve_old, serve_new)
+
+          dashboard_old = '''    const extensionsResult = await boundedPhaseTime("discoverAndLoadExtensions", () => discoverAndLoadExtensions(
+      [
+        ...selfExtensionPaths,
+        ...getEnabledPiExtensionPaths(cwd),
+        ...packageExtensionPaths,
+        ...claudeCliPaths,
+        ...droidCliPaths,
+        ...llamaCppPaths,
+      ],
+      cwd,
+'''
+          dashboard_new = '''    const extensionPaths = finalizeCliExtensionPaths({
+      selfExtensionPaths,
+      discoveredExtensionPaths: getEnabledPiExtensionPaths(cwd),
+      packageExtensionPaths,
+      claudeCliPaths,
+      droidCliPaths,
+      llamaCppPaths,
+    });
+
+    const extensionsResult = await boundedPhaseTime("discoverAndLoadExtensions", () => discoverAndLoadExtensions(
+      extensionPaths,
+      cwd,
+'''
+          replace_once("packages/cli/src/commands/dashboard.ts", dashboard_old, dashboard_new)
+
+          replace_once(
+              ".changeset/f25-vendored-claude-order.md",
+              "summary: Keep Fusion's vendored Claude CLI adapter first when reconciling extension paths.\ncategory: fix\ndev: Remove any existing vendored occurrence before prepending the canonical adapter path while filtering external aliases.",
+              "summary: Prevent installed Claude CLI adapters from overriding Fusion's bundled Claude integration.\ncategory: fix\ndev: Centralize CLI extension-path finalization so dashboard, serve, and daemon apply the same vendored Claude precedence.",
+          )
+          PY
+
+      - name: Verify focused behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm --dir packages/cli exec vitest run src/commands/__tests__/extension-paths.test.ts --reporter=verbose
+          pnpm --dir packages/core exec vitest run src/__tests__/reconcile-claude-cli-paths.test.ts --reporter=verbose
+          pnpm check:changesets
+
+      - name: Commit and push follow-up
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_sha="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$remote_sha" = "$TARGET_SHA"
+          git config user.name "Brooklyn Rose Ludlow"
+          git config user.email "22346091+brookcub@users.noreply.github.com"
+          git add \
+            .changeset/f25-vendored-claude-order.md \
+            packages/cli/src/commands/extension-paths.ts \
+            packages/cli/src/commands/__tests__/extension-paths.test.ts \
+            packages/cli/src/commands/daemon.ts \
+            packages/cli/src/commands/serve.ts \
+            packages/cli/src/commands/dashboard.ts
+          git diff --cached --check
+          git commit -m "fix(F25): centralize CLI Claude path finalization"
+          git push origin "HEAD:refs/heads/$TARGET_BRANCH"
