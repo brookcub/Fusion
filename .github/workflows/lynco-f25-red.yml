@@ -1,0 +1,19 @@
+name: LynCo F25 current-head RED
+
+on:
+  push:
+    branches: [qualification/f25-red-29d81f6]
+
+permissions:
+  contents: read
+
+jobs:
+  red:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+        with:
+          node-version: "24"
+      - name: Run F25 regression
+        run: pnpm --dir packages/core exec vitest run src/__tests__/reconcile-claude-cli-paths.test.ts --silent=passed-only --reporter=verbose
