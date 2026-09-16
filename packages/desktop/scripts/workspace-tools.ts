@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { dirname, resolve } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { cp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
@@ -8,26 +9,27 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 export const packageRoot = resolve(__dirname, "..");
 export const workspaceRoot = resolve(packageRoot, "..", "..");
 
+/** Resolve the package's JavaScript entrypoint, not its shell shim. */
 function resolveBin(command: string, cwd: string): string {
-  const suffix = process.platform === "win32" ? ".cmd" : "";
-  const localBin = resolve(cwd, "node_modules", ".bin", `${command}${suffix}`);
-  if (existsSync(localBin)) {
-    return localBin;
+  const packageName = command === "tsc" ? "typescript" : command;
+  const require = createRequire(import.meta.url);
+  const manifestPath = require.resolve(`${packageName}/package.json`, { paths: [cwd, workspaceRoot] });
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { bin?: string | Record<string, string> };
+  const entry = typeof manifest.bin === "string" ? manifest.bin : manifest.bin?.[command];
+  if (typeof entry !== "string" || !entry) {
+    throw new Error(`Package ${packageName} does not declare the ${command} executable`);
   }
-
-  return resolve(workspaceRoot, "node_modules", ".bin", `${command}${suffix}`);
+  return resolve(dirname(manifestPath), entry);
 }
 
 export function runWorkspaceBin(command: string, args: string[], cwd: string): Promise<void> {
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(resolveBin(command, cwd), args, {
+    const child = spawn(process.execPath, [resolveBin(command, cwd), ...args], {
       cwd,
       stdio: "inherit",
       env: process.env,
-      // On Windows the resolved bin is a .cmd shim; Node refuses to spawn
-      // .cmd/.bat without a shell (EINVAL) since CVE-2024-27980. resolveBin
-      // produces an absolute, space-free path, so shell quoting is safe here.
-      shell: process.platform === "win32",
+      // User/project paths are argv data, never another shell command.
+      shell: false,
     });
 
     child.on("error", rejectPromise);

@@ -40,6 +40,8 @@ export interface SandboxRunStreamingOptions {
   maxBuffer: number;
   signal?: AbortSignal;
   env?: NodeJS.ProcessEnv;
+  /** Optional best-effort activity observation, not a completion verdict. */
+  onOutput?: (stream: "stdout" | "stderr", chunk: string) => void;
 }
 
 export type SandboxStreamingResult =
