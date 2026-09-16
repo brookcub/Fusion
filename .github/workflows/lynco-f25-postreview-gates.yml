@@ -1,0 +1,76 @@
+name: LynCo F25 post-review qualification
+
+on:
+  push:
+    branches: [qualification/f25-postreview-gates-ef3e16a]
+
+permissions:
+  contents: read
+
+env:
+  TARGET_SHA: ef3e16aaea9971b34aaf124ba763fd0ed97e0eed
+
+jobs:
+  full-pr-gates:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h localhost -p 5432 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      FUSION_PG_TEST_URL_BASE: postgresql://postgres:postgres@localhost:5432
+      PGPASSWORD: postgres
+    steps:
+      - name: Checkout exact PR tip
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.TARGET_SHA }}
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+
+      - name: Verify exact PR tip and shared authority wiring
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          node - <<'NODE'
+          const fs = require('node:fs');
+          for (const file of ['daemon.ts', 'serve.ts', 'dashboard.ts']) {
+            const text = fs.readFileSync(`packages/cli/src/commands/${file}`, 'utf8');
+            if (!text.includes('finalizeCliExtensionPaths({')) {
+              throw new Error(`${file} does not route through finalizeCliExtensionPaths`);
+            }
+          }
+          NODE
+
+      - name: Focused finalizer regression
+        run: pnpm --dir packages/cli exec vitest run src/commands/__tests__/extension-paths.test.ts --reporter=verbose
+
+      - name: Focused reconciler regression
+        run: pnpm --dir packages/core exec vitest run src/__tests__/reconcile-claude-cli-paths.test.ts --reporter=verbose
+
+      - name: Changeset format
+        run: pnpm check:changesets
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Build
+        run: pnpm build
+
+      - name: Gate tests
+        run: pnpm test:gate
