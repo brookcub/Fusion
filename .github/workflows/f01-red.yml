@@ -1,0 +1,38 @@
+name: F01 current-runtime red
+
+on:
+  push:
+    branches: [qualification/f01-red-f30af0a]
+
+env:
+  F01_BRANCH: hardening/f01-windows-literal-argv
+  F01_SHA: f30af0ab1645e6ffb9476a1420b552d52d30b08e
+
+jobs:
+  repro:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout exact F01 test tip
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.F01_SHA }}
+          fetch-depth: 0
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+
+      - name: Verify exact test tip
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$F01_SHA"
+          remote_sha="$(git ls-remote origin "refs/heads/$F01_BRANCH" | awk '{print $1}')"
+          test "$remote_sha" = "$F01_SHA"
+
+      - name: Run F01 regression
+        shell: bash
+        run: pnpm --dir packages/desktop exec vitest run src/__tests__/workspace-literal-argv.test.ts --reporter=verbose
