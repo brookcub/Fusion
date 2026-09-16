@@ -1,0 +1,35 @@
+name: F03 current-runtime red
+
+on:
+  push:
+    branches: [qualification/f03-red-0d93e67]
+
+env:
+  F03_BRANCH: hardening/f03-windows-owned-process-tree
+  F03_SHA: 0d93e674aa37d5196ec26c1097c3b77e4fc31ca4
+
+jobs:
+  repro:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout exact F03 test tip
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.F03_SHA }}
+          fetch-depth: 0
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+      - name: Verify exact F03 test tip
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$F03_SHA"
+          remote_sha="$(git ls-remote origin "refs/heads/$F03_BRANCH" | awk '{print $1}')"
+          test "$remote_sha" = "$F03_SHA"
+      - name: Run F03 ownership regression
+        shell: bash
+        run: pnpm --dir packages/engine exec vitest run src/sandbox/__tests__/windows-owned-command.test.ts --reporter=verbose
