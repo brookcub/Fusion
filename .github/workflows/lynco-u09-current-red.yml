@@ -1,0 +1,20 @@
+name: LynCo U09 current-head RED
+
+on:
+  push:
+    branches:
+      - qualification/u09-red-29d81f6
+
+permissions:
+  contents: read
+
+jobs:
+  u09-windows-red:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+        with:
+          node-version: "24"
+      - name: Run U09 regression
+        run: node --test scripts/__tests__/ensure-test-artifacts-entrypoint.test.mjs
