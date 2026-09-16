@@ -22,11 +22,11 @@ jobs:
           from pathlib import Path
           path = Path("packages/cli/src/bin.ts")
           text = path.read_text()
-          old = '''        const port = pi !== -1 ? parseInt(args[pi + 1], 10) : 4040;\n'''
-          new = '''        let port: number;\n        if (pi !== -1) {\n          port = parseInt(args[pi + 1], 10);\n        } else {\n          const { GlobalSettingsStore } = await import("@fusion/core");\n          const settings = await new GlobalSettingsStore().getSettings();\n          port = settings.daemonPort ?? 4040;\n        }\n'''
+          old = '''        const portIdx = args.indexOf("--port");\n        const portIdxShort = args.indexOf("-p");\n        const pi = portIdx !== -1 ? portIdx : portIdxShort;\n        const port = pi !== -1 ? parseInt(args[pi + 1], 10) : 4040;\n        const paused = args.includes("--paused");\n'''
+          new = '''        const portIdx = args.indexOf("--port");\n        const portIdxShort = args.indexOf("-p");\n        const pi = portIdx !== -1 ? portIdx : portIdxShort;\n        let port: number;\n        if (pi !== -1) {\n          port = parseInt(args[pi + 1], 10);\n        } else {\n          const { GlobalSettingsStore } = await import("@fusion/core");\n          const settings = await new GlobalSettingsStore().getSettings();\n          port = settings.daemonPort ?? 4040;\n        }\n        const paused = args.includes("--paused");\n'''
           count = text.count(old)
           if count != 1:
-              raise SystemExit(f"expected one dashboard port fallback anchor, found {count}")
+              raise SystemExit(f"expected one dashboard-specific port fallback anchor, found {count}")
           path.write_text(text.replace(old, new, 1))
           PY
           git diff --check
