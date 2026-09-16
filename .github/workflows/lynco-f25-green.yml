@@ -1,0 +1,21 @@
+name: LynCo F25 green qualification
+
+on:
+  push:
+    branches: [qualification/f25-green-29d81f6]
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+        with:
+          node-version: "24"
+      - name: Focused F25 regression suite
+        run: pnpm --dir packages/core exec vitest run src/__tests__/reconcile-claude-cli-paths.test.ts --silent=passed-only --reporter=verbose
+      - name: Validate changeset
+        run: pnpm check:changesets
