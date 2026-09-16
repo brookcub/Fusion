@@ -1,0 +1,44 @@
+name: LynCo F33 help-text follow-up builder
+
+on:
+  push:
+    branches:
+      - automation/f33-helptext-followup-20260916
+
+permissions:
+  contents: write
+
+jobs:
+  patch-live-pr-branch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Patch exact live PR tip
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET_BRANCH='fix/f33-stored-dashboard-port-20260916'
+          EXPECTED='eb097c5c60da067383cb0ed04ba4c3462ccd7ba4'
+          git fetch origin "$TARGET_BRANCH"
+          ACTUAL="$(git rev-parse FETCH_HEAD)"
+          test "$ACTUAL" = "$EXPECTED"
+          git checkout -B "$TARGET_BRANCH" "$ACTUAL"
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('packages/cli/src/bin.ts')
+          s = p.read_text(encoding='utf-8')
+          old = '  --port, -p <port>          Dashboard/serve port (default: 4040)'
+          new = '  --port, -p <port>          Dashboard/serve port (dashboard: saved port or 4040; serve: 4040)'
+          if s.count(old) != 1:
+              raise SystemExit(f'expected exactly one help-text anchor, found {s.count(old)}')
+          p.write_text(s.replace(old, new), encoding='utf-8')
+          PY
+          grep -F -- 'Dashboard/serve port (dashboard: saved port or 4040; serve: 4040)' packages/cli/src/bin.ts
+          git diff --check
+          git config user.name 'Brooklyn Rose Ludlow'
+          git config user.email '22346091+brookcub@users.noreply.github.com'
+          git add packages/cli/src/bin.ts
+          git commit -m 'docs(F33): clarify dashboard port fallback'
+          git push origin HEAD:"$TARGET_BRANCH"
