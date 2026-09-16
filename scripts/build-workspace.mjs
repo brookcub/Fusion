@@ -7,7 +7,7 @@ FNXC:WorkspaceBuild 2026-07-15-03:20:
 Root `pnpm build` was pegging CPU for ~2 minutes even when nothing changed: non-plugin packages always rebuilt, CLI packaging always staged desktop + 15 plugins + DTS, and tsc had no incremental cache. Extend the content-hash skip cache to ALL workspace packages (not just plugins), support `--force` / `--full`, and default CLI packaging to a fast local mode (full package on CI or FUSION_CLI_FULL_PACKAGE=1).
 */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -559,6 +559,22 @@ export function ensureFullPackageCliPlanned(plannedPackages, skippedPackages, { 
   };
 }
 
+function clearIncrementalStateForMissingOutputs(plannedPackages, rootDir) {
+  for (const pkg of plannedPackages) {
+    if (pkg.buildReason !== "missing-output") continue;
+    const packageRoot = path.join(rootDir, pkg.dir);
+    const buildInfoFiles = fg.sync(["**/*.tsbuildinfo"], {
+      cwd: packageRoot,
+      onlyFiles: true,
+      unique: true,
+      ignore: ["node_modules/**", "dist/**"],
+    });
+    for (const relativePath of buildInfoFiles) {
+      rmSync(path.join(packageRoot, relativePath), { force: true });
+    }
+  }
+}
+
 export function main({
   rootDir = repoRoot,
   spawnFn = spawnSync,
@@ -595,6 +611,9 @@ export function main({
     console.log("[build-workspace] full CLI packaging enabled (CI / FUSION_CLI_FULL_PACKAGE / --full)");
   }
 
+  // Missing emitted output invalidates package-local TypeScript incremental
+  // state. Without this, tsc may exit zero while intentionally emitting nothing.
+  clearIncrementalStateForMissingOutputs(plannedPackages, rootDir);
   const result = runPlannedBuilds(plannedPackages, rootDir, spawnFn, { fullPackage: effectiveFullPackage, env });
   if (result.status !== 0) {
     process.stderr.write(`[build-workspace] FAILED packages: ${result.packageNames.join(", ") || "(none)"}\n`);
