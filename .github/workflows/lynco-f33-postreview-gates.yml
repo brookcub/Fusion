@@ -1,0 +1,78 @@
+name: LynCo F33 post-review qualification
+
+on:
+  push:
+    branches:
+      - qualification/f33-postreview-gates-3c60ba1
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  TARGET_SHA: "3c60ba17b2bc71130be415bb11ea5fa6529da215"
+
+jobs:
+  targeted:
+    name: Targeted regression (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.TARGET_SHA }}
+      - uses: ./.github/actions/setup-node-pnpm
+      - name: Verify exact PR tip and help text
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const text = fs.readFileSync('packages/cli/src/bin.ts', 'utf8');
+          const expected = 'Dashboard/serve port (dashboard: saved port or 4040; serve: 4040)';
+          if (!text.includes(expected)) throw new Error('updated port help text missing');
+          NODE
+      - name: Run F33 dashboard-port regression
+        run: pnpm --dir packages/cli exec vitest run src/__tests__/bin.test.ts -t "actual stored dashboard port dispatch" --silent=passed-only --reporter=verbose
+
+  full-pr-gates:
+    name: Full PR gates
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h localhost -p 5432 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@localhost:5432"
+      PGPASSWORD: "postgres"
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.TARGET_SHA }}
+      - uses: ./.github/actions/setup-node-pnpm
+      - name: Verify exact PR tip
+        run: test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+      - name: Changeset format
+        run: pnpm check:changesets
+      - name: Lint
+        run: pnpm lint
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Build
+        run: pnpm build
+      - name: Gate tests
+        run: pnpm test:gate
