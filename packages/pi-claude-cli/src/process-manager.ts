@@ -7,13 +7,49 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { writeFileSync, unlinkSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, writeFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+
+const promptFileByProcess = new WeakMap<ChildProcess, string>();
+const unclaimedPromptFiles = new Set<string>();
+const ownedPromptFiles = new Set<string>();
 
 function debugLog(message: string): void {
   if (process.env.PI_CLAUDE_CLI_DEBUG !== "1") return;
   console.error(`[pi-claude-cli] ${message}`);
+}
+
+function legacyPromptFilePath(): string {
+  return join(tmpdir(), `pi-claude-cli-sysprompt-${process.pid}.txt`);
+}
+
+function allocatePromptFilePath(): string {
+  const base = legacyPromptFilePath();
+  if (!unclaimedPromptFiles.has(base) && !ownedPromptFiles.has(base) && !existsSync(base)) {
+    return base;
+  }
+  let candidate: string;
+  do {
+    candidate = join(
+      tmpdir(),
+      `pi-claude-cli-sysprompt-${process.pid}-${randomUUID()}.txt`,
+    );
+  } while (
+    unclaimedPromptFiles.has(candidate) ||
+    ownedPromptFiles.has(candidate) ||
+    existsSync(candidate)
+  );
+  return candidate;
+}
+
+function removePromptFile(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch {
+    // File doesn't exist or was already deleted — cleanup is idempotent.
+  }
 }
 
 /**
@@ -55,13 +91,11 @@ export function buildClaudeSpawnArgs(
   }
 
   if (systemPrompt) {
-    // Write system prompt to a temp file to avoid ENAMETOOLONG on Windows.
-    // Claude CLI's --append-system-prompt accepts a file path or literal text.
-    const tmpFile = join(
-      tmpdir(),
-      `pi-claude-cli-sysprompt-${process.pid}.txt`,
-    );
+    // Each invocation owns its prompt path. A second request in the same Fusion
+    // process must never replace bytes that the first Claude child has not read.
+    const tmpFile = allocatePromptFilePath();
     writeFileSync(tmpFile, systemPrompt, "utf-8");
+    unclaimedPromptFiles.add(tmpFile);
     args.push("--append-system-prompt", tmpFile);
   }
 
@@ -94,11 +128,35 @@ export function spawnClaude(
     resumeSessionId: options?.resumeSessionId,
     newSessionId: options?.newSessionId,
   });
+  const promptIndex = args.indexOf("--append-system-prompt");
+  const promptFile = promptIndex >= 0 ? args[promptIndex + 1] : undefined;
 
-  const proc = spawn("claude", args, {
-    stdio: ["pipe", "pipe", "pipe"],
-    cwd: options?.cwd ?? process.cwd(),
-  });
+  let proc: ChildProcess;
+  try {
+    proc = spawn("claude", args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      cwd: options?.cwd ?? process.cwd(),
+    });
+  } catch (error) {
+    if (promptFile) {
+      unclaimedPromptFiles.delete(promptFile);
+      removePromptFile(promptFile);
+    }
+    throw error;
+  }
+
+  if (promptFile) {
+    unclaimedPromptFiles.delete(promptFile);
+    // Unit tests may mock writeFileSync without creating a file. Track ownership
+    // only when there is an actual resource to protect and delete.
+    if (existsSync(promptFile)) {
+      promptFileByProcess.set(proc, promptFile);
+      ownedPromptFiles.add(promptFile);
+      const cleanupOwnedPrompt = () => cleanupSystemPromptFile(proc);
+      proc.once("close", cleanupOwnedPrompt);
+      proc.once("error", cleanupOwnedPrompt);
+    }
+  }
 
   debugLog(`spawnClaude: pid=${proc.pid} model=${modelId}`);
 
@@ -106,15 +164,32 @@ export function spawnClaude(
 }
 
 /**
- * Clean up the temp system prompt file created by spawnClaude.
- * Safe to call multiple times or when no file exists.
+ * Clean up prompt files created by this module.
+ *
+ * When a process is supplied, only that child's file is removed. The no-arg
+ * form remains for direct buildClaudeSpawnArgs callers and legacy tests; it
+ * never removes a path currently owned by a live child.
  */
-export function cleanupSystemPromptFile(): void {
-  try {
-    unlinkSync(join(tmpdir(), `pi-claude-cli-sysprompt-${process.pid}.txt`));
-  } catch {
-    // File doesn't exist or already deleted — ignore
+export function cleanupSystemPromptFile(proc?: ChildProcess): void {
+  if (proc) {
+    const promptFile = promptFileByProcess.get(proc);
+    if (!promptFile) return;
+    promptFileByProcess.delete(proc);
+    ownedPromptFiles.delete(promptFile);
+    removePromptFile(promptFile);
+    return;
   }
+
+  if (unclaimedPromptFiles.size > 0) {
+    for (const promptFile of [...unclaimedPromptFiles]) {
+      unclaimedPromptFiles.delete(promptFile);
+      removePromptFile(promptFile);
+    }
+    return;
+  }
+
+  const legacyPath = legacyPromptFilePath();
+  if (!ownedPromptFiles.has(legacyPath)) removePromptFile(legacyPath);
 }
 
 /**
@@ -197,7 +272,7 @@ export function cleanupProcess(proc: ChildProcess): void {
 /**
  * Attach a data listener to stderr and accumulate output into a buffer.
  *
- * @param proc - The Claude subprocess
+ * @param proc - The subprocess
  * @returns A function that returns the accumulated stderr string
  */
 export function captureStderr(proc: ChildProcess): () => string {
