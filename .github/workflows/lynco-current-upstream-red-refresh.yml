@@ -1,0 +1,76 @@
+name: LynCo current-upstream RED refresh
+
+on:
+  push:
+    branches:
+      - qualification/red-refresh-a8c2de5
+
+permissions:
+  contents: read
+
+jobs:
+  regressions:
+    name: RED refresh / ${{ matrix.id }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        id: [F24, F27, F26, U10, U11, F05, FUSI017]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+        with:
+          node-version: "24"
+      - name: Run exact stored regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.id }}" in
+            F24)
+              pnpm --dir packages/core exec vitest run src/__tests__/startup-memo-policy.test.ts --silent=passed-only --reporter=verbose
+              ;;
+            F27)
+              pnpm --dir packages/pi-claude-cli exec vitest run src/__tests__/prompt-file-ownership.test.ts src/__tests__/prompt-file-process-ownership.test.ts --reporter=verbose
+              ;;
+            F26)
+              pnpm --dir packages/dashboard exec vitest run src/__tests__/claude-cli-probe-contract.test.ts --silent=passed-only --reporter=verbose
+              ;;
+            U10)
+              node --test scripts/__tests__/build-missing-incremental-output.test.mjs
+              ;;
+            U11)
+              node --test scripts/__tests__/build-certification-input-identity.test.mjs
+              ;;
+            F05)
+              pnpm --dir packages/engine exec vitest run src/__tests__/verification-parity.test.ts src/__tests__/verification-sandbox-truth.test.ts --silent=passed-only --reporter=verbose
+              ;;
+            FUSI017)
+              pnpm --dir packages/engine exec vitest run src/__tests__/completion-handoff-boundary.test.ts --silent=passed-only --reporter=verbose
+              ;;
+          esac
+
+  f12-postgres:
+    name: RED refresh / F12 real PostgreSQL
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      FUSION_PG_TEST_URL_BASE: postgresql://postgres@localhost:5432/postgres
+      FUSION_PG_TEST_SETUP_PARTICIPANT: "1"
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+        with:
+          node-version: "24"
+      - name: Run exact F12 regression against real PostgreSQL
+        run: pnpm --dir packages/core exec vitest run --config vitest.pg.config.ts src/__tests__/postgres/workflow-step-instance-terminal-fence.pg.test.ts --silent=passed-only --reporter=verbose
