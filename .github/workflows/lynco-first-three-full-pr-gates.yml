@@ -1,0 +1,118 @@
+name: LynCo first three full PR gates
+
+on:
+  push:
+    branches: [qualification/full-pr-gates-first-three-20260916]
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  qualify:
+    name: ${{ matrix.id }} exact submission tip
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: U09
+            branch: fix/u09-windows-artifact-entrypoint-20260916
+            sha: b3ca6a7052b1391a7564768a8bb899d23f94c327
+          - id: F33
+            branch: fix/f33-stored-dashboard-port-20260916
+            sha: eb097c5c60da067383cb0ed04ba4c3462ccd7ba4
+          - id: F25
+            branch: fix/f25-vendored-claude-order-20260916
+            sha: 697724b162f626e40c4614703427b5e260fe96c0
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h localhost -p 5432 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@localhost:5432"
+      PGPASSWORD: "postgres"
+    steps:
+      - name: Checkout exact submission tip
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ matrix.sha }}
+          fetch-depth: 1
+
+      - name: Prove exact submission branch tip
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "${{ matrix.sha }}"
+          git fetch origin "refs/heads/${{ matrix.branch }}" --depth=1
+          test "$(git rev-parse FETCH_HEAD)" = "${{ matrix.sha }}"
+          test -z "$(git status --porcelain)"
+          echo "Qualified ${{ matrix.id }} at ${{ matrix.sha }} from ${{ matrix.branch }}"
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+
+      - name: Changeset format
+        id: changesets
+        continue-on-error: true
+        run: pnpm check:changesets
+
+      - name: Lint
+        id: lint
+        continue-on-error: true
+        run: pnpm lint
+
+      - name: Typecheck
+        id: typecheck
+        continue-on-error: true
+        run: pnpm typecheck
+
+      - name: Build
+        id: build
+        continue-on-error: true
+        run: pnpm build
+
+      - name: Gate tests
+        id: gate
+        continue-on-error: true
+        run: pnpm test:gate
+
+      - name: Record exact outcomes
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### ${{ matrix.id }} — ${{ matrix.sha }}"
+            echo "- pnpm check:changesets: ${{ steps.changesets.outcome }}"
+            echo "- pnpm lint: ${{ steps.lint.outcome }}"
+            echo "- pnpm typecheck: ${{ steps.typecheck.outcome }}"
+            echo "- pnpm build: ${{ steps.build.outcome }}"
+            echo "- pnpm test:gate: ${{ steps.gate.outcome }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Require all five checks
+        if: always()
+        shell: bash
+        run: |
+          failed=0
+          for outcome in \
+            "${{ steps.changesets.outcome }}" \
+            "${{ steps.lint.outcome }}" \
+            "${{ steps.typecheck.outcome }}" \
+            "${{ steps.build.outcome }}" \
+            "${{ steps.gate.outcome }}"; do
+            if [ "$outcome" != "success" ]; then failed=1; fi
+          done
+          exit "$failed"
