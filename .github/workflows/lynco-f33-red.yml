@@ -1,0 +1,24 @@
+name: LynCo F33 current-head RED
+
+on:
+  push:
+    branches: [qualification/f33-red-29d81f6]
+
+permissions:
+  contents: read
+
+jobs:
+  red:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+        with:
+          node-version: "24"
+      - name: Run F33 regression
+        shell: bash
+        run: pnpm --dir packages/cli exec vitest run src/__tests__/bin.test.ts -t "actual stored dashboard port dispatch" --silent=passed-only --reporter=verbose
