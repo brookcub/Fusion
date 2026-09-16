@@ -1,0 +1,101 @@
+name: LynCo build F33 test commit
+
+on:
+  push:
+    branches: [automation/f33-test-builder-29d81f6]
+
+permissions:
+  contents: write
+
+jobs:
+  build-test-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: fix/f33-stored-dashboard-port-20260916
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-node-pnpm
+        with:
+          node-version: "24"
+      - name: Apply current-head F33 regression only
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("packages/cli/src/__tests__/bin.test.ts")
+          text = path.read_text()
+
+          def replace_once(old, new, label):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one anchor, found {count}")
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              'import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";\n',
+              'import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";\n',
+              "vitest import",
+          )
+          replace_once(
+              'import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";\n',
+              'import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";\n',
+              "node:fs import",
+          )
+          replace_once(
+              '  runTaskMerge: vi.fn(),\n  runTaskUpdate: vi.fn(),\n',
+              '  runTaskMerge: vi.fn(),\n  runTaskReconcile: vi.fn(),\n  runTaskUpdate: vi.fn(),\n',
+              "commandMocks task reconcile",
+          )
+          replace_once(
+              'const onboardEnv = vi.hoisted(() => ({\n  centralDbPath: "/tmp/fusion-central.db",\n}));\n',
+              'const onboardEnv = vi.hoisted(() => ({\n  centralDbPath: "/tmp/fusion-central.db",\n  settingsDir: "",\n}));\n',
+              "onboardEnv settingsDir",
+          )
+          replace_once(
+              '    getDefaultCentralDbPath: vi.fn(() => onboardEnv.centralDbPath),\n',
+              '    getDefaultCentralDbPath: vi.fn(() => onboardEnv.centralDbPath),\n    GlobalSettingsStore: class extends actual.GlobalSettingsStore {\n      constructor() { super(onboardEnv.settingsDir || undefined); }\n    },\n',
+              "GlobalSettingsStore mock",
+          )
+          replace_once(
+              'const ttyState = vi.hoisted(() => ({\n',
+              'const dashboardCliState = vi.hoisted(() => ({ shouldSupervise: false }));\n\nconst ttyState = vi.hoisted(() => ({\n',
+              "dashboard CLI state",
+          )
+          replace_once(
+              '  shouldSuperviseDashboard: vi.fn(() => false),\n',
+              '  shouldSuperviseDashboard: vi.fn(() => dashboardCliState.shouldSupervise),\n',
+              "dashboard supervision mock",
+          )
+          replace_once(
+              '  runTaskMerge: commandMocks.runTaskMerge,\n  runTaskUpdate: commandMocks.runTaskUpdate,\n',
+              '  runTaskMerge: commandMocks.runTaskMerge,\n  runTaskReconcile: commandMocks.runTaskReconcile,\n  runTaskUpdate: commandMocks.runTaskUpdate,\n',
+              "task module reconcile export",
+          )
+          insert_anchor = 'vi.mock("../commands/settings-import.js", () => ({ runSettingsImport: commandMocks.runSettingsImport }));\n'
+          replace_once(
+              insert_anchor,
+              insert_anchor + 'vi.mock("../commands/mcp-memory-server.js", () => ({ runMcpMemoryServer: vi.fn() }));\n',
+              "memory MCP mock",
+          )
+
+          describe_block = '''describe("actual stored dashboard port dispatch", () => {\n  let root: string;\n\n  beforeAll(async () => {\n    await vi.importActual("@fusion/core");\n  });\n\n  beforeEach(() => {\n    vi.clearAllMocks();\n    root = mkdtempSync(join(tmpdir(), "fusion settings port "));\n    onboardEnv.settingsDir = root;\n    onboardEnv.centralDbPath = join(root, "central.db");\n    dashboardCliState.shouldSupervise = false;\n    process.env.PI_PACKAGE_DIR = root;\n    writeFileSync(\n      join(root, "package.json"),\n      JSON.stringify({ name: "synthetic-pi", version: "0.0.0", piConfig: { configDir: ".fusion" } }),\n    );\n    process.env.FUSION_SKIP_ONBOARDING = "1";\n    commandMocks.runDashboard.mockResolvedValue({ dispose: vi.fn() });\n    commandMocks.runDashboardSupervised.mockResolvedValue(undefined);\n  });\n\n  afterEach(() => {\n    process.argv = originalArgv;\n    process.exit = originalExit;\n    if (originalPiPackageDir === undefined) delete process.env.PI_PACKAGE_DIR;\n    else process.env.PI_PACKAGE_DIR = originalPiPackageDir;\n    if (originalSkipOnboardingEnv === undefined) delete process.env.FUSION_SKIP_ONBOARDING;\n    else process.env.FUSION_SKIP_ONBOARDING = originalSkipOnboardingEnv;\n    rmSync(root, { recursive: true, force: true });\n    onboardEnv.settingsDir = "";\n  });\n\n  async function storePort(value: number) {\n    writeFileSync(join(root, "settings.json"), JSON.stringify({ daemonPort: value }));\n    const actual = await vi.importActual<typeof import("@fusion/core")>("@fusion/core");\n    expect((await new actual.GlobalSettingsStore(root).getSettings()).daemonPort).toBe(value);\n  }\n\n  it("control: omitted setting retains the default dashboard port", async () => {\n    await runBin(["dashboard", "--no-supervise"]);\n    expect(commandMocks.runDashboard).toHaveBeenCalledWith(4040, expect.any(Object));\n  }, 15_000);\n\n  it.each([6789, 0])("control: explicit CLI port %i wins over stored settings", async (port) => {\n    await storePort(5678);\n    await runBin(["dashboard", "--no-supervise", "--port", String(port)]);\n    expect(commandMocks.runDashboard).toHaveBeenCalledWith(port, expect.any(Object));\n  }, 15_000);\n\n  it("omitted CLI port preserves the stored daemonPort preference", async () => {\n    await storePort(5678);\n    await runBin(["dashboard", "--no-supervise"]);\n    expect(commandMocks.runDashboard).toHaveBeenCalledWith(5678, expect.any(Object));\n  });\n\n  it("supervised dispatch uses the same stored port", async () => {\n    await storePort(5678);\n    dashboardCliState.shouldSupervise = true;\n    await runBin(["dashboard"]);\n    expect(commandMocks.runDashboardSupervised).toHaveBeenCalledWith(5678);\n  });\n});\n\n'''
+          replace_once(
+              'const originalArgv = process.argv;\n',
+              describe_block + 'const originalArgv = process.argv;\n',
+              "F33 describe block",
+          )
+
+          path.write_text(text)
+          PY
+          git diff --check
+      - name: Commit regression to clean branch
+        shell: bash
+        run: |
+          git config user.name "Brooklyn Rose Ludlow"
+          git config user.email "22346091+brookcub@users.noreply.github.com"
+          git add packages/cli/src/__tests__/bin.test.ts
+          git commit -m "test(F33): reproduce stored dashboard port being ignored"
+          git push origin HEAD:fix/f33-stored-dashboard-port-20260916
