@@ -1,0 +1,32 @@
+name: LynCo current-upstream Windows RED refresh
+
+on:
+  push:
+    branches:
+      - qualification/windows-red-refresh-a8c2de5
+
+permissions:
+  contents: read
+
+jobs:
+  windows-regressions:
+    name: Windows RED refresh / ${{ matrix.id }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        id: [F01, U09, F03]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+        with:
+          node-version: "24"
+      - name: Run exact stored Windows regression
+        shell: pwsh
+        run: |
+          switch ("${{ matrix.id }}") {
+            "F01" { pnpm --dir packages/desktop exec vitest run src/__tests__/workspace-literal-argv.test.ts --silent=passed-only --reporter=verbose; break }
+            "U09" { node --test scripts/__tests__/ensure-test-artifacts-entrypoint.test.mjs; break }
+            "F03" { pnpm --dir packages/engine exec vitest run src/sandbox/__tests__/windows-owned-command.test.ts --silent=passed-only --reporter=verbose; break }
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
