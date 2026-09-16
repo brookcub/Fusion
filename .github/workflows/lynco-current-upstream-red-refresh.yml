@@ -65,7 +65,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      FUSION_PG_TEST_URL_BASE: postgresql://postgres@localhost:5432/postgres
+      FUSION_PG_TEST_URL_BASE: postgresql://postgres@localhost:5432
       FUSION_PG_TEST_SETUP_PARTICIPANT: "1"
     steps:
       - uses: actions/checkout@v7.0.1
