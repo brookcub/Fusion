@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -43,6 +44,14 @@ function sha(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
+function resolveOptionalManifest(requireFromAcp: NodeJS.Require, packageName: string): string | null {
+  try {
+    return requireFromAcp.resolve(`${packageName}/package.json`);
+  } catch {
+    return null;
+  }
+}
+
 try {
   // Build output is produced by the workflow before this probe. Pack exactly that publishable tree.
   runPnpm(["--dir", cliDir, "pack", "--pack-destination", packDir], repoRoot);
@@ -58,6 +67,7 @@ try {
   const installedReal = realpathSync(installedRoot);
   const repoReal = realpathSync(repoRoot);
   assert.ok(!installedReal.startsWith(repoReal + (process.platform === "win32" ? "\\" : "/")), `installed package leaked back into repo: ${installedReal}`);
+  const installedRequire = createRequire(join(installedRoot, "package.json"));
 
   const installedBin = join(installedRoot, "dist", "bin.js");
   assert.ok(existsSync(installedBin), "installed CLI dist/bin.js is missing");
@@ -104,17 +114,22 @@ try {
   const importedRuntime = await import(pathToFileURL(runtimeBundle).href + `?qualification=${Date.now()}`);
   assert.ok(Object.keys(importedRuntime).length > 0, "installed Claude runtime bundle imported but exposed no module surface");
 
-  const installedAcpManifestPath = join(installDir, "node_modules", "claude-code-cli-acp", "package.json");
-  assert.ok(existsSync(installedAcpManifestPath), "published Fusion dependency claude-code-cli-acp is missing after external install");
+  // Resolve transitive package topology from installed Fusion, not from the probe project's
+  // root node_modules. This is the product-faithful Node/pnpm resolution contract.
+  const installedAcpManifestPath = installedRequire.resolve("claude-code-cli-acp/package.json");
   const installedAcpManifest = JSON.parse(readFileSync(installedAcpManifestPath, "utf8"));
   const stagedAcpManifest = JSON.parse(readFileSync(stagedLauncherManifestPath, "utf8"));
   assert.equal(stagedAcpManifest.version, installedAcpManifest.version, "staged ACP launcher version differs from installed dependency");
 
   const optionalNames = Object.keys(installedAcpManifest.optionalDependencies ?? {});
   assert.ok(optionalNames.length > 0, "claude-code-cli-acp declares no optional native packages to verify");
+  const acpRequire = createRequire(installedAcpManifestPath);
   const installedNative = optionalNames
-    .map((name) => ({ name, manifest: join(installDir, "node_modules", ...name.split("/"), "package.json") }))
-    .find((candidate) => existsSync(candidate.manifest));
+    .map((name) => {
+      const manifest = resolveOptionalManifest(acpRequire, name);
+      return manifest ? { name, manifest } : null;
+    })
+    .find((candidate): candidate is { name: string; manifest: string } => candidate !== null);
   assert.ok(installedNative, `no platform-native ACP optional dependency installed; candidates=${optionalNames.join(",")}`);
   const nativeManifest = JSON.parse(readFileSync(installedNative!.manifest, "utf8"));
   const nativeRoot = dirname(installedNative!.manifest);
