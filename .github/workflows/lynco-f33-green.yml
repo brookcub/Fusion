@@ -1,0 +1,28 @@
+name: LynCo F33 green qualification
+
+on:
+  push:
+    branches: [qualification/f33-green-29d81f6]
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+        with:
+          node-version: "24"
+      - name: Focused F33 regression suite
+        shell: bash
+        run: pnpm --dir packages/cli exec vitest run src/__tests__/bin.test.ts -t "actual stored dashboard port dispatch" --silent=passed-only --reporter=verbose
+      - name: Validate changeset
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: pnpm check:changesets
