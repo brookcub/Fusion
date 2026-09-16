@@ -1,0 +1,44 @@
+name: LynCo current-upstream GREEN refresh
+
+on:
+  push:
+    branches:
+      - qualification/green-refresh-a8c2de5
+
+permissions:
+  contents: read
+
+jobs:
+  green-regressions:
+    name: GREEN refresh / ${{ matrix.id }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        id: [F24, F27, F26, F05, FUSI017]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+        with:
+          node-version: "24"
+      - name: Run exact stored regression after preserved fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.id }}" in
+            F24)
+              pnpm --dir packages/core exec vitest run src/__tests__/startup-memo-policy.test.ts --silent=passed-only --reporter=verbose
+              ;;
+            F27)
+              pnpm --dir packages/pi-claude-cli exec vitest run src/__tests__/prompt-file-ownership.test.ts src/__tests__/prompt-file-process-ownership.test.ts --reporter=verbose
+              ;;
+            F26)
+              pnpm --dir packages/dashboard exec vitest run src/__tests__/claude-cli-probe-contract.test.ts --silent=passed-only --reporter=verbose
+              ;;
+            F05)
+              pnpm --dir packages/engine exec vitest run src/__tests__/verification-parity.test.ts src/__tests__/verification-sandbox-truth.test.ts --silent=passed-only --reporter=verbose
+              ;;
+            FUSI017)
+              pnpm --dir packages/engine exec vitest run src/__tests__/completion-handoff-boundary.test.ts --silent=passed-only --reporter=verbose
+              ;;
+          esac
