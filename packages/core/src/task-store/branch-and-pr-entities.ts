@@ -313,6 +313,14 @@ export async function saveWorkflowRunStepInstanceAsyncImpl(
         integratedAt: state.integratedAt ?? null,
         updatedAt: now,
       },
+      // Terminal foreach state is graph-ownership evidence. A delayed writer
+      // from the same run/instance may arrive later, but it cannot reopen work
+      // that has already completed or failed. Terminal incoming writes remain
+      // allowed so terminal metadata such as integratedAt can still advance.
+      setWhere: sql`
+        ${schema.project.workflowRunStepInstances.status} not in ('completed', 'failed')
+        or excluded.status in ('completed', 'failed')
+      `,
     });
 }
 
