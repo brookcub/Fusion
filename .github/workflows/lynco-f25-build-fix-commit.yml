@@ -1,0 +1,40 @@
+name: LynCo build F25 fix commit
+
+on:
+  push:
+    branches: [automation/f25-fix-builder-29d81f6]
+
+permissions:
+  contents: write
+
+jobs:
+  build-fix-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: fix/f25-vendored-claude-order-20260916
+          fetch-depth: 0
+      - name: Apply minimal F25 fix
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("packages/core/src/plugins/pi-extensions.ts")
+          text = path.read_text()
+          old = '''  const filtered = paths.filter((p) => !isExternalClaudeCliPath(p, vendoredPath));\n  if (!filtered.includes(vendoredPath)) {\n    return [vendoredPath, ...filtered];\n  }\n  return filtered;\n'''
+          new = '''  const filtered = paths.filter(\n    (p) => p !== vendoredPath && !isExternalClaudeCliPath(p, vendoredPath),\n  );\n  return [vendoredPath, ...filtered];\n'''
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f"expected one reconcileClaudeCliPaths body, found {count}")
+          path.write_text(text.replace(old, new, 1))
+          PY
+          git diff --check
+      - name: Commit fix to clean branch
+        shell: bash
+        run: |
+          git config user.name "Brooklyn Rose Ludlow"
+          git config user.email "22346091+brookcub@users.noreply.github.com"
+          git add packages/core/src/plugins/pi-extensions.ts
+          git commit -m "fix(F25): keep vendored Claude adapter first"
+          git push origin HEAD:fix/f25-vendored-claude-order-20260916
