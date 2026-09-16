@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { resolveClaudeCliExtensionFromModuleUrl } from "../../packages/cli/src/commands/claude-cli-extension.ts";
@@ -41,12 +41,6 @@ function runPnpm(args: string[], cwd: string) {
 
 function sha(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
-}
-
-function assertOutsideRepo(path: string) {
-  const rel = relative(repoRoot, realpathSync(path));
-  assert.ok(rel.startsWith("..") || resolve(path) === realpathSync(path), `expected external path, got ${path}`);
-  assert.ok(!realpathSync(path).startsWith(realpathSync(repoRoot) + process.platform === "win32" ? "\\" : "/"));
 }
 
 try {
@@ -129,8 +123,8 @@ try {
   assert.ok(typeof loadEntry === "string" && loadEntry.length > 0, `native ACP package ${installedNative!.name} has no loadable entry`);
   assert.ok(existsSync(resolve(nativeRoot, loadEntry)), `native ACP entry is missing: ${resolve(nativeRoot, loadEntry)}`);
 
-  // Execute the staged launcher from the external cwd. We tolerate a non-zero doctor result
-  // when Claude itself is absent, but module/native-loader failures are disqualifying.
+  // Execute the staged launcher from the external cwd. A non-zero doctor result is acceptable
+  // when Claude itself is absent; module/native-loader failures are not.
   const doctor = spawnSync(process.execPath, [stagedLauncher, "doctor"], {
     cwd: installDir,
     env: isolatedEnv,
