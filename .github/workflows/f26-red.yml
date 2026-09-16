@@ -1,0 +1,30 @@
+name: F26 current-runtime red
+
+on:
+  push:
+    branches: [qualification/f26-red-c09c6d5]
+
+env:
+  F26_BRANCH: hardening/f26-bounded-claude-probe
+  F26_SHA: c09c6d55b6c1b845544e3973b131daf8cfac3bdc
+
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact F26 test tip
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.F26_SHA }}
+          fetch-depth: 0
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+      - name: Verify exact F26 test tip
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$F26_SHA"
+          remote_sha="$(git ls-remote origin "refs/heads/$F26_BRANCH" | awk '{print $1}')"
+          test "$remote_sha" = "$F26_SHA"
+      - name: Run F26 contract regression
+        run: pnpm --dir packages/dashboard exec vitest run src/__tests__/claude-cli-probe-contract.test.ts --reporter=verbose
