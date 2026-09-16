@@ -1,0 +1,40 @@
+name: LynCo build F33 fix commit
+
+on:
+  push:
+    branches: [automation/f33-fix-builder-29d81f6]
+
+permissions:
+  contents: write
+
+jobs:
+  build-fix-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: fix/f33-stored-dashboard-port-20260916
+          fetch-depth: 0
+      - name: Apply minimal F33 fix
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("packages/cli/src/bin.ts")
+          text = path.read_text()
+          old = '''        const port = pi !== -1 ? parseInt(args[pi + 1], 10) : 4040;\n'''
+          new = '''        let port: number;\n        if (pi !== -1) {\n          port = parseInt(args[pi + 1], 10);\n        } else {\n          const { GlobalSettingsStore } = await import("@fusion/core");\n          const settings = await new GlobalSettingsStore().getSettings();\n          port = settings.daemonPort ?? 4040;\n        }\n'''
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f"expected one dashboard port fallback anchor, found {count}")
+          path.write_text(text.replace(old, new, 1))
+          PY
+          git diff --check
+      - name: Commit fix to clean branch
+        shell: bash
+        run: |
+          git config user.name "Brooklyn Rose Ludlow"
+          git config user.email "22346091+brookcub@users.noreply.github.com"
+          git add packages/cli/src/bin.ts
+          git commit -m "fix(F33): honor stored dashboard port when CLI flag is omitted"
+          git push origin HEAD:fix/f33-stored-dashboard-port-20260916
