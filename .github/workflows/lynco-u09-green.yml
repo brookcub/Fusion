@@ -1,0 +1,21 @@
+name: LynCo U09 green qualification
+
+on:
+  push:
+    branches: [qualification/u09-green-29d81f6]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+        with:
+          node-version: "24"
+      - name: Focused U09 regression
+        run: node --test scripts/__tests__/ensure-test-artifacts-entrypoint.test.mjs
+      - name: Validate changeset
+        run: pnpm check:changesets
