@@ -1,0 +1,50 @@
+name: LynCo runtime baseline builder
+
+on:
+  push:
+    branches: [automation/lynco-runtime-baseline-20260916]
+
+permissions:
+  contents: write
+
+env:
+  RUNTIME_BRANCH: lynco/runtime
+  BASE_SHA: 29d81f6277e8f3485ff058d1ce4f539331fa5c0a
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout automation branch
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Build runtime baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Brooklyn Rose Ludlow"
+          git config user.email "22346091+brookcub@users.noreply.github.com"
+
+          runtime_sha="$(git ls-remote origin "refs/heads/$RUNTIME_BRANCH" | awk '{print $1}')"
+          test "$runtime_sha" = "$BASE_SHA"
+
+          git fetch origin \
+            fix/u09-windows-artifact-entrypoint-20260916 \
+            fix/f33-stored-dashboard-port-20260916 \
+            fix/f25-vendored-claude-order-20260916
+
+          git checkout -B runtime "$BASE_SHA"
+
+          git merge --squash origin/fix/u09-windows-artifact-entrypoint-20260916
+          git commit -m "fix(runtime): integrate Windows artifact entrypoint fix"
+
+          git merge --squash origin/fix/f33-stored-dashboard-port-20260916
+          git commit -m "fix(runtime): integrate stored dashboard port fix"
+
+          git merge --squash origin/fix/f25-vendored-claude-order-20260916
+          git commit -m "fix(runtime): integrate Claude extension finalization fix"
+
+          git diff "$BASE_SHA" --check
+          git push origin "HEAD:refs/heads/$RUNTIME_BRANCH"
