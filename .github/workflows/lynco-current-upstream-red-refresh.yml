@@ -83,7 +83,27 @@ jobs:
       - uses: ./.github/actions/setup-node-pnpm
         with:
           node-version: "24"
-      - name: Run exact stored F33 dashboard-port regression
+      - name: Adapt only newly-required task command mock surface
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, writeFileSync } from "node:fs";
+          const path = "packages/cli/src/__tests__/bin.test.ts";
+          let text = readFileSync(path, "utf8");
+          const first = "  runTaskMerge: vi.fn(),\n";
+          const second = "  runTaskMerge: commandMocks.runTaskMerge,\n";
+          if (!text.includes("runTaskReconcile: vi.fn()")) {
+            if (!text.includes(first)) throw new Error("F33 fixture anchor 1 moved");
+            text = text.replace(first, first + "  runTaskReconcile: vi.fn(),\n");
+          }
+          if (!text.includes("runTaskReconcile: commandMocks.runTaskReconcile")) {
+            if (!text.includes(second)) throw new Error("F33 fixture anchor 2 moved");
+            text = text.replace(second, second + "  runTaskReconcile: commandMocks.runTaskReconcile,\n");
+          }
+          writeFileSync(path, text);
+          NODE
+      - name: Run unchanged stored F33 dashboard-port assertions
+        shell: bash
         run: pnpm --dir packages/cli exec vitest run src/__tests__/bin.test.ts -t "actual stored dashboard port dispatch" --silent=passed-only --reporter=verbose
 
   f12-postgres:
@@ -111,3 +131,84 @@ jobs:
           node-version: "24"
       - name: Run exact F12 regression against real PostgreSQL
         run: pnpm --dir packages/core exec vitest run --config vitest.pg.config.ts src/__tests__/postgres/workflow-step-instance-terminal-fence.pg.test.ts --silent=passed-only --reporter=verbose
+
+  package-boundary:
+    name: F25/F32 sealed package boundary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+        with:
+          node-version: "24"
+      - name: Seed an existing but stale desktop dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf packages/desktop/dist
+          mkdir -p packages/desktop/dist
+          printf 'stale-desktop-sentinel\n' > packages/desktop/dist/lynco-stale-sentinel.txt
+      - name: Build the real full CLI package
+        run: pnpm --dir packages/cli build:package
+      - name: Pack and install outside the repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACK_DIR="$RUNNER_TEMP/fusion-pack"
+          INSTALL_DIR="$RUNNER_TEMP/fusion-install"
+          HOME_DIR="$RUNNER_TEMP/fusion-home"
+          CWD_DIR="$RUNNER_TEMP/fusion-cwd"
+          rm -rf "$PACK_DIR" "$INSTALL_DIR" "$HOME_DIR" "$CWD_DIR"
+          mkdir -p "$PACK_DIR" "$INSTALL_DIR" "$HOME_DIR" "$CWD_DIR"
+          pnpm --dir packages/cli pack --pack-destination "$PACK_DIR"
+          TARBALL="$(find "$PACK_DIR" -maxdepth 1 -name 'runfusion-fusion-*.tgz' -print -quit)"
+          test -n "$TARBALL"
+          printf '{"name":"lynco-fusion-package-boundary","private":true,"version":"0.0.0"}\n' > "$INSTALL_DIR/package.json"
+          npm install --prefix "$INSTALL_DIR" --no-audit --no-fund "$TARBALL"
+          INSTALLED_ROOT="$INSTALL_DIR/node_modules/@runfusion/fusion"
+          echo "INSTALLED_ROOT=$INSTALLED_ROOT" >> "$GITHUB_ENV"
+          echo "ISOLATED_HOME=$HOME_DIR" >> "$GITHUB_ENV"
+          echo "UNRELATED_CWD=$CWD_DIR" >> "$GITHUB_ENV"
+      - name: Installed CLI loads from unrelated cwd and isolated home
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$UNRELATED_CWD"
+          HOME="$ISOLATED_HOME" FUSION_HOME="$ISOLATED_HOME/.fusion-runtime" node "$INSTALLED_ROOT/bin.mjs" --help > "$RUNNER_TEMP/fusion-help.txt"
+          grep -q 'fn — AI-orchestrated task board' "$RUNNER_TEMP/fusion-help.txt"
+      - name: F25 canonical packaged Claude adapter resolution and alias ownership
+        shell: bash
+        run: |
+          set -euo pipefail
+          export INSTALLED_ROOT
+          pnpm --dir packages/cli exec tsx --eval '
+            import { strict as assert } from "node:assert";
+            import { join } from "node:path";
+            import { pathToFileURL } from "node:url";
+            import { resolveClaudeCliExtensionFromModuleUrl } from "./src/commands/claude-cli-extension.ts";
+            import { reconcileClaudeCliPaths } from "../core/src/plugins/pi-extensions.ts";
+            const root = process.env.INSTALLED_ROOT!;
+            const result = resolveClaudeCliExtensionFromModuleUrl(pathToFileURL(join(root, "dist", "bin.js")).href);
+            assert.equal(result.status, "ok", JSON.stringify(result));
+            if (result.status !== "ok") process.exit(2);
+            assert.ok(result.path.startsWith(join(root, "dist", "pi-claude-cli")), result.path);
+            const staleGlobal = "/tmp/stale/node_modules/pi-claude-cli/index.ts";
+            const staleHome = "/tmp/home/.pi/agent/extensions/pi-claude-cli/index.ts";
+            const unrelated = "/tmp/home/.fusion/extensions/unrelated/index.ts";
+            const reconciled = reconcileClaudeCliPaths([staleGlobal, unrelated, staleHome, result.path], result.path);
+            assert.equal(reconciled[0], result.path);
+            assert.equal(reconciled.filter((p) => p === result.path).length, 1);
+            assert.ok(!reconciled.includes(staleGlobal));
+            assert.ok(!reconciled.includes(staleHome));
+            assert.ok(reconciled.includes(unrelated));
+            console.log(JSON.stringify({ status: result.status, path: result.path, packageVersion: result.packageVersion, reconciled }));
+          '
+      - name: F32 installed desktop runtime must be fresh and launchable in shape
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$INSTALLED_ROOT/dist/desktop/main.js"
+          if test -e "$INSTALLED_ROOT/dist/desktop/lynco-stale-sentinel.txt"; then
+            echo 'stale desktop dist was accepted and shipped' >&2
+            exit 1
+          fi
+          node --check "$INSTALLED_ROOT/dist/desktop/main.js"
