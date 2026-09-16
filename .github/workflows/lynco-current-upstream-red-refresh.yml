@@ -49,6 +49,28 @@ jobs:
               ;;
           esac
 
+  windows-regressions:
+    name: RED refresh Windows / ${{ matrix.id }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        id: [F01, U09, F03]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+        with:
+          node-version: "24"
+      - name: Run exact stored Windows regression
+        shell: pwsh
+        run: |
+          switch ("${{ matrix.id }}") {
+            "F01" { pnpm --dir packages/desktop exec vitest run src/__tests__/workspace-literal-argv.test.ts --silent=passed-only --reporter=verbose }
+            "U09" { node --test scripts/__tests__/ensure-test-artifacts-entrypoint.test.mjs }
+            "F03" { pnpm --dir packages/engine exec vitest run src/sandbox/__tests__/windows-owned-command.test.ts --silent=passed-only --reporter=verbose }
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
   f12-postgres:
     name: RED refresh / F12 real PostgreSQL
     runs-on: ubuntu-latest
