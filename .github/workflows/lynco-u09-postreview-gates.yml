@@ -1,0 +1,65 @@
+name: LynCo U09 post-review qualification
+
+on:
+  push:
+    branches: [qualification/u09-postreview-gates-d8ae9c8]
+
+permissions:
+  contents: read
+
+jobs:
+  targeted:
+    name: Targeted regression (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: d8ae9c84aec5d5d7abec927d1b85e430051a570f
+      - uses: ./.github/actions/setup-node-pnpm
+      - name: Verify exact PR tip
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "d8ae9c84aec5d5d7abec927d1b85e430051a570f"
+      - name: Run portable entrypoint regression
+        run: node --test scripts/__tests__/ensure-test-artifacts-entrypoint.test.mjs
+
+  full-gates:
+    name: Full PR gates
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h localhost -p 5432 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      FUSION_PG_TEST_URL_BASE: postgresql://postgres:postgres@localhost:5432
+      PGPASSWORD: postgres
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: d8ae9c84aec5d5d7abec927d1b85e430051a570f
+      - uses: ./.github/actions/setup-node-pnpm
+      - name: Verify exact PR tip
+        run: test "$(git rev-parse HEAD)" = "d8ae9c84aec5d5d7abec927d1b85e430051a570f"
+      - name: Changeset format
+        run: pnpm check:changesets
+      - name: Lint
+        run: pnpm lint
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Build
+        run: pnpm build
+      - name: Gate tests
+        run: pnpm test:gate
