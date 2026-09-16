@@ -1,0 +1,20 @@
+name: LynCo F33 current-upstream RED refresh
+
+on:
+  push:
+    branches:
+      - qualification/red-f33-a8c2de5
+
+permissions:
+  contents: read
+
+jobs:
+  f33:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+        with:
+          node-version: "24"
+      - name: Run F33 stored-port regression
+        run: pnpm --dir packages/cli exec vitest run src/__tests__/bin.test.ts --silent=passed-only --reporter=verbose
