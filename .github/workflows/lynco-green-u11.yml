@@ -1,0 +1,15 @@
+name: LynCo U11 GREEN refresh
+on:
+  push:
+    branches: [qualification/green-u11-a8c2de5]
+permissions:
+  contents: read
+jobs:
+  u11:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+        with:
+          node-version: "24"
+      - run: node --test scripts/__tests__/build-certification-input-identity.test.mjs
