@@ -71,6 +71,21 @@ jobs:
           }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+  f33:
+    name: RED refresh F33 / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+        with:
+          node-version: "24"
+      - name: Run exact stored F33 dashboard-port regression
+        run: pnpm --dir packages/cli exec vitest run src/__tests__/bin.test.ts -t "actual stored dashboard port dispatch" --silent=passed-only --reporter=verbose
+
   f12-postgres:
     name: RED refresh / F12 real PostgreSQL
     runs-on: ubuntu-latest
