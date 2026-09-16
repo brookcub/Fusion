@@ -1,0 +1,29 @@
+name: LynCo packaged runtime boundary qualification
+
+on:
+  push:
+    branches:
+      - qualification/package-runtime-a8c2de5
+
+permissions:
+  contents: read
+
+jobs:
+  packaged-runtime:
+    name: Packaged runtime / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+        with:
+          node-version: "24"
+      - name: Build fresh workspace artifacts
+        run: pnpm build:full
+      - name: Build the full publishable CLI package
+        run: pnpm --dir packages/cli build:package
+      - name: Install tarball outside the repo and prove packaged runtime boundaries
+        run: pnpm exec tsx scripts/qualification/package-runtime-boundary.mts
