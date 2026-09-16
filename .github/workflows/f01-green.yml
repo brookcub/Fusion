@@ -1,0 +1,92 @@
+name: F01 current-runtime green
+
+on:
+  push:
+    branches: [qualification/f01-green-4ea116d]
+
+env:
+  F01_BRANCH: hardening/f01-windows-literal-argv
+  F01_SHA: 4ea116d77f28fe8a854305abe23c95a6de195b71
+
+jobs:
+  windows-targeted:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact F01 tip
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.F01_SHA }}
+          fetch-depth: 0
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+      - name: Verify exact F01 tip
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$F01_SHA"
+          remote_sha="$(git ls-remote origin "refs/heads/$F01_BRANCH" | awk '{print $1}')"
+          test "$remote_sha" = "$F01_SHA"
+      - name: F01 literal argv regression
+        shell: bash
+        run: pnpm --dir packages/desktop exec vitest run src/__tests__/workspace-literal-argv.test.ts --reporter=verbose
+      - name: U09 Windows entrypoint regression
+        shell: bash
+        run: node --test scripts/__tests__/ensure-test-artifacts-entrypoint.test.mjs
+      - name: F33 stored dashboard port regression
+        shell: bash
+        run: pnpm --dir packages/cli exec vitest run src/__tests__/bin.test.ts -t "actual stored dashboard port dispatch" --reporter=verbose
+
+  full-pr-gates:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: fusion_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d fusion_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres@localhost:5432/fusion_test
+      FUSION_DATABASE_URL: postgresql://postgres@localhost:5432/fusion_test
+    steps:
+      - name: Checkout exact F01 tip
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.F01_SHA }}
+          fetch-depth: 0
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+      - name: Verify exact F01 tip
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$F01_SHA"
+          remote_sha="$(git ls-remote origin "refs/heads/$F01_BRANCH" | awk '{print $1}')"
+          test "$remote_sha" = "$F01_SHA"
+      - name: F01 literal argv regression
+        run: pnpm --dir packages/desktop exec vitest run src/__tests__/workspace-literal-argv.test.ts --reporter=verbose
+      - name: U09 portable regression
+        run: node --test scripts/__tests__/ensure-test-artifacts-entrypoint.test.mjs
+      - name: F33 stored dashboard port regression
+        run: pnpm --dir packages/cli exec vitest run src/__tests__/bin.test.ts -t "actual stored dashboard port dispatch" --reporter=verbose
+      - name: F25 shared finalizer regression
+        run: pnpm --dir packages/cli exec vitest run src/commands/__tests__/extension-paths.test.ts --reporter=verbose
+      - name: F25 core reconciler regression
+        run: pnpm --dir packages/core exec vitest run src/__tests__/reconcile-claude-cli-paths.test.ts --reporter=verbose
+      - name: Changeset format
+        run: pnpm check:changesets
+      - name: Lint
+        run: pnpm lint
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Build
+        run: pnpm build
+      - name: Gate tests
+        run: pnpm test:gate
