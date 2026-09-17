@@ -1,0 +1,28 @@
+name: F27 process ownership red
+
+on:
+  push:
+    branches: [qualification/f27-process-ownership-red-2c8f911]
+
+env:
+  F27_BRANCH: hardening/f27-unique-prompt-file-ownership-runtime
+  F27_SHA: 2c8f911fea438b7dbdaa9e65a9410bb39366380d
+
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.F27_SHA }}
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-node-pnpm
+      - name: Verify exact characterization ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$F27_SHA"
+          remote_sha="$(git ls-remote origin "refs/heads/$F27_BRANCH" | awk '{print $1}')"
+          test "$remote_sha" = "$F27_SHA"
+      - name: Run both F27 ownership contracts
+        run: pnpm --dir packages/pi-claude-cli exec vitest run src/__tests__/prompt-file-ownership.test.ts src/__tests__/prompt-file-process-ownership.test.ts --reporter=verbose
