@@ -1,0 +1,79 @@
+name: F03 Windows owned process tree green
+
+on:
+  push:
+    branches: [qualification/f03-green-1de561d]
+
+env:
+  F03_BRANCH: hardening/f03-windows-owned-process-tree
+  F03_SHA: 1de561d15ae40908d6a696da6e1089f6388329d3
+
+jobs:
+  windows-owned-tree:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact F03 candidate
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.F03_SHA }}
+          fetch-depth: 0
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+      - name: Verify exact F03 candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$F03_SHA"
+          remote_sha="$(git ls-remote origin "refs/heads/$F03_BRANCH" | awk '{print $1}')"
+          test "$remote_sha" = "$F03_SHA"
+          test -z "$(git status --porcelain)"
+      - name: F03 owned process tree regression
+        shell: bash
+        run: pnpm --dir packages/engine exec vitest run src/sandbox/__tests__/windows-owned-command.test.ts --reporter=verbose
+
+  full-gates:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: fusion_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d fusion_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres@localhost:5432/fusion_test
+      FUSION_DATABASE_URL: postgresql://postgres@localhost:5432/fusion_test
+      FUSION_PG_TEST_OWNER_ROLE: postgres
+    steps:
+      - name: Checkout exact F03 candidate
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.F03_SHA }}
+          fetch-depth: 0
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+      - name: Verify exact F03 candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$F03_SHA"
+          remote_sha="$(git ls-remote origin "refs/heads/$F03_BRANCH" | awk '{print $1}')"
+          test "$remote_sha" = "$F03_SHA"
+          test -z "$(git status --porcelain)"
+      - name: Changeset format
+        run: pnpm check:changesets
+      - name: Lint
+        run: pnpm lint
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Build
+        run: pnpm build
+      - name: Gate tests
+        run: pnpm test:gate
