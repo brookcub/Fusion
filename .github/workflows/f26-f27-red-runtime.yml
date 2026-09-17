@@ -1,0 +1,46 @@
+name: F26 F27 current-runtime red
+
+on:
+  push:
+    branches: [qualification/f26-f27-red-runtime-20260916]
+
+jobs:
+  repro:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: f26
+            branch: hardening/f26-bounded-claude-probe-runtime
+            sha: 32454465c10ec0877d8cf5b8c177395481bfd4bb
+            package: packages/dashboard
+            test: src/__tests__/claude-cli-probe-contract.test.ts
+          - label: f27
+            branch: hardening/f27-unique-prompt-file-ownership-runtime
+            sha: 6cea131e3e1156fa0656d99368276d6b22f5ea59
+            package: packages/pi-claude-cli
+            test: src/__tests__/prompt-file-ownership.test.ts
+    name: repro (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact characterization tip
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ matrix.sha }}
+          fetch-depth: 0
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+      - name: Verify exact characterization ref
+        shell: bash
+        env:
+          EXPECTED_BRANCH: ${{ matrix.branch }}
+          EXPECTED_SHA: ${{ matrix.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          remote_sha="$(git ls-remote origin "refs/heads/$EXPECTED_BRANCH" | awk '{print $1}')"
+          test "$remote_sha" = "$EXPECTED_SHA"
+          test -z "$(git status --porcelain)"
+      - name: Run characterization contract
+        shell: bash
+        run: pnpm --dir "${{ matrix.package }}" exec vitest run "${{ matrix.test }}" --reporter=verbose
