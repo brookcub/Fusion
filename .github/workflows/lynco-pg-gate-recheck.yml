@@ -1,0 +1,59 @@
+name: LynCo corrected PostgreSQL gate recheck
+
+on:
+  push:
+    branches: [qualification/lynco-runtime-pg-role-fd71e8d]
+
+jobs:
+  gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: runtime-baseline
+            branch: lynco/runtime
+            sha: fd71e8dba85831ce97637a982e15f25885f00a26
+          - label: f01-candidate
+            branch: hardening/f01-windows-literal-argv
+            sha: 4ea116d77f28fe8a854305abe23c95a6de195b71
+    name: gate (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: fusion_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d fusion_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres@localhost:5432/fusion_test
+      FUSION_DATABASE_URL: postgresql://postgres@localhost:5432/fusion_test
+      FUSION_PG_TEST_OWNER_ROLE: postgres
+    steps:
+      - name: Checkout exact product tip
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ matrix.sha }}
+          fetch-depth: 0
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+      - name: Verify exact product ref
+        shell: bash
+        env:
+          EXPECTED_BRANCH: ${{ matrix.branch }}
+          EXPECTED_SHA: ${{ matrix.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          remote_sha="$(git ls-remote origin "refs/heads/$EXPECTED_BRANCH" | awk '{print $1}')"
+          test "$remote_sha" = "$EXPECTED_SHA"
+          test -z "$(git status --porcelain)"
+      - name: Gate tests with explicit PostgreSQL owner role
+        run: pnpm test:gate
