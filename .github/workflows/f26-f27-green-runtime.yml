@@ -1,0 +1,72 @@
+name: F26 F27 current-runtime green
+
+on:
+  push:
+    branches: [qualification/f26-f27-green-runtime-20260916]
+
+jobs:
+  qualify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: f26
+            branch: hardening/f26-bounded-claude-probe-runtime
+            sha: 922df4a1be1a78529e7969b5a70bbdcbbc23fd51
+            package: packages/dashboard
+            focused: src/__tests__/claude-cli-probe-contract.test.ts
+          - label: f27
+            branch: hardening/f27-unique-prompt-file-ownership-runtime
+            sha: 3bed9f9606a403eda7b8e2ce0d33e9bf6af124c3
+            package: packages/pi-claude-cli
+            focused: src/__tests__/prompt-file-ownership.test.ts src/__tests__/prompt-file-process-ownership.test.ts
+    name: qualify (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: fusion_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d fusion_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      FUSION_PG_TEST_URL_BASE: postgresql://postgres@localhost:5432
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ matrix.sha }}
+          fetch-depth: 0
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+      - name: Verify exact candidate ref
+        shell: bash
+        env:
+          EXPECTED_BRANCH: ${{ matrix.branch }}
+          EXPECTED_SHA: ${{ matrix.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          remote_sha="$(git ls-remote origin "refs/heads/$EXPECTED_BRANCH" | awk '{print $1}')"
+          test "$remote_sha" = "$EXPECTED_SHA"
+          test -z "$(git status --porcelain)"
+      - name: Focused regression
+        shell: bash
+        run: pnpm --dir "${{ matrix.package }}" exec vitest run ${{ matrix.focused }} --reporter=verbose
+      - name: Changeset format
+        run: pnpm check:changesets
+      - name: Lint
+        run: pnpm lint
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Build
+        run: pnpm build
+      - name: Gate tests
+        run: pnpm test:gate
