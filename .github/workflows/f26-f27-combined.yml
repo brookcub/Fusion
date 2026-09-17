@@ -1,0 +1,59 @@
+name: F26 F27 combined runtime qualification
+
+on:
+  push:
+    branches: [qualification/f26-f27-combined-48553bd]
+
+env:
+  INTEGRATION_BRANCH: integration/f26-f27-runtime-20260916
+  INTEGRATION_SHA: 48553bd835ff603c9cc2620edc60423e3d501292
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: fusion_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d fusion_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      FUSION_PG_TEST_URL_BASE: postgresql://postgres@localhost:5432
+    steps:
+      - name: Checkout exact combined candidate
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.INTEGRATION_SHA }}
+          fetch-depth: 0
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+      - name: Verify exact combined ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$INTEGRATION_SHA"
+          remote_sha="$(git ls-remote origin "refs/heads/$INTEGRATION_BRANCH" | awk '{print $1}')"
+          test "$remote_sha" = "$INTEGRATION_SHA"
+          test -z "$(git status --porcelain)"
+      - name: F26 focused regression
+        run: pnpm --dir packages/dashboard exec vitest run src/__tests__/claude-cli-probe-contract.test.ts --reporter=verbose
+      - name: F27 focused regressions
+        run: pnpm --dir packages/pi-claude-cli exec vitest run src/__tests__/prompt-file-ownership.test.ts src/__tests__/prompt-file-process-ownership.test.ts --reporter=verbose
+      - name: Changeset format
+        run: pnpm check:changesets
+      - name: Lint
+        run: pnpm lint
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Build
+        run: pnpm build
+      - name: Gate tests
+        run: pnpm test:gate
