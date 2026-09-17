@@ -16,6 +16,9 @@ jobs:
           - label: f01-candidate
             branch: hardening/f01-windows-literal-argv
             sha: 4ea116d77f28fe8a854305abe23c95a6de195b71
+          - label: f03-candidate
+            branch: hardening/f03-windows-owned-process-tree
+            sha: 1de561d15ae40908d6a696da6e1089f6388329d3
     name: gate (${{ matrix.label }})
     runs-on: ubuntu-latest
     services:
@@ -33,9 +36,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
-      DATABASE_URL: postgresql://postgres@localhost:5432/fusion_test
-      FUSION_DATABASE_URL: postgresql://postgres@localhost:5432/fusion_test
-      FUSION_PG_TEST_OWNER_ROLE: postgres
+      FUSION_PG_TEST_URL_BASE: postgresql://postgres@localhost:5432
     steps:
       - name: Checkout exact product tip
         uses: actions/checkout@v7.0.1
@@ -55,5 +56,5 @@ jobs:
           remote_sha="$(git ls-remote origin "refs/heads/$EXPECTED_BRANCH" | awk '{print $1}')"
           test "$remote_sha" = "$EXPECTED_SHA"
           test -z "$(git status --porcelain)"
-      - name: Gate tests with explicit PostgreSQL owner role
+      - name: Gate tests against the configured PostgreSQL URL
         run: pnpm test:gate
