@@ -1,0 +1,37 @@
+name: Runtime v2 Windows core contracts
+
+on:
+  push:
+    branches: [qualification/runtime-v2-windows-core-a745983]
+
+env:
+  CANDIDATE_BRANCH: integration/lynco-runtime-v2-c515e7e
+  CANDIDATE_SHA: a745983838947aa0904ebe948175ca356f170d91
+
+jobs:
+  windows-core:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          fetch-depth: 0
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+      - name: Verify exact candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          remote_sha="$(git ls-remote origin "refs/heads/$CANDIDATE_BRANCH" | awk '{print $1}')"
+          test "$remote_sha" = "$CANDIDATE_SHA"
+      - name: U09 artifact entrypoint
+        shell: bash
+        run: node --test scripts/__tests__/ensure-test-artifacts-entrypoint.test.mjs
+      - name: F01 literal argv
+        shell: bash
+        run: pnpm --dir packages/desktop exec vitest run src/__tests__/workspace-literal-argv.test.ts --reporter=verbose
+      - name: F03 Windows owned process tree
+        shell: bash
+        run: pnpm --dir packages/engine exec vitest run src/sandbox/__tests__/windows-owned-command.test.ts --reporter=verbose
