@@ -1,0 +1,50 @@
+name: Runtime v2 contract replay
+
+on:
+  push:
+    branches: [qualification/runtime-v2-contract-red-c515e7e]
+
+jobs:
+  u09:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+      - run: node --test scripts/__tests__/ensure-test-artifacts-entrypoint.test.mjs
+
+  f01:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+      - shell: bash
+        run: pnpm --dir packages/desktop exec vitest run src/__tests__/workspace-literal-argv.test.ts --reporter=verbose
+
+  f03:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+      - shell: bash
+        run: pnpm --dir packages/engine exec vitest run src/sandbox/__tests__/windows-owned-command.test.ts --reporter=verbose
+
+  f26:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+      - run: pnpm --dir packages/dashboard exec vitest run src/__tests__/claude-cli-probe-contract.test.ts --reporter=verbose
+
+  f27:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+      - run: pnpm --dir packages/pi-claude-cli exec vitest run src/__tests__/prompt-file-ownership.test.ts src/__tests__/prompt-file-process-ownership.test.ts --reporter=verbose
+
+  f25-f33:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/setup-node-pnpm
+      - run: node --test scripts/__tests__/lynco-runtime-v2-structural-contracts.test.mjs
