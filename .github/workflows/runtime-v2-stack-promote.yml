@@ -38,6 +38,7 @@ jobs:
         run: |
           set -euo pipefail
           node --test scripts/__tests__/ensure-test-artifacts-entrypoint.test.mjs
+          pnpm --filter @fusion-plugin-examples/antigravity-runtime build
           pnpm --dir packages/cli exec vitest run src/__tests__/bin.test.ts -t "actual stored dashboard port dispatch" --reporter=verbose
           pnpm --dir packages/cli exec vitest run src/commands/__tests__/extension-paths.test.ts --reporter=verbose
           pnpm --dir packages/core exec vitest run src/__tests__/reconcile-claude-cli-paths.test.ts --reporter=verbose
