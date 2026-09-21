@@ -1,0 +1,117 @@
+name: Runtime v2 final qualification
+
+on:
+  push:
+    branches: [qualification/runtime-v2-final-a745983]
+
+env:
+  CANDIDATE_BRANCH: integration/lynco-runtime-v2-c515e7e
+  CANDIDATE_SHA: a745983838947aa0904ebe948175ca356f170d91
+
+jobs:
+  windows-contracts:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          fetch-depth: 0
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+      - name: Verify exact candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          remote_sha="$(git ls-remote origin "refs/heads/$CANDIDATE_BRANCH" | awk '{print $1}')"
+          test "$remote_sha" = "$CANDIDATE_SHA"
+      - name: Build Antigravity test dependency
+        shell: bash
+        run: pnpm --filter @fusion-plugin-examples/antigravity-runtime build
+      - name: U09 artifact entrypoint
+        shell: bash
+        run: node --test scripts/__tests__/ensure-test-artifacts-entrypoint.test.mjs
+      - name: F33 stored dashboard port
+        shell: bash
+        run: pnpm --dir packages/cli exec vitest run src/__tests__/bin.test.ts -t "actual stored dashboard port dispatch" --reporter=verbose
+      - name: F01 literal argv
+        shell: bash
+        run: pnpm --dir packages/desktop exec vitest run src/__tests__/workspace-literal-argv.test.ts --reporter=verbose
+      - name: F03 Windows owned process tree
+        shell: bash
+        run: pnpm --dir packages/engine exec vitest run src/sandbox/__tests__/windows-owned-command.test.ts --reporter=verbose
+
+  linux-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          fetch-depth: 0
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+      - name: Verify exact candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          remote_sha="$(git ls-remote origin "refs/heads/$CANDIDATE_BRANCH" | awk '{print $1}')"
+          test "$remote_sha" = "$CANDIDATE_SHA"
+      - name: U09 portable artifact entrypoint
+        run: node --test scripts/__tests__/ensure-test-artifacts-entrypoint.test.mjs
+      - name: F25 CLI extension finalizer
+        run: pnpm --dir packages/cli exec vitest run src/commands/__tests__/extension-paths.test.ts --reporter=verbose
+      - name: F25 Claude reconciler
+        run: pnpm --dir packages/core exec vitest run src/__tests__/reconcile-claude-cli-paths.test.ts --reporter=verbose
+      - name: F26 Claude probe contract
+        run: pnpm --dir packages/dashboard exec vitest run src/__tests__/claude-cli-probe-contract.test.ts --reporter=verbose
+      - name: F27 prompt ownership
+        run: pnpm --dir packages/pi-claude-cli exec vitest run src/__tests__/prompt-file-ownership.test.ts src/__tests__/prompt-file-process-ownership.test.ts --reporter=verbose
+
+  full-gates:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: fusion_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d fusion_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      FUSION_PG_TEST_URL_BASE: postgresql://postgres@localhost:5432
+      DATABASE_URL: postgresql://postgres@localhost:5432/fusion_test
+      FUSION_DATABASE_URL: postgresql://postgres@localhost:5432/fusion_test
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          fetch-depth: 0
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+      - name: Verify exact candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          remote_sha="$(git ls-remote origin "refs/heads/$CANDIDATE_BRANCH" | awk '{print $1}')"
+          test "$remote_sha" = "$CANDIDATE_SHA"
+      - name: Changeset format
+        run: pnpm check:changesets
+      - name: Lint
+        run: pnpm lint
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Build
+        run: pnpm build
+      - name: Gate tests
+        run: pnpm test:gate
