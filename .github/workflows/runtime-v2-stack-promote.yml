@@ -1,0 +1,54 @@
+name: Runtime v2 stack promote
+
+on:
+  push:
+    branches: [automation/runtime-v2-stack-promote-20260921]
+
+permissions:
+  contents: write
+
+env:
+  BASE_SHA: c515e7edfaf08f63abf09fc767dd8d82c6b8f949
+  TARGET_BRANCH: integration/lynco-runtime-v2-c515e7e
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-node-pnpm
+      - name: Replay exact Runtime 1 stack
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')" = "$BASE_SHA"
+          git checkout --detach "$BASE_SHA"
+          git config user.name "Brooklyn Rose Ludlow"
+          git config user.email "22346091+brookcub@users.noreply.github.com"
+          git fetch origin refs/heads/lynco/runtime:refs/remotes/origin/lynco/runtime
+          for sha in             1d071578f1adb26c9811f43b793dc8fdb108d3ff             4933b1b98d02d2e91944e7749d015943feebca64             fd71e8dba85831ce97637a982e15f25885f00a26             f30af0ab1645e6ffb9476a1420b552d52d30b08e             4ea116d77f28fe8a854305abe23c95a6de195b71             0d93e674aa37d5196ec26c1097c3b77e4fc31ca4             1de561d15ae40908d6a696da6e1089f6388329d3             32454465c10ec0877d8cf5b8c177395481bfd4bb             3b8bc1390c23476b77b450aab060cc145a17c8f9             922df4a1be1a78529e7969b5a70bbdcbbc23fd51             48553bd835ff603c9cc2620edc60423e3d501292
+          do
+            git cherry-pick "$sha"
+          done
+          git diff "$BASE_SHA"..HEAD --check
+      - name: Focused Runtime 2 regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test scripts/__tests__/ensure-test-artifacts-entrypoint.test.mjs
+          pnpm --dir packages/cli exec vitest run src/__tests__/bin.test.ts -t "actual stored dashboard port dispatch" --reporter=verbose
+          pnpm --dir packages/cli exec vitest run src/commands/__tests__/extension-paths.test.ts --reporter=verbose
+          pnpm --dir packages/core exec vitest run src/__tests__/reconcile-claude-cli-paths.test.ts --reporter=verbose
+          pnpm --dir packages/desktop exec vitest run src/__tests__/workspace-literal-argv.test.ts --reporter=verbose
+          pnpm --dir packages/dashboard exec vitest run src/__tests__/claude-cli-probe-contract.test.ts --reporter=verbose
+          pnpm --dir packages/pi-claude-cli exec vitest run src/__tests__/prompt-file-ownership.test.ts src/__tests__/prompt-file-process-ownership.test.ts --reporter=verbose
+          pnpm check:changesets
+      - name: Push qualified focused stack
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')" = "$BASE_SHA"
+          git push origin "HEAD:refs/heads/$TARGET_BRANCH"
+          echo "PROMOTED_SHA=$(git rev-parse HEAD)"
