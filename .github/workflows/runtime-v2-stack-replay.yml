@@ -1,0 +1,45 @@
+name: Runtime v2 old-stack replay
+
+on:
+  push:
+    branches: [qualification/runtime-v2-stack-replay-c515e7e]
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Replay old LynCo runtime stack
+        shell: bash
+        run: |
+          set -u
+          git config user.name "Brooklyn Rose Ludlow"
+          git config user.email "22346091+brookcub@users.noreply.github.com"
+          git fetch origin refs/heads/lynco/runtime:refs/remotes/origin/lynco/runtime
+          commits=(
+            1d071578f1adb26c9811f43b793dc8fdb108d3ff
+            4933b1b98d02d2e91944e7749d015943feebca64
+            fd71e8dba85831ce97637a982e15f25885f00a26
+            f30af0ab1645e6ffb9476a1420b552d52d30b08e
+            4ea116d77f28fe8a854305abe23c95a6de195b71
+            0d93e674aa37d5196ec26c1097c3b77e4fc31ca4
+            1de561d15ae40908d6a696da6e1089f6388329d3
+            32454465c10ec0877d8cf5b8c177395481bfd4bb
+            3b8bc1390c23476b77b450aab060cc145a17c8f9
+            922df4a1be1a78529e7969b5a70bbdcbbc23fd51
+            48553bd835ff603c9cc2620edc60423e3d501292
+          )
+          for sha in "${commits[@]}"; do
+            echo "=== REPLAY $sha ==="
+            if git cherry-pick "$sha"; then
+              echo "REPLAY_OK $sha"
+            else
+              echo "REPLAY_CONFLICT $sha"
+              git status --short
+              git diff --name-only --diff-filter=U
+              exit 17
+            fi
+          done
+          echo "ALL_REPLAYED"
