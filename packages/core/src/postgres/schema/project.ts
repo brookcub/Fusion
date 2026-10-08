@@ -1020,7 +1020,8 @@ export const agentRuns = projectSchema.table("agent_runs", {
   status: text("status").notNull(),
 }, (t) => [
   primaryKey({ columns: [t.projectId, t.id] }),
-  foreignKey({ columns: [t.projectId, t.agentId], foreignColumns: [agents.projectId, agents.id] }).onDelete("cascade"),
+  // A run is durable evidence even after its ephemeral agent is retired.
+  // Keep agentId as historical attribution without a cascading agent FK.
   index("idxAgentRunsAgentIdStartedAt").on(t.agentId, t.startedAt),
   index("idxAgentRunsProjectStartedAt").on(t.projectId, t.startedAt),
   index("idxAgentRunsStatus").on(t.status),

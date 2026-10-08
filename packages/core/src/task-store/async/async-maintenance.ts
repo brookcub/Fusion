@@ -88,18 +88,8 @@ export async function pruneOperationalLogsAsync(
   Retention reports one aggregate count per table. The database counts deleted tuples inside a CTE so maintenance never transfers or materializes every deleted primary key in application memory.
   */
   await count("activityLog", sql`DELETE FROM project.activity_log WHERE project_id = ${projectId} AND timestamp < ${cutoff} RETURNING 1`);
-  /*
-  FNXC:PostgresRetention 2026-07-14-18:12:
-  Legacy run-audit and heartbeat rows do not carry project_id. Scope deletion through their owning task/agent instead; taskless audit rows remain retained because their project cannot be proven, which is safer than cross-project deletion.
-  */
-  await count("runAuditEvents", sql`
-    DELETE FROM project.run_audit_events AS events
-    WHERE events.timestamp < ${cutoff}
-      AND events.task_id IN (
-        SELECT id FROM project.tasks WHERE project_id = ${projectId}
-      )
-    RETURNING 1
-  `);
+  // Run audit and completed agent-run rows are durable execution traces, not
+  // operational churn. Keep them regardless of this shorter retention window.
   await count("agentHeartbeats", sql`
     DELETE FROM project.agent_heartbeats AS heartbeats
     WHERE heartbeats.timestamp < ${cutoff}
@@ -109,7 +99,6 @@ export async function pruneOperationalLogsAsync(
       )
     RETURNING 1
   `);
-  await count("agentRuns", sql`DELETE FROM project.agent_runs WHERE project_id = ${projectId} AND ended_at IS NOT NULL AND ended_at < ${cutoff} RETURNING 1`);
   await count("agentConfigRevisions", sql`
     DELETE FROM project.agent_config_revisions AS revisions
     WHERE revisions.project_id = ${projectId}

@@ -58,7 +58,8 @@ pgDescribe("PostgreSQL operational maintenance", () => {
   it("covers every operational table while retaining recent rows and each agent's newest revision", async () => {
     /*
     FNXC:PostgresRetentionCoverage 2026-07-14-18:55:
-    Retention is an operational contract for every migrated history table, not only activity_log. Exercise every delete branch with real PostgreSQL rows so column drift and project-scope regressions cannot silently disable cleanup.
+    Operational cleanup retains run traces and audit records while pruning
+    other expired rows. Exercise the boundary with real PostgreSQL rows.
     */
     const old = new Date(Date.now() - 10 * 86_400_000).toISOString();
     const lessOld = new Date(Date.now() - 9 * 86_400_000).toISOString();
@@ -98,14 +99,14 @@ pgDescribe("PostgreSQL operational maintenance", () => {
     const result = await pruneOperationalLogsAsync({ ...h.layer(), projectId }, 86_400_000);
 
     expect(result.deletedByTable).toMatchObject({
-      runAuditEvents: 1,
       agentHeartbeats: 1,
-      agentRuns: 1,
       agentConfigRevisions: 1,
       usageEvents: 1,
     });
-    expect((await h.adminDb().select().from(schema.project.runAuditEvents).where(inArray(schema.project.runAuditEvents.id, ["audit-old", "audit-new"]))).map((row) => row.id)).toEqual(["audit-new"]);
-    expect((await h.adminDb().select().from(schema.project.agentRuns).where(inArray(schema.project.agentRuns.id, ["agent-run-old", "agent-run-new", "agent-run-active"]))).map((row) => row.id).sort()).toEqual(["agent-run-active", "agent-run-new"]);
+    expect(result.deletedByTable).not.toHaveProperty("runAuditEvents");
+    expect(result.deletedByTable).not.toHaveProperty("agentRuns");
+    expect((await h.adminDb().select().from(schema.project.runAuditEvents).where(inArray(schema.project.runAuditEvents.id, ["audit-old", "audit-new"]))).map((row) => row.id).sort()).toEqual(["audit-new", "audit-old"]);
+    expect((await h.adminDb().select().from(schema.project.agentRuns).where(inArray(schema.project.agentRuns.id, ["agent-run-old", "agent-run-new", "agent-run-active"]))).map((row) => row.id).sort()).toEqual(["agent-run-active", "agent-run-new", "agent-run-old"]);
     expect((await h.adminDb().select().from(schema.project.agentConfigRevisions).where(inArray(schema.project.agentConfigRevisions.id, ["revision-old", "revision-newest"]))).map((row) => row.id)).toEqual(["revision-newest"]);
   });
 

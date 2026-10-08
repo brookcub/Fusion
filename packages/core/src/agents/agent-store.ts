@@ -2371,8 +2371,8 @@ export class AgentStore extends EventEmitter {
       }
 
       // FNXC:SqliteFinalRemoval 2026-06-25-23:55:
-      // Backend mode: delete via async Drizzle helper (cascading FKs handle
-      // heartbeats, runs, task sessions, API keys, config revisions, etc.).
+      // Backend mode: delete via async Drizzle helper. Historical run rows
+      // outlive ephemeral agents; other dependent rows follow their FKs.
             await deleteAgentAsync(this.asyncLayer!.db, agentId, this.workflowProjectId);
 
       // FN-7723: keep this instance's own change-detection snapshot in sync

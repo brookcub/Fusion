@@ -16,6 +16,7 @@ import {
   type RestoreMigrationCatalog,
 } from "../postgres/restore-migration-reconcile.js";
 import {
+  AGENT_RUN_TRACE_RETENTION_VERSION,
   AGENT_RATING_PROJECT_ISOLATION_VERSION,
   AGENT_RATINGS_PROJECT_PARTITION_VERSION,
   ANALYTICS_ISOLATION_SCHEMA_VERSION,
@@ -97,6 +98,7 @@ function createRestoreCatalog(
     triggers?: ReadonlyArray<{ relation: string; name: string }>;
     policies?: ReadonlyArray<{ relation: string; name: string }>;
     indexes?: ReadonlyArray<{ relation: string; name: string }>;
+    foreignKeys?: ReadonlyArray<{ relation: string; foreignRelation: string }>;
     rlsForced?: readonly string[];
   } = {},
 ): RestoreMigrationCatalog & {
@@ -120,6 +122,7 @@ function createRestoreCatalog(
   const triggers = new Set((extras.triggers ?? []).map((entry) => namedObjectKey(entry.relation, entry.name)));
   const policies = new Set((extras.policies ?? []).map((entry) => namedObjectKey(entry.relation, entry.name)));
   const indexes = new Set((extras.indexes ?? []).map((entry) => namedObjectKey(entry.relation, entry.name)));
+  const foreignKeys = new Set((extras.foreignKeys ?? []).map((entry) => namedObjectKey(entry.relation, entry.foreignRelation)));
   const rlsForced = new Set(extras.rlsForced ?? []);
   const applied = new Set(RESTORED_SCHEMA_RELATION_SENTINELS.map((sentinel) => sentinel.version));
   const catalog: RestoreMigrationCatalog & {
@@ -156,6 +159,9 @@ function createRestoreCatalog(
     async indexExists(qualifiedRelation, indexName) {
       if (indexOverride) return indexes.has(namedObjectKey(qualifiedRelation, indexName));
       return expectedNamedObjects("indexes", qualifiedRelation).includes(indexName);
+    },
+    async foreignKeyToExists(qualifiedRelation, foreignRelation) {
+      return foreignKeys.has(namedObjectKey(qualifiedRelation, foreignRelation));
     },
     async rowLevelSecurityForced(qualifiedRelation) {
       if (rlsForcedOverride) return rlsForced.has(qualifiedRelation);
@@ -898,6 +904,18 @@ describe("PostgreSQL paired restore orchestration", () => {
       allColumns,
     );
     expect(await detectRestoredSchemaRewindFloor(ownershipCatalog)).toBe(PROJECT_OWNERSHIP_SCHEMA_VERSION);
+  });
+
+  it("replays run retention when a restored project brings back the agent cascade", async () => {
+    const relations = RESTORED_SCHEMA_RELATION_SENTINELS.flatMap((entry) => [...(entry.relations ?? [])]);
+    const columns = RESTORED_SCHEMA_RELATION_SENTINELS.flatMap((entry) => [...(entry.columns ?? [])]);
+    relations.push("project.agent_runs");
+    const stale = createRestoreCatalog(relations, columns, [], [], {
+      foreignKeys: [{ relation: "project.agent_runs", foreignRelation: "project.agents" }],
+    });
+    expect(await detectRestoredSchemaRewindFloor(stale)).toBe(AGENT_RUN_TRACE_RETENTION_VERSION);
+    const current = createRestoreCatalog(relations, columns);
+    expect(await detectRestoredSchemaRewindFloor(current)).toBeNull();
   });
 
   it("unstamps omitted ALTER columns even when later CREATE TABLE sentinels exist", async () => {

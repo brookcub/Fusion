@@ -188,8 +188,36 @@ pgDescribe("agent project isolation", () => {
     expect(await readRaw(projectB.projectId)).toEqual(beforeReassignmentB);
     expect((await readAgent(projectA.db, sharedId, projectA.projectId))?.taskId).toBe("task-a-updated");
 
+    await projectA.db.insert(schema.project.agentRuns).values({
+      projectId: projectA.projectId, id: "historical-run-a", agentId: sharedId,
+      data: { id: "historical-run-a", agentId: sharedId }, startedAt: now,
+      endedAt: now, status: "completed",
+    });
+    await projectA.db.insert(schema.project.agentRuns).values({
+      projectId: projectA.projectId, id: "active-run-a", agentId: sharedId,
+      data: { id: "active-run-a", agentId: sharedId, status: "active" },
+      startedAt: now, endedAt: null, status: "active",
+    });
     expect(await deleteAgent(projectA.db, sharedId, projectA.projectId)).toBe(true);
     expect(await readAgent(projectA.db, sharedId, projectA.projectId)).toBeNull();
+    expect(await projectA.db.select({ id: schema.project.agentRuns.id })
+      .from(schema.project.agentRuns)
+      .where(and(eq(schema.project.agentRuns.projectId, projectA.projectId),
+        eq(schema.project.agentRuns.id, "historical-run-a"))))
+      .toEqual([{ id: "historical-run-a" }]);
+    const retiredRun = await projectA.db.select({ status: schema.project.agentRuns.status,
+      data: schema.project.agentRuns.data, endedAt: schema.project.agentRuns.endedAt })
+      .from(schema.project.agentRuns)
+      .where(and(eq(schema.project.agentRuns.projectId, projectA.projectId),
+        eq(schema.project.agentRuns.id, "active-run-a")));
+    expect(retiredRun[0]?.status).toBe("terminated");
+    expect(retiredRun[0]?.endedAt).not.toBeNull();
+    expect(retiredRun[0]?.data).toMatchObject({ status: "terminated" });
+    await expect(projectA.db.insert(schema.project.agentRuns).values({
+      projectId: projectA.projectId, id: "orphan-active", agentId: sharedId,
+      data: { id: "orphan-active", agentId: sharedId, status: "active" },
+      startedAt: now, endedAt: null, status: "active",
+    })).rejects.toThrow();
     expect((await readAgent(projectB.db, sharedId, projectB.projectId))?.name).toBe("Agent B store update");
 
     // An undefined project id intentionally remains unscoped: it sees B's row and writes its legacy partition.

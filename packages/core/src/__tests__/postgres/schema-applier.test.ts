@@ -27,6 +27,7 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import { sql } from "drizzle-orm";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { createDrizzleRestoreMigrationCatalog, reconcileRestoredSchemaMigrations } from "../../postgres/restore-migration-reconcile.js";
 import {
   applySchemaBaseline,
   getAppliedMigrations,
@@ -117,6 +118,7 @@ import {
   CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION,
   OVERLAP_WAIT_SYNC_VERSION,
   DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION,
+  AGENT_RUN_TRACE_RETENTION_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ProjectPartitionRekeyError, rekeyFallbackProjectPartition } from "../../postgres/migration-stamping.js";
 import type { PluginSchemaInitHook } from "../../postgres/plugin-schema-hook.js";
@@ -173,7 +175,7 @@ describe("schema-applier: immutable migration identities", () => {
     expect(TASK_PLANNING_FAILURE_VERSION).toBe("0072");
     expect(CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION).toBe("0073");
     expect(Number(SCHEMA_BASELINE_VERSION)).toBeGreaterThanOrEqual(Number(CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION));
-    expect(SCHEMA_BASELINE_VERSION).toBe("0085");
+    expect(SCHEMA_BASELINE_VERSION).toBe("0086");
   });
 
   it("keeps monitor and approval isolation assigned to version 0003", () => {
@@ -753,6 +755,53 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     await applySchemaBaseline(ctx.db);
     const second = await applySchemaBaseline(ctx.db);
     expect(second.applied).toBe(false);
+  });
+
+  it("upgrades 0085 agent-run cascade without losing historical traces", async () => {
+    ctx = await setupFreshDb();
+    await applySchemaBaseline(ctx.db, { pluginHooks: [] });
+    await ctx.db.execute(sql.raw(`
+      DELETE FROM public.fusion_schema_migrations WHERE version = '0086';
+      DROP TRIGGER guard_active_agent_run ON project.agent_runs;
+      DROP TRIGGER terminate_runs_on_agent_delete ON project.agents;
+      ALTER TABLE project.agent_runs ADD CONSTRAINT agent_runs_agent_id_agents_id_fk
+        FOREIGN KEY (project_id, agent_id) REFERENCES project.agents(project_id, id) ON DELETE CASCADE;
+      INSERT INTO project.agents(id, name, role, created_at, updated_at)
+      VALUES ('trace-agent', 'Trace Agent', 'worker', '2026-01-01', '2026-01-01');
+      INSERT INTO project.agent_runs(id, agent_id, data, started_at, ended_at, status)
+      VALUES ('trace-run', 'trace-agent', '{"id":"trace-run"}'::jsonb,
+              '2026-01-01', '2026-01-01', 'completed');
+    `));
+
+    expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(true);
+    expect(await getAppliedMigrations(ctx.db)).toContain("0086");
+    await ctx.db.execute(sql`DELETE FROM project.agents WHERE id = 'trace-agent'`);
+    expect(await ctx.db.execute(sql`SELECT id, agent_id FROM project.agent_runs WHERE id = 'trace-run'`))
+      .toEqual([{ id: "trace-run", agent_id: "trace-agent" }]);
+    expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(false);
+  });
+
+  it("replays a restored 0086 marker whose old cascade would erase a trace", async () => {
+    ctx = await setupFreshDb();
+    await applySchemaBaseline(ctx.db);
+    await ctx.db.execute(sql.raw(`
+      DROP TRIGGER guard_active_agent_run ON project.agent_runs;
+      DROP TRIGGER terminate_runs_on_agent_delete ON project.agents;
+      ALTER TABLE project.agent_runs ADD CONSTRAINT agent_runs_agent_id_agents_id_fk
+        FOREIGN KEY (project_id, agent_id) REFERENCES project.agents(project_id, id) ON DELETE CASCADE;
+      INSERT INTO project.agents(id, name, role, created_at, updated_at)
+      VALUES ('restored-agent', 'Restored Agent', 'worker', '2026-01-01', '2026-01-01');
+      INSERT INTO project.agent_runs(id, agent_id, data, started_at, ended_at, status)
+      VALUES ('restored-run', 'restored-agent', '{"id":"restored-run"}'::jsonb,
+              '2026-01-01', '2026-01-01', 'completed');
+    `));
+
+    const result = await reconcileRestoredSchemaMigrations(createDrizzleRestoreMigrationCatalog(ctx.db));
+    expect(result.rewoundFrom).toBe("0086");
+    expect(await getAppliedMigrations(ctx.db)).toContain("0086");
+    await ctx.db.execute(sql`DELETE FROM project.agents WHERE id = 'restored-agent'`);
+    expect(await ctx.db.execute(sql`SELECT id FROM project.agent_runs WHERE id = 'restored-run'`))
+      .toEqual([{ id: "restored-run" }]);
   });
 
   /*
@@ -2024,6 +2073,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION,
       OVERLAP_WAIT_SYNC_VERSION,
       DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION,
+      AGENT_RUN_TRACE_RETENTION_VERSION,
     ]);
   });
 
@@ -2258,6 +2308,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION,
       OVERLAP_WAIT_SYNC_VERSION,
       DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION,
+      AGENT_RUN_TRACE_RETENTION_VERSION,
     ]);
   });
 
@@ -2373,6 +2424,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION,
       OVERLAP_WAIT_SYNC_VERSION,
       DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION,
+      AGENT_RUN_TRACE_RETENTION_VERSION,
     ]);
   });
 
@@ -2488,6 +2540,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION,
       OVERLAP_WAIT_SYNC_VERSION,
       DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION,
+      AGENT_RUN_TRACE_RETENTION_VERSION,
     ]);
   });
 });

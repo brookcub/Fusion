@@ -72,10 +72,10 @@ function makeExecutor(agentStore: unknown, steps = 1) {
   } as any);
 }
 
-function makeForeignKeyStore(roster: Array<{ id: string; role?: string; roles?: string[]; metadata?: object }>) {
+function makeGuardedRunStore(roster: Array<{ id: string; role?: string; roles?: string[]; metadata?: object }>) {
   const saveRun = vi.fn(async (run: { agentId: string }) => {
     if (!roster.some((agent) => agent.id === run.agentId)) {
-      throw new Error("agent_runs_agent_id_fkey");
+      throw new Error("active agent run admission rejected a missing agent");
     }
   });
   return {
@@ -140,7 +140,7 @@ describe("workflow step activity run agent attribution", () => {
   });
 
   it("persists start and completed rows with the provisioned executor owner", async () => {
-    const store = makeForeignKeyStore([executorOwner]);
+    const store = makeGuardedRunStore([executorOwner]);
     mocks.createSession.mockResolvedValue(makeSession());
 
     const results = await makeExecutor(store).executeAll();
@@ -153,7 +153,7 @@ describe("workflow step activity run agent attribution", () => {
   });
 
   it("skips unresolvable roster writes once without changing two-step results", async () => {
-    const store = makeForeignKeyStore([]);
+    const store = makeGuardedRunStore([]);
     mocks.createSession.mockResolvedValue(makeSession());
 
     const results = await makeExecutor(store, 2).executeAll();
@@ -191,7 +191,7 @@ describe("workflow step activity run agent attribution", () => {
   });
 
   it("never sends completed, failed, or terminated rows with an unproved id", async () => {
-    const store = makeForeignKeyStore([executorOwner]);
+    const store = makeGuardedRunStore([executorOwner]);
 
     mocks.createSession.mockResolvedValueOnce(makeSession());
     await makeExecutor(store).executeAll();

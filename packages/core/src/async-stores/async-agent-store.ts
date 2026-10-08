@@ -324,8 +324,9 @@ export async function findAgentRowsByName(
 }
 
 /**
- * Delete an agent by id. Cascading foreign keys remove heartbeats, runs,
- * task sessions, API keys, config revisions, and blocked states.
+ * Delete an agent by id. Cascading foreign keys remove ephemeral heartbeats,
+ * task sessions, API keys, config revisions, and blocked states. Historical
+ * agent-run rows deliberately retain their attributed agent id.
  */
 export async function deleteAgent(
   handle: QueryHandle,

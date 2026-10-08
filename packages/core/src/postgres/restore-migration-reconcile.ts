@@ -67,6 +67,7 @@ import {
   applySchemaBaseline,
   AI_MERGE_REVIEW_RECONCILIATION_VERSION,
   AGENT_ACTIVITY_EVENTS_VERSION,
+  AGENT_RUN_TRACE_RETENTION_VERSION,
   AGENT_RATING_PROJECT_ISOLATION_VERSION,
   AGENT_RATINGS_PROJECT_PARTITION_VERSION,
   ANALYTICS_ISOLATION_SCHEMA_VERSION,
@@ -138,6 +139,7 @@ export interface RestoreMigrationCatalog {
   triggerExists(qualifiedRelation: string, triggerName: string): Promise<boolean>;
   policyExists(qualifiedRelation: string, policyName: string): Promise<boolean>;
   indexExists(qualifiedRelation: string, indexName: string): Promise<boolean>;
+  foreignKeyToExists(qualifiedRelation: string, foreignRelation: string): Promise<boolean>;
   rowLevelSecurityForced(qualifiedRelation: string): Promise<boolean>;
   applyRewindAndReplay(floor: string | null): Promise<void>;
 }
@@ -173,6 +175,7 @@ export interface RestoredSchemaRelationSentinel {
   readonly policies?: readonly RestoredSchemaNamedObjectSentinel[];
   readonly indexes?: readonly RestoredSchemaNamedObjectSentinel[];
   readonly absentColumns?: readonly RestoredSchemaColumnSentinel[];
+  readonly absentForeignKeys?: ReadonlyArray<{ relation: string; foreignRelation: string }>;
   readonly forcedRowLevelSecurity?: readonly string[];
 }
 
@@ -366,6 +369,10 @@ export const RESTORED_SCHEMA_RELATION_SENTINELS: readonly RestoredSchemaRelation
   { version: TASK_REQUIRE_PLAN_APPROVAL_VERSION, columns: [tasksColumn("require_plan_approval")] },
   { version: PATCHNODE_ENTRIES_VERSION, relations: ["project.patchnode_entries"] },
   { version: OVERLAP_WAIT_SYNC_VERSION, relations: ["project.task_overlap_waits"] },
+  { version: AGENT_RUN_TRACE_RETENTION_VERSION,
+    absentForeignKeys: [{ relation: "project.agent_runs", foreignRelation: "project.agents" }],
+    triggers: [{ relation: "project.agent_runs", name: "guard_active_agent_run" },
+      { relation: "project.agents", name: "terminate_runs_on_agent_delete" }] },
 ];
 
 export async function detectRestoredSchemaRewindFloor(
@@ -433,6 +440,14 @@ export async function detectRestoredSchemaRewindFloor(
       for (const column of sentinel.absentColumns ?? []) {
         if (!(await catalog.relationExists(column.relation))) continue;
         if (!(await catalog.columnExists(column.relation, column.column))) continue;
+        missing = true;
+        break;
+      }
+    }
+    if (!missing) {
+      for (const foreignKey of sentinel.absentForeignKeys ?? []) {
+        if (!(await catalog.relationExists(foreignKey.relation))) continue;
+        if (!(await catalog.foreignKeyToExists(foreignKey.relation, foreignKey.foreignRelation))) continue;
         missing = true;
         break;
       }
@@ -597,6 +612,17 @@ export function createDrizzleRestoreMigrationCatalog(
           WHERE nsp.nspname = ${schema}
             AND rel.relname = ${table}
             AND idx.relname = ${indexName}
+        ) AS present
+      `)) as unknown as Array<{ present: boolean }>;
+      return rows[0]?.present === true;
+    },
+    async foreignKeyToExists(qualifiedRelation, foreignRelation) {
+      const rows = (await db.execute(sql`
+        SELECT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid = to_regclass(${qualifiedRelation})
+            AND confrelid = to_regclass(${foreignRelation})
+            AND contype = 'f'
         ) AS present
       `)) as unknown as Array<{ present: boolean }>;
       return rows[0]?.present === true;

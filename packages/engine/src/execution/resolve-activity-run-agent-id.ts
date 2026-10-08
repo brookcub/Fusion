@@ -10,8 +10,8 @@ export type WorkflowStepRunAgentStore = {
 
 /**
  * FNXC:CommandCenterActivity 2026-09-04-14:11:
- * `project.agent_runs.agent_id` has a composite foreign key to `project.agents`, so a role slug
- * or unproved string is a guaranteed constraint violation. This seam turns a candidate into a
+ * Active run writes are guarded by the database against missing agents, so a role slug
+ * or unproved string can fail at admission. This seam turns a candidate into a
  * proven roster id or an explicit unattributable verdict; it never invents an id. Built-in owners
  * win same-role pools because provisioning seeds one owner per role while operators may add pool
  * members. Proving attribution reads the store, so the read is bounded, swallowing, and called

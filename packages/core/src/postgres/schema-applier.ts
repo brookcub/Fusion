@@ -89,7 +89,9 @@ touches no data; it must advance in the same change that ships a new migration f
 /* FNXC:PatchnodeLedger 2026-08-28-12:16: the permanent ledger table must exist before TaskStore can commit a completion move atomically with its entry. */
 /* FNXC:ChatSidebarPerf 2026-09-08-04:48: baseline marker includes the chat-message recency index required for index-backed sidebar previews. */
 /* FNXC:OverlapWaitSynchronization 2026-09-17-00:22: advance the ceiling so an upgraded project has the durable wait table before any overlap-marker transition tries to record into it. Renumbered 0074->0084 (2026-09-18): upstream's own migrations 0074 (FN-323 project notes) through 0083 (FN-514) are absent from this branch by design (it excludes their source commits), but the numeric slots are real and must not be reused, or a database that ran the real 0074..0083 would be misread as compatible with this branch's different 0074. */
-export const SCHEMA_BASELINE_VERSION = "0085";
+/** Historical agent runs must not cascade away with ephemeral agents. */
+export const AGENT_RUN_TRACE_RETENTION_VERSION = "0086";
+export const SCHEMA_BASELINE_VERSION = AGENT_RUN_TRACE_RETENTION_VERSION;
 /** FNXC:SymbolLock 2026-07-20-10:00: upgrades need durable task declarations before admission resolves symbols. */
 export const TASK_DECLARED_SYMBOLS_VERSION = "0028";
 const INITIAL_SCHEMA_VERSION = "0000";
@@ -545,6 +547,7 @@ const TASK_PLANNING_FAILURE_MIGRATION_PATH = join(MIGRATIONS_DIR, "0072_fn_9273_
 const CHAT_MESSAGES_SESSION_RECENCY_INDEX_MIGRATION_PATH = join(MIGRATIONS_DIR, "0073_fn_9275_chat_messages_session_recency_index.sql");
 const OVERLAP_WAIT_SYNC_MIGRATION_PATH = join(MIGRATIONS_DIR, "0084_fn_332_overlap_sync.sql");
 const DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_MIGRATION_PATH = join(MIGRATIONS_DIR, "0085_drop_excluded_upstream_feature_schema.sql");
+const AGENT_RUN_TRACE_RETENTION_MIGRATION_PATH = join(MIGRATIONS_DIR, "0086_preserve_agent_runs_after_agent_delete.sql");
 
 /**
  * Ensure the migration bookkeeping table exists. Lives in the public schema so
@@ -690,6 +693,7 @@ export async function applySchemaBaseline(
     const chatMessagesSessionRecencyIndexAlreadyApplied = applied.includes(CHAT_MESSAGES_SESSION_RECENCY_INDEX_VERSION);
     const overlapWaitSyncAlreadyApplied = applied.includes(OVERLAP_WAIT_SYNC_VERSION);
     const dropExcludedUpstreamFeatureSchemaAlreadyApplied = applied.includes(DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION);
+    const agentRunTraceRetentionAlreadyApplied = applied.includes(AGENT_RUN_TRACE_RETENTION_VERSION);
     assertBinaryNotOlderThanDatabase(applied);
     let schemaChanged = false;
 
@@ -1631,6 +1635,32 @@ export async function applySchemaBaseline(
       const migrationSql = await readFile(DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_MIGRATION_PATH, "utf8");
       await tx.execute(sql.raw(migrationSql));
       await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${DROP_EXCLUDED_UPSTREAM_FEATURE_SCHEMA_VERSION}) ON CONFLICT (version) DO NOTHING`);
+      schemaChanged = true;
+    }
+    const agentRunTablesPresent = ((await tx.execute(sql`
+      SELECT to_regclass('project.agent_runs') IS NOT NULL
+         AND to_regclass('project.agents') IS NOT NULL AS present
+    `)) as unknown as Array<{ present: boolean }>)[0]?.present ?? false;
+    const agentRunCascadePresent = ((await tx.execute(sql`
+      SELECT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = to_regclass('project.agent_runs')
+          AND confrelid = to_regclass('project.agents')
+          AND contype = 'f'
+      ) AS present
+    `)) as unknown as Array<{ present: boolean }>)[0]?.present ?? false;
+    const agentRunRetentionTriggersMissing = ((await tx.execute(sql`
+      SELECT
+        NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = to_regclass('project.agent_runs')
+          AND tgname = 'guard_active_agent_run' AND NOT tgisinternal)
+        OR NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = to_regclass('project.agents')
+          AND tgname = 'terminate_runs_on_agent_delete' AND NOT tgisinternal) AS missing
+    `)) as unknown as Array<{ missing: boolean }>)[0]?.missing ?? true;
+    if (agentRunTablesPresent &&
+        (!agentRunTraceRetentionAlreadyApplied || agentRunCascadePresent || agentRunRetentionTriggersMissing)) {
+      const migrationSql = await readFile(AGENT_RUN_TRACE_RETENTION_MIGRATION_PATH, "utf8");
+      await tx.execute(sql.raw(migrationSql));
+      await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${AGENT_RUN_TRACE_RETENTION_VERSION}) ON CONFLICT (version) DO NOTHING`);
       schemaChanged = true;
     }
     return { applied: schemaChanged, pluginHooksRun: pluginHooks.length };
